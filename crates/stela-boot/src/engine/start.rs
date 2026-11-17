@@ -1483,11 +1483,11 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
 }
 
 /// What probe found of the GPUs and the platform around them: the display
-/// controllers, the PCI-to-ISA bridges, each GPU's ACPI companion and the
+/// controllers, the chipset functions, each GPU's ACPI companion and the
 /// ports above each GPU.
 type FoundGpus = (
     Vec<stela_drivers::gpu::Adapter>,
-    Vec<stela_drivers::probe::IsaBridge>,
+    Vec<stela_drivers::probe::ChipsetFunction>,
     Vec<(stela_drivers::bus::pci::Address, String)>,
     stela_drivers::probe::GpuPorts,
 );
@@ -1502,7 +1502,7 @@ fn open_gpus(
     acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    (adapters, isa_bridges, companions, ports): FoundGpus,
+    (adapters, chipset, companions, ports): FoundGpus,
 ) -> bool {
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
     let guest_ram = handoff.guest[..handoff.guest_count]
@@ -1558,7 +1558,7 @@ fn open_gpus(
             gpu::claim_all(
                 &services,
                 &adapters,
-                &isa_bridges,
+                &chipset,
                 &ports,
                 gop,
                 firmware.as_ref(),
@@ -3299,7 +3299,7 @@ fn start_devices(
                 network_account,
                 gpus,
                 gpu_companions,
-                isa_bridges,
+                chipset,
                 gpu_ports,
                 usb,
                 bluetooth: host_controller,
@@ -3358,7 +3358,7 @@ fn start_devices(
                     host_acpi,
                     handoff,
                     host_firmware,
-                    (gpus, isa_bridges, gpu_companions, gpu_ports),
+                    (gpus, chipset, gpu_companions, gpu_ports),
                 )
             {
                 let firmware = handoff
