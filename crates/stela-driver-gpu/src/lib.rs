@@ -13,6 +13,8 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod anv;
 #[cfg(feature = "linux-drm")]
 pub mod command_line;
 #[cfg(feature = "i915-port")]
@@ -124,10 +126,7 @@ impl Adapter {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
             Vendor::Amd => "AMDGPU is not ported to Stela",
-            Vendor::Intel => {
-                "it needs Linux's i915 driver, which Stela does not have: its xe driver runs \
-                 Tiger Lake and later"
-            }
+            Vendor::Intel => "no driver here runs Stela's Metal device on this Intel GPU",
             Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
         }
     }
