@@ -1609,6 +1609,7 @@ fn open_gpus(
         #[cfg(feature = "nvk")]
         heap_bytes,
     };
+    gpu::amd_acpi_methods(acpi, &claimed);
     // Store the claim's lines before Linux starts, so the USB keeps them
     // even when the start never returns.
     output::flush_log();
