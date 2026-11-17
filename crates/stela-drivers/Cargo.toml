@@ -24,7 +24,6 @@ xe-port = ["stela-driver-gpu/xe-port"]
 metal = ["stela-driver-gpu/metal"]
 metal-vulkan = ["stela-driver-gpu/metal-vulkan"]
 metal-linked = ["stela-driver-gpu/metal-linked"]
-radv = ["amdgpu-port", "metal-linked", "stela-driver-gpu/radv"]
 # Test builds only: the Metal device's memory cap.
 vram-cap = ["stela-driver-gpu/vram-cap"]
 
