@@ -76,7 +76,7 @@ impl fmt::Display for Counted {
 }
 
 /// FNV-1a over the formatted text.
-fn hash(text: fmt::Arguments<'_>) -> u64 {
+pub(crate) fn hash(text: fmt::Arguments<'_>) -> u64 {
     struct Fnv(u64);
     impl fmt::Write for Fnv {
         fn write_str(&mut self, s: &str) -> fmt::Result {

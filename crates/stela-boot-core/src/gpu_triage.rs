@@ -1,41 +1,88 @@
 //! Lines a GPU's boot log carries for whoever reads it after a failure on a
 //! PC nobody here can test: a one-time summary of what the GPU and its
 //! driver are, and a bound on lines that repeat.
-use alloc::{collections::BTreeMap, format, string::String};
+use core::fmt;
 
 /// Counts a keyed line's repeats and says which to print: the first, then
 /// each power of two, so a line that repeats every frame costs a log a few
-/// lines that still show how often it came.
-#[derive(Default)]
+/// lines that still show how often it came. Keys are kept as hashes of
+/// their text in a table of fixed size, so a count allocates nothing: a
+/// `WARN` may come while the heap is exhausted.
 pub struct Repeats {
-    counts: BTreeMap<String, u64>,
+    /// Each tracked key's hash and count, the first `tracked` of them used.
+    counts: [(u64, u64); KEYS],
+    tracked: usize,
+    /// The count of every key past the table.
+    untracked: u64,
 }
 
 /// Keys a [`Repeats`] tracks; a key past them is printed at the powers of
 /// two of the untracked count.
 const KEYS: usize = 256;
 
+/// How a counted line is printed: the suffix after its text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Seen {
+    /// Its first time: no suffix.
+    First,
+    /// A power of two of its count.
+    Times(u64),
+    /// A power of two of the count of the keys past the table.
+    PastTable(u64),
+}
+
+impl fmt::Display for Seen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::First => Ok(()),
+            Self::Times(count) => write!(f, " (seen {count} times)"),
+            Self::PastTable(count) => write!(f, " ({count} past the log's table)"),
+        }
+    }
+}
+
+impl Default for Repeats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Repeats {
     pub const fn new() -> Self {
         Self {
-            counts: BTreeMap::new(),
+            counts: [(0, 0); KEYS],
+            tracked: 0,
+            untracked: 0,
         }
     }
 
-    /// Count one more `key`: the suffix to print it with, `Some("")` the
-    /// first time and `Some(" (seen N times)")` at each power of two after,
-    /// `None` when it is not printed.
-    pub fn count(&mut self, key: &str) -> Option<String> {
-        let tracked = self.counts.len() < KEYS || self.counts.contains_key(key);
-        let key = if tracked { key } else { "" };
-        let count = self.counts.entry(String::from(key)).or_insert(0);
+    /// Count one more `key`: how to print it, `None` when it is not
+    /// printed.
+    pub fn count(&mut self, key: fmt::Arguments<'_>) -> Option<Seen> {
+        let hash = crate::repeated_lines::hash(key);
+        let slot = match self.counts[..self.tracked]
+            .iter()
+            .position(|&(known, _)| known == hash)
+        {
+            Some(slot) => Some(slot),
+            None if self.tracked < KEYS => {
+                self.counts[self.tracked] = (hash, 0);
+                self.tracked += 1;
+                Some(self.tracked - 1)
+            }
+            None => None,
+        };
+        let count = match slot {
+            Some(slot) => &mut self.counts[slot].1,
+            None => &mut self.untracked,
+        };
         *count += 1;
         let count = *count;
-        match (count.is_power_of_two(), tracked) {
+        match (count.is_power_of_two(), slot.is_some()) {
             (false, _) => None,
-            (true, true) if count == 1 => Some(String::new()),
-            (true, true) => Some(format!(" (seen {count} times)")),
-            (true, false) => Some(format!(" ({count} past the log's table)")),
+            (true, true) if count == 1 => Some(Seen::First),
+            (true, true) => Some(Seen::Times(count)),
+            (true, false) => Some(Seen::PastTable(count)),
         }
     }
 }
@@ -156,13 +203,17 @@ impl core::fmt::Display for PagesAtStop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{format, string::String, vec::Vec};
 
     #[test]
     fn a_repeated_line_prints_at_its_first_and_each_power_of_two() {
         let mut repeats = Repeats::new();
         let printed: Vec<(u64, String)> = (1..=17)
-            .filter_map(|n| repeats.count("amdgpu_irq.c:670").map(|suffix| (n, suffix)))
+            .filter_map(|n| {
+                repeats
+                    .count(format_args!("{}:{}", "amdgpu_irq.c", 670))
+                    .map(|seen| (n, format!("{seen}")))
+            })
             .collect();
         assert_eq!(
             printed,
@@ -175,26 +226,52 @@ mod tests {
             ]
         );
         // Another line is counted apart.
-        assert_eq!(repeats.count("dma-mapping.h:668"), Some(String::new()));
+        assert_eq!(
+            repeats.count(format_args!("dma-mapping.h:668")),
+            Some(Seen::First)
+        );
     }
 
     #[test]
     fn keys_past_the_table_share_one_count() {
         let mut repeats = Repeats::new();
         for key in 0..KEYS {
-            assert_eq!(repeats.count(&format!("{key}")), Some(String::new()));
+            assert_eq!(repeats.count(format_args!("{key}")), Some(Seen::First));
         }
+        assert_eq!(repeats.count(format_args!("new")), Some(Seen::PastTable(1)));
         assert_eq!(
-            repeats.count("new"),
-            Some(String::from(" (1 past the log's table)"))
+            format!("{}", Seen::PastTable(2)),
+            " (2 past the log's table)"
         );
         assert_eq!(
-            repeats.count("other"),
-            Some(String::from(" (2 past the log's table)"))
+            repeats.count(format_args!("other")),
+            Some(Seen::PastTable(2))
         );
-        assert_eq!(repeats.count("third"), None);
+        assert_eq!(repeats.count(format_args!("third")), None);
         // A tracked key still counts on its own.
-        assert_eq!(repeats.count("0"), Some(String::from(" (seen 2 times)")));
+        assert_eq!(repeats.count(format_args!("0")), Some(Seen::Times(2)));
+    }
+
+    /// A `WARN` may come while the heap is exhausted: the count takes no
+    /// memory beyond the table it was made with, and its suffix is written
+    /// from the count alone.
+    #[test]
+    fn a_count_allocates_nothing() {
+        use crate::native_memory::tests::allocation_failure;
+        let mut repeats = Repeats::new();
+        allocation_failure::arm(usize::MAX);
+        let seen = [(); 4].map(|()| repeats.count(format_args!("{}:{}", "nouveau_bo.c", 42)));
+        let observation = allocation_failure::disarm();
+        assert_eq!(observation.attempts, 0);
+        assert_eq!(
+            seen,
+            [
+                Some(Seen::First),
+                Some(Seen::Times(2)),
+                None,
+                Some(Seen::Times(4))
+            ]
+        );
     }
 
     /// A heap stop names an integrated GPU's share as such, and the bound

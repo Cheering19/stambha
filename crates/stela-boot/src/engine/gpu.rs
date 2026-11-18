@@ -977,10 +977,17 @@ impl Platform for Host {
     fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>) {
         let file = file.to_str().unwrap_or("(not UTF-8)");
         let condition = condition.and_then(|text| text.to_str().ok()).unwrap_or("");
-        let Some(repeats) = self.warned.borrow_mut().count(&format!("{file}:{line}")) else {
+        // Counted without allocating, as a WARN may come while the heap is
+        // exhausted; one raised while a count is made, from the line sink
+        // below it, is written as it is.
+        let seen = match self.warned.try_borrow_mut() {
+            Ok(mut warned) => warned.count(format_args!("{file}:{line}")),
+            Err(_) => Some(stela_boot_core::gpu_triage::Seen::First),
+        };
+        let Some(seen) = seen else {
             return;
         };
-        self.report(format_args!("WARN {file}:{line} {condition}{repeats}"));
+        self.report(format_args!("WARN {file}:{line} {condition}{seen}"));
     }
 
     fn unsupported(&self, operation: &CStr) {
