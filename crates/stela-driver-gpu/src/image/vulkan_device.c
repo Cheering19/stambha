@@ -3,8 +3,10 @@
  * (`cargo xtask gpu image-test`): this program links RADV's and ANV's
  * objects as the image compiles them, only built for Linux instead of the
  * image's COFF target, with the image's C library under them and host.c
- * under that, and runs one driver over render nodes Mesa's DRM shim answers.
- * It makes the instance and every physical device, then on each GPU in turn
+ * under that, and runs them over render nodes Mesa's DRM shim answers, each
+ * GPU's as its kernel driver would: RADV on amdgpu, ANV on xe or i915. It
+ * makes each driver's instance and every physical device, then on each GPU in
+ * turn
  * the device, host-visible memory it maps, writes and maps again, and one
  * submission of a fill of a buffer, then waits for it; each GPU's work must
  * reach that GPU's render node and no other. What differs from a Linux host
@@ -12,8 +14,9 @@
  * answers a fixed value) shows here as it would on a GPU, short of what only
  * a GPU's work shows.
  *
- * Usage: image_device radv <amdgpu device name> <GPUs: 1 or 2>
- *        image_device anv <PCI device ID, hex> 1
+ * Usage: image_device <GPU> [<GPU>], each GPU <kernel>:<device>: amdgpu and
+ * its device name, or xe or i915 and the PCI device ID in hex. Two Intel
+ * GPUs must be the same device, as the shims model one of each driver.
  * Prints "image device: ..." and "image ioctls: ..." and exits 0, or names
  * the step that failed and exits 1. */
 #include <stdio.h>
@@ -23,12 +26,10 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
-#include <stela/host.h>
+#include "image_host.h"
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL radv_icdGetInstanceProcAddr(VkInstance, const char *);
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL anv_icdGetInstanceProcAddr(VkInstance, const char *);
-void image_host_list(const struct stela_libc_drm_device *gpus, unsigned int count, int intel);
-unsigned int image_host_driver_ioctls(unsigned int gpu);
 
 #define CHECK(condition)                                                                       \
 	do {                                                                                   \
@@ -53,6 +54,7 @@ unsigned int image_host_driver_ioctls(unsigned int gpu);
 
 #define BUFFER_BYTES (64u << 10)
 
+/* The calls of the driver in use, which use_driver() sets. */
 static PFN_vkGetInstanceProcAddr entry;
 static PFN_vkCreateInstance vkCreateInstance;
 static PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices;
@@ -62,6 +64,66 @@ static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperti
 static PFN_vkCreateDevice vkCreateDevice;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 static PFN_vkDestroyInstance vkDestroyInstance;
+
+/* One Vulkan driver of the program: its entry, instance and calls. */
+struct driver {
+	const char *name;
+	PFN_vkGetInstanceProcAddr entry;
+	VkInstance instance;
+	PFN_vkEnumeratePhysicalDevices enumerate;
+	PFN_vkGetPhysicalDeviceProperties properties;
+	PFN_vkGetPhysicalDeviceQueueFamilyProperties families;
+	PFN_vkGetPhysicalDeviceMemoryProperties memory;
+	PFN_vkCreateDevice create_device;
+	PFN_vkGetDeviceProcAddr device_entry;
+	PFN_vkDestroyInstance destroy;
+};
+
+static struct driver drivers[2] = {
+	{.name = "radv", .entry = radv_icdGetInstanceProcAddr},
+	{.name = "anv", .entry = anv_icdGetInstanceProcAddr},
+};
+
+static void use_driver(const struct driver *driver)
+{
+	entry = driver->entry;
+	vkEnumeratePhysicalDevices = driver->enumerate;
+	vkGetPhysicalDeviceProperties = driver->properties;
+	vkGetPhysicalDeviceQueueFamilyProperties = driver->families;
+	vkGetPhysicalDeviceMemoryProperties = driver->memory;
+	vkCreateDevice = driver->create_device;
+	vkGetDeviceProcAddr = driver->device_entry;
+	vkDestroyInstance = driver->destroy;
+}
+
+/* The driver's instance and calls. */
+static int start(struct driver *driver)
+{
+	entry = driver->entry;
+	LOAD(NULL, vkCreateInstance);
+	VK(vkCreateInstance(
+		&(VkInstanceCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+			.pApplicationInfo =
+				&(VkApplicationInfo){
+					.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+					.apiVersion = VK_API_VERSION_1_3,
+				},
+		},
+		NULL, &driver->instance));
+	VkInstance instance = driver->instance;
+	driver->enumerate = (PFN_vkEnumeratePhysicalDevices)entry(instance, "vkEnumeratePhysicalDevices");
+	driver->properties =
+		(PFN_vkGetPhysicalDeviceProperties)entry(instance, "vkGetPhysicalDeviceProperties");
+	driver->families = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)entry(
+		instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+	driver->memory = (PFN_vkGetPhysicalDeviceMemoryProperties)entry(
+		instance, "vkGetPhysicalDeviceMemoryProperties");
+	driver->create_device = (PFN_vkCreateDevice)entry(instance, "vkCreateDevice");
+	driver->device_entry = (PFN_vkGetDeviceProcAddr)entry(instance, "vkGetDeviceProcAddr");
+	driver->destroy = (PFN_vkDestroyInstance)entry(instance, "vkDestroyInstance");
+	return 0;
+}
 
 /* A device of one physical device, with one queue of a compute family. */
 static int open_device(VkPhysicalDevice physical, uint32_t *queue_family, VkDevice *device)
@@ -211,54 +273,67 @@ static int work(VkPhysicalDevice physical)
 
 int main(int argc, char **argv)
 {
-	CHECK(argc == 4);
-	int intel = !strcmp(argv[1], "anv");
-	CHECK(intel || !strcmp(argv[1], "radv"));
-	unsigned int count = (unsigned int)strtoul(argv[3], NULL, 10);
+	unsigned int count = (unsigned int)argc - 1;
 	CHECK(count == 1 || count == 2);
 	/* The GPUs as Stela's GPU service lists them: one render node each, at
-	 * its own PCI function; the shim answers each as the device named. */
+	 * its own PCI function; each kernel driver's shim answers its GPUs as
+	 * the device named. */
 	struct stela_libc_drm_device gpus[2];
+	enum image_kernel kernels[2];
+	struct driver *driver_of[2];
 	for (unsigned int gpu = 0; gpu < count; gpu++) {
+		const char *argument = argv[gpu + 1];
+		const char *device = strchr(argument, ':');
+		CHECK(device);
+		size_t length = (size_t)(device - argument);
+		device++;
+		int intel;
+		if (length == 6 && !strncmp(argument, "amdgpu", 6)) {
+			kernels[gpu] = IMAGE_AMDGPU;
+			intel = 0;
+		} else if (length == 2 && !strncmp(argument, "xe", 2)) {
+			kernels[gpu] = IMAGE_XE;
+			intel = 1;
+		} else {
+			CHECK(length == 4 && !strncmp(argument, "i915", 4));
+			kernels[gpu] = IMAGE_I915;
+			intel = 1;
+		}
+		driver_of[gpu] = &drivers[intel];
 		memset(&gpus[gpu], 0, sizeof(gpus[gpu]));
 		gpus[gpu].vendor = intel ? 0x8086 : 0x1002;
-		gpus[gpu].device = intel ? (uint16_t)strtoul(argv[2], NULL, 16) : 0x15e7;
-		gpus[gpu].bus = (uint8_t)(intel ? 0 : 4 + gpu);
-		gpus[gpu].slot = (uint8_t)(intel ? 2 : 0);
+		gpus[gpu].device = intel ? (uint16_t)strtoul(device, NULL, 16) : 0x15e7;
+		gpus[gpu].bus = (uint8_t)(4 + gpu);
 		gpus[gpu].minor = gpu;
 	}
-	image_host_list(gpus, count, intel);
-	entry = intel ? anv_icdGetInstanceProcAddr : radv_icdGetInstanceProcAddr;
+	image_host_list(gpus, kernels, count);
 
-	LOAD(NULL, vkCreateInstance);
-	VkInstance instance;
-	VK(vkCreateInstance(
-		&(VkInstanceCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-			.pApplicationInfo =
-				&(VkApplicationInfo){
-					.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-					.apiVersion = VK_API_VERSION_1_3,
-				},
-		},
-		NULL, &instance));
-	LOAD(instance, vkEnumeratePhysicalDevices);
-	LOAD(instance, vkGetPhysicalDeviceProperties);
-	LOAD(instance, vkGetPhysicalDeviceQueueFamilyProperties);
-	LOAD(instance, vkGetPhysicalDeviceMemoryProperties);
-	LOAD(instance, vkCreateDevice);
-	LOAD(instance, vkGetDeviceProcAddr);
-	LOAD(instance, vkDestroyInstance);
-
-	uint32_t physical_count = 0;
-	VK(vkEnumeratePhysicalDevices(instance, &physical_count, NULL));
-	CHECK(physical_count == count);
+	/* Each driver's instance finds its own vendor's GPUs, in list order. */
 	VkPhysicalDevice physicals[2];
-	VK(vkEnumeratePhysicalDevices(instance, &physical_count, physicals));
-	VkPhysicalDeviceProperties properties;
-	for (unsigned int gpu = 0; gpu < count; gpu++) {
-		vkGetPhysicalDeviceProperties(physicals[gpu], &properties);
-		CHECK(properties.vendorID == gpus[gpu].vendor);
+	for (unsigned int index = 0; index < 2; index++) {
+		struct driver *driver = &drivers[index];
+		unsigned int wanted = 0;
+		for (unsigned int gpu = 0; gpu < count; gpu++)
+			wanted += driver_of[gpu] == driver;
+		if (!wanted)
+			continue;
+		if (start(driver))
+			return 1;
+		use_driver(driver);
+		uint32_t found = 0;
+		VK(vkEnumeratePhysicalDevices(driver->instance, &found, NULL));
+		CHECK(found == wanted);
+		VkPhysicalDevice list[2];
+		VK(vkEnumeratePhysicalDevices(driver->instance, &found, list));
+		unsigned int next = 0;
+		for (unsigned int gpu = 0; gpu < count; gpu++) {
+			if (driver_of[gpu] != driver)
+				continue;
+			physicals[gpu] = list[next++];
+			VkPhysicalDeviceProperties properties;
+			vkGetPhysicalDeviceProperties(physicals[gpu], &properties);
+			CHECK(properties.vendorID == gpus[gpu].vendor);
+		}
 	}
 	/* A device held open on every GPU, as the GPU service holds them: a
 	 * library that took a second GPU's descriptor for a GPU it already
@@ -266,12 +341,14 @@ int main(int argc, char **argv)
 	VkDevice held[2];
 	for (unsigned int gpu = 0; gpu < count; gpu++) {
 		uint32_t family;
+		use_driver(driver_of[gpu]);
 		if (open_device(physicals[gpu], &family, &held[gpu]))
 			return 1;
 	}
 	/* Each GPU's device, memory and submission reach its own render node. */
 	for (unsigned int gpu = 0; gpu < count; gpu++) {
 		unsigned int before[2] = {image_host_driver_ioctls(0), image_host_driver_ioctls(1)};
+		use_driver(driver_of[gpu]);
 		if (work(physicals[gpu]))
 			return 1;
 		for (unsigned int other = 0; other < count; other++) {
@@ -280,19 +357,29 @@ int main(int argc, char **argv)
 		}
 	}
 	for (unsigned int gpu = 0; gpu < count; gpu++) {
+		use_driver(driver_of[gpu]);
 		DEVICE_LOAD(held[gpu], vkDestroyDevice);
 		vkDestroyDevice(held[gpu], NULL);
 	}
-	vkGetPhysicalDeviceProperties(physicals[0], &properties);
-	vkDestroyInstance(instance, NULL);
-
-	printf("image device: %s on %u GPU%s: %s, API %u.%u, pipeline cache UUID "
-	       "%02x%02x%02x%02x..., one submission on each waited for\n",
-	       argv[1], count, count == 1 ? "" : "s", properties.deviceName,
-	       VK_API_VERSION_MAJOR(properties.apiVersion),
-	       VK_API_VERSION_MINOR(properties.apiVersion), properties.pipelineCacheUUID[0],
-	       properties.pipelineCacheUUID[1], properties.pipelineCacheUUID[2],
-	       properties.pipelineCacheUUID[3]);
+	printf("image device:");
+	for (unsigned int gpu = 0; gpu < count; gpu++) {
+		VkPhysicalDeviceProperties properties;
+		use_driver(driver_of[gpu]);
+		vkGetPhysicalDeviceProperties(physicals[gpu], &properties);
+		printf("%s %s on %s: %s, API %u.%u, pipeline cache UUID %02x%02x%02x%02x...",
+		       gpu ? ";" : "", driver_of[gpu]->name, argv[gpu + 1], properties.deviceName,
+		       VK_API_VERSION_MAJOR(properties.apiVersion),
+		       VK_API_VERSION_MINOR(properties.apiVersion), properties.pipelineCacheUUID[0],
+		       properties.pipelineCacheUUID[1], properties.pipelineCacheUUID[2],
+		       properties.pipelineCacheUUID[3]);
+	}
+	printf("; one submission on each waited for\n");
+	for (unsigned int index = 0; index < 2; index++) {
+		if (drivers[index].instance) {
+			use_driver(&drivers[index]);
+			vkDestroyInstance(drivers[index].instance, NULL);
+		}
+	}
 	printf("image ioctls:");
 	for (unsigned int gpu = 0; gpu < count; gpu++)
 		printf(" gpu%u=%u", gpu, image_host_driver_ioctls(gpu));

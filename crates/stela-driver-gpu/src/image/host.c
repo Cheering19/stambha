@@ -3,9 +3,11 @@
  * made of Linux's system calls, for a static Linux program that links the
  * image's own Mesa objects, C library and defines (`cargo xtask gpu
  * image-test`). Its render nodes are answered by Mesa's DRM shim
- * (src/drm-shim/device.c) with a driver's no-op shim behind it, called
- * directly rather than through an interposed C library: the image has no
- * other. Mappings follow host.h's contract, as Stela's GPU service does:
+ * (src/drm-shim/device.c) with a kernel driver's no-op shim behind each,
+ * called directly rather than through an interposed C library: the image has
+ * no other. Mesa's DRM shim models one kernel driver; here each GPU's ioctls
+ * run with its own driver's part of the shim's device in place, one at a
+ * time, so GPUs of two kernel drivers share one process as in the image. Mappings follow host.h's contract, as Stela's GPU service does:
  * any page-aligned run of a mapping may be unmapped.
  *
  * The shims model the kernel, so what they read of the environment and the
@@ -20,6 +22,7 @@
 #include <stela/host.h>
 
 #include "drm-shim/drm_shim.h"
+#include "image_host.h"
 
 #define LINUX_WRITE 1
 #define LINUX_MMAP 9
@@ -400,18 +403,67 @@ long long stela_libc_drm_seek(int fd, long long offset, int whence)
 #define IOCTL_NUMBER(request) ((request) & 0xff)
 #define IOCTL_TYPE(request) (((request) >> 8) & 0xff)
 
+/* The part of the shim's device each kernel driver's no-op shim sets. */
+struct personality {
+	__typeof__(shim_device.iomem_region) iomem_region;
+	int (**driver_ioctls)(int fd, unsigned long request, void *arg);
+	int driver_ioctl_count;
+	void (*driver_bo_free)(struct shim_bo *bo);
+	const char *driver_name, *unique;
+	int version_major, version_minor, version_patchlevel;
+	int bus_type;
+};
+
+static struct personality personalities[IMAGE_KERNELS];
+static enum image_kernel kernel_of[2];
+static volatile int shim_lock;
+
+static void take_personality(struct personality *personality)
+{
+	personality->iomem_region = shim_device.iomem_region;
+	personality->driver_ioctls = shim_device.driver_ioctls;
+	personality->driver_ioctl_count = shim_device.driver_ioctl_count;
+	personality->driver_bo_free = shim_device.driver_bo_free;
+	personality->driver_name = shim_device.driver_name;
+	personality->unique = shim_device.unique;
+	personality->version_major = shim_device.version_major;
+	personality->version_minor = shim_device.version_minor;
+	personality->version_patchlevel = shim_device.version_patchlevel;
+	personality->bus_type = shim_device.bus_type;
+}
+
+static void put_personality(const struct personality *personality)
+{
+	shim_device.iomem_region = personality->iomem_region;
+	shim_device.driver_ioctls = personality->driver_ioctls;
+	shim_device.driver_ioctl_count = personality->driver_ioctl_count;
+	shim_device.driver_bo_free = personality->driver_bo_free;
+	shim_device.driver_name = personality->driver_name;
+	shim_device.unique = personality->unique;
+	shim_device.version_major = personality->version_major;
+	shim_device.version_minor = personality->version_minor;
+	shim_device.version_patchlevel = personality->version_patchlevel;
+	shim_device.bus_type = personality->bus_type;
+}
+
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument)
 {
 	int index = drm_index(fd);
 	if (index < 0)
 		return -EBADF;
+	int gpu = drm_gpu[index];
 	if (IOCTL_TYPE(request) == DRM_IOCTL_BASE && IOCTL_NUMBER(request) >= DRM_COMMAND_BASE &&
 	    IOCTL_NUMBER(request) < DRM_COMMAND_END)
-		__atomic_fetch_add(&driver_ioctls[drm_gpu[index]], 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&driver_ioctls[gpu], 1, __ATOMIC_RELAXED);
+	/* The no-op shims never wait, so one ioctl at a time costs nothing. */
+	lock(&shim_lock);
+	put_personality(&personalities[kernel_of[gpu]]);
 	errno = 0;
 	int result = drm_shim_ioctl(fd, request, argument);
-	if (result == -1 && errno)
-		return -errno;
+	int error = errno;
+	unlock(&shim_lock);
+	if (result == -1 && error)
+		return -error;
 	return result;
 }
 
@@ -515,23 +567,52 @@ int stela_drm_shim_stat64(const char *path, void *buffer)
 	return stela_drm_shim_stat(path, buffer);
 }
 
-/* Which driver's shim answers, set by the program before the device starts. */
+/* Each kernel driver's no-op shim, started in turn as the shim's device
+ * starts, its part of the device kept for its GPUs' ioctls. */
 void amdgpu_shim_driver_init(void);
 void xe_shim_driver_init(void);
-static void (*shim_start)(void);
+void i915_shim_driver_init(void);
+static void (*const kernel_start[IMAGE_KERNELS])(void) = {
+	[IMAGE_AMDGPU] = amdgpu_shim_driver_init,
+	[IMAGE_XE] = xe_shim_driver_init,
+	[IMAGE_I915] = i915_shim_driver_init,
+};
+static bool kernel_used[IMAGE_KERNELS];
 
 void image_shim_driver_init(void)
 {
-	shim_start();
+	struct personality blank;
+	take_personality(&blank);
+	for (unsigned int kernel = 0; kernel < IMAGE_KERNELS; kernel++) {
+		if (!kernel_used[kernel])
+			continue;
+		put_personality(&blank);
+		kernel_start[kernel]();
+		take_personality(&personalities[kernel]);
+	}
 }
 
-/* The GPUs the program shows and the shim that answers them. */
-void image_host_list(const struct stela_libc_drm_device *gpus, unsigned int count, int intel)
+/* i915's shim can take a device from a JSON description, which the image
+ * test never gives it. */
+bool image_no_device_json(const char *json, void *devinfo);
+
+bool image_no_device_json(const char *json, void *devinfo)
 {
-	for (unsigned int gpu = 0; gpu < count && gpu < 2; gpu++)
+	(void)json;
+	(void)devinfo;
+	return false;
+}
+
+/* The GPUs the program shows and the kernel driver that answers each. */
+void image_host_list(const struct stela_libc_drm_device *gpus, const enum image_kernel *kernels,
+		     unsigned int count)
+{
+	for (unsigned int gpu = 0; gpu < count && gpu < 2; gpu++) {
 		listed[gpu] = gpus[gpu];
+		kernel_of[gpu] = kernels[gpu];
+		kernel_used[kernels[gpu]] = true;
+	}
 	listed_count = count < 2 ? count : 2;
-	shim_start = intel ? xe_shim_driver_init : amdgpu_shim_driver_init;
 	drm_shim_device_init();
 }
 

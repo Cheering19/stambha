@@ -4,7 +4,7 @@
 //! the image compiled it with, with only the target changed from the
 //! image's COFF one to Linux's, linked into a static Linux program with the
 //! image's C library under the drivers and `image/host.c` under that, and
-//! run over Mesa's DRM shim with amdgpu's and xe's no-op shims
+//! run over Mesa's DRM shim with amdgpu's, xe's and i915's no-op shims
 //! (`image/vulkan_device.c`).
 //!
 //! The hosted tests (`radv-test`, `anv-test`) build Mesa again for the host,
@@ -48,16 +48,23 @@ const LEFT_OUT: [&str; 9] = [
     "src_compiler_rust_",
 ];
 
-/// Each run: the driver, the device the shim shows, how many GPUs are listed.
-const RUNS: [(&str, &str, u32); 8] = [
-    ("radv", "raphael_mendocino", 1),
-    ("radv", "navi21", 1),
-    ("radv", "polaris10", 2),
-    ("anv", "9a49", 1),
-    ("anv", "46a6", 1),
-    ("anv", "7d55", 1),
-    ("anv", "56a0", 1),
-    ("anv", "e20b", 1),
+/// Each run's GPUs, as kernel driver and device: amdgpu's by name, xe's
+/// and i915's by PCI device ID. RADV runs on amdgpu, ANV on xe and i915.
+const RUNS: [&[&str]; 13] = [
+    &["amdgpu:raphael_mendocino"],
+    &["amdgpu:navi21"],
+    &["amdgpu:polaris10", "amdgpu:polaris10"],
+    &["xe:9a49"],
+    &["xe:46a6"],
+    &["xe:7d55"],
+    &["xe:56a0"],
+    &["xe:e20b"],
+    &["i915:9a49"],
+    &["i915:46a6"],
+    &["i915:7d55"],
+    &["i915:56a0"],
+    // An AMD and an Intel GPU in one image, each driver on its own.
+    &["amdgpu:navi21", "xe:56a0"],
 ];
 
 pub fn test(jobs: u16) -> Result<()> {
@@ -243,6 +250,16 @@ fn own_units(image: &Path, objects: &Path) -> Result<Vec<Unit>> {
                 "clock_gettime=image_host_clock_gettime",
             ],
         ),
+        like(
+            &anv,
+            mesa.join("intel/tools/intel_noop_drm_shim.c"),
+            "i915_noop_drm_shim",
+            &[
+                "drm_shim_driver_init=i915_shim_driver_init",
+                "os_get_option=image_host_option",
+                "intel_device_info_from_json=image_no_device_json",
+            ],
+        ),
     ])
 }
 
@@ -304,38 +321,41 @@ fn link(
     Ok(program)
 }
 
-/// Runs each of [`RUNS`]; every one must reach its submission.
+/// Runs each of [`RUNS`]; every one must reach its submissions.
 fn run(program: &Path, directory: &Path) -> Result<()> {
     let mut failures = Vec::new();
-    for (driver, device, gpus) in RUNS {
+    for gpus in RUNS {
         let mut command = Command::new("timeout");
         command
             .arg("120")
             .arg(program)
-            .args([driver, device, &gpus.to_string()])
-            .stdin(Stdio::null());
-        if driver == "radv" {
-            command.env("AMDGPU_GPU_ID", device);
-        } else {
-            command.env("INTEL_STUB_GPU_DEVICE_ID", device);
+            .args(gpus)
+            .stdin(Stdio::null())
+            .env_remove("AMDGPU_GPU_ID")
+            .env_remove("INTEL_STUB_GPU_DEVICE_ID");
+        for gpu in gpus {
+            match gpu.split_once(':') {
+                Some(("amdgpu", device)) => command.env("AMDGPU_GPU_ID", device),
+                Some((_, device)) => command.env("INTEL_STUB_GPU_DEVICE_ID", device),
+                None => bail!("a run's GPU without its kernel driver: {gpu}"),
+            };
         }
+        let name = gpus.join("+").replace(':', "-");
         let output = command.output()?;
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        fs::write(
-            directory.join(format!("{driver}-{device}-{gpus}.log")),
-            &text,
-        )?;
+        fs::write(directory.join(format!("{name}.log")), &text)?;
         let reached = text
             .lines()
             .find(|line| line.starts_with("image device: ") && line.contains("submission"));
         match (output.status.success(), reached) {
-            (true, Some(line)) => println!("{device}: {line}"),
+            (true, Some(line)) => println!("{line}"),
             _ => failures.push(format!(
-                "{driver} on {device} ({gpus} GPU): {}",
+                "{}: {}",
+                gpus.join(" "),
                 text.lines()
                     .rev()
                     .find(|line| !line.trim().is_empty())
@@ -351,7 +371,7 @@ fn run(program: &Path, directory: &Path) -> Result<()> {
     );
     println!(
         "the image's RADV and ANV, with its C library and defines, made their devices and \
-         one submission each on {} runs",
+         one submission on each GPU of {} runs",
         RUNS.len()
     );
     Ok(())
