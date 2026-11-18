@@ -154,18 +154,49 @@ pub fn unbound(address: &str, driver: &str, dark: bool) -> String {
 /// reported while the GPUs started, when the stop came before the start
 /// finished: it says why the GPU did not start. `firmware` is what the
 /// GPU's own firmware said about that start ([`GspStart::failure`]).
-pub fn driver_stopped(stop: &str, failed_start: Option<&str>, firmware: Option<&str>) -> String {
+/// `maker` is the maker of the GPU that did not start ([`failed_maker`]),
+/// none when the start does not tell.
+pub fn driver_stopped(
+    stop: &str,
+    failed_start: Option<&str>,
+    firmware: Option<&str>,
+    maker: Option<Vendor>,
+) -> String {
+    let gpu = match maker {
+        Some(vendor) => format!("the {} GPU", self::maker(vendor)),
+        None => String::from("the GPU"),
+    };
     match (failed_start, firmware) {
         (Some(error), Some(firmware)) => format!(
-            "the NVIDIA GPU did not start ({error}). {firmware}. Stela cannot yet finish the GPU \
+            "{gpu} did not start ({error}). {firmware}. Stela cannot yet finish the GPU \
              driver's cleanup after that ({stop})"
         ),
         (Some(error), None) => format!(
-            "the NVIDIA GPU did not start ({error}), and Stela cannot yet finish the GPU \
-             driver's cleanup after that ({stop})"
+            "{gpu} did not start ({error}), and Stela cannot yet finish the GPU driver's \
+             cleanup after that ({stop})"
         ),
         (None, _) => format!("the GPU driver stopped: {stop}"),
     }
+}
+
+/// The maker of the GPU whose start failed with `error`, the first error
+/// Linux reported, among the `claimed` GPUs by PCI address: the one whose
+/// address the error carries (a driver's `dev_err` names its device), else
+/// the one maker every claimed GPU shares. None when neither tells.
+pub fn failed_maker(error: &str, claimed: &[(String, Vendor)]) -> Option<Vendor> {
+    let named = claimed.iter().find(|(address, _)| {
+        error
+            .split(|c: char| c.is_ascii_whitespace() || c == ',' || c == '(' || c == ')')
+            .any(|word| word.strip_suffix(':').unwrap_or(word) == address.as_str())
+    });
+    if let Some((_, vendor)) = named {
+        return Some(*vendor);
+    }
+    let (_, first) = claimed.first()?;
+    claimed
+        .iter()
+        .all(|(_, vendor)| vendor == first)
+        .then_some(*first)
 }
 
 /// `NV_VGPU_MSG_EVENT_GSP_INIT_DONE`: GSP-RM's report that its own start
@@ -500,16 +531,56 @@ mod tests {
             driver_stopped(
                 "IRQ action retirement unavailable; request retained",
                 Some("nouveau 0000:01:00.0: gsp: init failed, -22"),
-                None
+                None,
+                Some(Vendor::Nvidia)
             ),
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22), and \
              Stela cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
              unavailable; request retained)"
         );
-        assert_eq!(driver_stopped("x", None, None), "the GPU driver stopped: x");
         assert_eq!(
-            driver_stopped("x", None, Some("y")),
+            driver_stopped("x", None, None, None),
             "the GPU driver stopped: x"
+        );
+        assert_eq!(
+            driver_stopped("x", None, Some("y"), Some(Vendor::Amd)),
+            "the GPU driver stopped: x"
+        );
+    }
+
+    #[test]
+    fn a_failed_start_names_the_maker_of_the_gpu_that_failed() {
+        // igpu3's first error: amdgpu's PSP on an AMD iGPU, beside an
+        // NVIDIA GPU here to show the address decides.
+        let error = "amdgpu 0000:01:00.0: psp reg (0x16080) wait timed out, mask: 8000ffff, \
+                     read: 80020115 exp: 80000000";
+        let both = [
+            (String::from("0000:02:00.0"), Vendor::Nvidia),
+            (String::from("0000:01:00.0"), Vendor::Amd),
+        ];
+        let maker = failed_maker(error, &both);
+        assert_eq!(maker, Some(Vendor::Amd));
+        assert_eq!(
+            driver_stopped(
+                "IRQ action retirement unavailable; request retained",
+                Some(error),
+                None,
+                maker
+            ),
+            "the AMD GPU did not start (amdgpu 0000:01:00.0: psp reg (0x16080) wait timed out, \
+             mask: 8000ffff, read: 80020115 exp: 80000000), and Stela cannot yet finish the GPU \
+             driver's cleanup after that (IRQ action retirement unavailable; request retained)"
+        );
+        // An address only as a prefix of a longer one names nothing.
+        assert_eq!(failed_maker("amdgpu 0000:01:00.01: x", &both), None);
+        // An error without an address: the one maker of every claimed GPU.
+        assert_eq!(failed_maker("[drm] failed", &both[1..]), Some(Vendor::Amd));
+        assert_eq!(failed_maker("[drm] failed", &both), None);
+        assert_eq!(failed_maker("[drm] failed", &[]), None);
+        assert_eq!(
+            driver_stopped("x", Some("[drm] failed"), None, None),
+            "the GPU did not start ([drm] failed), and Stela cannot yet finish the GPU driver's \
+             cleanup after that (x)"
         );
     }
 
@@ -541,7 +612,8 @@ mod tests {
             driver_stopped(
                 "IRQ action retirement unavailable; request retained",
                 Some("nouveau 0000:01:00.0: gsp: init failed, -22"),
-                Some(&failure)
+                Some(&failure),
+                Some(Vendor::Nvidia)
             ),
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22). The \
              GPU's own firmware, GSP-RM 570.144, ended its initialisation (GSP_INIT_DONE, right \

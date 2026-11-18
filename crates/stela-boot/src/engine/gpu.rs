@@ -783,6 +783,9 @@ struct Host {
     first_error: RefCell<Option<String>>,
     /// What GSP-RM said about its start, which that reason then names.
     gsp_start: RefCell<stela_boot_core::gpu_status::GspStart>,
+    /// Each claimed GPU's PCI address and maker, which that reason names
+    /// the failed GPU by.
+    gpus: Vec<(String, gpu::Vendor)>,
 }
 
 impl Host {
@@ -922,10 +925,14 @@ impl Platform for Host {
             ),
             Some(_) => (None, None),
         };
+        let maker = failed_start
+            .as_deref()
+            .and_then(|error| stela_boot_core::gpu_status::failed_maker(error, &self.gpus));
         output::fatal(stela_boot_core::gpu_status::driver_stopped(
             message,
             failed_start.as_deref(),
             firmware.as_deref(),
+            maker,
         ))
     }
 
@@ -2517,6 +2524,10 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         reported: RefCell::new(BTreeSet::new()),
         first_error: RefCell::new(None),
         gsp_start: RefCell::new(Default::default()),
+        gpus: claimed
+            .iter()
+            .map(|claimed| (claimed.name.clone(), claimed.stack.vendor))
+            .collect(),
     };
     // SAFETY: boot's original code and allocator remain installed permanently.
     unsafe {
