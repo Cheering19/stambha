@@ -740,14 +740,25 @@ fn select_firmware(
         return Err(lacks(name, &missing, names.len()));
     }
     if summarized {
+        // Each file by its name less its directory and `.bin`, so a file
+        // the selection left out shows without a line for each.
+        let given: Vec<&str> = bindings
+            .iter()
+            .map(|(_, request)| {
+                let file = request.name.as_str();
+                let file = file.rsplit('/').next().unwrap_or(file);
+                file.strip_suffix(".bin").unwrap_or(file)
+            })
+            .collect();
         output::arguments(format_args!(
             "GPU {name}: {} firmware files of {} bytes, of which its driver loads those the \
-             device names\n",
+             device names: {}\n",
             bindings.len(),
             bindings
                 .iter()
                 .map(|(image, _)| image.bytes().len())
-                .sum::<usize>()
+                .sum::<usize>(),
+            given.join(" ")
         ));
     }
     names.extend(read.iter().map(|(_, name)| String::from(*name)));
