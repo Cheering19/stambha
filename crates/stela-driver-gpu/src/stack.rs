@@ -368,7 +368,7 @@ impl GpuStack {
 
 /// [`GpuStack::claim_order`] of a GPU that draws or not and is integrated,
 /// discrete or not known before its probe.
-fn claim_rank(draws: bool, integrated: Option<bool>) -> u8 {
+pub(crate) fn claim_rank(draws: bool, integrated: Option<bool>) -> u8 {
     match (draws, integrated) {
         (true, Some(false)) => 0,
         (true, None) => 1,
