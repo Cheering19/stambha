@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <asm/cpufeature.h>
 #include <asm/smp.h>
+#include <asm/special_insns.h>
 #include <asm/tsc.h>
 #include <stela/linux.h>
 
@@ -49,6 +50,21 @@ bool stela_linux_cpu_has(unsigned int feature)
 		return false;
 	}
 	return (word & BIT(feature % 32)) != 0;
+}
+
+/* Read once: asm/special_insns.h asks for every cache line it writes back,
+ * and CPUID is far slower than the write-back (a VM exit in a guest). */
+bool stela_linux_has_clflushopt(void)
+{
+	/* 0: not read yet; 1: absent; 2: present. */
+	static int known;
+	int value = __atomic_load_n(&known, __ATOMIC_RELAXED);
+
+	if (!value) {
+		value = stela_linux_cpu_has(X86_FEATURE_CLFLUSHOPT) ? 2 : 1;
+		__atomic_store_n(&known, value, __ATOMIC_RELAXED);
+	}
+	return value == 2;
 }
 
 /* kernel/up.c's: Linux code here knows one processor (NR_CPUS 1), so the

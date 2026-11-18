@@ -5,6 +5,7 @@
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <asm/cpufeature.h>
+#include <asm/special_insns.h>
 
 /* Runtime owns the actual saved CPU frame and retained stack. This Linux
  * task metadata contains no duplicate architecture context switch state. */
