@@ -1993,7 +1993,7 @@ pub(super) fn claim_all(
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
     port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
-) -> (Vec<Claimed>, Vec<Refused>, Vec<String>) {
+) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::{self, Reason};
     use stela_drivers::gpu::selection::{self, Choice, Driven, Found};
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
@@ -2023,7 +2023,7 @@ pub(super) fn claim_all(
             ));
             refused.push(refused_as(adapter, Reason::Other, &why));
         }
-        return (Vec::new(), refused, Vec::new());
+        return (Vec::new(), refused);
     }
     let mut claimed: Vec<Claimed> = Vec::new();
     let mut refused = Vec::new();
@@ -2034,7 +2034,7 @@ pub(super) fn claim_all(
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
                 refused.push(refused_as(adapter, Reason::Other, &why));
             }
-            return (claimed, refused, Vec::new());
+            return (claimed, refused);
         }
     };
     let found: Vec<Found> = adapters
@@ -2091,27 +2091,7 @@ pub(super) fn claim_all(
     for (function, &index) in claimed.iter_mut().zip(&chosen.claimed) {
         function.later = matches!(chosen.choices[index], Choice::Later { .. });
     }
-    // The boot screen's line for each one not started beside one that was.
-    let notes = match claimed.is_empty() {
-        true => Vec::new(),
-        false => chosen
-            .choices
-            .iter()
-            .zip(adapters.iter().zip(&found))
-            .filter_map(|(choice, (adapter, found))| match *choice {
-                Choice::Unused(_) => Some(gpu_status::unused_beside(
-                    &adapter.name(),
-                    found.firmware_screen,
-                )),
-                Choice::Left { beside } => Some(gpu_status::left(
-                    &adapter.name(),
-                    &adapters[beside].name(),
-                )),
-                _ => None,
-            })
-            .collect(),
-    };
-    (claimed, refused, notes)
+    (claimed, refused)
 }
 
 /// One line for each display controller found: its address, IDs, name and

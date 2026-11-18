@@ -1553,7 +1553,7 @@ fn open_gpus(
         let random = stela_drivers::probe::NativeServices::entropy(&services)
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
-        let (claimed, refused, notes) = random.as_ref().map_or_else(Default::default, |_| {
+        let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
             gpu::claim_all(
                 &services,
                 &adapters,
@@ -1564,13 +1564,11 @@ fn open_gpus(
                 &|address| gpu::link::port_above(mmio, address),
             )
         });
-        (claimed, refused, notes, random)
+        (claimed, refused, random)
     });
-    let (claimed, refused, notes, random) = match claimed {
-        Ok((claimed, refused, notes, Some(random))) if !claimed.is_empty() => {
-            (claimed, refused, notes, random)
-        }
-        Ok((_, refused, _, _)) => {
+    let (claimed, refused, random) = match claimed {
+        Ok((claimed, refused, Some(random))) if !claimed.is_empty() => (claimed, refused, random),
+        Ok((_, refused, _)) => {
             // Each GPU that did not start, and why, or that there is none.
             use stela_boot_core::gpu_status;
             match refused.split_first() {
@@ -1659,7 +1657,7 @@ fn open_gpus(
                     &gpu.why,
                 ));
             }
-            for line in others.iter().chain(&notes) {
+            for line in &others {
                 crate::status::info(line);
             }
             true

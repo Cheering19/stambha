@@ -38,13 +38,14 @@ pub fn market_name(vendor: Vendor, device: u16, revision: u8) -> Option<String> 
 }
 
 /// [`market_name`], else the maker and the PCI IDs: "NVIDIA GPU 10de:2c02",
-/// or "display adapter 1a03:2000" for a maker without a GPU stack.
+/// or "display adapter" for a maker without a GPU stack, whose IDs tell a
+/// user nothing: the log's `GPU SELECT` line holds them.
 pub fn name(vendor: Vendor, device: u16, revision: u8) -> String {
     market_name(vendor, device, revision).unwrap_or_else(|| {
         let ids = format!("{:04x}:{device:04x}", vendor.pci_id());
         match maker(vendor) {
             Some(maker) => format!("{maker} GPU {ids}"),
-            None => format!("display adapter {ids}"),
+            None => String::from("display adapter"),
         }
     })
 }
@@ -112,12 +113,9 @@ mod tests {
         assert_eq!(name(Vendor::Nvidia, 0xfffe, 0), "NVIDIA GPU 10de:fffe");
         assert_eq!(name(Vendor::Amd, 0xfffe, 0xc1), "AMD GPU 1002:fffe");
         assert_eq!(name(Vendor::Intel, 0xfffe, 0), "Intel GPU 8086:fffe");
-        // ASPEED's BMC display: no maker's name, only its IDs.
+        // ASPEED's BMC display: no maker's name.
         assert_eq!(market_name(Vendor::Other(0x1a03), 0x2000, 0x52), None);
-        assert_eq!(
-            name(Vendor::Other(0x1a03), 0x2000, 0x52),
-            "display adapter 1a03:2000"
-        );
+        assert_eq!(name(Vendor::Other(0x1a03), 0x2000, 0x52), "display adapter");
         // A non-display function's ID names nothing: NVIDIA's HD audio.
         assert_eq!(market_name(Vendor::Nvidia, 0x22e8, 0xa1), None);
         assert_eq!(

@@ -46,25 +46,6 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     }
 }
 
-/// The screen line for a GPU left with the firmware beside the GPU that
-/// draws, `drawer`: it would only show that GPU's frames, and no screen the
-/// PC started on is on it.
-pub fn left(gpu: &str, drawer: &str) -> String {
-    format!("the {gpu} is not started: the {drawer} draws, and the screen is not on it")
-}
-
-/// The screen line for a display adapter no stack of this Stela drives,
-/// beside a GPU that started. `screen`: the screen the PC started on is
-/// on it, and it shows macOS by copy.
-pub fn unused_beside(gpu: &str, screen: bool) -> String {
-    match screen {
-        true => {
-            format!("the {gpu} keeps the screen the PC started on, as Stela has no driver for it")
-        }
-        false => format!("the {gpu} is not used: Stela has no driver for it"),
-    }
-}
-
 /// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
 /// device and `instead` draws in its place.
 pub fn draws_instead(wanted: &str, instead: &str) -> String {
@@ -655,10 +636,10 @@ mod tests {
             "the AMD Radeon RX 7900 XTX at 0000:03:00.0 is not used: AMDGPU is not ported to \
              Stela"
         );
-        // QEMU's virtio GPU: no maker's name, only its IDs.
+        // QEMU's virtio GPU: no maker's name.
         assert_eq!(
             adapter(&at(1, Vendor::Other(0x1af4), 0x1050, 1)),
-            "the display adapter 1af4:1050 at 0000:01:00.0"
+            "the display adapter at 0000:01:00.0"
         );
     }
 
@@ -683,20 +664,6 @@ mod tests {
              draws"
         );
         assert!(shows_only("Intel Arc A770", None).ends_with("no Vulkan driver for it"));
-        assert_eq!(
-            left("Intel UHD Graphics 770", nvidia),
-            "the Intel UHD Graphics 770 is not started: the NVIDIA GeForce RTX 5080 draws, and \
-             the screen is not on it"
-        );
-        assert_eq!(
-            unused_beside("Intel UHD Graphics 630", true),
-            "the Intel UHD Graphics 630 keeps the screen the PC started on, as Stela has no \
-             driver for it"
-        );
-        assert_eq!(
-            unused_beside("display adapter 1a03:2000", false),
-            "the display adapter 1a03:2000 is not used: Stela has no driver for it"
-        );
         assert_eq!(
             draws_instead(nvidia, amd),
             "the NVIDIA GeForce RTX 5080 could not draw for macOS, so the AMD Radeon Graphics \
