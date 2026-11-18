@@ -777,6 +777,12 @@ mod tests {
         let arguments = hosted::arguments(RADV.name, RADV.options);
         assert!(arguments.contains(&"-Dvulkan-drivers=amd".to_owned()));
         assert!(arguments.contains(&"-Damd-use-llvm=false".to_owned()));
+        // The image has no `dladdr`, so RADV's cache UUID needs a named ID.
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.starts_with("-Dradv-build-id="))
+        );
         assert_eq!(RADV.libraries[0].name, "libdrm_amdgpu");
     }
 }

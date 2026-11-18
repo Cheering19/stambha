@@ -151,6 +151,10 @@ const LIBDRM_AMDGPU: Library = Library {
     ],
 };
 
+/// "Stela statically", the build ID note of `compat/mesa/build_id.c`, in hex
+/// with its 20 bytes' padding.
+const RADV_BUILD_ID: &str = "-Dradv-build-id=5374656c6120737461746963616c6c7900000000";
+
 /// The loader entry every Mesa Vulkan driver defines.
 const ENTRY: &str = "vk_icdGetInstanceProcAddr";
 /// NVK. Its OpenCL kernels are `compat/mesa/nvkcl.c`, so it needs no host
@@ -216,7 +220,11 @@ pub(super) const RADV: Driver = Driver {
         "metro_exodus_GetSemaphoreCounterValue",
         "radv_metro_exodus_GetSemaphoreCounterValue",
     )],
-    options: &["-Damd-use-llvm=false"],
+    // RADV keys its cache UUID on the build ID of its own shared object, read
+    // through `dladdr`, which the image lacks: without one no physical device
+    // is made ("cannot generate UUID"). Mesa's option names the ID instead,
+    // here the bytes of the one note `compat/mesa/build_id.c` gives NVK and ANV.
+    options: &["-Damd-use-llvm=false", RADV_BUILD_ID],
     host_tools: true,
     // A release image holds no amdgpu, so none of its GPUs asks for RADV.
     released: false,
