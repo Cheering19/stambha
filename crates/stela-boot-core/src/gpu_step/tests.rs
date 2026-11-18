@@ -15,7 +15,7 @@ use crate::gpu_status::{Picture, shown_by_copy, unbound};
 use crate::screen::finished_step;
 use alloc::{string::ToString, vec};
 use stela_drivers::bus::pci::Address;
-use stela_drivers::gpu::selection::{Driven, select};
+use stela_drivers::gpu::selection::{Driven, fall_back, select};
 use stela_drivers::gpu::stack::GpuStack;
 
 /// Which image boots.
@@ -47,6 +47,8 @@ struct Gpu {
     refused: Option<(Reason, &'static str)>,
     /// Its driver's probe fails.
     unbound: bool,
+    /// Its driver binds it and its Metal device does not open, for this.
+    no_metal: Option<&'static str>,
 }
 
 const fn gpu(bus: u8, slot: u8, vendor: u16, device: u16, revision: u8) -> Gpu {
@@ -61,6 +63,7 @@ const fn gpu(bus: u8, slot: u8, vendor: u16, device: u16, revision: u8) -> Gpu {
         screen: false,
         refused: None,
         unbound: false,
+        no_metal: None,
     }
 }
 
@@ -99,6 +102,13 @@ impl Gpu {
     const fn unbound(self) -> Self {
         Self {
             unbound: true,
+            ..self
+        }
+    }
+
+    const fn no_metal(self, why: &'static str) -> Self {
+        Self {
+            no_metal: Some(why),
             ..self
         }
     }
@@ -199,8 +209,192 @@ const BMC: Gpu = gpu(2, 0, ASPEED, 0x2000, 0x52).not_driven("");
 /// The NVIDIA claim's refusal when the USB holds no firmware for its chip.
 const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
+/// The first error Linux reports in a failed probe, as the tests have it.
+fn probe_error(gpu: &Gpu) -> String {
+    format!(
+        "{} {}: probe failed with error -5",
+        gpu.driver(),
+        gpu.adapter().address
+    )
+}
+
+/// A boot of a PC as the engine runs it: the claims, the probes, the
+/// fallbacks after a GPU chosen to draw failed, the Metal devices.
+struct Booting<'a> {
+    pc: &'a [Gpu],
+    adapters: Vec<Adapter>,
+    found: Vec<Found>,
+    names: Vec<String>,
+    chosen: Selection,
+    /// The census indices of the GPUs that failed after their claim.
+    failed: Vec<usize>,
+    /// The bound GPUs, by census index, in the order they bound.
+    bound: Vec<usize>,
+    /// The claimed GPUs no driver bound, by census index.
+    unbound: Vec<usize>,
+    screen: Vec<(Mark, String)>,
+    log: Vec<String>,
+}
+
+impl Booting<'_> {
+    fn draws(&self, index: usize) -> bool {
+        self.found[index].stack.is_ok_and(|driven| driven.draws)
+    }
+
+    /// Each GPU's probe, in the order given; a driver that does not bind its
+    /// GPU says so as it happens (`warn_unbound`).
+    fn probe(&mut self, indices: &[usize]) {
+        for &index in indices {
+            let gpu = &self.pc[index];
+            if gpu.unbound {
+                let picture = match gpu.screen {
+                    true => Picture::ResetForClaim,
+                    false => Picture::Elsewhere,
+                };
+                let address = self.adapters[index].address.to_string();
+                self.screen.push((
+                    Mark::Warn,
+                    unbound(&self.names[index], &address, gpu.driver(), picture),
+                ));
+                self.unbound.push(index);
+            } else {
+                self.bound.push(index);
+            }
+        }
+    }
+
+    /// A fallback's claims after the GPUs of `stages` failed, as the
+    /// engine's `Fallback` makes them: the GPUs claimed newly.
+    fn fall_back(&mut self, stages: &[(usize, Stage)]) -> Vec<usize> {
+        let before = self.chosen.clone();
+        self.failed.extend(stages.iter().map(|&(index, _)| index));
+        let mut refused = Vec::new();
+        let after = fall_back(&self.found, &before, &self.failed, |index| {
+            match self.pc[index].refused {
+                Some((reason, why)) => {
+                    let draws = self.found[index].stack.is_ok_and(|driven| driven.draws);
+                    refused.push(Refused::new(&self.adapters[index], draws, reason, why));
+                    false
+                }
+                None => true,
+            }
+        });
+        let drawing = after.claimed.iter().copied().find(|&index| {
+            after.choices[index] == Choice::First
+                && self.draws(index)
+                && !self.failed.contains(&index)
+        });
+        let next = Next::of(&before, &after, drawing);
+        for (index, stage) in stages {
+            self.log.push(format!(
+                "GPU FALLBACK {}",
+                fallback_line(&self.adapters, *index, stage, &next)
+            ));
+        }
+        self.screen
+            .extend(refused.iter().map(|gpu| (Mark::Warn, gpu.line())));
+        let claimed = stela_drivers::gpu::selection::newly_claimed(&before, &after);
+        self.chosen = after;
+        claimed
+    }
+
+    /// While a GPU chosen to draw is unbound and has not failed yet, the
+    /// GPUs that draw in its place are claimed and probed.
+    fn fall_back_after_probe(&mut self) {
+        loop {
+            let stages: Vec<(usize, Stage)> = self
+                .unbound
+                .iter()
+                .copied()
+                .filter(|&index| self.draws(index) && !self.failed.contains(&index))
+                .map(|index| {
+                    let gpu = &self.pc[index];
+                    (
+                        index,
+                        Stage::Probe {
+                            what: format!("{} did not bind it", gpu.driver()),
+                            error: Some(probe_error(gpu)),
+                        },
+                    )
+                })
+                .collect();
+            if stages.is_empty() {
+                return;
+            }
+            let claimed = self.fall_back(&stages);
+            if claimed.is_empty() {
+                return;
+            }
+            self.probe(&claimed);
+        }
+    }
+
+    /// The step's bound GPUs, in the order they bound.
+    fn bound(&self) -> Vec<Bound<'_>> {
+        self.bound
+            .iter()
+            .map(|&index| Bound {
+                market: &self.names[index],
+                draws: true,
+                integrated: self.pc[index].integrated,
+                shows_screen: self.pc[index].screen,
+            })
+            .collect()
+    }
+
+    /// The bound GPUs' Metal choice, `display` the bound index whose output
+    /// took the display.
+    fn metal(&self, display: Option<usize>) -> stela_drivers::gpu::stack::MetalDevices {
+        let candidates: Vec<Candidate> = self
+            .bound()
+            .iter()
+            .enumerate()
+            .map(|(index, gpu)| Candidate {
+                draws: gpu.draws,
+                integrated: gpu.integrated,
+                drives_display: display == Some(index),
+            })
+            .collect();
+        metal_devices(&candidates)
+    }
+
+    /// The services that open on the bound GPUs from bound index `first`
+    /// on, as `gate::open_from` opens them: the bound index of each that
+    /// opened, and the drawing GPUs that did not, with why.
+    fn open_from(
+        &self,
+        first: usize,
+        display: Option<usize>,
+    ) -> (Vec<usize>, Vec<(usize, String)>) {
+        let chosen = self.metal(display);
+        let mut failed = Vec::new();
+        let mut open = |indices: &[usize]| -> Vec<usize> {
+            indices
+                .iter()
+                .copied()
+                .filter(|&index| index >= first)
+                .filter(|&index| match self.pc[self.bound[index]].no_metal {
+                    Some(why) => {
+                        failed.push((index, String::from(why)));
+                        false
+                    }
+                    None => true,
+                })
+                .collect()
+        };
+        let mut opened = open(&chosen.serve);
+        if opened.is_empty() {
+            opened = open(&chosen.display_only);
+        }
+        (opened, failed)
+    }
+}
+
 /// The boot screen's lines from the GPU step on, as `status` draws them,
-/// and the log's `GPU SELECT` lines, of `pc` booted by `build`.
+/// and the log's `GPU SELECT` and `GPU FALLBACK` lines, of `pc` booted by
+/// `build`, as the engine boots it: the claims, the probes in two turns,
+/// a fallback after each stage a GPU chosen to draw fails at, the display
+/// and the Metal devices.
 fn boot(pc: &[Gpu], build: Build) -> (Vec<String>, Vec<String>) {
     let adapters: Vec<Adapter> = pc.iter().map(Gpu::adapter).collect();
     let found: Vec<Found> = pc.iter().map(|gpu| gpu.found(build)).collect();
@@ -213,78 +407,178 @@ fn boot(pc: &[Gpu], build: Build) -> (Vec<String>, Vec<String>) {
         }
         None => true,
     });
-    let log = selection_lines(&adapters, &found, &chosen, &refused)
+    let mut log: Vec<String> = selection_lines(&adapters, &found, &chosen, &refused)
         .into_iter()
         .map(|line| format!("GPU SELECT {line}"))
         .collect();
+    log.extend(
+        refusal_lines(&adapters, &found, &chosen, &refused)
+            .into_iter()
+            .map(|line| format!("GPU FALLBACK {line}")),
+    );
     let ports: &[Vendor] = match build {
         Build::Release => &[Vendor::Nvidia],
         Build::Full => &[Vendor::Nvidia, Vendor::Amd, Vendor::Intel],
     };
-    let mut screen: Vec<(Mark, String)> = Vec::new();
-    let mut bound = Vec::new();
-    let mut failed_names = Vec::new();
     let names: Vec<String> = adapters.iter().map(Adapter::name).collect();
-    let step = if chosen.claimed.is_empty() {
-        not_started(&adapters, &refused, ports)
-    } else {
-        // Each claimed GPU's probe, in the claims' order; a driver that does
-        // not bind its GPU says so as it happens.
-        for &index in &chosen.claimed {
-            let gpu = &pc[index];
-            if gpu.unbound {
-                let picture = match gpu.screen {
-                    true => Picture::ResetForClaim,
-                    false => Picture::Elsewhere,
-                };
-                let address = adapters[index].address.to_string();
-                screen.push((
-                    Mark::Warn,
-                    unbound(&names[index], &address, gpu.driver(), picture),
-                ));
-                failed_names.push(names[index].as_str());
-            } else {
-                bound.push(Bound {
-                    market: &names[index],
-                    draws: true,
-                    integrated: gpu.integrated,
-                    shows_screen: gpu.screen,
-                });
-            }
-        }
-        match bound.is_empty() {
-            // The engine's `Error::NoDevices`: each GPU said why above.
-            true => vec![(Mark::Warn, String::from(crate::gpu_status::NONE_BOUND))],
-            false => started(&bound, &failed_names, &refused),
+    let mut booting = Booting {
+        pc,
+        adapters,
+        found,
+        names,
+        chosen,
+        failed: Vec::new(),
+        bound: Vec::new(),
+        unbound: Vec::new(),
+        screen: Vec::new(),
+        log,
+    };
+    if booting.chosen.claimed.is_empty() {
+        let step = not_started(&booting.adapters, &refused, ports);
+        return finish(booting, step, None);
+    }
+    // The first turn, then the GPUs that may only show another's frames.
+    let (later, first): (Vec<usize>, Vec<usize>) = booting
+        .chosen
+        .claimed
+        .iter()
+        .copied()
+        .partition(|&index| matches!(booting.chosen.choices[index], Choice::Later { .. }));
+    booting.probe(&first);
+    booting.probe(&later);
+    booting.fall_back_after_probe();
+    let step = match booting.bound.is_empty() {
+        // The engine's `Error::NoDevices`: each GPU said why above.
+        true => vec![(Mark::Warn, String::from(crate::gpu_status::NONE_BOUND))],
+        false => {
+            let failed_names: Vec<&str> = booting
+                .unbound
+                .iter()
+                .filter(|&&index| booting.draws(index))
+                .map(|&index| booting.names[index].as_str())
+                .collect();
+            let dark = booting
+                .unbound
+                .iter()
+                .find(|&&index| pc[index].screen)
+                .map(|&index| booting.names[index].as_str());
+            started(&booting.bound(), &failed_names, &refused, dark)
         }
     };
+    if booting.bound.is_empty() {
+        return finish(booting, step, None);
+    }
     let mut lines = step.into_iter();
     let (mark, result) = lines.next().unwrap();
-    screen.push((mark, finished_step(TITLE, None, &result, 0)));
-    screen.extend(lines);
-    // The display step: with no started GPU's screen, the GPU that draws
-    // is copied to the screen the PC started on.
-    let drawer = {
-        let candidates: Vec<Candidate> = bound
+    booting
+        .screen
+        .push((mark, finished_step(TITLE, None, &result, 0)));
+    booting.screen.extend(lines);
+    // The display: the first bound GPU with a screen on its outputs.
+    let display = booting.bound.iter().position(|&index| pc[index].screen);
+    let (mut served, mut failed) = booting.open_from(0, display);
+    // A drawing GPU whose Metal device did not open gives way.
+    loop {
+        let stages: Vec<(usize, Stage)> = failed
             .iter()
-            .map(|gpu| Candidate {
-                draws: gpu.draws,
-                integrated: gpu.integrated,
-                drives_display: false,
+            .map(|(index, why)| {
+                let census = booting.bound[*index];
+                (
+                    census,
+                    Stage::Metal {
+                        driver: String::from(pc[census].driver()),
+                        error: String::from(why),
+                    },
+                )
             })
+            .filter(|(census, _)| !booting.failed.contains(census))
             .collect();
-        metal_devices(&candidates)
-            .serve
-            .first()
-            .map(|&first| bound[first].market)
-    };
-    if let Some(drawer) = drawer
-        && !bound.iter().any(|gpu| gpu.shows_screen)
-        && pc.iter().any(|gpu| gpu.screen)
-    {
-        screen.push((Mark::Info, shown_by_copy(drawer)));
+        if stages.is_empty() {
+            break;
+        }
+        if let Some(&first) = served.first() {
+            let drawing = booting.bound[first];
+            for (index, stage) in &stages {
+                let line = fallback_line(&booting.adapters, *index, stage, &Next::Drawing(drawing));
+                booting.log.push(format!("GPU FALLBACK {line}"));
+            }
+            booting
+                .failed
+                .extend(stages.iter().map(|&(index, _)| index));
+            break;
+        }
+        let from = booting.bound.len();
+        let claimed = booting.fall_back(&stages);
+        if claimed.is_empty() {
+            break;
+        }
+        booting.probe(&claimed);
+        booting.fall_back_after_probe();
+        if booting.bound.len() == from {
+            break;
+        }
+        let display = display.or_else(|| {
+            booting.bound[from..]
+                .iter()
+                .position(|&index| pc[index].screen)
+                .map(|position| from + position)
+        });
+        let more = booting.open_from(from, display);
+        served.extend(more.0);
+        failed = more.1;
     }
-    let screen = screen
+    // `report_drawer`: the GPU chosen to draw opened no Metal device and
+    // another did.
+    let wanted = booting.metal(display).serve.first().copied();
+    if let (Some(wanted), Some(&served)) = (wanted, served.first())
+        && wanted != served
+    {
+        let line = crate::gpu_status::draws_instead(
+            &booting.names[booting.bound[wanted]],
+            &booting.names[booting.bound[served]],
+        );
+        booting.screen.push((Mark::Warn, line));
+    }
+    let drawer = served.first().map(|&index| booting.bound[index]);
+    finish(
+        booting,
+        Vec::new(),
+        drawer.map(|drawer| (drawer, display.is_some())),
+    )
+}
+
+/// The boot's screen and log once `step`, the step's lines where the boot
+/// ended before the display, is shown: with `drawn` (the census index of
+/// the GPU that draws, and whether a GPU's output took the display), a
+/// picture copied to the firmware's screen when it still shows.
+fn finish(
+    mut booting: Booting<'_>,
+    step: Vec<(Mark, String)>,
+    drawn: Option<(usize, bool)>,
+) -> (Vec<String>, Vec<String>) {
+    let mut lines = step.into_iter();
+    if let Some((mark, result)) = lines.next() {
+        booting
+            .screen
+            .push((mark, finished_step(TITLE, None, &result, 0)));
+        booting.screen.extend(lines);
+    }
+    // The firmware's screen still shows where no claimed GPU that holds it
+    // was reset for its driver.
+    let dark = booting
+        .bound
+        .iter()
+        .chain(&booting.unbound)
+        .any(|&index| booting.pc[index].screen);
+    if let Some((drawer, false)) = drawn
+        && !dark
+        && booting.pc.iter().any(|gpu| gpu.screen)
+    {
+        let line = shown_by_copy(&booting.names[drawer]);
+        booting.screen.push((Mark::Info, line));
+    }
+    let screen = booting
+        .screen
         .into_iter()
         .map(|(mark, text)| match mark {
             Mark::Ok => format!("[  ok  ]  {text}"),
@@ -292,7 +586,7 @@ fn boot(pc: &[Gpu], build: Build) -> (Vec<String>, Vec<String>) {
             Mark::Info => format!("          {text}"),
         })
         .collect();
-    (screen, log)
+    (screen, booting.log)
 }
 
 /// The text of each PC, booted by each build.
@@ -622,7 +916,8 @@ fn a_card_whose_claim_is_refused_leaves_the_integrated_gpu_to_draw() {
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: the GPU's register BAR does not decode
-GPU SELECT started none"#,
+GPU SELECT started none
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
     );
     assert_boots(
         pc,
@@ -633,7 +928,8 @@ GPU SELECT started none"#,
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: integrated, draws; started first
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: the GPU's register BAR does not decode
-GPU SELECT started in this order: Intel UHD Graphics 770 at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: Intel UHD Graphics 770 at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
     );
 }
 
@@ -649,7 +945,8 @@ fn a_card_whose_driver_fails_leaves_the_integrated_gpu_that_shows_the_monitor_to
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
-GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
     );
     assert_boots(
         pc,
@@ -659,13 +956,14 @@ GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A dis
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: integrated, draws; started after NVIDIA GeForce RTX 5080 at 0000:01:00.0: it may only show the frames that GPU draws
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
-GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0, Intel UHD Graphics 770 at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0, Intel UHD Graphics 770 at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
     );
 }
 
-/// A card whose driver fails with the monitor on it: the integrated GPU was left with the firmware before the probe, so no GPU starts.
+/// A card whose driver fails with the monitor on it: the integrated GPU left with the firmware is claimed and started in its place, and the screen says where macOS shows.
 #[test]
-fn a_card_whose_driver_fails_with_the_monitor_on_it_leaves_no_gpu() {
+fn a_card_whose_driver_fails_with_the_monitor_on_it_gives_way_to_the_integrated_gpu() {
     let pc: &[Gpu] = &[UHD_770, RTX_5080.screen().unbound()];
     assert_boots(
         pc,
@@ -675,17 +973,20 @@ fn a_card_whose_driver_fails_with_the_monitor_on_it_leaves_no_gpu() {
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
-GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
     );
     assert_boots(
         pc,
         Build::Full,
         r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
-[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: integrated, draws; left with the firmware: it would only show the frames NVIDIA GeForce RTX 5080 at 0000:01:00.0 draws, and the firmware's picture is not on it
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
-GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
     );
 }
 
@@ -756,7 +1057,8 @@ fn a_card_refused_for_missing_firmware() {
     let both = r#"[ warn ]  Starting the GPU (the USB has no firmware for this PC's NVIDIA GeForce RTX 5080. On another computer, plug in this USB and run `stela repair`)
 --
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
-GPU SELECT started none"#;
+GPU SELECT started none
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: no pinned firmware for the observed GPU chipset was loaded; no other GPU of this PC can draw in its place"#;
     assert_boots(pc, Build::Release, both);
     assert_boots(pc, Build::Full, both);
 }
@@ -775,7 +1077,8 @@ fn a_laptop_whose_nvidia_gpu_lacks_firmware_draws_on_the_integrated_one() {
 --
 GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stela's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
-GPU SELECT started none"#,
+GPU SELECT started none
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: no pinned firmware for the observed GPU chipset was loaded; no other GPU of this PC can draw in its place"#,
     );
     assert_boots(
         pc,
@@ -785,7 +1088,8 @@ GPU SELECT started none"#,
 --
 GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: integrated, draws; started first
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
-GPU SELECT started in this order: Intel Iris Xe Graphics at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
+GPU SELECT started in this order: Intel Iris Xe Graphics at 0000:00:02.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: no pinned firmware for the observed GPU chipset was loaded; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
     );
 }
 
@@ -845,4 +1149,335 @@ fn a_release_never_mentions_the_amd_and_intel_ports() {
             assert!(!screen.contains(word), "{word}: {screen}");
         }
     }
+}
+
+/// The screen from the GPU step on and the log's `GPU FALLBACK` lines of
+/// `pc` booted by `build`.
+fn fallback_text(pc: &[Gpu], build: Build) -> String {
+    let (screen, log) = boot(pc, build);
+    let fallback: Vec<String> = log
+        .into_iter()
+        .filter(|line| line.starts_with("GPU FALLBACK "))
+        .collect();
+    let mut text = format!("{}\n--", screen.join("\n"));
+    for line in fallback {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    text
+}
+
+/// The stages a GPU chosen to draw fails at, each applied to the GPU at
+/// `index` of `pc`.
+fn failing(pc: &[Gpu], index: usize, stage: &str) -> Vec<Gpu> {
+    let mut pc = pc.to_vec();
+    pc[index] = match stage {
+        "claim" => pc[index].refused(Reason::Other, "the GPU's register BAR does not decode"),
+        "probe" => pc[index].unbound(),
+        _ => pc[index].no_metal("Metal could not open: DeviceLost"),
+    };
+    pc
+}
+
+/// Each stage of a PC: what the boot screen says and what the log's
+/// `GPU FALLBACK` lines say, in a release and in the full build.
+fn assert_falls_back(pc: &[Gpu], failed: usize, cells: &[(&str, &str, &str)]) {
+    for &(stage, release, full) in cells {
+        let pc = failing(pc, failed, stage);
+        assert_eq!(
+            fallback_text(&pc, Build::Release),
+            release,
+            "{stage} Release"
+        );
+        assert_eq!(fallback_text(&pc, Build::Full), full, "{stage} Full");
+    }
+}
+
+/// A desktop's card with the monitor on it, beside the processor's GPU. The discrete GPU fails at each stage in turn.
+#[test]
+fn a_desktop_card_with_the_monitor_on_it_and_an_integrated_gpu_falls_back_at_each_stage() {
+    let pc: &[Gpu] = &[UHD_770, RTX_5080.screen()];
+    assert_falls_back(
+        pc,
+        1,
+        &[
+            (
+                "claim",
+                r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
+          No screen is connected to the Intel UHD Graphics 770, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+            (
+                "probe",
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+            (
+                "metal",
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the Intel UHD Graphics 770 draws instead. The boot log on this USB says why
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+        ],
+    );
+}
+
+/// A desktop's card beside the processor's GPU, the monitor on the motherboard. The discrete GPU fails at each stage in turn.
+#[test]
+fn a_desktop_card_and_an_integrated_gpu_with_the_monitor_on_it_falls_back_at_each_stage() {
+    let pc: &[Gpu] = &[UHD_770.screen(), RTX_5080];
+    assert_falls_back(
+        pc,
+        1,
+        &[
+            (
+                "claim",
+                r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+            (
+                "probe",
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+            (
+                "metal",
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+          the Intel UHD Graphics 770 shows the picture on the screens wired to it
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the Intel UHD Graphics 770 draws instead. The boot log on this USB says why
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+        ],
+    );
+}
+
+/// A laptop whose panel hangs on the processor's GPU. The discrete GPU fails at each stage in turn.
+#[test]
+fn a_laptop_with_the_panel_on_the_integrated_gpu_falls_back_at_each_stage() {
+    let pc: &[Gpu] = &[IRIS_XE_RPL.screen(), RTX_4060_LAPTOP];
+    assert_falls_back(
+        pc,
+        1,
+        &[
+            (
+                "claim",
+                r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+            (
+                "probe",
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+            (
+                "metal",
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
+          the Intel Iris Xe Graphics shows the picture on the screens wired to it
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open, so the Intel Iris Xe Graphics draws instead. The boot log on this USB says why
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
+            ),
+        ],
+    );
+}
+
+/// A laptop whose display mux puts the panel on the discrete GPU. The discrete GPU fails at each stage in turn.
+#[test]
+fn a_laptop_with_the_panel_on_the_discrete_gpu_falls_back_at_each_stage() {
+    let pc: &[Gpu] = &[IRIS_XE_RPL, RTX_4060_LAPTOP.screen()];
+    assert_falls_back(
+        pc,
+        1,
+        &[
+            (
+                "claim",
+                r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
+          No screen is connected to the Intel Iris Xe Graphics, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; the Intel Iris Xe Graphics at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+            (
+                "probe",
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
+[ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 4060 Laptop GPU, which did not start. Connect a screen to the Intel Iris Xe Graphics, and macOS shows on it
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel Iris Xe Graphics at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+            (
+                "metal",
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open, so the Intel Iris Xe Graphics draws instead. The boot log on this USB says why
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel Iris Xe Graphics at 0000:00:02.0 is claimed and started in its place"#,
+            ),
+        ],
+    );
+}
+
+/// A desktop with two cards, the monitor on the first. The discrete GPU fails at each stage in turn.
+#[test]
+fn a_desktop_with_two_cards_falls_back_at_each_stage() {
+    let pc: &[Gpu] = &[RTX_5080.screen(), RX_7900_XTX];
+    assert_falls_back(
+        pc,
+        0,
+        &[
+            (
+                "claim",
+                r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (AMD Radeon RX 7900 XTX, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
+          No screen is connected to the AMD Radeon RX 7900 XTX, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the AMD Radeon RX 7900 XTX at 0000:03:00.0, started beside it, draws in its place"#,
+            ),
+            (
+                "probe",
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[  ok  ]  Starting the GPU (AMD Radeon RX 7900 XTX, as the NVIDIA GeForce RTX 5080 did not start)
+[ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the AMD Radeon RX 7900 XTX, and macOS shows on it
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the AMD Radeon RX 7900 XTX at 0000:03:00.0, started beside it, draws in its place"#,
+            ),
+            (
+                "metal",
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
+                r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the AMD Radeon RX 7900 XTX draws instead. The boot log on this USB says why
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the AMD Radeon RX 7900 XTX at 0000:03:00.0, started beside it, draws in its place"#,
+            ),
+        ],
+    );
+}
+
+/// A release starts no GPU of another maker in place of an NVIDIA GPU that
+/// fails at any stage: its screen is the one it showed before fallbacks,
+/// and its log says no other GPU can draw.
+#[test]
+fn a_release_falls_back_to_no_other_maker() {
+    let pcs: &[(&[Gpu], usize)] = &[
+        (&[UHD_770, RTX_5080.screen()], 1),
+        (&[UHD_770.screen(), RTX_5080], 1),
+        (&[IRIS_XE_RPL.screen(), RTX_4060_LAPTOP], 1),
+        (&[IRIS_XE_RPL, RTX_4060_LAPTOP.screen()], 1),
+        (&[RTX_5080.screen(), RX_7900_XTX], 0),
+        (&[RTX_4060_LAPTOP, RADEON_780M.screen()], 0),
+        (&[RTX_5080.screen()], 0),
+    ];
+    for &(pc, failed) in pcs {
+        for stage in ["claim", "probe", "metal"] {
+            let (screen, log) = boot(&failing(pc, failed, stage), Build::Release);
+            let screen = screen.join("\n");
+            for words in [
+                "in its place",
+                "draws instead",
+                "No screen shows macOS yet",
+                ", as the ",
+            ] {
+                assert!(!screen.contains(words), "{stage}: {screen}");
+            }
+            let fallback: Vec<&String> = log
+                .iter()
+                .filter(|line| line.starts_with("GPU FALLBACK "))
+                .collect();
+            assert_eq!(fallback.len(), 1, "{stage}: {log:?}");
+            assert!(
+                fallback[0].ends_with("; no other GPU of this PC can draw in its place"),
+                "{stage}: {log:?}"
+            );
+        }
+    }
+}
+
+/// Two GPUs that fail in turn: the second, claimed in place of the first,
+/// gives way to none, and the boot says so for each.
+#[test]
+fn a_gpu_claimed_in_place_of_another_fails_in_turn() {
+    let pc: &[Gpu] = &[UHD_770.unbound(), RTX_5080.screen().unbound()];
+    assert_eq!(
+        fallback_text(pc, Build::Full),
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[ warn ]  the Intel UHD Graphics 770 at 0000:00:02.0 did not start: its driver i915 stopped with an error. The boot log on this USB says why
+[ warn ]  Starting the GPU (no GPU started; the lines above say why)
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place
+GPU FALLBACK 0000:00:02.0 Intel UHD Graphics 770: its driver's probe failed: i915 did not bind it; Linux's first error: i915 0000:00:02.0: probe failed with error -5; no other GPU of this PC can draw in its place"#
+    );
+    let pc: &[Gpu] = &[RTX_5080.screen().unbound(), RX_7900_XTX.unbound(), UHD_770];
+    assert_eq!(
+        fallback_text(pc, Build::Full),
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+[ warn ]  the AMD Radeon RX 7900 XTX at 0000:03:00.0 did not start: its driver amdgpu stopped with an error. The boot log on this USB says why
+[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 and the AMD Radeon RX 7900 XTX did not start)
+[ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
+--
+GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place
+GPU FALLBACK 0000:03:00.0 AMD Radeon RX 7900 XTX: its driver's probe failed: amdgpu did not bind it; Linux's first error: amdgpu 0000:03:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#
+    );
 }

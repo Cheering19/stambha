@@ -1,8 +1,14 @@
-//! The boot screen's GPU step and the log's `GPU SELECT` lines, from what
-//! the selection chose ([`stela_drivers::gpu::selection`]), which claims
-//! were refused and which GPUs their drivers bound. The engine prints what
-//! these answer; they read nothing of the machine, so a test gives every
-//! kind of PC its whole text (`gpu_step/tests.rs`).
+//! The boot screen's GPU step and the log's `GPU SELECT` and `GPU FALLBACK`
+//! lines, from what the selection chose ([`stela_drivers::gpu::selection`]),
+//! which claims were refused, which GPUs their drivers bound and which
+//! opened no Metal device. The engine prints what these answer; they read
+//! nothing of the machine, so a test gives every kind of PC its whole text
+//! (`gpu_step/tests.rs`), each stage a GPU chosen to draw may fail at too.
+//!
+//! A GPU chosen to draw that fails at its claim, its driver's probe or its
+//! Metal device gives way to the next GPU the selection starts without it
+//! ([`stela_drivers::gpu::selection::fall_back`]): one `GPU FALLBACK` line
+//! names the GPU, the stage, its error and what draws in its place.
 //!
 //! The screen names the GPU that draws macOS by its market name, says which
 //! other GPU shows the picture where one does, and says why a GPU that would
@@ -113,7 +119,15 @@ pub struct Bound<'a> {
 /// `unbound`, the names of drawing GPUs no driver bound). A refused GPU then
 /// says why. A GPU that only shows the picture says so where a screen may
 /// hang on it; elsewhere it needs nothing of the user, and the log has it.
-pub fn started(bound: &[Bound], unbound: &[&str], refused: &[Refused]) -> Vec<(Mark, String)> {
+/// `dark` names a GPU no driver bound whose screen, the one the PC started
+/// on, went dark: where no bound GPU has a screen, the step says where
+/// macOS shows instead ([`gpu_status::no_screen`]).
+pub fn started(
+    bound: &[Bound],
+    unbound: &[&str],
+    refused: &[Refused],
+    dark: Option<&str>,
+) -> Vec<(Mark, String)> {
     let candidates: Vec<Candidate> = bound
         .iter()
         .map(|gpu| Candidate {
@@ -147,7 +161,147 @@ pub fn started(bound: &[Bound], unbound: &[&str], refused: &[Refused]) -> Vec<(M
             })
             .map(|(_, gpu)| (Mark::Info, gpu_status::shows_only(gpu.market, drawer))),
     );
+    if let (Some(drawer), Some(dark)) = (drawer, dark)
+        && !bound.iter().any(|gpu| gpu.shows_screen)
+    {
+        lines.push((Mark::Warn, gpu_status::no_screen(dark, drawer)));
+    }
     lines
+}
+
+/// The stage at which a GPU started to draw macOS failed, which the log's
+/// `GPU FALLBACK` line names with its error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Its claim was refused, in the refusal's words.
+    Claim(String),
+    /// No kernel driver bound it: `what` says so as the start does ("nouveau
+    /// did not bind it", "nouveau's probe did not finish in 60 s"), and
+    /// `error` is the first error Linux reported in its probe.
+    Probe { what: String, error: Option<String> },
+    /// Its kernel driver `driver` bound it, and its Metal device did not
+    /// open, for `error`.
+    Metal { driver: String, error: String },
+}
+
+impl Stage {
+    /// The stage and its error, in words.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Claim(why) => format!("its claim was refused: {why}"),
+            Self::Probe {
+                what,
+                error: Some(error),
+            } => format!("its driver's probe failed: {what}; Linux's first error: {error}"),
+            Self::Probe { what, error: None } => {
+                format!("its driver's probe failed: {what}; Linux reported no error")
+            }
+            Self::Metal { driver, error } => format!(
+                "{driver} bound it, and its Metal device did not open: {error}; it still shows \
+                 the screens wired to it"
+            ),
+        }
+    }
+}
+
+/// What takes a failed GPU's place, by census index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// GPUs that were left with the firmware, claimed and started now.
+    Claimed(Vec<usize>),
+    /// A GPU that started beside it and draws in its place.
+    Drawing(usize),
+    /// None: no other GPU of the PC can draw.
+    Nothing,
+}
+
+impl Next {
+    /// What follows once GPUs could not draw, from the selection `before`
+    /// and the one made again without them, `after`
+    /// ([`stela_drivers::gpu::selection::fall_back`]): the GPUs it claims
+    /// newly, else `drawing`, a started GPU that draws now.
+    pub fn of(before: &Selection, after: &Selection, drawing: Option<usize>) -> Self {
+        let claimed = stela_drivers::gpu::selection::newly_claimed(before, after);
+        match (claimed.is_empty(), drawing) {
+            (false, _) => Self::Claimed(claimed),
+            (true, Some(drawing)) => Self::Drawing(drawing),
+            (true, None) => Self::Nothing,
+        }
+    }
+
+    /// In words; `name` names a GPU of the census.
+    pub fn describe(&self, name: &dyn Fn(usize) -> String) -> String {
+        match self {
+            Self::Claimed(claimed) => {
+                let names: Vec<String> = claimed.iter().map(|&index| name(index)).collect();
+                format!(
+                    "the {} {} claimed and started in its place",
+                    names.join(" and the "),
+                    if names.len() == 1 { "is" } else { "are" }
+                )
+            }
+            Self::Drawing(index) => {
+                format!(
+                    "the {}, started beside it, draws in its place",
+                    name(*index)
+                )
+            }
+            Self::Nothing => String::from("no other GPU of this PC can draw in its place"),
+        }
+    }
+}
+
+/// The log's `GPU FALLBACK` line, without its prefix, for the GPU `failed`
+/// of `adapters`, by census index, that failed at `stage`, and what took its
+/// place: one line for each stage a GPU chosen to draw failed at.
+pub fn fallback_line(adapters: &[Adapter], failed: usize, stage: &Stage, next: &Next) -> String {
+    let named = |index: usize| {
+        let adapter = &adapters[index];
+        format!("{} at {}", adapter.name(), adapter.address)
+    };
+    let adapter = &adapters[failed];
+    format!(
+        "{} {}: {}; {}",
+        adapter.address,
+        adapter.name(),
+        stage.describe(),
+        next.describe(&named)
+    )
+}
+
+/// The `GPU FALLBACK` lines of the claims, without their prefix: one for
+/// each GPU whose claim was refused (`refused` gives its words) and that
+/// would have started to draw had every claim succeeded, with what the
+/// selection `chosen` started in its place.
+pub fn refusal_lines(
+    adapters: &[Adapter],
+    found: &[Found],
+    chosen: &Selection,
+    refused: &[Refused],
+) -> Vec<String> {
+    let ideal = stela_drivers::gpu::selection::select(found, |_| true);
+    let draws = |index: usize| found[index].stack.is_ok_and(|driven| driven.draws);
+    let drawing = chosen
+        .claimed
+        .iter()
+        .copied()
+        .find(|&index| chosen.choices[index] == Choice::First && draws(index));
+    let next = Next::of(&ideal, chosen, drawing);
+    (0..adapters.len())
+        .filter(|&index| {
+            chosen.choices[index] == Choice::Refused
+                && ideal.choices[index] == Choice::First
+                && draws(index)
+        })
+        .map(|index| {
+            let address = format!("{}", adapters[index].address);
+            let why = refused
+                .iter()
+                .find(|gpu| gpu.address == address)
+                .map_or_else(String::new, |gpu| gpu.why.clone());
+            fallback_line(adapters, index, &Stage::Claim(why), &next)
+        })
+        .collect()
 }
 
 /// The log's `GPU SELECT` lines, without their prefix: one for each display

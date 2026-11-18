@@ -57,7 +57,21 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
 /// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
 /// device and `instead` draws in its place.
 pub fn draws_instead(wanted: &str, instead: &str) -> String {
-    format!("the {wanted} could not draw for macOS, so the {instead} draws instead")
+    format!(
+        "the {wanted} could not draw for macOS: its Metal device did not open, so the {instead} \
+         draws instead. The boot log on this USB says why"
+    )
+}
+
+/// The screen line when the GPU that draws, `drawer`, has no screen it
+/// knows of and the screen the PC started on went dark with `failed`, the
+/// GPU it is wired to, which did not start: macOS shows on a screen
+/// connected to the GPU that draws, which the boot looks for once a second.
+pub fn no_screen(failed: &str, drawer: &str) -> String {
+    format!(
+        "No screen shows macOS yet: the screen the PC started on is wired to the {failed}, \
+         which did not start. Connect a screen to the {drawer}, and macOS shows on it"
+    )
 }
 
 /// Why an NVIDIA GPU did not start.
@@ -674,8 +688,14 @@ mod tests {
         assert!(shows_only("Intel Arc A770", None).ends_with("no Vulkan driver for it"));
         assert_eq!(
             draws_instead(nvidia, amd),
-            "the NVIDIA GeForce RTX 5080 could not draw for macOS, so the AMD Radeon Graphics \
-             draws instead"
+            "the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not \
+             open, so the AMD Radeon Graphics draws instead. The boot log on this USB says why"
+        );
+        assert_eq!(
+            no_screen(nvidia, amd),
+            "No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA \
+             GeForce RTX 5080, which did not start. Connect a screen to the AMD Radeon \
+             Graphics, and macOS shows on it"
         );
         assert_eq!(
             shown_by_copy(amd),
