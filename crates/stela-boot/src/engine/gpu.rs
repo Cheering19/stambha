@@ -1339,6 +1339,12 @@ pub(super) struct Claimed {
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
+    /// Its market name, or its maker and IDs.
+    market: String,
+    /// Its probe waits for the first turn's: it may only show the frames
+    /// another GPU draws ([`stela_drivers::gpu::selection::Choice::Later`]).
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    later: bool,
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
     stack: &'static GpuStack,
     /// Whether it is integrated as its kernel driver's table says before the
@@ -1703,6 +1709,8 @@ fn claim(
         placement,
         bars,
         name: format!("{address}"),
+        market: adapter.name(),
+        later: false,
         stack,
         #[cfg(feature = "nvk")]
         integrated: stack.kernel.table_integrated(adapter),
@@ -1811,6 +1819,10 @@ fn cold_refusal(
 /// (`stela_boot_core::gpu_status`).
 pub(super) struct Refused {
     pub(super) vendor: gpu::Vendor,
+    /// Its market name, or its maker and IDs.
+    pub(super) name: String,
+    /// Its stack draws, so it would have drawn macOS.
+    pub(super) draws: bool,
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
@@ -1818,9 +1830,12 @@ pub(super) struct Refused {
     pub(super) why: String,
 }
 
-/// Claim every adapter Stela has a driver stack for ([`GpuStack::select`]),
-/// each reported if it cannot be, and the ones refused. In a foreground
-/// continuation, with probe finished.
+/// Claim the adapters [`selection::select`] starts, each reported if it
+/// cannot be, and the ones refused. Every display controller found is logged
+/// once with its name, kind and what was chosen for it, and why. In a
+/// foreground continuation, with probe finished.
+///
+/// [`selection::select`]: stela_drivers::gpu::selection::select
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
@@ -1828,32 +1843,29 @@ pub(super) fn claim_all(
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
     port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
-) -> (Vec<Claimed>, Vec<Refused>) {
-    use stela_boot_core::gpu_status::Reason;
+) -> (Vec<Claimed>, Vec<Refused>, Vec<String>) {
+    use stela_boot_core::gpu_status::{self, Reason};
+    use stela_drivers::gpu::selection::{self, Choice, Driven, Found};
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
         vendor: adapter.vendor,
+        name: adapter.name(),
+        draws: GpuStack::select(adapter).is_ok_and(GpuStack::draws),
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
         why: format!("{why}"),
     };
-    let mut driven = Vec::new();
-    for adapter in adapters {
-        match GpuStack::select(adapter) {
-            Ok(stack) => driven.push((stack, adapter)),
-            Err(reason) => output::arguments(format_args!(
-                "GPU {} vendor={:?} device={:04x} unused: {reason}\n",
-                adapter.address, adapter.vendor, adapter.device,
-            )),
-        }
-    }
-    // Drawing discrete GPUs come first, then drawing integrated ones, then
-    // display-only ones, each in the firmware's order, so the GPUs Metal
-    // prefers have the first DRM minors whatever else the PC holds.
-    driven.sort_by_key(|(stack, adapter)| stack.claim_order(adapter));
+    let stacks: Vec<_> = adapters.iter().map(GpuStack::select).collect();
+    let driven = || {
+        adapters
+            .iter()
+            .zip(&stacks)
+            .filter(|(_, stack)| stack.is_ok())
+            .map(|(adapter, _)| adapter)
+    };
     if !cfg!(feature = "nvk") {
         let mut refused = Vec::new();
-        for (_, adapter) in driven {
+        for adapter in driven() {
             let why = "this image has no GPU driver: build it with `cargo xtask boot build`";
             output::arguments(format_args!(
                 "GPU {} left with firmware: {why}\n",
@@ -1861,34 +1873,35 @@ pub(super) fn claim_all(
             ));
             refused.push(refused_as(adapter, Reason::Other, &why));
         }
-        return (Vec::new(), refused);
+        return (Vec::new(), refused, Vec::new());
     }
-    let mut claimed = Vec::new();
+    let mut claimed: Vec<Claimed> = Vec::new();
     let mut refused = Vec::new();
     let source = match gop {
         Ok(source) => source,
         Err(why) => {
-            for (_, adapter) in driven {
+            for adapter in driven() {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
                 refused.push(refused_as(adapter, Reason::Other, &why));
             }
-            return (claimed, refused);
+            return (claimed, refused, Vec::new());
         }
     };
-    // The claimed GPUs that draw, each with how it counts as integrated.
-    let mut drawing: Vec<(String, bool)> = Vec::new();
-    for (stack, adapter) in driven {
-        let integrated = stack.kernel.table_integrated(adapter);
-        if let Some(drawer) = shows_frames_only(&drawing, stack.draws(), integrated)
-            && !may_show_screen(source, adapter.address)
-        {
-            output::arguments(format_args!(
-                "GPU {} left with firmware: it would only show the frames GPU {drawer} draws, \
-                 and the firmware's picture is not on it, so no display needs it\n",
-                adapter.address
-            ));
-            continue;
-        }
+    let found: Vec<Found> = adapters
+        .iter()
+        .zip(&stacks)
+        .map(|(adapter, stack)| Found {
+            stack: stack.map(|stack| Driven {
+                draws: stack.draws(),
+                integrated: stack.kernel.table_integrated(adapter),
+            }),
+            firmware_screen: may_show_screen(source, adapter.address),
+        })
+        .collect();
+    let chosen = selection::select(&found, |index| {
+        let (adapter, Ok(stack)) = (&adapters[index], stacks[index]) else {
+            return false;
+        };
         let result = catalog
             .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
             .and_then(|catalog| {
@@ -1903,14 +1916,10 @@ pub(super) fn claim_all(
                 )
             });
         match result {
-            Ok(function) => {
-                if stack.draws() {
-                    drawing.push((
-                        function.name.clone(),
-                        stela_drivers::gpu::stack::drawing_kind(integrated),
-                    ));
-                }
+            Ok(mut function) => {
+                function.market = adapter.name();
                 claimed.push(function);
+                true
             }
             Err(error) => {
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
@@ -1923,23 +1932,76 @@ pub(super) fn claim_all(
                     _ => Reason::Other,
                 };
                 refused.push(refused_as(adapter, reason, &error));
+                false
             }
         }
+    });
+    report_selection(adapters, &found, &chosen);
+    for (function, &index) in claimed.iter_mut().zip(&chosen.claimed) {
+        function.later = matches!(chosen.choices[index], Choice::Later { .. });
     }
-    (claimed, refused)
+    // The boot screen's line for each one not started beside one that was.
+    let notes = match claimed.is_empty() {
+        true => Vec::new(),
+        false => chosen
+            .choices
+            .iter()
+            .zip(adapters.iter().zip(&found))
+            .filter_map(|(choice, (adapter, found))| match *choice {
+                Choice::Unused(_) => Some(gpu_status::unused_beside(
+                    &adapter.name(),
+                    found.firmware_screen,
+                )),
+                Choice::Left { beside } => Some(gpu_status::left(
+                    &adapter.name(),
+                    &adapters[beside].name(),
+                )),
+                _ => None,
+            })
+            .collect(),
+    };
+    (claimed, refused, notes)
 }
 
-/// The claimed drawing GPU whose frames a GPU surely would only show
-/// ([`stela_drivers::gpu::stack::only_shows_frames_of`]). `drawing` holds
-/// each claimed drawing GPU's name and how it counts as integrated.
-fn shows_frames_only(
-    drawing: &[(String, bool)],
-    draws: bool,
-    integrated: Option<bool>,
-) -> Option<&str> {
-    let kinds: Vec<bool> = drawing.iter().map(|(_, integrated)| *integrated).collect();
-    stela_drivers::gpu::stack::only_shows_frames_of(&kinds, draws, integrated)
-        .map(|index| drawing[index].0.as_str())
+/// One line for each display controller found: its address, IDs, name and
+/// kind, and what [`selection::select`] chose for it; then the order the
+/// started ones were claimed in, which the display and the Metal device
+/// follow.
+///
+/// [`selection::select`]: stela_drivers::gpu::selection::select
+fn report_selection(
+    adapters: &[gpu::Adapter],
+    found: &[stela_drivers::gpu::selection::Found],
+    chosen: &stela_drivers::gpu::selection::Selection,
+) {
+    let named = |index: usize| {
+        let adapter = &adapters[index];
+        format!("{} at {}", adapter.name(), adapter.address)
+    };
+    for (index, (adapter, found)) in adapters.iter().zip(found).enumerate() {
+        let kind = match found.stack {
+            Ok(driven) => format!("{}; ", driven.describe()),
+            Err(_) => String::new(),
+        };
+        output::arguments(format_args!(
+            "GPU SELECT {} {:04x}:{:04x} rev {:02x} {}: {kind}{}\n",
+            adapter.address,
+            adapter.vendor.pci_id(),
+            adapter.device,
+            adapter.revision,
+            adapter.name(),
+            chosen.choices[index].describe(&named),
+        ));
+    }
+    if !chosen.claimed.is_empty() {
+        let order: Vec<String> = chosen.claimed.iter().map(|&index| named(index)).collect();
+        output::arguments(format_args!(
+            "GPU SELECT started in this order: {}. A discrete GPU that draws gives the Metal \
+             device before an integrated one, and the next one does where it fails; the \
+             display is the first of them with a connected display, else the firmware's screen\n",
+            order.join(", ")
+        ));
+    }
 }
 
 /// Whether the firmware's picture may be on the function at `address`, as
@@ -1965,6 +2027,8 @@ fn may_show_screen(
 #[cfg(feature = "nvk")]
 struct Bound {
     name: String,
+    /// Its market name, or its maker and IDs.
+    market: String,
     /// Whether it may be the GPU that showed the firmware's screen, when the
     /// screen's function is unknown.
     shows_screen: bool,
@@ -2028,12 +2092,35 @@ fn gpu_share_parameter(pages: Option<usize>) -> Option<String> {
     pages.map(|pages| format!("ttm.pages_limit={pages}"))
 }
 
+/// A claimed GPU no driver bound.
+struct Unbound {
+    name: String,
+    /// Its market name, or its maker and IDs.
+    market: String,
+    driver: &'static str,
+    /// The firmware's picture was on it.
+    dark: bool,
+    /// Its stack draws.
+    draws: bool,
+}
+
+impl Unbound {
+    fn of(claimed: &Claimed) -> Self {
+        Self {
+            name: claimed.name.clone(),
+            market: claimed.market.clone(),
+            driver: claimed.stack.kernel.driver,
+            dark: claimed.shows_screen,
+            draws: claimed.stack.draws(),
+        }
+    }
+}
+
 struct Started {
     _attached: Vec<Attached<Device>>,
     _searched: Vec<stela_linux::function::Published>,
-    /// The claimed GPUs no driver bound: each one's address, the driver,
-    /// and whether the firmware's picture was on it.
-    unbound: Vec<(String, &'static str, bool)>,
+    /// The claimed GPUs no driver bound.
+    unbound: Vec<Unbound>,
     #[cfg(feature = "nvk")]
     bound: Vec<Bound>,
     result: Result<(), Errno>,
@@ -2135,6 +2222,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                     #[cfg(feature = "nvk")]
                     job.bound.push(Bound {
                         name: claimed.name,
+                        market: claimed.market,
                         shows_screen: claimed.shows_screen,
                         stack: claimed.stack,
                         integrated: claimed.integrated,
@@ -2156,11 +2244,13 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                             ""
                         }
                     ));
-                    job.unbound.push((
-                        claimed.name,
-                        claimed.stack.kernel.driver,
-                        claimed.shows_screen,
-                    ));
+                    job.unbound.push(Unbound {
+                        name: claimed.name,
+                        market: claimed.market,
+                        driver: claimed.stack.kernel.driver,
+                        dark: claimed.shows_screen,
+                        draws: claimed.stack.draws(),
+                    });
                 }
                 job._attached.push(attached);
             }
@@ -2289,6 +2379,85 @@ pub(super) fn ident() -> String {
     String::from("no GPU driver in this build")
 }
 
+/// The result of the boot screen's GPU step once the GPUs bound: the name
+/// of the GPU that is to draw macOS ([`gate::metal_choice`]), with the
+/// drawing GPUs among `refused` and those no driver bound, in whose place it
+/// draws, and then a line for each other bound GPU, why it does not draw.
+pub(super) fn started(
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] refused: &[Refused],
+) -> (String, Vec<String>) {
+    use stela_boot_core::gpu_status;
+    #[cfg(feature = "nvk")]
+    if let Some(gpu) = installed() {
+        let bound = &gpu.start.bound;
+        let chosen = gate::metal_choice(bound, None);
+        let drawer = chosen.serve.first().map(|&index| bound[index].market.as_str());
+        let failed: Vec<String> = refused
+            .iter()
+            .filter(|gpu| gpu.draws)
+            .map(|gpu| gpu.name.clone())
+            .chain(
+                gpu.start
+                    .unbound
+                    .iter()
+                    .filter(|gpu| gpu.draws)
+                    .map(|gpu| gpu.market.clone()),
+            )
+            .collect();
+        let result = gpu_status::started(
+            drawer,
+            &failed,
+            bound.first().map(|gpu| gpu.market.as_str()),
+        );
+        // Without a GPU that draws, the first one is the step's own.
+        let others = bound
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| {
+                !chosen.serve.contains(&index) && (drawer.is_some() || index != 0)
+            })
+            .map(|(_, gpu)| gpu_status::shows_only(&gpu.market, drawer))
+            .collect();
+        return (result, others);
+    }
+    (String::from("started"), Vec::new())
+}
+
+/// The name of the GPU that draws macOS: the one the first Metal service
+/// runs on, else the one chosen for it, else the first GPU that started.
+/// For the boot log's GPU summary and the screen's lines.
+#[cfg(feature = "nvk")]
+pub(super) fn drawing_name() -> Option<&'static str> {
+    let bound = &installed()?.start.bound;
+    let index = gate::served_gpu(0)
+        .or_else(|| {
+            gate::metal_choice(bound, display::taken_index())
+                .serve
+                .first()
+                .copied()
+        })
+        .unwrap_or(0);
+    market_name(index)
+}
+
+/// Without GPU drivers no GPU draws.
+#[cfg(not(feature = "nvk"))]
+pub(super) fn drawing_name() -> Option<&'static str> {
+    None
+}
+
+/// The market name of the bound GPU at `index` (the claims' order, which
+/// DRM minors and [`gate::served_gpu`] use), or its maker and IDs where the
+/// table has no name.
+#[cfg(feature = "nvk")]
+pub(super) fn market_name(index: usize) -> Option<&'static str> {
+    installed()?
+        .start
+        .bound
+        .get(index)
+        .map(|gpu| gpu.market.as_str())
+}
+
 /// Why this boot gives macOS no Metal device, if it does not. WindowServer
 /// aborts without one and watchdogd
 /// then panics the system, so a boot of macOS stops here instead.
@@ -2343,7 +2512,42 @@ pub(super) fn serve(
         };
         display::take(screen.unwrap_or((0, 0)), shown, size);
         gate::open_service();
+        report_drawer();
     }
+}
+
+/// When the GPU chosen to draw macOS opened no Metal device and another one
+/// did, the boot screen says which draws instead; the log names the GPU that
+/// draws and the one that shows the display either way.
+#[cfg(feature = "nvk")]
+fn report_drawer() {
+    let Some(gpu) = installed() else {
+        return;
+    };
+    let bound = &gpu.start.bound;
+    let taken = display::taken_index();
+    let wanted = gate::metal_choice(bound, taken).serve.first().copied();
+    let served = gate::served_gpu(0);
+    if let (Some(wanted), Some(served)) = (wanted, served)
+        && wanted != served
+    {
+        crate::status::warning(&stela_boot_core::gpu_status::draws_instead(
+            &bound[wanted].market,
+            &bound[served].market,
+        ));
+    }
+    let named = |index: Option<usize>| match index.and_then(|index| bound.get(index)) {
+        Some(gpu) => format!("the {} at {}", gpu.market, gpu.name),
+        None => String::from("none"),
+    };
+    output::arguments(format_args!(
+        "GPU USE draws macOS: {}; shows the display: {}\n",
+        named(served),
+        match taken {
+            Some(_) => named(taken),
+            None => String::from("no GPU output"),
+        }
+    ));
 }
 
 /// When a GPU's display shows on a laptop's built-in panel, set the panel's
@@ -2569,8 +2773,13 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         ))
     })??;
     // On the boot screen too, for the case that another adapter shows it.
-    for (name, driver, dark) in &job.unbound {
-        crate::status::warning(&stela_boot_core::gpu_status::unbound(name, driver, *dark));
+    for unbound in &job.unbound {
+        crate::status::warning(&stela_boot_core::gpu_status::unbound(
+            &unbound.market,
+            &unbound.name,
+            unbound.driver,
+            unbound.dark,
+        ));
     }
     let result = job.result.map_err(Error::Init);
     #[cfg(feature = "nvk")]
@@ -2730,37 +2939,18 @@ fn mount_and_start(
     Ok((owner, threads, job))
 }
 
-/// The claimed GPUs in the two turns of their probes: first those that may
+/// The claimed GPUs in the two turns of their probes, as the selection put
+/// them ([`stela_drivers::gpu::selection::Choice`]): first those that may
 /// serve the Metal device, then those that may only show the frames another
-/// draws ([`stela_drivers::gpu::stack::may_only_show_frames_of`]), each in
-/// the claims' order: a GPU whose kind only its probe tells waits for a
-/// known discrete one. A probe of the second turn that hangs or fails then
-/// costs its own GPU, not the one macOS draws on.
+/// draws, each in the claims' order. A probe of the second turn that hangs or
+/// fails then costs its own GPU, not the one macOS draws on.
 fn by_probe_turn(
     claimed: ManuallyDrop<Vec<Claimed>>,
 ) -> (ManuallyDrop<Vec<Claimed>>, ManuallyDrop<Vec<Claimed>>) {
-    #[cfg(feature = "nvk")]
-    {
-        let mut drawing = Vec::new();
-        let (first, later): (Vec<_>, Vec<_>) = ManuallyDrop::into_inner(claimed)
-            .into_iter()
-            .partition(|claimed| {
-                let draws = claimed.stack.draws();
-                let first = stela_drivers::gpu::stack::may_only_show_frames_of(
-                    &drawing,
-                    draws,
-                    claimed.integrated,
-                )
-                .is_none();
-                if first && draws {
-                    drawing.push(stela_drivers::gpu::stack::drawing_kind(claimed.integrated));
-                }
-                first
-            });
-        (ManuallyDrop::new(first), ManuallyDrop::new(later))
-    }
-    #[cfg(not(feature = "nvk"))]
-    (claimed, ManuallyDrop::new(Vec::new()))
+    let (later, first): (Vec<_>, Vec<_>) = ManuallyDrop::into_inner(claimed)
+        .into_iter()
+        .partition(|claimed| cfg!(feature = "nvk") && claimed.later);
+    (ManuallyDrop::new(first), ManuallyDrop::new(later))
 }
 
 /// Probes `later`, the GPUs that would only show another's frames, after the
@@ -2779,16 +2969,7 @@ fn probe_later(
         // Linux did not start; nothing can bind them.
         return Ok(());
     }
-    let mut names: Vec<(String, &'static str, bool)> = later
-        .iter()
-        .map(|claimed| {
-            (
-                claimed.name.clone(),
-                claimed.stack.kernel.driver,
-                claimed.shows_screen,
-            )
-        })
-        .collect();
+    let mut names: Vec<Unbound> = later.iter().map(Unbound::of).collect();
     let deadline = time
         .now_ns()
         .and_then(|now| {
@@ -2808,11 +2989,12 @@ fn probe_later(
         unsafe { threads.submit(later_job) }.map_err(|refusal| Error::Submit(refusal.error))?;
     // Their GPUs are reported unbound with why, and the first turn's go on.
     let mut lost = |job: &mut Started, why: &dyn core::fmt::Display| {
-        for (name, driver, dark) in names.drain(..) {
+        for unbound in names.drain(..) {
             output::arguments(format_args!(
-                "GPU {name}: {driver}'s probe {why}; the GPUs that started go on without it\n"
+                "GPU {}: {}'s probe {why}; the GPUs that started go on without it\n",
+                unbound.name, unbound.driver
             ));
-            job.unbound.push((name, driver, dark));
+            job.unbound.push(unbound);
         }
     };
     match wait_for_child(

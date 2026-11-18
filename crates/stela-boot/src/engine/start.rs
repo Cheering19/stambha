@@ -1543,7 +1543,7 @@ fn open_gpus(
         let random = stela_drivers::probe::NativeServices::entropy(&services)
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
-        let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
+        let (claimed, refused, notes) = random.as_ref().map_or_else(Default::default, |_| {
             gpu::claim_all(
                 &services,
                 &adapters,
@@ -1553,11 +1553,13 @@ fn open_gpus(
                 &|address| gpu::link::port_above(mmio, address),
             )
         });
-        (claimed, refused, random)
+        (claimed, refused, notes, random)
     });
-    let (claimed, random) = match claimed {
-        Ok((claimed, _, Some(random))) if !claimed.is_empty() => (claimed, random),
-        Ok((_, refused, _)) => {
+    let (claimed, refused, notes, random) = match claimed {
+        Ok((claimed, refused, notes, Some(random))) if !claimed.is_empty() => {
+            (claimed, refused, notes, random)
+        }
+        Ok((_, refused, _, _)) => {
             // Each GPU that did not start, and why, or that there is none.
             use stela_boot_core::gpu_status;
             match refused.split_first() {
@@ -1565,6 +1567,7 @@ fn open_gpus(
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
                         first.vendor,
+                        &first.name,
                         &first.address,
                         first.device,
                         first.reason,
@@ -1573,6 +1576,7 @@ fn open_gpus(
                     for gpu in rest {
                         crate::status::info(&gpu_status::refused(
                             gpu.vendor,
+                            &gpu.name,
                             &gpu.address,
                             gpu.device,
                             gpu.reason,
@@ -1631,7 +1635,22 @@ fn open_gpus(
     ));
     let ok = match opened {
         Ok(()) => {
-            crate::status::done("started");
+            // The GPU that draws, then why each other GPU found does not.
+            let (result, others) = gpu::started(&refused);
+            crate::status::done(&result);
+            for gpu in &refused {
+                crate::status::warning(&stela_boot_core::gpu_status::refused(
+                    gpu.vendor,
+                    &gpu.name,
+                    &gpu.address,
+                    gpu.device,
+                    gpu.reason,
+                    &gpu.why,
+                ));
+            }
+            for line in others.iter().chain(&notes) {
+                crate::status::info(line);
+            }
             true
         }
         Err(error) => {
