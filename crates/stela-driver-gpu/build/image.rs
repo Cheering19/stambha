@@ -9,7 +9,8 @@ use stela_c_build::linux_capture::{self as initcalls, Captured, Projection, Unit
 
 /// Ordinals of the image's units after the common cohort: DRM's own level
 /// (its core, helpers and buses) holds 5 to 31, and the drivers' units 32
-/// on: nouveau 32, xe 33 and its display parameters 34, amdgpu 35.
+/// on: nouveau 32, xe 33 and its display parameters 34, amdgpu 35, i915
+/// 36.
 pub const FIRST_DRIVER_ORDINAL: u32 = 32;
 
 /// The kernel services a driver's objects import that the environment lacks

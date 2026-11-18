@@ -15,6 +15,8 @@ pub mod metal;
 pub mod amdgpu;
 #[cfg(feature = "linux-drm")]
 pub mod command_line;
+#[cfg(feature = "i915-port")]
+pub mod i915;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 
