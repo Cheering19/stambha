@@ -15,12 +15,13 @@ pub(crate) fn binary(ips: &[(u16, u8, u8, u8)], table_version: u16) -> Vec<u8> {
     let put32 = |bytes: &mut Vec<u8>, at: usize, value: u32| {
         bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())
     };
-    put32(&mut bytes, 0, BINARY_SIGNATURE);
+    // The signatures as the GPU's firmware lays them out.
+    bytes[0..4].copy_from_slice(&[0x07, 0x14, 0x21, 0x28]);
     put16(&mut bytes, 4, 1);
     let total = bytes.len();
     put16(&mut bytes, 10, total as u16);
     put16(&mut bytes, 12, TABLE as u16);
-    put32(&mut bytes, TABLE, DISCOVERY_TABLE_SIGNATURE);
+    bytes[TABLE..TABLE + 4].copy_from_slice(b"IPDS");
     put16(&mut bytes, TABLE + 4, table_version);
     put16(&mut bytes, TABLE + 6, (total - TABLE) as u16);
     put16(&mut bytes, TABLE + 12, 1);
@@ -210,5 +211,29 @@ fn a_refused_index_write_reads_no_table_and_says_why() {
         }
     }
     // Every dword reads all ones: no signature.
-    assert_eq!(read(&Refusing), Err(Error::Signature));
+    assert_eq!(
+        read(&Refusing).map_err(|failure| failure.error),
+        Err(Error::Signature)
+    );
+}
+
+#[test]
+fn a_table_not_taken_says_where_it_was_read_and_what_it_held() {
+    // A good binary whose table does not start "IPDS".
+    let mut table = binary(RAPHAEL, 3);
+    table[64] = b'X';
+    let place = Place {
+        offset: 0x1fff_0000,
+        bytes: TABLE_BYTES,
+    };
+    let failure = Failure::found(Error::TableSignature, place, &table);
+    assert_eq!(
+        alloc::format!("{failure}"),
+        "TableSignature; read 0x2800 bytes at VRAM offset 0x1fff0000, which start \
+         [07, 14, 21, 28]; its table at 0x40 starts [58, 50, 44, 53]"
+    );
+    assert_eq!(
+        alloc::format!("{}", Failure::from(Error::NotReady)),
+        "NotReady"
+    );
 }

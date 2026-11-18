@@ -34,8 +34,10 @@ pub const BELOW_TOP: u64 = 64 << 10;
 /// The most a scratch-register size may ask to read.
 const MOST_BYTES: usize = 64 << 10;
 
+/// `BINARY_SIGNATURE` and `DISCOVERY_TABLE_SIGNATURE` of
+/// `include/discovery.h`, as little-endian dwords: the latter is "IPDS".
 pub const BINARY_SIGNATURE: u32 = 0x2821_1407;
-const DISCOVERY_TABLE_SIGNATURE: u32 = 0x5344_4950;
+const DISCOVERY_TABLE_SIGNATURE: u32 = 0x5344_5049;
 
 /// The hardware IDs of the blocks whose firmware amdgpu names after their
 /// versions (`soc15_hw_ip.h`).
@@ -147,7 +149,7 @@ pub trait Registers {
 /// `MM_INDEX_HI` and `MM_DATA` window one dword at a time, as
 /// `amdgpu_device_mm_access` reads it; the index registers hold their
 /// earlier values again after.
-pub fn read(registers: &impl Registers) -> Result<Vec<Ip>, Error> {
+pub fn read(registers: &impl Registers) -> Result<Vec<Ip>, Failure> {
     let index = (registers.read(MM_INDEX), registers.read(MM_INDEX_HI));
     let vram = |position: u64| -> u32 {
         let selected = registers.write(MM_INDEX, position as u32 | 0x8000_0000)
@@ -158,19 +160,77 @@ pub fn read(registers: &impl Registers) -> Result<Vec<Ip>, Error> {
             u32::MAX
         }
     };
-    let result = place(|offset| registers.read(offset), vram).and_then(|place| {
-        let mut binary = Vec::new();
-        binary
-            .try_reserve_exact(place.bytes)
-            .map_err(|_| Error::Memory)?;
-        for at in (0..place.bytes as u64).step_by(4) {
-            binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
-        }
-        parse(&binary)
-    });
+    let result = place(|offset| registers.read(offset), vram)
+        .map_err(Failure::from)
+        .and_then(|place| {
+            let mut binary = Vec::new();
+            binary
+                .try_reserve_exact(place.bytes)
+                .map_err(|_| Failure::from(Error::Memory))?;
+            for at in (0..place.bytes as u64).step_by(4) {
+                binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
+            }
+            parse(&binary).map_err(|error| Failure::found(error, place, &binary))
+        });
     registers.write(MM_INDEX, index.0);
     registers.write(MM_INDEX_HI, index.1);
     result
+}
+
+/// Why [`read`] took no table, with what it found where it read one: the
+/// VRAM offset, the binary's first bytes and, past a good binary header,
+/// where its IP discovery table was and that table's first bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Failure {
+    pub error: Error,
+    pub read: Option<(Place, [u8; 4])>,
+    pub table: Option<(u16, [u8; 4])>,
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            read: None,
+            table: None,
+        }
+    }
+}
+
+impl Failure {
+    fn found(error: Error, place: Place, binary: &[u8]) -> Self {
+        let first = |at: usize| -> Option<[u8; 4]> { binary.get(at..at + 4)?.try_into().ok() };
+        let entry = match u16_at(binary, 4) {
+            Ok(0 | 1) => Some(12),
+            Ok(2) => Some(16),
+            _ => None,
+        };
+        let table = entry
+            .and_then(|entry| u16_at(binary, entry).ok())
+            .and_then(|offset| Some((offset, first(usize::from(offset))?)));
+        Self {
+            error,
+            read: first(0).map(|bytes| (place, bytes)),
+            table,
+        }
+    }
+}
+
+impl core::fmt::Display for Failure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.error)?;
+        if let Some((place, bytes)) = self.read {
+            write!(
+                f,
+                "; read {:#x} bytes at VRAM offset {:#x}, which start {:02x?}",
+                place.bytes, place.offset, bytes
+            )?;
+        }
+        if let Some((offset, bytes)) = self.table {
+            write!(f, "; its table at {offset:#x} starts {bytes:02x?}")?;
+        }
+        Ok(())
+    }
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, Error> {

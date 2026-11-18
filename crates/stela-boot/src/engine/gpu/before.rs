@@ -437,7 +437,7 @@ fn ip_discovery(
         page,
         registers,
     })
-    .map_err(|error| format!("{error:?}"))
+    .map_err(|failure| format!("{failure}"))
 }
 
 /// The files xe and the display code ask for on the Intel GPU with PCI
