@@ -1552,16 +1552,21 @@ fn summarize(bound: &Bound, facts: &str, integrated: bool, service: Option<&Shar
         None => (None, String::new()),
     };
     let heap = crate::ALLOCATOR.usage();
+    let share = stela_drivers::gpu::metal::device::share::probe()
+        .and_then(|probe| probe())
+        .map(|state| (state.held, state.limit));
     let summary = stela_boot_core::gpu_triage::Summary {
         address: &bound.name,
         vendor: bound.drm.vendor,
         device: bound.drm.device,
         revision: bound.drm.revision,
+        market: &bound.market,
         driver: bound.stack.kernel.driver,
         facts,
         integrated,
         working_set,
         heaps: &heaps,
+        share,
         heap_live: heap.live,
         heap_total: heap.total,
     };

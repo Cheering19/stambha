@@ -48,6 +48,8 @@ pub struct Summary<'a> {
     pub vendor: u16,
     pub device: u16,
     pub revision: u8,
+    /// Its market name, or its maker and IDs.
+    pub market: &'a str,
     /// The kernel driver's name.
     pub driver: &'a str,
     /// What the kernel driver says of itself and the chip: its version, the
@@ -59,7 +61,11 @@ pub struct Summary<'a> {
     pub working_set: Option<u64>,
     /// The Vulkan driver's heaps, `size/kind` each.
     pub heaps: &'a str,
-    /// Stela's heap: bytes in use and its size.
+    /// An integrated GPU's share of RAM: the bytes Linux holds of it and
+    /// its size. None where the memory plan gave it none.
+    pub share: Option<(u64, u64)>,
+    /// Stela's heap: bytes in use and its size, which an integrated GPU
+    /// with no share takes its pages from.
     pub heap_live: usize,
     pub heap_total: usize,
 }
@@ -69,21 +75,28 @@ impl core::fmt::Display for Summary<'_> {
         let mib = |bytes: u64| bytes >> 20;
         write!(
             f,
-            "GPU SUMMARY {} {:04x}:{:04x} rev {:#04x} driver {}",
-            self.address, self.vendor, self.device, self.revision, self.driver
+            "GPU SUMMARY {} {:04x}:{:04x} rev {:#04x} {}: driver {}",
+            self.address, self.vendor, self.device, self.revision, self.market, self.driver
         )?;
         if !self.facts.is_empty() {
             write!(f, " {}", self.facts)?;
         }
-        if self.integrated {
-            write!(
+        match (self.integrated, self.share) {
+            (true, Some((held, limit))) => write!(
                 f,
-                "; integrated: its memory is system memory from Stela's heap of {}M ({}M in use)",
+                "; integrated: its memory is the GPU's share of RAM, of which Linux holds {}M \
+                 of {}M",
+                mib(held),
+                mib(limit)
+            )?,
+            (true, None) => write!(
+                f,
+                "; integrated with no share of RAM: its memory is system memory from Stela's \
+                 heap of {}M ({}M in use)",
                 mib(self.heap_total as u64),
                 mib(self.heap_live as u64)
-            )?;
-        } else {
-            f.write_str("; discrete")?;
+            )?,
+            (false, _) => f.write_str("; discrete")?,
         }
         match self.working_set {
             Some(bytes) => write!(f, "; Metal works in {}M", mib(bytes))?,
@@ -142,25 +155,39 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_of_an_integrated_gpu_names_the_heap_its_memory_comes_from() {
+    fn the_summary_names_the_gpu_and_where_its_memory_comes_from() {
         let summary = Summary {
             address: "0000:01:00.0",
             vendor: 0x1002,
             device: 0x13c0,
             revision: 0xcb,
+            market: "AMD Radeon Graphics",
             driver: "amdgpu",
             facts: "3.64.0 family GC_10_3_6",
             integrated: true,
-            working_set: Some(1893 << 20),
-            heaps: " 635M/host 1270M/local",
+            working_set: Some(1512 << 20),
+            heaps: " 938M/host 1877M/local",
+            share: Some((480 << 20, 2560 << 20)),
             heap_live: 512 << 20,
-            heap_total: 3300 << 20,
+            heap_total: 2816 << 20,
         };
         assert_eq!(
             format!("{summary}"),
-            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb driver amdgpu 3.64.0 family \
-             GC_10_3_6; integrated: its memory is system memory from Stela's heap of 3300M \
-             (512M in use); Metal works in 1893M; Vulkan heaps 635M/host 1270M/local"
+            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb AMD Radeon Graphics: driver amdgpu \
+             3.64.0 family GC_10_3_6; integrated: its memory is the GPU's share of RAM, of \
+             which Linux holds 480M of 2560M; Metal works in 1512M; Vulkan heaps 938M/host \
+             1877M/local"
+        );
+        let summary = Summary {
+            share: None,
+            ..summary
+        };
+        assert_eq!(
+            format!("{summary}"),
+            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb AMD Radeon Graphics: driver amdgpu \
+             3.64.0 family GC_10_3_6; integrated with no share of RAM: its memory is system \
+             memory from Stela's heap of 2816M (512M in use); Metal works in 1512M; Vulkan \
+             heaps 938M/host 1877M/local"
         );
         let summary = Summary {
             integrated: false,
@@ -171,8 +198,8 @@ mod tests {
         };
         assert_eq!(
             format!("{summary}"),
-            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb driver amdgpu; discrete; the driver \
-             gave no memory size; no Vulkan device"
+            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb AMD Radeon Graphics: driver amdgpu; \
+             discrete; the driver gave no memory size; no Vulkan device"
         );
     }
 }
