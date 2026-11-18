@@ -175,6 +175,7 @@ pub const DRIVER: super::native::Driver = {
         // amdgpu's recovery from a hung GPU holds back the VM work closing
         // RADV's file waits for.
         keep_lost: true,
+        check_first_submission: true,
     }
 };
 

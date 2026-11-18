@@ -148,6 +148,7 @@ pub const DRIVER: super::native::Driver = {
             count: stela_nvk_count_failures,
         }),
         keep_lost: false,
+        check_first_submission: false,
     }
 };
 

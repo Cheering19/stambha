@@ -201,7 +201,14 @@ pub const DRIVER: super::native::Driver = {
         nir_options: stela_anv_nir_options,
         submit_thread: None,
         refusals: None,
+        // xe's and i915's closes of a file wait for no recovery: they kill
+        // its queues and contexts, and the memory goes when its last fence
+        // signals.
         keep_lost: false,
+        // A GPU xe or i915 left with engines that do not run, or that hangs
+        // again after their recovery, is found in 2 s rather than by their
+        // job timeout and heartbeat, as every client's work waits on it.
+        check_first_submission: true,
     }
 };
 
