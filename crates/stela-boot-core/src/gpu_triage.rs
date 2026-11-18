@@ -64,6 +64,10 @@ pub struct Summary<'a> {
     /// An integrated GPU's share of RAM: the bytes Linux holds of it and
     /// its size. None where the memory plan gave it none.
     pub share: Option<(u64, u64)>,
+    /// A discrete GPU's bound on Linux's pages, which its system-memory
+    /// buffers and its evictions from VRAM take: the bytes Linux holds and
+    /// the most it may hold. None where the plan set no bound.
+    pub pages: Option<(u64, u64)>,
     /// Stela's heap: bytes in use and its size, which an integrated GPU
     /// with no share takes its pages from.
     pub heap_live: usize,
@@ -96,7 +100,18 @@ impl core::fmt::Display for Summary<'_> {
                 mib(self.heap_total as u64),
                 mib(self.heap_live as u64)
             )?,
-            (false, _) => f.write_str("; discrete")?,
+            (false, _) => {
+                f.write_str("; discrete")?;
+                if let Some((held, limit)) = self.pages {
+                    write!(
+                        f,
+                        ", its system-memory buffers among Linux's pages, of which Linux holds \
+                         {}M of the {}M it may hold",
+                        mib(held),
+                        mib(limit)
+                    )?;
+                }
+            }
         }
         match self.working_set {
             Some(bytes) => write!(f, "; Metal works in {}M", mib(bytes))?,
@@ -106,6 +121,34 @@ impl core::fmt::Display for Summary<'_> {
             f.write_str("; no Vulkan device")
         } else {
             write!(f, "; Vulkan heaps{}", self.heaps)
+        }
+    }
+}
+
+/// What Linux held of its pages at a heap exhaustion stop, after the heap's
+/// own figures: an integrated GPU's share (`share`), whose pages its GTT
+/// takes, or the bound the plan set on Linux's pages beside a discrete GPU.
+/// Written without allocating, as the heap is exhausted.
+pub struct PagesAtStop {
+    pub held: u64,
+    pub limit: u64,
+    pub share: bool,
+}
+
+impl core::fmt::Display for PagesAtStop {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (held, limit) = (self.held >> 20, self.limit >> 20);
+        match self.share {
+            true => write!(
+                f,
+                "; the GPU's share of RAM: Linux holds {held}M of {limit}M, its GTT's pages \
+                 among them"
+            ),
+            false => write!(
+                f,
+                "; Linux's pages, apart from the heap's own needs: it holds {held}M of the \
+                 {limit}M it may hold"
+            ),
         }
     }
 }
@@ -154,6 +197,31 @@ mod tests {
         assert_eq!(repeats.count("0"), Some(String::from(" (seen 2 times)")));
     }
 
+    /// A heap stop names an integrated GPU's share as such, and the bound
+    /// beside a discrete GPU as Linux's pages, which are no share of RAM.
+    #[test]
+    fn a_heap_stop_names_linuxs_pages_as_the_plan_held_them() {
+        let pages = |share| {
+            format!(
+                "{}",
+                PagesAtStop {
+                    held: 300 << 20,
+                    limit: 392 << 20,
+                    share,
+                }
+            )
+        };
+        assert_eq!(
+            pages(true),
+            "; the GPU's share of RAM: Linux holds 300M of 392M, its GTT's pages among them"
+        );
+        assert_eq!(
+            pages(false),
+            "; Linux's pages, apart from the heap's own needs: it holds 300M of the 392M it may \
+             hold"
+        );
+    }
+
     #[test]
     fn the_summary_names_the_gpu_and_where_its_memory_comes_from() {
         let summary = Summary {
@@ -168,6 +236,7 @@ mod tests {
             working_set: Some(1512 << 20),
             heaps: " 938M/host 1877M/local",
             share: Some((480 << 20, 2560 << 20)),
+            pages: None,
             heap_live: 512 << 20,
             heap_total: 2816 << 20,
         };
@@ -200,6 +269,18 @@ mod tests {
             format!("{summary}"),
             "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb AMD Radeon Graphics: driver amdgpu; \
              discrete; the driver gave no memory size; no Vulkan device"
+        );
+        // A discrete GPU's pages are held to the plan's bound, which is no
+        // share of RAM of its own.
+        let summary = Summary {
+            pages: Some((212 << 20, 876 << 20)),
+            ..summary
+        };
+        assert_eq!(
+            format!("{summary}"),
+            "GPU SUMMARY 0000:01:00.0 1002:13c0 rev 0xcb AMD Radeon Graphics: driver amdgpu; \
+             discrete, its system-memory buffers among Linux's pages, of which Linux holds 212M \
+             of the 876M it may hold; the driver gave no memory size; no Vulkan device"
         );
     }
 }

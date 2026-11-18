@@ -1558,9 +1558,20 @@ fn summarize(bound: &Bound, facts: &str, integrated: bool, service: Option<&Shar
         None => (None, String::new()),
     };
     let heap = crate::ALLOCATOR.usage();
-    let share = stela_drivers::gpu::metal::device::share::probe()
+    // Only an integrated GPU works in a share: the probe of one speaks of
+    // an integrated GPU, and a discrete GPU's pages are held to the plan's
+    // bound alone, which is no share of its own.
+    let share = integrated
+        .then(stela_drivers::gpu::metal::device::share::probe)
+        .flatten()
         .and_then(|probe| probe())
         .map(|state| (state.held, state.limit));
+    let pages = match stela_linux::pages::held_and_limit() {
+        (held, limit) if !integrated && limit != 0 => {
+            Some((held as u64 * PAGE, limit as u64 * PAGE))
+        }
+        _ => None,
+    };
     let summary = stela_boot_core::gpu_triage::Summary {
         address: &bound.name,
         vendor: bound.drm.vendor,
@@ -1573,6 +1584,7 @@ fn summarize(bound: &Bound, facts: &str, integrated: bool, service: Option<&Shar
         working_set,
         heaps: &heaps,
         share,
+        pages,
         heap_live: heap.live,
         heap_total: heap.total,
     };

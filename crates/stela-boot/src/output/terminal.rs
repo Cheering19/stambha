@@ -196,15 +196,20 @@ impl core::fmt::Display for Failed {
             return Ok(());
         };
         write!(f, "{failure}")?;
-        // An integrated GPU's pages, its GTT among them, come from its
-        // share of RAM, not the heap: what Linux held of it says whether
-        // the GPU's work was near its own limit too. Two plain reads.
+        // Linux's pages are held apart from the heap's own needs, to an
+        // integrated GPU's share or to the plan's bound beside a discrete
+        // GPU: what Linux held says whether the GPU's work was near its own
+        // limit too. Plain reads, no allocation.
+        let page = stela_boot_core::native_memory::PAGE as u64;
         match stela_linux::pages::held_and_limit() {
             (held, limit) if limit != 0 => write!(
                 f,
-                "; the GPU's share of RAM: Linux holds {}M of {}M, its GTT's pages among them",
-                (held * stela_boot_core::native_memory::PAGE) >> 20,
-                (limit * stela_boot_core::native_memory::PAGE) >> 20
+                "{}",
+                stela_boot_core::gpu_triage::PagesAtStop {
+                    held: held as u64 * page,
+                    limit: limit as u64 * page,
+                    share: crate::native_memory::gpu_share() != 0,
+                }
             ),
             _ => Ok(()),
         }
