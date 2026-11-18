@@ -1406,11 +1406,10 @@ fn open_gpu(
         // Its kernel driver shows frames; `display` takes its outputs.
         return None;
     }
-    // Read before the GPU's first work, for the guest's `StelaHost`.
-    client::remember_memory(index as u32, bound.stack);
-    // So is what the driver says of the chip, for the summary below: once
-    // the GPU hung, a file's close may wait for the driver's reset.
-    let facts = client::describe(index as u32, bound.stack);
+    // Read before the GPU's first work, for the guest's `StelaHost`, with
+    // what the driver says of the chip, for the summary below: once the GPU
+    // hung, a file's close may wait for the driver's reset.
+    let facts = client::remember_memory(index as u32, bound.stack);
     let shares_memory = integrated(index, bound);
     let link = match PcieLink::admitted(bound.link, shares_memory) {
         Ok(link) => link,

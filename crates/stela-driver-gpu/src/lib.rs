@@ -19,6 +19,7 @@ pub mod command_line;
 pub mod xe;
 
 pub mod cold;
+pub mod drm_version;
 pub mod gsp_perf;
 pub mod names;
 pub mod nouveau_chip;

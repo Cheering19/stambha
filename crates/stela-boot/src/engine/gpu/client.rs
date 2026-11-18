@@ -1797,53 +1797,47 @@ pub(super) fn query<T>(
     answer
 }
 
-/// What the kernel driver of the bound GPU at `index` says of itself and
-/// the chip, for the boot log's summary of the GPU: DRM's name and version,
-/// then its stack's own description
-/// ([`stela_drivers::gpu::stack::Kernel::describe`]), asked on one render
-/// file before the GPU's first work. Empty when the driver answers nothing.
-pub(super) fn describe(index: u32, stack: &GpuStack) -> alloc::string::String {
-    let Some(minor) = minor(index as usize) else {
-        return alloc::string::String::new();
-    };
-    let fd = submit(Operation::Open(RENDER_MINOR + minor)) as c_int;
-    if fd < 0 {
-        return alloc::string::String::new();
-    }
-    let mut control = device_control(fd);
-    // DRM's name is the driver's, which the summary already names.
-    let mut text = stela_drivers::gpu::stack::drm_version(&mut control)
-        .map(|version| match version.strip_prefix(stack.kernel.driver) {
-            Some(number) => alloc::string::String::from(number.trim_start()),
-            None => version,
-        })
-        .unwrap_or_default();
-    if let Some(facts) = stack
-        .kernel
-        .describe
-        .and_then(|describe| describe(&mut control))
-    {
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(&facts);
-    }
-    close_descriptor(fd);
-    text
-}
-
 /// The device memory bytes [`remember_memory`] read of each bound GPU, by
 /// index; zero before it read them.
 static MEMORY_BYTES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Asks the kernel driver of the bound GPU at `index` for its device memory
-/// once, before the GPU's first work, for [`vram_bytes`].
-pub(super) fn remember_memory(index: u32, stack: &GpuStack) {
-    if let Some(bytes) = query(index, stack.kernel.memory_bytes)
+/// once, before the GPU's first work, for [`vram_bytes`], and answers what
+/// the driver says of itself and the chip for the boot log's summary of the
+/// GPU: its DRM version, which the build read from the driver's source,
+/// then its stack's own description
+/// ([`stela_drivers::gpu::stack::Kernel::describe`]). Both queries are
+/// asked on one render file; the version needs none.
+pub(super) fn remember_memory(index: u32, stack: &GpuStack) -> alloc::string::String {
+    let mut facts = stack
+        .kernel
+        .version
+        .map(|(major, minor, patch)| alloc::format!("{major}.{minor}.{patch}"))
+        .unwrap_or_default();
+    let Some(fd) = minor(index as usize)
+        .map(|minor| submit(Operation::Open(RENDER_MINOR + minor)) as c_int)
+        .filter(|&fd| fd >= 0)
+    else {
+        return facts;
+    };
+    let mut control = device_control(fd);
+    if let Some(bytes) = (stack.kernel.memory_bytes)(&mut control)
         && let Some(kept) = MEMORY_BYTES.get(index as usize)
     {
         kept.store(bytes, Ordering::Relaxed);
     }
+    if let Some(described) = stack
+        .kernel
+        .describe
+        .and_then(|describe| describe(&mut control))
+    {
+        if !facts.is_empty() {
+            facts.push(' ');
+        }
+        facts.push_str(&described);
+    }
+    close_descriptor(fd);
+    facts
 }
 
 /// The device memory bytes of the GPU of Metal service `service`, for the

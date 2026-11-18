@@ -1,6 +1,8 @@
 #[cfg(feature = "amdgpu-port")]
 #[path = "build/amdgpu.rs"]
 mod amdgpu;
+#[path = "src/drm_version.rs"]
+mod drm_version;
 #[cfg(feature = "linux-drm")]
 #[path = "build/image.rs"]
 mod image;
@@ -46,9 +48,37 @@ fn vulkan_drivers() {
     }
 }
 
+/// Each driver stack's DRM version, read from its driver's source
+/// (`stack::Kernel::version`): `None` for a driver whose source this
+/// checkout does not hold.
+fn drm_versions() {
+    const DRM: &str = "../../third_party/linux/drivers/gpu/drm";
+    const DRIVERS: [(&str, &str, &str); 3] = [
+        ("NOUVEAU", "nouveau/nouveau_drv.h", "DRIVER_"),
+        ("AMDGPU", "amd/amdgpu/amdgpu_drv.c", "KMS_DRIVER_"),
+        ("XE", "xe/xe_drv.h", "DRIVER_"),
+    ];
+    let mut text = String::new();
+    for (name, file, prefix) in DRIVERS {
+        let path = std::path::Path::new(DRM).join(file);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let version = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|source| drm_version::version(&source, prefix));
+        text.push_str(&format!(
+            "/// `{file}`'s `{prefix}MAJOR`, `MINOR` and `PATCHLEVEL`.\n\
+             pub const {name}: Option<(u32, u32, u32)> = {version:?};\n"
+        ));
+    }
+    let output =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    std::fs::write(output.join("drm_versions.rs"), text).expect("write the drivers' DRM versions");
+}
+
 fn main() {
     nouveau_firmware::validate();
     vulkan_drivers();
+    drm_versions();
     // Active ports declare their native source inputs below. Without this
     // baseline Cargo watches every vendored file even when no C port is used.
     println!("cargo:rerun-if-changed=build.rs");
