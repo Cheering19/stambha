@@ -14,6 +14,7 @@ bool stela_linux_pci_devices_present(void);
  * from a successful absent capability (*found == 0). No context ownership moves. */
 int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
+const char *stela_linux_pci_driver_name(const struct pci_dev *device);
 /* Whether the owner of an attached function routes its MSI-X table, and
  * how many vectors it has lines for (0 for none or no table). */
 bool stela_linux_pci_routes_msix(const struct pci_dev *device);

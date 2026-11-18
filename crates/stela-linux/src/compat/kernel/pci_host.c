@@ -1191,6 +1191,85 @@ static void test_msix(void)
 	stela_linux_pci_remove_device(dev);
 }
 
+/* A device two registered drivers' tables hold, as i915's and xe's both hold
+ * Tiger Lake: the first registered driver is offered it first, and when that
+ * probe fails, what the probe set up is released and the next driver binds
+ * it, as Linux's driver core tries each driver in turn. */
+static u8 fallback_config[256];
+static unsigned int first_probes, second_probes, first_releases;
+
+static int fallback_read(void *context, int where, int size, u32 *value)
+{
+	*value = 0;
+	memcpy(value, (u8 *)context + where, (size_t)size);
+	return 0;
+}
+
+static int fallback_write(void *context, int where, int size, u32 value)
+{
+	memcpy((u8 *)context + where, &value, (size_t)size);
+	return 0;
+}
+
+static void first_release(void *data)
+{
+	(void)data;
+	first_releases++;
+}
+
+static int first_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	(void)id;
+	first_probes++;
+	assert(!devm_add_action(&dev->dev, first_release, NULL));
+	return -ENODEV;
+}
+
+static int second_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	(void)dev, (void)id;
+	/* The first driver's setup is gone before the next probe runs. */
+	assert(first_releases == first_probes);
+	second_probes++;
+	return 0;
+}
+
+static void test_fallback(void)
+{
+	static const struct pci_device_id both[] = {
+		{.vendor = PCI_VENDOR_ID_INTEL, .device = 0x9a49,
+		 .subvendor = (u32)PCI_ANY_ID, .subdevice = (u32)PCI_ANY_ID}, {}};
+	static struct pci_driver first = {.name = "first", .id_table = both,
+					  .probe = first_probe};
+	static struct pci_driver second = {.name = "second", .id_table = both,
+					   .probe = second_probe};
+	memcpy(&fallback_config[PCI_VENDOR_ID], "\x86\x80\x49\x9a", 4);
+	memcpy(&fallback_config[PCI_CLASS_REVISION], "\x01\x00\x00\x03", 4);
+	struct stela_linux_pci_function function = {
+		.context = fallback_config, .read_config = fallback_read,
+		.write_config = fallback_write, .dma_map = test_map, .dma_unmap = test_unmap,
+		.enable_msi = test_enable_msi, .disable_msi = test_disable_msi,
+		.dma_limit = DMA_BIT_MASK(39), .bus = 0, .devfn = PCI_DEVFN(2, 0), .irq = 16,
+	};
+	/* The drivers register before the function is attached, as in the
+	 * image: its publication offers it to each in turn. */
+	assert(!pci_register_driver(&first) && !pci_register_driver(&second));
+	struct pci_dev *dev = stela_linux_pci_attach(&function, NULL);
+
+	assert(dev);
+	assert(first_probes == 1 && first_releases == 1 && second_probes == 1);
+	assert(stela_linux_pci_bound(dev) && dev->driver == &second);
+	assert(!strcmp(stela_linux_pci_driver_name(dev), "second"));
+	stela_linux_pci_remove_device(dev);
+	pci_unregister_driver(&second);
+	pci_unregister_driver(&first);
+	assert(first_probes == 1 && second_probes == 1);
+	/* A function no driver binds has no driver's name. */
+	dev = stela_linux_pci_attach(&function, NULL);
+	assert(dev && !stela_linux_pci_bound(dev) && !stela_linux_pci_driver_name(dev));
+	stela_linux_pci_remove_device(dev);
+}
+
 static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
 static const struct stela_linux_owner test_owner = {.services = &test_services};
 
@@ -1228,6 +1307,7 @@ int main(void)
 	assert(!stela_linux_pci_screen_ended_at(3, PCI_DEVFN(2, 0)));
 	assert(!stela_linux_pci_screen_ended_at(4, PCI_DEVFN(1, 0)));
 	test_msix();
+	test_fallback();
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);

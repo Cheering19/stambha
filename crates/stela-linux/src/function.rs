@@ -338,6 +338,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn stela_linux_owner() -> *const super::owner::RawOwner;
     fn stela_linux_pci_bound(device: *const c_void) -> bool;
+    fn stela_linux_pci_driver_name(device: *const c_void) -> *const c_char;
     fn stela_linux_pci_shutdown(device: *mut c_void);
     fn stela_linux_pci_remove_device(device: *mut c_void);
     fn stela_linux_pci_quarantined_functions() -> u64;
@@ -1084,6 +1085,20 @@ impl<H: Host> Attached<H> {
     pub unsafe fn bound(&self) -> bool {
         // SAFETY: the caller's contract, over this function's live device.
         unsafe { stela_linux_pci_bound(self.device.as_ptr()) }
+    }
+
+    /// The name of the driver that took the function, as Linux names it:
+    /// the first registered driver whose table holds the function and whose
+    /// probe succeeded, which is a later one when an earlier one's failed.
+    ///
+    /// # Safety
+    /// In an entered Linux owner.
+    pub unsafe fn driver(&self) -> Option<&core::ffi::CStr> {
+        // SAFETY: the caller's contract, over this function's live device.
+        let name = unsafe { stela_linux_pci_driver_name(self.device.as_ptr()) };
+        // SAFETY: a bound driver's name is its registered `pci_driver`'s,
+        // which lives as long as the image that registered it.
+        (!name.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(name) })
     }
 }
 

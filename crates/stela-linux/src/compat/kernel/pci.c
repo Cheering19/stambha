@@ -731,6 +731,13 @@ bool stela_linux_pci_bound(const struct pci_dev *device)
 	return device->dev.driver;
 }
 
+/* The name of the driver bound to the device, which is the first registered
+ * driver whose table holds it and whose probe succeeded, or NULL. */
+const char *stela_linux_pci_driver_name(const struct pci_dev *device)
+{
+	return device->driver ? device->driver->name : NULL;
+}
+
 /* What the kernel's shutdown does of a device: its driver stops the hardware. */
 void stela_linux_pci_shutdown(struct pci_dev *dev)
 {
