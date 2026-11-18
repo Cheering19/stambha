@@ -12,7 +12,10 @@ use super::{
     abi::DeviceLocation,
     capabilities::Platform,
     open::Attachment,
-    vulkan::{DriverId, PhysicalDeviceType, physical::Identity},
+    vulkan::{
+        DriverId, PhysicalDeviceType,
+        physical::{HeapLayout, Identity},
+    },
 };
 use alloc::string::String;
 
@@ -110,6 +113,7 @@ pub fn admit_named(
         linear_row_alignment: LINEAR_ROW_ALIGNMENT,
         linear_offset_alignment: LINEAR_OFFSET_ALIGNMENT,
         sparse_page_bytes: SPARSE_PAGE_BYTES,
+        heaps: HeapLayout::Disjoint,
     })
 }
 

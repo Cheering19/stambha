@@ -22,7 +22,7 @@ use super::{
     vertex::VertexFormat,
     vulkan::{
         FormatFeatures, PhysicalDeviceType, ResolveModes, SampleCounts,
-        physical::{Features, FormatSupport, PhysicalDevice},
+        physical::{Features, FormatSupport, HeapLayout, PhysicalDevice},
     },
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -119,6 +119,9 @@ pub struct Platform {
     pub linear_offset_alignment: u64,
     /// The backend's sparse page size, which is also its tile size.
     pub sparse_page_bytes: u64,
+    /// How the Vulkan driver's memory heaps share memory, which decides the
+    /// memory the GPU works in (`recommendedMaxWorkingSetSize`).
+    pub heaps: HeapLayout,
 }
 
 /// One capability this device does not provide and the layer that lacks it.
@@ -1004,8 +1007,12 @@ impl Derivation<'_> {
             has_unified_memory: integrated,
             recommended_max_working_set_size: device
                 .memory
-                .device_local_budget()
-                .unwrap_or_else(|| device.memory.device_local_bytes()),
+                .working_set_budget(self.platform.heaps, integrated)
+                .unwrap_or_else(|| {
+                    device
+                        .memory
+                        .working_set_bytes(self.platform.heaps, integrated)
+                }),
             limits: limits_out,
             argument_buffers_tier: argument_tier,
             read_write_texture_tier: read_write_tier,

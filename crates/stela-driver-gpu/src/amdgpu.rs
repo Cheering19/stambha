@@ -146,13 +146,21 @@ pub mod query {
         get::<18>(control, DEV_INFO).map(|words| words[17] & FUSION != 0)
     }
 
-    /// The memory the driver hands out: the usable bytes of its VRAM heap
-    /// and of its GTT heap, which on an integrated GPU is system memory.
-    /// `struct drm_amdgpu_memory_info` is three heaps (VRAM, its
-    /// CPU-accessible part, GTT) of four 64-bit fields, the second usable.
+    /// The memory the GPU works in: a discrete GPU's VRAM, as nouveau gives
+    /// its frame buffer's size; a GPU built into the processor
+    /// ([`integrated`]) works in the usable part of its carve-out and of the
+    /// system memory its GTT maps, which it shares. `struct
+    /// drm_amdgpu_memory_info` is three heaps (VRAM, its CPU-accessible
+    /// part, GTT) of four 64-bit fields: total, usable, used, largest.
     pub fn memory_bytes(control: Control) -> Option<u64> {
+        let integrated = integrated(control)?;
         let heaps = get::<12>(control, MEMORY)?;
-        heaps[1].checked_add(heaps[9]).filter(|bytes| *bytes != 0)
+        let bytes = if integrated {
+            heaps[1].checked_add(heaps[9])?
+        } else {
+            heaps[0]
+        };
+        (bytes != 0).then_some(bytes)
     }
 
     /// `DRM_IOCTL_AMDGPU_CTX`: `DRM_IOWR(DRM_COMMAND_BASE + 0x02, union
@@ -359,11 +367,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn queries_ask_the_info_ioctl_and_keep_refusals() {
-        let mut asked = alloc::vec::Vec::new();
-        let mut fused = false;
-        let mut answer = |request: u32, argument: *mut c_void| {
+    /// An answer to amdgpu's info queries: the family, `ids_flags` with
+    /// fusion when `fused`, and VRAM of 8 GiB (7.5 usable) beside a GTT of
+    /// 16 GiB, each query recorded.
+    fn info(
+        asked: &mut alloc::vec::Vec<(u32, u32, u32)>,
+        fused: bool,
+    ) -> impl FnMut(u32, *mut c_void) -> i32 + '_ {
+        move |request: u32, argument: *mut c_void| {
             // SAFETY: the query passes its own record and answer buffer.
             let record = unsafe { &*argument.cast::<[u64; 4]>() };
             let (size, query) = (record[1] as u32, (record[1] >> 32) as u32);
@@ -377,37 +388,49 @@ mod tests {
                 // half of the third word.
                 words[2] = 0x1234_5678_0000_0091;
                 if size > 136 {
-                    // `ids_flags`: preemption, then fusion on the second ask.
+                    // `ids_flags`: preemption, and fusion.
                     words[17] = if fused { 3 } else { 2 };
-                    fused = true;
                 }
             } else {
-                words[1] = 512 << 20;
-                words[9] = 16 << 30;
+                words[0] = 8 << 30;
+                words[1] = (8 << 30) - (512 << 20);
+                words[8] = 16 << 30;
+                words[9] = 15 << 30;
             }
             0
-        };
+        }
+    }
+
+    #[test]
+    fn queries_ask_the_info_ioctl_and_keep_refusals() {
+        let mut asked = alloc::vec::Vec::new();
+        let mut answer = info(&mut asked, false);
         assert_eq!(query::family(&mut answer), Some(0x91));
-        assert_eq!(
-            query::memory_bytes(&mut answer),
-            Some((512 << 20) + (16 << 30))
-        );
         assert_eq!(query::integrated(&mut answer), Some(false));
-        assert_eq!(query::integrated(&mut answer), Some(true));
-        assert_eq!(
-            asked,
-            [
-                (0x4020_6445, 0x16, 24),
-                (0x4020_6445, 0x19, 96),
-                (0x4020_6445, 0x16, 144),
-                (0x4020_6445, 0x16, 144)
-            ]
-        );
+        drop(answer);
+        assert_eq!(asked, [(0x4020_6445, 0x16, 24), (0x4020_6445, 0x16, 144)]);
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!(query::family(&mut refuse), None);
         assert_eq!(query::integrated(&mut refuse), None);
         assert_eq!(query::memory_bytes(&mut refuse), None);
         let mut empty = |_: u32, _: *mut c_void| 0;
         assert_eq!(query::memory_bytes(&mut empty), None);
+    }
+
+    /// A discrete GPU's memory is its VRAM, where the GTT's system memory
+    /// was added to it; an integrated GPU's is what it shares, its usable
+    /// carve-out and GTT.
+    #[test]
+    fn a_gpus_memory_is_its_vram_or_the_memory_it_shares() {
+        let mut asked = alloc::vec::Vec::new();
+        assert_eq!(
+            query::memory_bytes(&mut info(&mut asked, false)),
+            Some(8 << 30)
+        );
+        assert_eq!(asked, [(0x4020_6445, 0x16, 144), (0x4020_6445, 0x19, 96)]);
+        assert_eq!(
+            query::memory_bytes(&mut info(&mut alloc::vec::Vec::new(), true)),
+            Some((8 << 30) - (512 << 20) + (15 << 30))
+        );
     }
 }

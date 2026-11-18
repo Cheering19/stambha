@@ -9,7 +9,10 @@ use super::{
     abi::DeviceLocation,
     capabilities::Platform,
     open::{self, Admission, Attachment},
-    vulkan::{DriverId, PhysicalDeviceType, physical::Identity},
+    vulkan::{
+        DriverId, PhysicalDeviceType,
+        physical::{HeapLayout, Identity},
+    },
 };
 use alloc::string::String;
 
@@ -90,6 +93,7 @@ impl Chip {
             linear_row_alignment: LINEAR_ROW_ALIGNMENT,
             linear_offset_alignment: LINEAR_OFFSET_ALIGNMENT,
             sparse_page_bytes: SPARSE_PAGE_BYTES,
+            heaps: HeapLayout::Nested,
         }
     }
 }
