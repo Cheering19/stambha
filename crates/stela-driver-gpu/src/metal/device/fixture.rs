@@ -175,6 +175,10 @@ pub(crate) struct MockBackend {
     pub(crate) compute: Vec<ComputePipelineInfo>,
     /// The pipelines each pipeline cache holds.
     pub(crate) caches: BTreeMap<u64, u8>,
+    /// The data each pipeline cache was made from, in order.
+    pub(crate) cache_inputs: Vec<Vec<u8>>,
+    /// What a pipeline cache's data begins with, before its count.
+    pub(crate) cache_header: Vec<u8>,
     /// While a call may defer, the next compute pipeline creation defers
     /// to a job that runs until this opens.
     pub(crate) pipeline_gate: Option<Arc<AtomicBool>>,
@@ -459,11 +463,15 @@ impl Backend for MockBackend {
     }
     fn create_pipeline_cache(&mut self, data: &[u8]) -> Result<PipelineCache> {
         let id = self.id();
-        self.caches.insert(id, data.first().copied().unwrap_or(0));
+        self.cache_inputs.push(data.to_vec());
+        let count = data.get(self.cache_header.len()).copied();
+        self.caches.insert(id, count.unwrap_or(0));
         Ok(PipelineCache(id))
     }
     fn pipeline_cache_data(&mut self, cache: PipelineCache) -> Result<Vec<u8>> {
-        Ok(alloc::vec![self.caches[&cache.0]])
+        let mut data = self.cache_header.clone();
+        data.push(self.caches[&cache.0]);
+        Ok(data)
     }
     fn create_graphics_pipeline(&mut self, info: &GraphicsPipelineInfo) -> Result<Pipeline> {
         self.source(info.source)?;

@@ -38,6 +38,7 @@ use crate::metal::{
     },
 };
 use alloc::{format, string::String, vec::Vec};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// What a destroyed object's id fails with.
 const DESTROYED: &str = "unknown or destroyed object";
@@ -518,6 +519,50 @@ pub struct MeshPipelineRequest {
 /// begins with when it holds this device's pipelines.
 pub const ARCHIVE_HEADER_BYTES: u64 = 32;
 
+/// Where the pipeline cache UUID lies in that header.
+const ARCHIVE_UUID: core::ops::Range<usize> = 16..32;
+
+/// The build identity of the drivers that compile pipelines, set once
+/// before any device opens ([`set_build_identity`]).
+static BUILD: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static BUILD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Names the build of the drivers that compile pipelines: the hash of the
+/// image's driver archives. A driver's pipeline cache UUID comes from its
+/// build ID, which is the same in every Stela build, so an archive file a
+/// guest keeps across a Stela update is told apart by this instead.
+pub fn set_build_identity(identity: &'static [u8]) {
+    BUILD.store(identity.as_ptr().cast_mut(), Ordering::Relaxed);
+    BUILD_BYTES.store(identity.len(), Ordering::Release);
+}
+
+fn build_identity() -> &'static [u8] {
+    let bytes = BUILD_BYTES.load(Ordering::Acquire);
+    let start = BUILD.load(Ordering::Relaxed);
+    if start.is_null() {
+        return &[];
+    }
+    // SAFETY: `set_build_identity` stored a static slice's start, then its length.
+    unsafe { core::slice::from_raw_parts(start, bytes) }
+}
+
+/// The UUID an archive file of this build's pipelines for a driver of
+/// `pipeline_cache_uuid` names in its header: the driver's, mixed with the
+/// drivers' build identity.
+pub fn archive_uuid(pipeline_cache_uuid: &[u8; 16]) -> [u8; 16] {
+    use stela_crypto::{Sha256, digest::Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(b"Stela binary archive");
+    hasher.update(pipeline_cache_uuid);
+    let build = build_identity();
+    hasher.update((build.len() as u64).to_le_bytes());
+    hasher.update(build);
+    let digest = hasher.finalize();
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    uuid
+}
+
 impl<B: Backend, C: Compiler> Device<B, C> {
     /// `newLibraryWithSource:` of the AIR the source compiled to.
     /// `dependencies` are `MTLCompileOptions.libraries`, which load with the
@@ -703,8 +748,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Whether an archive file beginning with `header` may hold this
     /// device's pipelines: a pipeline cache header of version one naming
-    /// its vendor, device and pipeline cache UUID. The driver ignores any
-    /// other data, such as another GPU's archive, so it need not be read.
+    /// its vendor, device and this build's archive UUID ([`archive_uuid`]).
+    /// The driver ignores any other data, such as another GPU's archive, so
+    /// it need not be read; another Stela build's it would not ignore, as
+    /// its drivers' UUID is the same.
     pub fn archive_header_matches(&self, header: &[u8]) -> bool {
         let identity = &self.backend.physical_device().identity;
         let word = |at: usize| {
@@ -716,12 +763,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             && word(4) == Some(1)
             && word(8) == Some(identity.vendor_id)
             && word(12) == Some(identity.device_id)
-            && header.get(16..32) == Some(&identity.pipeline_cache_uuid[..])
+            && header.get(ARCHIVE_UUID) == Some(&archive_uuid(&identity.pipeline_cache_uuid)[..])
     }
 
     /// `newBinaryArchiveWithDescriptor:error:` of `data`, a file's bytes:
     /// another device's or driver's archive holds nothing of this one's.
     pub fn new_archive(&mut self, data: &[u8]) -> Result<ArchiveId> {
+        // The driver reads its own UUID where the file names this build's.
+        let mut restored;
+        let data = if self.archive_header_matches(data) {
+            restored = data.to_vec();
+            restored[ARCHIVE_UUID]
+                .copy_from_slice(&self.backend.physical_device().identity.pipeline_cache_uuid);
+            &restored[..]
+        } else {
+            data
+        };
         let cache = self.backend.create_pipeline_cache(data)?;
         let index = self.pipelines.archives.insert(ArchiveObject {
             cache,
@@ -733,7 +790,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The bytes `serializeToURL:error:` writes.
     pub fn archive_data(&mut self, id: ArchiveId) -> Result<Vec<u8>> {
         let cache = self.pipelines.archives.get(id.0)?.cache;
-        self.backend.pipeline_cache_data(cache)
+        let mut data = self.backend.pipeline_cache_data(cache)?;
+        // The file names this build's archive UUID where the driver's is.
+        let uuid = self.backend.physical_device().identity.pipeline_cache_uuid;
+        if data.len() as u64 >= ARCHIVE_HEADER_BYTES && data[ARCHIVE_UUID] == uuid {
+            data[ARCHIVE_UUID].copy_from_slice(&archive_uuid(&uuid));
+        }
+        Ok(data)
     }
 
     /// Ends the creator's use of an archive, which goes with the last

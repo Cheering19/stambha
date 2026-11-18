@@ -1382,6 +1382,11 @@ fn construct(constructed: &mut bool) {
     if !core::mem::replace(constructed, true) {
         // SAFETY: the one call, before any other of the C's.
         unsafe { stela_mesa::stela_constructors() };
+        // The drivers' pipeline cache UUID is every Stela build's; their
+        // archives' hash names this build in the guest's archive files.
+        stela_drivers::gpu::metal::device::pipelines::set_build_identity(
+            stela_mesa::COMPILER_SHA256.as_bytes(),
+        );
     }
 }
 

@@ -1717,12 +1717,15 @@ fn cache_header(vendor: u32, device: u32, uuid: [u8; 16]) -> Vec<u8> {
 fn archive_files_hold_pipelines_only_under_this_devices_header() {
     let mut device = device();
     let identity = device.backend().physical_device().identity.clone();
-    let (vendor, id, uuid) = (
+    let (vendor, id, driver_uuid) = (
         identity.vendor_id,
         identity.device_id,
         identity.pipeline_cache_uuid,
     );
+    let uuid = super::pipelines::archive_uuid(&driver_uuid);
     assert!(device.archive_header_matches(&cache_header(vendor, id, uuid)));
+    // The driver's own UUID is every Stela build's: another build's file.
+    assert!(!device.archive_header_matches(&cache_header(vendor, id, driver_uuid)));
     let mut other_uuid = uuid;
     other_uuid[15] ^= 1;
     assert!(!device.archive_header_matches(&cache_header(vendor, id, other_uuid)));
@@ -1736,6 +1739,31 @@ fn archive_files_hold_pipelines_only_under_this_devices_header() {
     assert!(!device.archive_header_matches(&short));
     assert!(!device.archive_header_matches(&cache_header(vendor, id, uuid)[..31]));
     assert!(!device.archive_header_matches(&[]));
+}
+
+#[test]
+fn archive_files_name_this_builds_uuid_and_the_driver_reads_its_own() {
+    let mut device = device();
+    let identity = device.backend().physical_device().identity.clone();
+    let driver = cache_header(
+        identity.vendor_id,
+        identity.device_id,
+        identity.pipeline_cache_uuid,
+    );
+    device.backend().cache_header = driver.clone();
+    let archive = device.new_archive(&[]).unwrap();
+    let data = device.archive_data(archive).unwrap();
+    let file = cache_header(
+        identity.vendor_id,
+        identity.device_id,
+        super::pipelines::archive_uuid(&identity.pipeline_cache_uuid),
+    );
+    assert_eq!(data[..32], file[..]);
+    assert!(device.archive_header_matches(&data));
+    device.new_archive(&data).unwrap();
+    let read = device.backend().cache_inputs.last().unwrap().clone();
+    assert_eq!(read[..32], driver[..], "the driver reads its own header");
+    assert_eq!(read[32..], data[32..]);
 }
 
 #[test]
