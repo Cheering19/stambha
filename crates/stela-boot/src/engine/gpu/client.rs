@@ -585,34 +585,34 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 result
             }
             Operation::Unmap(address) => {
-                let Some(ClientMap { mapping, pages, .. }) =
-                    gpu.mappings.borrow_mut().remove(&address)
-                else {
-                    return EFAULT;
-                };
-                client::unmap(mapping);
-                MAPPINGS.fetch_sub(1, Ordering::Relaxed);
-                // A processor that kept the translation keeps the addresses too.
-                if gpu.window.remove(address, pages) {
-                    gpu.window.release(address, pages);
+                let unmapped = gpu.mappings.borrow_mut().unmap(address);
+                match unmapped {
+                    Ok(Some((mapping, span))) => release_mapping(gpu, mapping, span),
+                    // The last fault running in it releases it.
+                    Ok(None) => {}
+                    Err(client_fault::NotMapped) => return EFAULT,
                 }
                 0
             }
             Operation::Fault { address, write } => {
-                let mappings = gpu.mappings.borrow();
-                let span = |(&start, map): (&u64, &ClientMap)| map.span(start);
-                let below = mappings.range(..=address).next_back();
-                let above = mappings.range(address.saturating_add(1)..).next();
-                let place = client_fault::place(below.map(span), above.map(span), address);
-                let result = match place {
-                    Place::Inside { .. } => {
-                        let (_, map) = below.expect("a place inside has its mapping");
-                        if client::fill_around(map.mapping, address, write) {
+                // The fault may sleep in Linux (TTM waits for a buffer's
+                // move), and other calls run meanwhile: the table is not
+                // borrowed across it, and the mapping is held instead.
+                let lookup = gpu.mappings.borrow_mut().begin_fault(address);
+                let result = match (lookup.place, lookup.held) {
+                    (Place::Inside { span, .. }, Some(mapping)) => {
+                        let served = client::fill_around(mapping, address, write);
+                        let released = gpu.mappings.borrow_mut().end_fault(span.start);
+                        if let Some((mapping, span)) = released {
+                            release_mapping(gpu, mapping, span);
+                        }
+                        if served {
                             return 0;
                         }
                         EFAULT
                     }
-                    Place::Outside { .. } => ENXIO,
+                    (Place::Inside { .. }, None) => EFAULT,
+                    (Place::Outside { .. }, _) => ENXIO,
                 };
                 // No allocation: the faulting code may hold the heap's lock.
                 output::arguments(format_args!(
@@ -620,7 +620,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     Unserved {
                         address,
                         write,
-                        place
+                        place: lookup.place
                     }
                 ));
                 result
@@ -675,13 +675,13 @@ unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64
     match unsafe { client::map(fd, address, size, offset) } {
         Ok(mapping) => {
             gpu.mappings.borrow_mut().insert(
-                address,
-                ClientMap {
-                    mapping,
-                    pages,
+                Span {
+                    start: address,
+                    pages: pages as u64,
                     fd,
                     offset,
                 },
+                mapping,
             );
             MAPPINGS.fetch_add(1, Ordering::Relaxed);
             address as i64
@@ -693,23 +693,19 @@ unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64
     }
 }
 
-/// A client's mapping of a file in the window.
-pub(super) struct ClientMap {
-    mapping: client::Mapping,
-    pages: usize,
-    /// The descriptor and file offset it maps, which name it in a line.
-    fd: c_int,
-    offset: u64,
-}
-
-impl ClientMap {
-    fn span(&self, start: u64) -> Span {
-        Span {
-            start,
-            pages: self.pages as u64,
-            fd: self.fd,
-            offset: self.offset,
-        }
+/// Ends a client's mapping once no fault runs in it: Linux's, then the
+/// window's pages.
+///
+/// # Safety
+/// As [`perform`]; `mapping` left the table, and no fault holds it.
+unsafe fn release_mapping(gpu: &Installed, mapping: client::Mapping, span: Span) {
+    // SAFETY: the function's contract.
+    unsafe { client::unmap(mapping) };
+    MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+    let pages = span.pages as usize;
+    // A processor that kept the translation keeps the addresses too.
+    if gpu.window.remove(span.start, pages) {
+        gpu.window.release(span.start, pages);
     }
 }
 

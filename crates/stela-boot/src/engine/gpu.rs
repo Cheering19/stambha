@@ -2295,9 +2295,10 @@ struct Installed {
     libc_clock: client::LibcClock,
     #[cfg(feature = "nvk")]
     heap_bytes: u64,
-    /// Clients' mappings, by address. For tasks.
+    /// Clients' mappings, by address, with the faults running in each. For
+    /// tasks; no borrow lasts across a call into Linux, which may sleep.
     #[cfg(feature = "nvk")]
-    mappings: RefCell<BTreeMap<u64, client::ClientMap>>,
+    mappings: RefCell<stela_boot_core::client_fault::Mappings<stela_linux::client::Mapping>>,
     /// Mesa's running threads, by the bottom of their stacks. Only Linux
     /// entries, under the host drivers' lock, read and change it.
     #[cfg(feature = "nvk")]
@@ -2814,7 +2815,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         #[cfg(feature = "nvk")]
         heap_bytes,
         #[cfg(feature = "nvk")]
-        mappings: RefCell::new(BTreeMap::new()),
+        mappings: RefCell::new(stela_boot_core::client_fault::Mappings::default()),
         #[cfg(feature = "nvk")]
         mesa_threads: RefCell::new(BTreeMap::new()),
         #[cfg(feature = "nvk")]
