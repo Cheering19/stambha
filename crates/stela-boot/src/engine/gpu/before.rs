@@ -342,6 +342,12 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
             return amdgpu_files(device);
         }
     };
+    // A compute accelerator is refused here, before its reset, as the
+    // port's rule leaves out every GPU RADV opens no device on.
+    #[cfg(feature = "amdgpu")]
+    if let Some(graphics) = discovery::version(&ips, discovery::GC) {
+        gpu::amdgpu::discovered_serves(graphics).map_err(ServiceError::Refused)?;
+    }
     let named: Vec<String> = [
         ("GC", discovery::GC),
         ("MP0", discovery::MP0),

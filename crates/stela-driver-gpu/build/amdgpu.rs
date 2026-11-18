@@ -436,6 +436,10 @@ pub fn tables() {
             "a revision quirk moves {listed} to {quirked}, of another graphics generation"
         );
     }
+    // The graphics versions IP discovery gives a block without graphics
+    // queues, on which RADV opens no device (`radv_is_gpu_supported`).
+    let compute_only = compute_only(&source("amdgpu_discovery.c"), &source)
+        .unwrap_or_else(|error| panic!("amdgpu's graphics blocks: {error}"));
     let mut text = String::from(
         "/// amdgpu's `pciidlist` entries that name a device: its ID, its family\n\
          /// (`CHIP_*` without the prefix), its graphics generation (the oldest\n\
@@ -473,7 +477,10 @@ pub fn tables() {
          /// The BAR of the register window of every device Stela drives.\n\
          pub(crate) const REGISTERS: u8 = {};\n\
          /// The oldest graphics generation IP discovery chooses a block of.\n\
-         pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n",
+         pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n\
+         /// The graphics versions (major, minor, revision) whose block\n\
+         /// IP discovery adds has no graphics queue: compute accelerators.\n\
+         pub(crate) const COMPUTE_ONLY: &[(u8, u8, u8)] = &{compute_only:?};\n",
         window.newer
     ));
     text.push_str(
@@ -824,4 +831,84 @@ fn mask_bits(controller: &str) -> Result<u8, String> {
         })
         .min()
         .ok_or_else(|| format!("{argument} is assigned no mask width"))
+}
+
+/// The graphics IP versions `amdgpu_discovery_set_gc_ip_blocks` gives a
+/// graphics block that makes no graphics queue: every version of a block
+/// whose source never sets `num_gfx_rings` (`gfx_v9_4_3.c`), and those a
+/// block's source tests for when it sets the count to zero (Arcturus' and
+/// Aldebaran's in `gfx_v9_0.c`). `source` reads a file of amdgpu's.
+fn compute_only(
+    discovery: &str,
+    source: &dyn Fn(&str) -> String,
+) -> Result<Vec<(u8, u8, u8)>, String> {
+    let body = between(
+        discovery,
+        "static int amdgpu_discovery_set_gc_ip_blocks(",
+        "\n}\n",
+    )?;
+    let (mut blocks, mut pending) = (BTreeMap::<String, Vec<(u8, u8, u8)>>::new(), Vec::new());
+    for line in body.lines() {
+        if let Some(version) = line.trim().strip_prefix("case ").and_then(ip_version) {
+            pending.push(version);
+        } else if let Some(rest) = line.split_once("amdgpu_device_ip_block_add(adev, &gfx_v") {
+            let block = rest
+                .1
+                .split_once("_ip_block")
+                .ok_or_else(|| format!("graphics block in {line:?}"))?
+                .0;
+            blocks
+                .entry(format!("gfx_v{block}"))
+                .or_default()
+                .append(&mut pending);
+        } else if line.trim() == "default:" {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        return Err(String::from("no graphics block is added"));
+    }
+    let mut versions = Vec::new();
+    for (block, listed) in blocks {
+        let text = source(&format!("{block}.c"));
+        if !text.contains("num_gfx_rings =") {
+            versions.extend(listed);
+            continue;
+        }
+        for (before, _) in text
+            .match_indices("num_gfx_rings = 0;")
+            .map(|(at, found)| (&text[..at], found))
+        {
+            let condition = before
+                .rsplit_once("if (")
+                .map_or("", |(_, condition)| condition);
+            versions.extend(
+                condition
+                    .split("IP_VERSION")
+                    .skip(1)
+                    .filter_map(ip_version)
+                    .filter(|version| listed.contains(version)),
+            );
+        }
+    }
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(versions)
+}
+
+/// The version of an `IP_VERSION(major, minor, revision)` that `text`
+/// starts with, after its name.
+fn ip_version(text: &str) -> Option<(u8, u8, u8)> {
+    let arguments = text
+        .strip_prefix("IP_VERSION")
+        .unwrap_or(text)
+        .trim_start()
+        .strip_prefix('(')?
+        .split_once(')')?
+        .0;
+    let mut numbers = arguments
+        .split(',')
+        .map(|number| number.trim().parse().ok());
+    let version = (numbers.next()??, numbers.next()??, numbers.next()??);
+    numbers.next().is_none().then_some(version)
 }

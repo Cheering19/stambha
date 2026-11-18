@@ -28,6 +28,21 @@ pub fn generation(device: u16) -> Option<(&'static str, u8)> {
         .map(|index| (DEVICES[index].1, DEVICES[index].2))
 }
 
+/// Whether a GPU amdgpu identifies by IP discovery, whose discovery table
+/// gives its graphics block the version `graphics` (major, minor,
+/// revision), can serve the Metal device: one whose block makes no graphics
+/// queue is a compute accelerator, on which RADV opens no Vulkan device
+/// (`radv_is_gpu_supported`), so the port leaves it out
+/// ([`amd_metal::LEFT_OUT`]). [`admits`] cannot tell, as the table is read
+/// only at the claim, before the GPU's reset.
+pub fn discovered_serves(graphics: (u8, u8, u8)) -> Result<(), &'static str> {
+    if COMPUTE_ONLY.contains(&graphics) {
+        Err(amd_metal::LEFT_OUT)
+    } else {
+        Ok(())
+    }
+}
+
 /// Every device IP discovery identifies is of a generation that serves the
 /// Metal device, so one the table matches by class is claimed.
 const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
@@ -350,6 +365,31 @@ mod tests {
         }
         // A device discovery identifies is GFX9 or later.
         assert_eq!(DISCOVERY_GENERATION, 9);
+    }
+
+    /// The graphics blocks without graphics queues at the pin: Arcturus'
+    /// and Aldebaran's (gfx_v9_0 makes none for them), the MI300 class
+    /// (gfx_v9_4_3) and GC 12.1 (gfx_v12_1). Graphics GPUs of every
+    /// generation IP discovery reaches serve.
+    #[test]
+    fn a_discovered_compute_accelerator_is_left_out() {
+        assert_eq!(
+            COMPUTE_ONLY,
+            [
+                (9, 4, 1),
+                (9, 4, 2),
+                (9, 4, 3),
+                (9, 4, 4),
+                (9, 5, 0),
+                (12, 1, 0)
+            ]
+        );
+        for accelerator in COMPUTE_ONLY {
+            assert_eq!(discovered_serves(*accelerator), Err(amd_metal::LEFT_OUT));
+        }
+        for graphics in [(9, 4, 0), (10, 3, 6), (11, 0, 0), (11, 5, 1), (12, 0, 1)] {
+            assert_eq!(discovered_serves(graphics), Ok(()), "{graphics:?}");
+        }
     }
 
     /// Each requirement the rule names is one the Metal device checks, so a
