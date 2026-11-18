@@ -2536,6 +2536,10 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     }
     #[cfg(feature = "nvk")]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
+    // Linux's tasks run on 16 KiB stacks, where a driver's failed probe
+    // stops the boot.
+    #[cfg(feature = "nvk")]
+    stack::keep_for_stop(window);
     let (owner, threads, job) = work.dispatch_linux(|runtime| {
         Ok(mount_and_start(
             work,

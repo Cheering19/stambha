@@ -3,10 +3,12 @@
 //! absent pages, so running off either end faults.
 use super::PAGE;
 use crate::{native_memory::SOURCE, native_mmio::Window};
-use core::{arch::naked_asm, ffi::c_void, mem::ManuallyDrop};
+use core::mem::ManuallyDrop;
 use stela_boot_core::page_window::Cache;
 use stela_boot_core::stack_guards::{GuardHit, StackGuards};
 use stela_drivers::bus::dma::memory::{CacheAttribute, PageSource, PinnedPages};
+
+pub(super) use crate::stack_switch::{on_stack, pointer};
 
 pub(super) struct Stack {
     window: &'static Window,
@@ -76,43 +78,29 @@ impl Drop for Stack {
     }
 }
 
-/// This code's stack pointer.
-pub(super) fn pointer() -> u64 {
-    let pointer: u64;
-    // SAFETY: reads a register.
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack)) };
-    pointer
-}
+/// The stack the boot's first stop runs on ([`crate::output::fatal`]), as
+/// deep as an ordinary task's: a stop raised in a Linux task, as a driver's
+/// failed probe raises one, stores the logs through the USB's drivers,
+/// whose frames pass that task's 16 KiB.
+const STOP_STACK_BYTES: usize = 1 << 20;
 
-#[unsafe(naked)]
-unsafe extern "win64" fn switch(
-    body: unsafe extern "win64" fn(*mut c_void),
-    argument: *mut c_void,
-    top: u64,
-) {
-    naked_asm!(
-        "push rbp",
-        "mov rbp, rsp",
-        "lea rsp, [r8 - 32]",
-        "mov rax, rcx",
-        "mov rcx, rdx",
-        "call rax",
-        "mov rsp, rbp",
-        "pop rbp",
-        "ret",
-    );
-}
-
-unsafe extern "win64" fn call(context: *mut c_void) {
-    // SAFETY: `on_stack` keeps its body through `switch`.
-    unsafe { (*context.cast::<&mut dyn FnMut()>())() };
-}
-
-/// Runs `body` on the stack ending at `top`, 16-byte aligned.
-///
-/// # Safety
-/// Nothing else uses the stack below `top` until this returns.
-pub(super) unsafe fn on_stack(top: u64, mut body: &mut dyn FnMut()) {
-    // SAFETY: the caller's contract, and the body outlives the call.
-    unsafe { switch(call, (&raw mut body).cast(), top) };
+/// Maps the stop's stack once, before Linux runs; it is kept for the boot.
+/// Without room for it, one line says so and a stop runs where it was
+/// raised.
+pub(super) fn keep_for_stop(window: &'static Window) {
+    if crate::output::stop_stack_kept() {
+        return;
+    }
+    match Stack::map(window, STOP_STACK_BYTES) {
+        Some(stack) => {
+            crate::output::keep_stop_stack(stack.bottom()..stack.top());
+            // Kept for the boot: a stop may come at any time.
+            core::mem::forget(stack);
+        }
+        None => crate::output::arguments(format_args!(
+            "STOP stack of {} KiB not kept: the host's window had no room; a stop runs on the \
+             stack it was raised on\n",
+            STOP_STACK_BYTES >> 10
+        )),
+    }
 }

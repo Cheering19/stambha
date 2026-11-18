@@ -58,6 +58,7 @@ mod random;
 mod selection;
 mod serial;
 mod status;
+mod stack_switch;
 mod stop;
 mod stop_record;
 mod storage;
