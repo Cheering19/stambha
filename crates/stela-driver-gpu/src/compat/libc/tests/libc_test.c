@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <stela/host.h>
 #include "host.h"
@@ -270,6 +271,31 @@ static void test_meminfo(void)
 	const char *volatile none = NULL;
 	CHECK(open(none, O_RDONLY) == -1 && errno == EFAULT);
 	CHECK(stat(none, &status) == -1 && errno == EFAULT);
+}
+
+/* Two render nodes of the host's, descriptors 3 and 4. */
+static void list_two_gpus(void)
+{
+	drm_device_count = 2;
+	drm_devices[0] = (struct stela_libc_drm_device){.vendor = 0x1002, .minor = 0};
+	drm_devices[1] = (struct stela_libc_drm_device){.vendor = 0x1002, .minor = 1};
+}
+
+static void test_render_node_status(void)
+{
+	list_two_gpus();
+	/* A render node's status comes from the host's list; Linux's stat opens
+	 * nothing, and an open of an amdgpu node makes a GPU address space. */
+	struct stat status;
+	CHECK(!stat("/dev/dri/renderD129", &status) && S_ISCHR(status.st_mode));
+	CHECK(major(status.st_rdev) == 226 && minor(status.st_rdev) == 129);
+	CHECK(drm_opens == 0);
+	errno = 0;
+	CHECK(stat("/dev/dri/renderD130", &status) == -1 && errno == ENOENT);
+	CHECK(stat("/dev/dri/renderD", &status) == -1 && stat("/dev/dri/renderD12x", &status) == -1);
+	CHECK(stat("/dev/dri/card0", &status) == -1 && errno == ENOENT);
+	CHECK(drm_opens == 0);
+	drm_device_count = 0;
 }
 
 static void test_refusals(void)
@@ -763,6 +789,7 @@ int main(void)
 	test_unmap_refusal();
 	test_anonymous_files();
 	test_meminfo();
+	test_render_node_status();
 	test_refusals();
 	test_loading();
 	test_futex();

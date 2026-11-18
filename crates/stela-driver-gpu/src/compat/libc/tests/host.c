@@ -157,9 +157,15 @@ void stela_libc_wake(const volatile unsigned int *word)
 	wakes++;
 }
 
+/* The render nodes a test lists, whose descriptors are 3 onwards in the
+ * list's order, and how often a node was opened. */
+struct stela_libc_drm_device drm_devices[2];
+unsigned int drm_device_count, drm_opens;
+
 int stela_libc_drm_open(unsigned int minor)
 {
 	(void)minor;
+	drm_opens++;
 	return -ENODEV;
 }
 
@@ -177,8 +183,10 @@ int stela_libc_drm_dup(int fd)
 
 long stela_libc_drm_rdev(int fd)
 {
-	(void)fd;
-	return -ENODEV;
+	if (fd < 3 || (unsigned int)fd - 3 >= drm_device_count)
+		return -ENODEV;
+	/* Linux's dev_t: the major above twenty bits of minor. */
+	return (226l << 20) | (128 + drm_devices[fd - 3].minor);
 }
 
 long long stela_libc_drm_seek(int fd, long long offset, int whence)
@@ -254,13 +262,12 @@ int stela_libc_drm_munmap(void *address, size_t size)
 
 unsigned int stela_libc_drm_devices(void)
 {
-	return 0;
+	return drm_device_count;
 }
 
 void stela_libc_drm_device(unsigned int index, struct stela_libc_drm_device *device)
 {
-	(void)index;
-	(void)device;
+	*device = drm_devices[index];
 }
 
 __asm__(".globl _start\n_start:\n\tand $-16, %rsp\n\tcall start\n");
