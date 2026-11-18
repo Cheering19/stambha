@@ -459,16 +459,12 @@ fn objcopy(build: &cc::Build) -> PathBuf {
 
 /// Linux's Intel PCI device ID lists, which i915's table is written with.
 const PCI_IDS: &str = "../../third_party/linux/include/drm/intel/pciids.h";
-/// Linux's x86 early quirks, whose `intel_early_ids` name how each
-/// integrated GPU's stolen memory is found before any driver runs.
-const EARLY_QUIRKS: &str = "../../third_party/linux/arch/x86/kernel/early-quirks.c";
-
 /// Write i915's PCI ID table for the Rust side (`src/i915.rs`), read from
 /// the driver's own `pciidlist` and Linux's ID lists. A clippy build reads
 /// it too, so it is written before any C is compiled.
 pub fn tables() {
     let table = Path::new(I915).join("i915_pci.c");
-    for watched in [table.as_path(), Path::new(PCI_IDS), Path::new(EARLY_QUIRKS)] {
+    for watched in [table.as_path(), Path::new(PCI_IDS)] {
         println!("cargo:rerun-if-changed={}", watched.display());
     }
     let ids = fs::read_to_string(PCI_IDS).expect("read Linux's Intel PCI IDs");
@@ -477,11 +473,6 @@ pub fn tables() {
         &ids,
     )
     .unwrap_or_else(|error| panic!("i915's PCI ID table: {error}"));
-    let methods = i915_tables::stolen_methods(
-        &fs::read_to_string(EARLY_QUIRKS).expect("read Linux's x86 early quirks"),
-        &ids,
-    )
-    .unwrap_or_else(|error| panic!("the early quirks' intel_early_ids: {error}"));
     let mut text = String::from(
         "/// i915's `pciidlist`: each PCI device ID with its descriptor's\n\
          /// `dma_mask_size`, `require_force_probe`, graphics IP version,\n\
@@ -497,14 +488,6 @@ pub fn tables() {
             described.platform,
             described.discrete
         ));
-    }
-    text.push_str(
-        "];\n/// The x86 early quirks' `intel_early_ids`: each device ID with the\n\
-         /// method (`<method>_early_ops`) that finds its stolen memory.\n\
-         pub(crate) const STOLEN: &[(u16, &str)] = &[\n",
-    );
-    for (device, method) in &methods {
-        text.push_str(&format!("    ({device:#06x}, {method:?}),\n"));
     }
     text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));

@@ -19,6 +19,8 @@ pub mod anv;
 pub mod command_line;
 #[cfg(feature = "i915-port")]
 pub mod i915;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod intel_stolen;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 

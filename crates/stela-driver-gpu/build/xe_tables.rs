@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Each device ID of `pciidlist` in `table` with the mask bits, the
 /// force-probe requirement, the platform name, whether it has a display
-/// engine and whether it is a discrete GPU (`is_dgfx`), of the descriptor
-/// its entry names, the ID lists expanded from `ids`.
-pub type Described = (u8, bool, String, bool, bool);
+/// engine, whether it is a discrete GPU (`is_dgfx`) and whether the table
+/// fixes its graphics IP (`pre_gmdid_graphics_ip`: graphics before 12.70,
+/// which report no version of their own), of the descriptor its entry
+/// names, the ID lists expanded from `ids`.
+pub type Described = (u8, bool, String, bool, bool, bool);
 pub fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
     // Each list macro's own IDs and the list macros it includes.
     let mut lists = BTreeMap::new();
@@ -103,6 +105,7 @@ pub fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, Strin
                     [".is_dgfx = 1", ".is_dgfx = true"]
                         .iter()
                         .any(|mark| body.contains(mark)),
+                    body.contains(".pre_gmdid_graphics_ip = "),
                 ),
             );
         }

@@ -9,7 +9,10 @@ mod drm_version;
 #[cfg(feature = "i915-port")]
 #[path = "build/i915.rs"]
 mod i915;
-#[cfg(feature = "i915-port")]
+// Its early-quirk reader serves xe's builds too; its ID table reader is
+// i915's.
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+#[cfg_attr(not(feature = "i915-port"), allow(dead_code))]
 #[path = "build/i915_tables.rs"]
 mod i915_tables;
 #[cfg(feature = "linux-drm")]
@@ -133,6 +136,37 @@ fn anv_devices() {
     fs::write(Path::new(&output).join("anv_devices.rs"), text).expect("write ANV's device table");
 }
 
+/// Write the x86 early quirks' stolen memory methods for the Rust side
+/// (`src/intel_stolen.rs`), read from `intel_early_ids` in
+/// `early-quirks.c` with Linux's ID lists: i915's GPUs and xe's before
+/// graphics 12.70 take their stolen memory from what those methods find.
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+fn intel_stolen() {
+    use std::{fs, path::Path};
+    const EARLY_QUIRKS: &str = "../../third_party/linux/arch/x86/kernel/early-quirks.c";
+    const PCI_IDS: &str = "../../third_party/linux/include/drm/intel/pciids.h";
+    for watched in [EARLY_QUIRKS, PCI_IDS] {
+        println!("cargo:rerun-if-changed={watched}");
+    }
+    let methods = i915_tables::stolen_methods(
+        &fs::read_to_string(EARLY_QUIRKS).expect("read Linux's x86 early quirks"),
+        &fs::read_to_string(PCI_IDS).expect("read Linux's Intel PCI IDs"),
+    )
+    .unwrap_or_else(|error| panic!("the early quirks' intel_early_ids: {error}"));
+    let mut text = String::from(
+        "/// The x86 early quirks' `intel_early_ids`: each device ID with the\n\
+         /// method (`<method>_early_ops`) that finds its stolen memory.\n\
+         pub(crate) const STOLEN: &[(u16, &str)] = &[\n",
+    );
+    for (device, method) in &methods {
+        text.push_str(&format!("    ({device:#06x}, {method:?}),\n"));
+    }
+    text.push_str("];\n");
+    let output = std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR");
+    fs::write(Path::new(&output).join("intel_stolen.rs"), text)
+        .expect("write the early quirks' stolen memory methods");
+}
+
 fn main() {
     nouveau_firmware::validate();
     vulkan_drivers();
@@ -146,6 +180,8 @@ fn main() {
     amdgpu::tables();
     #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     anv_devices();
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+    intel_stolen();
     #[cfg(feature = "xe-port")]
     xe::tables();
     #[cfg(feature = "i915-port")]

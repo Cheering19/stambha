@@ -52,6 +52,11 @@ pub(super) static XE: Before = Before {
             .target;
         let table = video_bios_table(&mut observed, target);
         let name = format!("{:04x}", adapter.device);
+        // Tiger Lake to Raptor Lake take it as i915 does (patch 0222); the
+        // others find theirs through BAR 2.
+        let stolen = gpu::xe::stolen_from_early_quirks(adapter.device)
+            .then(|| graphics_stolen(&mut observed, "xe"))
+            .flatten();
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
             identity: None,
@@ -60,7 +65,7 @@ pub(super) static XE: Before = Before {
             // parameter names before it looks anywhere else (`intel_bios.c`).
             parameters: table.map(|_| gpu::command_line::video_bios_table(VBT)),
             searched: chipset_bridges(&observed, "xe"),
-            stolen: None,
+            stolen,
         })
     },
     register_page: Protection::ReadOnly,
@@ -102,7 +107,7 @@ pub(super) static I915: Before = Before {
         let name = format!("{:04x}", adapter.device);
         let mut searched = chipset_bridges(&observed, "i915");
         searched.extend(host_bridge(&observed));
-        let stolen = graphics_stolen(&mut observed);
+        let stolen = graphics_stolen(&mut observed, "i915");
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
             identity: None,
@@ -139,9 +144,9 @@ fn host_bridge(observed: &Observed<'_>) -> Vec<Searched> {
 
 /// The graphics memory the firmware reserved for the GPU, by the method
 /// Linux's early quirks name for the device, with one line saying what was
-/// found or why none is reported.
-fn graphics_stolen(observed: &mut Observed<'_>) -> Option<(u64, u64)> {
-    use gpu::i915::stolen::{self, Absent};
+/// found for `driver` or why none is reported.
+fn graphics_stolen(observed: &mut Observed<'_>, driver: &str) -> Option<(u64, u64)> {
+    use gpu::intel_stolen::{self as stolen, Absent};
     let address = observed.adapter.address;
     let config = observed.function.config();
     let mut read = |offset: u16| config.read32(offset).ok();
@@ -151,7 +156,7 @@ fn graphics_stolen(observed: &mut Observed<'_>) -> Option<(u64, u64)> {
     match found {
         Ok(found) => {
             output::arguments(format_args!(
-                "GPU {address}: graphics stolen memory of {} KiB at {:#x}\n",
+                "GPU {address}: graphics stolen memory of {} KiB at {:#x}, given to {driver}\n",
                 found.size / 1024,
                 found.base
             ));
@@ -159,7 +164,7 @@ fn graphics_stolen(observed: &mut Observed<'_>) -> Option<(u64, u64)> {
         }
         Err(why) => {
             output::arguments(format_args!(
-                "GPU {address}: no graphics stolen memory is reported ({why:?}): i915 runs \
+                "GPU {address}: no graphics stolen memory is reported ({why:?}): {driver} runs \
                  without it\n"
             ));
             None

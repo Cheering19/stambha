@@ -357,17 +357,18 @@ pub fn tables() {
          /// and `require_force_probe`.\n\
          pub(crate) const DEVICES: &[(u16, u8, bool)] = &[\n",
     );
-    for (device, (bits, forced, _, _, _)) in &devices {
+    for (device, (bits, forced, ..)) in &devices {
         text.push_str(&format!("    ({device:#06x}, {bits}, {forced}),\n"));
     }
     text.push_str(
-        "];\n/// Each device ID's platform name (`PLATFORM()`), `has_display` and\n\
-         /// `is_dgfx`.\n\
-         pub(crate) const PLATFORMS: &[(u16, &str, bool, bool)] = &[\n",
+        "];\n/// Each device ID's platform name (`PLATFORM()`), `has_display`,\n\
+         /// `is_dgfx` and whether the descriptor fixes its graphics IP\n\
+         /// (`pre_gmdid_graphics_ip`).\n\
+         pub(crate) const PLATFORMS: &[(u16, &str, bool, bool, bool)] = &[\n",
     );
-    for (device, (_, _, platform, display, discrete)) in &devices {
+    for (device, (_, _, platform, display, discrete, fixed)) in &devices {
         text.push_str(&format!(
-            "    ({device:#06x}, {platform:?}, {display}, {discrete}),\n"
+            "    ({device:#06x}, {platform:?}, {display}, {discrete}, {fixed}),\n"
         ));
     }
     text.push_str("];\n");

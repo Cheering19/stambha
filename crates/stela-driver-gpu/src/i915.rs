@@ -5,8 +5,6 @@ use crate::{Adapter, stack::Control};
 
 include!(concat!(env!("OUT_DIR"), "/i915_devices.rs"));
 
-pub mod stolen;
-
 /// What i915's table says of a device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Platform {

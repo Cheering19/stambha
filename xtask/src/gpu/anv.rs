@@ -152,7 +152,7 @@ fn xe_devices(mesa: &Mesa) -> Result<Devices> {
     let firmware = xe_tables::uc_firmware(&read(linux.join("drivers/gpu/drm/xe/xe_uc_fw.c"))?)
         .map_err(|error| anyhow::anyhow!("xe's firmware table: {error}"))?;
     let mut devices = Devices::default();
-    for (id, (_, _, platform, _, discrete)) in table {
+    for (id, (_, _, platform, _, discrete, _)) in table {
         if firmware
             .get(&platform)
             .is_some_and(|files| files[0].is_some())

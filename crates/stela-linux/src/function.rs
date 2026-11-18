@@ -313,7 +313,8 @@ impl Drop for Published {
 
 /// Sets the graphics memory the firmware reserved for an integrated Intel
 /// GPU (`intel_graphics_stolen_res`), as Linux's x86 early quirks would
-/// have found it, for i915 to read during its probe.
+/// have found it, for i915, or xe before graphics 12.70, to read during its
+/// probe.
 ///
 /// # Safety
 /// In an entered Linux owner, before any driver registers.

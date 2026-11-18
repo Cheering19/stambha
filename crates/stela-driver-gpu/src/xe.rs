@@ -123,6 +123,17 @@ pub fn integrated(adapter: &Adapter) -> bool {
     platform(adapter.device).is_some_and(|platform| !platform.discrete)
 }
 
+/// Whether xe takes `device`'s stolen memory from the resource the arch's
+/// early quirks fill (`detect_stolen` in `xe_ttm_stolen_mgr.c`): an
+/// integrated GPU whose descriptor fixes its graphics IP, graphics before
+/// 12.70 (Tiger Lake to Raptor Lake). Discrete GPUs and later integrated
+/// ones find theirs through BAR 2 themselves.
+pub fn stolen_from_early_quirks(device: u16) -> bool {
+    PLATFORMS
+        .binary_search_by_key(&device, |(id, ..)| *id)
+        .is_ok_and(|index| !PLATFORMS[index].3 && PLATFORMS[index].4)
+}
+
 /// xe's device query (`DRM_IOCTL_XE_DEVICE_QUERY`, `uapi/drm/xe_drm.h`).
 pub mod query {
     use super::Control;
@@ -263,6 +274,31 @@ mod tests {
         assert!(!integrated(&adapter(0x8a56)));
     }
 
+    #[test]
+    fn early_quirks_give_stolen_memory_to_integrated_gpus_before_12_70_only() {
+        // Tiger Lake, Rocket Lake, Alder Lake S, P and N, Raptor Lake P:
+        // xe reads the early quirks' resource; Meteor Lake, Lunar Lake and
+        // Panther Lake find theirs through BAR 2, as do DG1, the Arc
+        // A-series and Battlemage.
+        for device in [0x9a49, 0x4c8a, 0x4680, 0x46a6, 0x46d0, 0xa7a0] {
+            assert!(stolen_from_early_quirks(device), "{device:04x}");
+        }
+        for device in [0x7d55, 0x64a0, 0xb080, 0x4905, 0x56a0, 0xe20b, 0x8a56] {
+            assert!(!stolen_from_early_quirks(device), "{device:04x}");
+        }
+        // Each is a device the early quirks name Ice Lake's method for
+        // (`gen11_early_ops`), and no other device of xe's table has one, so
+        // the boot finds stolen memory for exactly the devices that read it.
+        for (device, ..) in PLATFORMS {
+            assert_eq!(
+                crate::intel_stolen::method(*device) == Some("gen11"),
+                stolen_from_early_quirks(*device),
+                "{device:04x}"
+            );
+            assert_ne!(crate::intel_stolen::method(*device), Some("gen9"));
+        }
+    }
+
     /// A driver answering `DRM_IOCTL_XE_DEVICE_QUERY` with `words` for the
     /// query it holds, and refusing others.
     fn answering(held: u32, words: &[u64]) -> impl FnMut(u32, *mut core::ffi::c_void) -> i32 + '_ {
@@ -380,7 +416,7 @@ mod tests {
             revision: 0,
         };
         let mut admitted = 0;
-        for (device, name, display, _) in PLATFORMS {
+        for (device, name, display, ..) in PLATFORMS {
             let files = firmware(*device).unwrap();
             let mut inventory = Inventory::default();
             let required = recipes::require_xe(&mut inventory, *device);

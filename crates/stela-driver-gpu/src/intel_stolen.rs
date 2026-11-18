@@ -3,10 +3,13 @@
 //! driver runs (`arch/x86/kernel/early-quirks.c`, `intel_graphics_stolen`):
 //! the size from the GMCH control register and the base from the GPU's
 //! configuration, by the method that file's `intel_early_ids` names for the
-//! device. i915 reads the result as `intel_graphics_stolen_res`; Stela's
-//! arch runs no early quirks, so the boot computes it here from the same
-//! registers. The build reads `intel_early_ids` (`build/i915.rs`), so the
-//! device to method map is Linux's own.
+//! device. i915, and xe on Tiger Lake to Raptor Lake, read the result as
+//! `intel_graphics_stolen_res`; Stela's arch runs no early quirks, so the
+//! boot computes it here from the same registers. The build reads
+//! `intel_early_ids` (`build.rs`), so the device to method map is Linux's
+//! own.
+
+include!(concat!(env!("OUT_DIR"), "/intel_stolen.rs"));
 
 /// A read of 32 bits of the GPU's configuration at a dword-aligned offset.
 pub type Read<'a> = &'a mut dyn FnMut(u16) -> Option<u32>;
@@ -22,7 +25,7 @@ pub struct Stolen {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Absent {
     /// Linux's early quirks name no method for the device, or one of
-    /// graphics the boot does not hand i915 (before Skylake).
+    /// graphics the boot hands no driver (before Skylake).
     NoMethod,
     /// A register could not be read.
     Unreadable(u16),
@@ -41,8 +44,8 @@ const INTEL_BSM_MASK: u32 = 0xfff0_0000;
 
 /// The stolen memory of the device whose early-quirk method is `method`
 /// (the `*_early_ops` name without the suffix), read through `read`: the
-/// two methods of the graphics i915 is handed, Skylake's (`gen9`) and Ice
-/// Lake's (`gen11`). Both take the size from the GMCH control register
+/// two methods of the graphics the boot hands a driver, Skylake's (`gen9`)
+/// and Ice Lake's (`gen11`, which Tiger Lake to Raptor Lake share). Both take the size from the GMCH control register
 /// (`gen9_stolen_size`); the base is the 32-bit BSM register on Skylake
 /// (`gen3_stolen_base`) and the 64-bit one from Ice Lake on
 /// (`gen11_stolen_base`).
@@ -74,10 +77,10 @@ pub fn find(method: &str, read: Read) -> Result<Stolen, Absent> {
 
 /// The early-quirk method Linux names for `device`, from `intel_early_ids`.
 pub fn method(device: u16) -> Option<&'static str> {
-    super::STOLEN
+    STOLEN
         .binary_search_by_key(&device, |(id, _)| *id)
         .ok()
-        .map(|index| super::STOLEN[index].1)
+        .map(|index| STOLEN[index].1)
 }
 
 #[cfg(test)]
@@ -97,11 +100,7 @@ mod tests {
 
     #[test]
     fn methods_are_linuxs_by_device() {
-        assert!(
-            super::super::STOLEN
-                .windows(2)
-                .all(|pair| pair[0].0 < pair[1].0)
-        );
+        assert!(STOLEN.windows(2).all(|pair| pair[0].0 < pair[1].0));
         for (device, expected) in [
             (0x1916, "gen9"),
             (0x5a85, "gen9"),
@@ -111,11 +110,19 @@ mod tests {
             (0x8a56, "gen11"),
             (0x4571, "gen11"),
             (0x4e71, "gen11"),
+            (0x9a49, "gen11"),
+            (0xa7a0, "gen11"),
         ] {
             assert_eq!(method(device), Some(expected), "{device:04x}");
         }
-        // Every device i915 is handed has one of the two methods read here.
-        for &(device, ..) in super::super::DEVICES {
+        // Meteor Lake and later find theirs through BAR 2.
+        assert_eq!(method(0x7d55), None);
+    }
+
+    #[cfg(feature = "i915-port")]
+    #[test]
+    fn every_device_i915_is_handed_has_a_method_read_here() {
+        for &(device, ..) in crate::i915::DEVICES {
             let adapter = crate::Adapter {
                 address: crate::bus::pci::Address {
                     segment: 0,
@@ -127,7 +134,7 @@ mod tests {
                 device,
                 class: [3, 0, 0],
             };
-            if super::super::admits(&adapter).is_ok() {
+            if crate::i915::admits(&adapter).is_ok() {
                 assert!(
                     matches!(method(device), Some("gen9" | "gen11")),
                     "{device:04x}"
