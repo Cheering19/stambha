@@ -31,6 +31,8 @@ pub enum AxError {
     Firmware(&'static str),
     Dma(&'static str),
     SecureBootUnsupported,
+    /// The efuse could not be parsed (`-EINVAL` in `efuse.c`).
+    Efuse(&'static str),
     /// `rtw89_mac_reset_pwr_state_ax`: the MAC is already powered on (-EBUSY).
     AlreadyPowered,
 }
@@ -52,6 +54,7 @@ impl fmt::Display for AxError {
             Self::Firmware(what) => write!(f, "firmware: {what}"),
             Self::Dma(what) => write!(f, "dma: {what}"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
+            Self::Efuse(what) => write!(f, "efuse: {what}"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),
         }
     }
@@ -114,6 +117,19 @@ pub fn poll32<I: AxIo + ?Sized>(
     interval_us: u64,
     timeout_us: u64,
 ) -> Result<(), AxError> {
+    poll32_value(io, reg, mask, want, interval_us, timeout_us).map(|_| ())
+}
+
+/// `poll32`, returning the register value that satisfied the wait, as
+/// `read_poll_timeout` leaves it in its `val` argument.
+pub fn poll32_value<I: AxIo + ?Sized>(
+    io: &mut I,
+    reg: u32,
+    mask: u32,
+    want: u32,
+    interval_us: u64,
+    timeout_us: u64,
+) -> Result<u32, AxError> {
     let start = io.now_us()?;
     let end = start.checked_add(timeout_us).ok_or(AxError::Clock)?;
     let wants_all_ones = mask == u32::MAX && want == u32::MAX;
@@ -132,7 +148,7 @@ pub fn poll32<I: AxIo + ?Sized>(
             return Err(AxError::AllOnes { register: reg });
         }
         if value & mask == want {
-            return Ok(());
+            return Ok(value);
         }
         if now > end {
             return Err(AxError::Timeout {
