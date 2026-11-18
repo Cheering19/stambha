@@ -584,8 +584,8 @@ fn each_runners_pool_gives_the_kernel_half_what_it_needs_and_the_user_half_the_r
 ///   short of [`GPU_FLOOR`];
 /// - the 12 GiB VM of the AMD port's first run (`free=10842M heap=3300M
 ///   code=688M pool=710M guest=6144M`, where the heap ran out holding the
-///   GPU's pages) gives it the floor, 2 GiB, beside its 512 MiB carve-out;
-///   its heap is that of a host with 8.6 GiB free, the floor at its window.
+///   GPU's pages) gives it the floor, 2.5 GiB, beside its 512 MiB carve-out;
+///   its heap is that of a host with 8.1 GiB free, the heap's floor.
 ///   A 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of driver heaps in
 ///   a session of seven app launches, so its own part held 2.4 GiB, or up
 ///   to 2.9 GiB where the carve-out held some of the driver's buffers;
@@ -613,7 +613,7 @@ fn integrated_gpu_hosts_split_as_expected() {
         [
             [2704, 416, 382, 3072, 780],
             [2704, 416, 382, 3072, 1362],
-            [2848, 560, 598, 4788, 2048],
+            [2816, 528, 548, 4390, 2560],
             [4400, 832, 724, 7272, 2644],
             [5232, 1664, 858, 18700, 5290],
         ]

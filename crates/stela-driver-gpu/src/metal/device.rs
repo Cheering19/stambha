@@ -49,6 +49,7 @@ pub mod pins;
 pub mod pipelines;
 pub mod queue;
 mod reclaim;
+pub mod share;
 pub use reclaim::Reclaimed;
 pub mod resources;
 pub use resources::SurfaceNote;
@@ -180,6 +181,9 @@ pub struct Device<B: Backend, C: Compiler> {
     /// ([`VRAM_CAP`](crate::metal::vulkan::physical::VRAM_CAP)): at or over
     /// them an allocation runs out of memory without asking the driver.
     memory_cap: Option<u64>,
+    /// An integrated GPU's share of RAM: the platform's probe of it, and
+    /// what the device saw at its first allocation ([`share`]).
+    share: Option<share::Budget>,
     resources: resources::Resources,
     pipelines: pipelines::Pipelines,
     execution_sets: execution_sets::ExecutionSets,
@@ -393,6 +397,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             shortage: reclaim::Shortage::default(),
             host_calls: None,
             memory_cap: crate::metal::vulkan::physical::VRAM_CAP,
+            share: share::probe().map(|probe| share::Budget { probe, base: None }),
             resources: resources::Resources::default(),
             pipelines: pipelines::Pipelines::default(),
             execution_sets: execution_sets::ExecutionSets::default(),

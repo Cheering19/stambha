@@ -279,6 +279,15 @@ int stela_linux_page_catalog_limit(u64 generation, size_t pages)
 	return 0;
 }
 
+/* The ordinary pages Linux holds and its limit, 0 for none, read from any
+ * processor without the catalog's owner: a snapshot that may be a page or
+ * two behind, for a budget that keeps a margin. */
+void stela_linux_page_catalog_use(size_t *held, size_t *limit)
+{
+	*held = READ_ONCE(catalog.ordinary_live);
+	*limit = READ_ONCE(catalog.page_limit);
+}
+
 int stela_linux_page_owner_context(const struct stela_linux_owner *expected)
 {
     struct stela_linux_lease lease;
@@ -2225,6 +2234,12 @@ static void page_limit(void)
 	assert(held);
 	assert(stela_linux_page_catalog_limit(catalog.generation, 3) == -EBUSY);
 	assert(!stela_linux_page_catalog_limit(catalog.generation, 6));
+	{
+		size_t held, limit;
+
+		stela_linux_page_catalog_use(&held, &limit);
+		assert(limit == 6 && held == catalog.ordinary_live);
+	}
 	assert(totalram_pages() == 6 && zone_managed_pages(zone) == 6);
 	assert(stela_linux_page_boot_capacity() == 6);
 	unsigned long available = 0;

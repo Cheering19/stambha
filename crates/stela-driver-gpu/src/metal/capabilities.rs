@@ -1005,14 +1005,24 @@ impl Derivation<'_> {
             low_power: integrated,
             removable: self.platform.removable,
             has_unified_memory: integrated,
-            recommended_max_working_set_size: device
-                .memory
-                .working_set_budget(self.platform.heaps, integrated)
-                .unwrap_or_else(|| {
-                    device
-                        .memory
-                        .working_set_bytes(self.platform.heaps, integrated)
-                }),
+            recommended_max_working_set_size: {
+                let heaps = device
+                    .memory
+                    .working_set_budget(self.platform.heaps, integrated)
+                    .unwrap_or_else(|| {
+                        device
+                            .memory
+                            .working_set_bytes(self.platform.heaps, integrated)
+                    });
+                // A GPU with a share of RAM: what the share backs, as the
+                // device budgets its allocations.
+                match crate::metal::device::share::probe().and_then(|probe| probe()) {
+                    Some(state) if integrated => {
+                        heaps.min(crate::metal::device::share::working_set(state))
+                    }
+                    _ => heaps,
+                }
+            },
             limits: limits_out,
             argument_buffers_tier: argument_tier,
             read_write_texture_tier: read_write_tier,

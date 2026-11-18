@@ -3707,6 +3707,59 @@ fn a_device_out_of_memory_frees_at_once_what_work_in_flight_never_read() {
     complete(&mut device, running);
 }
 
+/// A device on an integrated GPU's share of RAM refuses an allocation
+/// the share would not hold, at its out-of-memory answer and with a note
+/// naming the share, before the driver's own allocation is asked: the
+/// share's state is what Linux holds of it, not the driver's budget.
+#[test]
+fn a_device_on_a_share_refuses_what_the_share_would_not_hold() {
+    use super::share::ShareState;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static HELD: AtomicU64 = AtomicU64::new(400 << 20);
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: HELD.load(Ordering::Relaxed),
+            limit: 1024 << 20,
+        })
+    }
+    let mut device = device_on(MockBackend::new());
+    device.share_memory(state);
+    // 1024M less a 64M margin and Linux's 400M leave 560M, which holds
+    // 448M of the guest's at 1.25 bytes each: seven 64M textures.
+    let large = TextureDescriptor {
+        width: 4096,
+        height: 4096,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let mut textures = Vec::new();
+    for _ in 0..7 {
+        textures.push(device.new_texture(&large).unwrap());
+    }
+    assert_eq!(device.new_texture(&large), Err(Error::OutOfMemory));
+    assert_eq!(device.memory().out_of_memory, 1);
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.ends_with("; the GPU's share of RAM: Linux holds 400M of 1024M"),
+        "{note}"
+    );
+    // Linux's own count decides too: with its pages near the limit even a
+    // small buffer is refused.
+    for texture in textures.drain(..) {
+        device.destroy_texture(texture).unwrap();
+    }
+    HELD.store(1000 << 20, Ordering::Relaxed);
+    assert_eq!(
+        device
+            .new_buffer(1 << 20, options(StorageMode::Private))
+            .err(),
+        Some(Error::OutOfMemory)
+    );
+    HELD.store(400 << 20, Ordering::Relaxed);
+    device
+        .new_buffer(1 << 20, options(StorageMode::Private))
+        .unwrap();
+}
+
 /// A test build's cap makes the device's allocations run out of memory at
 /// that many bytes held, with the same freeing and the same notes as a
 /// driver that is full.

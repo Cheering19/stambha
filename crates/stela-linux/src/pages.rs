@@ -254,6 +254,7 @@ unsafe extern "C" {
     fn stela_linux_page_catalog_unregister(generation: u64) -> c_int;
     fn stela_linux_page_catalog_verify(generation: u64) -> c_int;
     fn stela_linux_page_catalog_limit(generation: u64, pages: usize) -> c_int;
+    fn stela_linux_page_catalog_use(held: *mut usize, limit: *mut usize);
     fn stela_linux_page_owner_context(owner: *const super::owner::RawOwner) -> c_int;
     fn stela_linux_kernel_catalogue_active() -> bool;
     fn stela_linux_page_request_basic(gfp: u32) -> bool;
@@ -886,3 +887,13 @@ impl<P: Provider> Drop for Catalog<P> {
 
 #[cfg(test)]
 mod tests;
+
+/// The ordinary pages Linux holds now and the limit on them, when its
+/// catalog has one (an integrated GPU's share): a snapshot from any
+/// processor, which may be a page or two behind.
+pub fn held_under_limit() -> Option<(usize, usize)> {
+    let (mut held, mut limit) = (0, 0);
+    // SAFETY: two plain reads of the catalog's counts into locals.
+    unsafe { stela_linux_page_catalog_use(&raw mut held, &raw mut limit) };
+    (limit != 0).then_some((held, limit))
+}

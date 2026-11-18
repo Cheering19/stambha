@@ -55,8 +55,25 @@ pub unsafe fn initialize(cpu: usize, physical: u64, bytes: usize, table_offset: 
 static GPU_SHARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Records the integrated GPU's share of the heap the loader planned.
+/// With one, the Metal device budgets its allocations by what Linux holds
+/// of the share ([`share_state`]).
 pub(crate) fn set_gpu_share(bytes: u64) {
     GPU_SHARE.store(bytes, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "nvk")]
+    if bytes != 0 {
+        stela_drivers::gpu::metal::device::share::set_probe(share_state);
+    }
+}
+
+/// What Linux holds of the integrated GPU's share now, and its size, from
+/// the page catalog's counts; none before the catalog has its limit.
+#[cfg(feature = "nvk")]
+fn share_state() -> Option<stela_drivers::gpu::metal::device::share::ShareState> {
+    let (held, limit) = stela_linux::pages::held_under_limit()?;
+    Some(stela_drivers::gpu::metal::device::share::ShareState {
+        held: held as u64 * PAGE as u64,
+        limit: limit as u64 * PAGE as u64,
+    })
 }
 
 /// The ordinary pages Linux may hold at once: an integrated GPU's share of

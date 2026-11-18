@@ -123,18 +123,23 @@ const PACK_MARGIN: u64 = 16 * MIB;
 /// about two thirds, but those are limits on memory the system takes back
 /// under pressure; here the share is held from the guest for the boot, so
 /// it is a sixth: 2.6 GiB on a 16 GB PC, 5.2 GiB on a 32 GB PC, and the
-/// floor's 2 GiB below about 12 GiB free.
+/// floor's 2.5 GiB below about 15 GiB free.
 const GPU_SHARE: u64 = 6;
 /// The share a macOS desktop needs. A 16 GiB VM's AMD integrated GPU (512
 /// MiB carve-out, 3272 MiB of GTT) held 2058 MiB of RADV's heaps after a
-/// sign-in and seven app launches (`driver heaps use/budget/size:
-/// 277/1176/1176M/host 1781/2352/2352M/local`), and the 12 GiB VM's 1635 MiB
-/// one minute in, with only WindowServer and loginwindow presenting. RADV's
-/// heaps are the GTT and the carve-out's CPU-visible part (256 MiB there), so
-/// 2 GiB of share tells the guest about 2.3 GiB. A host that leaves the
-/// guest its floor only with less gets less, down to [`GPU_LEAST`], and says
-/// so.
-pub const GPU_FLOOR: u64 = 2 * GIB;
+/// sign-in and seven app launches, the guest holding 1326 MiB (`driver
+/// heaps use/budget/size: 277/1176/1176M/host 1781/2352/2352M/local`). A 12
+/// GiB VM's heaps held 489 MiB at the Metal device's first allocation and
+/// grew 1.22 bytes for each byte the guest held, to 1763 MiB for 1045 MiB,
+/// where its GTT, half of a 2 GiB share, ran out. The device budgets each
+/// allocation at 1.25 bytes of the share and keeps a sixteenth free
+/// (`metal::device::share` in the GPU crate), and Linux's own pages and the
+/// driver's first buffers take about 480 MiB of it, so the guest is told
+/// about (share - 480 MiB - share/16) * 0.8: 1.2 GiB of a 2 GiB share, short
+/// of the session above, and 1.5 GiB of 2.5 GiB, which holds it. A host
+/// that leaves the guest its floor only with less gets less, down to
+/// [`GPU_LEAST`], and says so.
+pub const GPU_FLOOR: u64 = 2560 * MIB;
 /// The most an integrated GPU's share grows to. A GPU whose firmware gives
 /// it a large carve-out (up to many GiB on recent processors) works in that
 /// beside the share; the guest keeps the rest of a large host.

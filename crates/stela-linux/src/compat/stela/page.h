@@ -168,6 +168,7 @@ unsigned long stela_linux_page_boot_capacity(void);
  * -EINVAL for zero or more than the ordinary inventory, -EBUSY when more is
  * held already. */
 int stela_linux_page_catalog_limit(u64 generation, size_t pages);
+void stela_linux_page_catalog_use(size_t *held, size_t *limit);
 /* Publish the ordinary free-frame snapshot only on success. */
 int stela_linux_available_page_frames(unsigned long *available);
 /* Entered serialized owner only. Pin one live aligned physical page's actual

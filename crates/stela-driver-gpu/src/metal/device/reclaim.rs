@@ -76,7 +76,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         info: &ImageInfo,
         request: MemoryRequest,
     ) -> Result<(Image, Memory, u64)> {
+        // What the image's texels take, for the share's budget: four bytes
+        // each, a third more for its levels, by its samples.
+        let [width, height, depth] = info.extent;
+        let texels = u64::from(width) * u64::from(height) * u64::from(depth);
+        let bytes = texels
+            .saturating_mul(4 * u64::from(info.array_layers.max(1)))
+            .saturating_mul(u64::from(info.samples.bits().max(1)))
+            .saturating_mul(if info.mip_levels > 1 { 4 } else { 3 })
+            / 3;
         self.reclaiming(
+            bytes,
             |backend| backend.create_image(info, request),
             || {
                 let [width, height, depth] = info.extent;
@@ -95,6 +105,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         request: MemoryRequest,
     ) -> Result<BufferAllocation> {
         self.reclaiming(
+            info.size,
             |backend| backend.create_buffer(info, request),
             || {
                 let place = if request.mapped { "mapped" } else { "device" };
@@ -111,6 +122,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         memory_types: u32,
     ) -> Result<Memory> {
         self.reclaiming(
+            bytes,
             |backend| backend.allocate_memory(bytes, request, memory_types),
             || format!("heap memory of {bytes} bytes"),
         )
@@ -118,10 +130,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     fn reclaiming<T>(
         &mut self,
+        bytes: u64,
         mut make: impl FnMut(&mut B) -> Result<T>,
         what: impl FnOnce() -> String,
     ) -> Result<T> {
-        let first = if self.over_cap() {
+        let first = if self.over_cap() || self.share_refuses(bytes) {
             Err(Error::OutOfMemory)
         } else {
             make(&mut self.backend)
@@ -130,7 +143,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             return first;
         }
         let reclaimed = self.reclaim()?;
-        let made = if reclaimed.any() && !self.over_cap() {
+        let made = if reclaimed.any() && !self.over_cap() && !self.share_refuses(bytes) {
             make(&mut self.backend)
         } else {
             first
@@ -142,9 +155,49 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// Whether a test build's cap leaves the device no memory: it holds as
     /// much as the cap in resources, recycled textures and upload chunks.
     fn over_cap(&self) -> bool {
-        self.memory_cap.is_some_and(|cap| {
-            self.allocated + self.recycled().bytes + self.upload_chunks().bytes >= cap
-        })
+        self.memory_cap.is_some_and(|cap| self.guest_bytes() >= cap)
+    }
+
+    /// The bytes the device holds: resources, recycled textures and upload
+    /// chunks.
+    fn guest_bytes(&self) -> u64 {
+        self.allocated + self.recycled().bytes + self.upload_chunks().bytes
+    }
+
+    /// Whether an integrated GPU's share of RAM would not hold an
+    /// allocation of `bytes` ([`super::share::refuses`]). The first asks
+    /// the share's state is the base the device's growth starts from.
+    fn share_refuses(&mut self, bytes: u64) -> bool {
+        let guest = self.guest_bytes();
+        let Some(budget) = &mut self.share else {
+            return false;
+        };
+        let Some(state) = (budget.probe)() else {
+            return false;
+        };
+        let base = *budget.base.get_or_insert(super::share::Base {
+            held: state.held,
+            guest,
+        });
+        super::share::refuses(state, base, guest, bytes)
+    }
+
+    /// The share's state for a note: Linux's pages of it and its size.
+    fn share_note(&self) -> String {
+        match self.share.and_then(|budget| (budget.probe)()) {
+            Some(state) => format!(
+                "; the GPU's share of RAM: Linux holds {}M of {}M",
+                state.held >> 20,
+                state.limit >> 20
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// Ties the device to a share with `probe`, as the platform's does.
+    #[cfg(test)]
+    pub(super) fn share_memory(&mut self, probe: super::share::Probe) {
+        self.share = Some(super::share::Budget { probe, base: None });
     }
 
     /// Holds the device to `bytes`, as a test build's cap does.
@@ -230,13 +283,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let driver = self.driver_heaps();
         self.shortage.notes.push_back(format!(
             "OUT OF MEMORY {count}: {} failed; {outcome}; the device holds allocated={}M \
-             deferred={}M behind {} command buffers recycled={}M chunks={}M; {driver}",
+             deferred={}M behind {} command buffers recycled={}M chunks={}M; {driver}{}",
             what(),
             mib(held.allocated),
             mib(held.deferred_bytes),
             held.in_flight,
             mib(held.recycled.bytes),
             mib(held.chunks.bytes),
+            self.share_note(),
         ));
     }
 
@@ -288,7 +342,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         });
         self.shortage.notes.push_back(format!(
             "VRAM holds {}M of the {}M the guest works in: allocated={}M recycled={}M \
-             chunks={}M blocks={}/{}M out_of_memory={}; {driver}{cap}",
+             chunks={}M blocks={}/{}M out_of_memory={}; {driver}{}{cap}",
             mib(held + memory.chunks.bytes),
             mib(budget),
             mib(memory.allocated),
@@ -297,6 +351,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             memory.blocks.blocks,
             mib(memory.blocks.block_bytes),
             memory.out_of_memory,
+            self.share_note(),
         ));
     }
 
