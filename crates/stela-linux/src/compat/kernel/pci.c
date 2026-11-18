@@ -678,6 +678,9 @@ static void bind(struct pci_driver *driver, struct pci_dev *dev)
 	if (error != -ENODEV)
 		dev_err(&dev->dev, "%s: probe failed: %pe\n", driver->name, ERR_PTR(error));
 	stela_linux_devres_release(&dev->dev);
+	/* What the driver's own error path left running is stopped before the
+	 * next driver is offered the function. */
+	stela_linux_pci_quiesce_failed(dev, driver->name);
 	dev->dev.driver = NULL;
 	dev->driver = NULL;
 }

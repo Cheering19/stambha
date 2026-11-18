@@ -21,6 +21,11 @@ bool stela_linux_pci_routes_msix(const struct pci_dev *device);
 int stela_linux_pci_msix_lines(struct pci_dev *device);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
+/* After `driver`'s probe of an attached function failed and its managed
+ * resources were released: free the interrupt requests left on its lines,
+ * turn its MSI or MSI-X and its bus mastering off, each said once. Nothing
+ * for a function no owner attached. */
+void stela_linux_pci_quiesce_failed(struct pci_dev *dev, const char *driver);
 /* The function's driver ends the picture the firmware left on its outputs:
  * it resets the function, or starts its display engine, which blanks what
  * the firmware lit. `why` names that step and outlives the boot (a string

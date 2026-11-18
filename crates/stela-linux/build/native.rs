@@ -558,6 +558,19 @@ impl Linux {
                 &format!("{COMPAT}/stela/writeback_init_test.c"),
                 &archives,
             );
+            // A failed probe's leftover interrupt requests take a line's
+            // mutex, so this run of the PCI host fixture wraps current.
+            let mut failed_probe = build.clone();
+            failed_probe
+                .define("STELA_LINUX_PCI_HOST_TEST", None)
+                .define("STELA_LINUX_PCI_HOST_FAILED_PROBE_TEST", None)
+                .flag("-Wl,--wrap=stela_linux_current");
+            tests.add(
+                &failed_probe,
+                "linux_pci_host_failed_probe",
+                &format!("{COMPAT}/kernel/pci_host.c"),
+                &archives,
+            );
         }
         // These component fixtures use init_task credentials without a native
         // task lease. Only their ELF links wrap current.
