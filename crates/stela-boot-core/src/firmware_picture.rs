@@ -9,7 +9,75 @@
 //! lets go with none of those, as a driver whose probe failed before them,
 //! leaves the picture as it was, and the boot draws on it again: its text,
 //! a stop's reason, or macOS's frames copied from another GPU.
+use crate::screen::Exclusive;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// [`Held`] as the processors that claim GPUs share it: each step takes it
+/// for a few instructions, and a wait for it has a deadline. A wait that
+/// gives up may miss a claim's hold or end, so from then on the record is
+/// not known to be whole and the picture is taken as ended: the boot never
+/// draws on it again ([`Self::lost`]).
+pub struct Record {
+    held: Exclusive<Held>,
+    lost: AtomicBool,
+}
+
+/// How a wait for the [`Record`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waited<R> {
+    Done(R),
+    /// The deadline passed with the record still taken; `first` for the
+    /// first such wait of the boot, which its caller says in a line.
+    GaveUp {
+        first: bool,
+    },
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Record {
+    pub const fn new() -> Self {
+        Self {
+            held: Exclusive::new(Held::new()),
+            lost: AtomicBool::new(false),
+        }
+    }
+
+    /// Run `f` on the record once it is free, waiting at most `limit`
+    /// ticks of `now`, which may wrap.
+    pub fn with_within<R>(
+        &self,
+        mut now: impl FnMut() -> u64,
+        limit: u64,
+        f: impl FnOnce(&mut Held) -> R,
+    ) -> Waited<R> {
+        let started = now();
+        match self
+            .held
+            .with_until(|| now().wrapping_sub(started) >= limit, f)
+        {
+            Some(result) => Waited::Done(result),
+            None => Waited::GaveUp {
+                first: !self.lost.swap(true, Ordering::Relaxed),
+            },
+        }
+    }
+
+    /// Run `f` on the record unless it is taken now, as a stop must.
+    pub fn try_with<R>(&self, f: impl FnOnce(&mut Held) -> R) -> Option<R> {
+        self.held.try_with(f)
+    }
+
+    /// A wait for the record gave up, so the picture is taken as ended.
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
 
 /// The claims holding the firmware's picture, by PCI bus and devfn, and
 /// whether a step ended it.
@@ -66,6 +134,43 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait for the record has a deadline: one that passes while another
+    /// step holds it gives up, says so once, and leaves the picture taken
+    /// as ended, so no later claim gives it back to the boot.
+    #[test]
+    fn a_wait_for_a_taken_record_ends_at_its_deadline() {
+        let record = Record::new();
+        assert_eq!(
+            record.with_within(|| 0, 10, |held| held.hold(IGPU.0, IGPU.1)),
+            Waited::Done(())
+        );
+        let clock = core::cell::Cell::new(u64::MAX - 3);
+        let tick = || {
+            clock.set(clock.get().wrapping_add(1));
+            clock.get()
+        };
+        let inner = record.try_with(|_| {
+            let first = record.with_within(tick, 10, |_| ());
+            let second = record.with_within(tick, 10, |_| ());
+            (first, second)
+        });
+        assert_eq!(
+            inner,
+            Some((
+                Waited::GaveUp { first: true },
+                Waited::GaveUp { first: false }
+            ))
+        );
+        assert!(clock.get() >= 20 - 4);
+        assert!(record.lost());
+        // The record itself still says the picture may come back; the loss
+        // is what keeps it from the boot.
+        assert_eq!(
+            record.with_within(|| 0, 10, |held| held.release(IGPU.0, IGPU.1)),
+            Waited::Done(true)
+        );
+    }
 
     const IGPU: (u8, u8) = (1, 0);
     const CARD: (u8, u8) = (3, 0);

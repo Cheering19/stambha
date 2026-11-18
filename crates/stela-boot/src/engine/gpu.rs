@@ -1781,9 +1781,39 @@ fn claim(
 
 /// The firmware's picture while GPU claims hold it
 /// ([`stela_boot_core::firmware_picture`]).
-static FIRMWARE_PICTURE: stela_boot_core::screen::Exclusive<
-    stela_boot_core::firmware_picture::Held,
-> = stela_boot_core::screen::Exclusive::new(stela_boot_core::firmware_picture::Held::new());
+static FIRMWARE_PICTURE: stela_boot_core::firmware_picture::Record =
+    stela_boot_core::firmware_picture::Record::new();
+
+/// The longest a claim's step waits for [`FIRMWARE_PICTURE`], which any
+/// other step holds for a few instructions.
+const PICTURE_WAIT_MS: u64 = 50;
+
+/// Runs `f` on the record of the firmware's picture for the claim of the
+/// GPU at `address` at its `step`, waiting [`PICTURE_WAIT_MS`] at most. A
+/// wait that gives up leaves the picture taken as ended for the rest of the
+/// boot, said in one line.
+fn with_picture<R>(
+    address: stela_drivers::bus::pci::Address,
+    step: &str,
+    f: impl FnOnce(&mut stela_boot_core::firmware_picture::Held) -> R,
+) -> Option<R> {
+    use stela_boot_core::firmware_picture::Waited;
+    let limit = crate::firmware::tsc_hz() / 1000 * PICTURE_WAIT_MS;
+    match FIRMWARE_PICTURE.with_within(host::rdtsc, limit, f) {
+        Waited::Done(result) => Some(result),
+        Waited::GaveUp { first } => {
+            if first {
+                output::arguments(format_args!(
+                    "GPU {address}: the record of the firmware's picture stayed taken for \
+                     {PICTURE_WAIT_MS} ms at its claim's {step}; the picture is taken as ended \
+                     for the rest of the boot, so neither the boot's text nor a stop's reason \
+                     is drawn on it again\n"
+                ));
+            }
+            None
+        }
+    }
+}
 
 /// The firmware's screen a claim retired before it sized the GPU's BARs.
 /// The picture lasts until a step ends it: the claim's reset, or a step of
@@ -1804,7 +1834,7 @@ impl RetiredScreen {
     fn hold(address: stela_drivers::bus::pci::Address, retired: bool) -> Self {
         if retired {
             let devfn = address.device << 3 | address.function;
-            FIRMWARE_PICTURE.with_until(|| false, |held| held.hold(address.bus, devfn));
+            with_picture(address, "hold", |held| held.hold(address.bus, devfn));
         }
         Self { address, retired }
     }
@@ -1816,7 +1846,9 @@ impl RetiredScreen {
             return;
         }
         let devfn = self.address.device << 3 | self.address.function;
-        FIRMWARE_PICTURE.with_until(|| false, |held| held.end(self.address.bus, devfn));
+        with_picture(self.address, "end", |held| {
+            held.end(self.address.bus, devfn)
+        });
         if let Some(step) = step {
             output::arguments(format_args!(
                 "GPU {}: the firmware's picture on it ended with its driver's {step}\n",
@@ -1831,9 +1863,10 @@ impl RetiredScreen {
             return;
         }
         let devfn = self.address.device << 3 | self.address.function;
-        let back = FIRMWARE_PICTURE
-            .with_until(|| false, |held| held.release(self.address.bus, devfn))
-            .unwrap_or(false);
+        let back = with_picture(self.address, "release", |held| {
+            held.release(self.address.bus, devfn)
+        })
+        .is_some_and(|back| back && !FIRMWARE_PICTURE.lost());
         if back && crate::console::restore_firmware() {
             output::arguments(format_args!(
                 "GPU {}: the firmware's picture stays on its screen, as nothing reset the GPU \
@@ -1886,7 +1919,7 @@ pub(crate) fn picture_at_stop() {
     let shows = FIRMWARE_PICTURE.try_with(|held| {
         held.shows_at_stop(|bus, devfn| stela_linux::function::screen_ended(bus, devfn).is_some())
     });
-    if shows == Some(true) && crate::console::restore_firmware() {
+    if shows == Some(true) && !FIRMWARE_PICTURE.lost() && crate::console::restore_firmware() {
         output::arguments(format_args!(
             "GPU: the firmware's picture still shows, so the stop's reason is drawn on it\n"
         ));
