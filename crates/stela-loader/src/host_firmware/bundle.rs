@@ -69,18 +69,23 @@ impl Ports {
     };
 }
 
-/// The port a recipe family belongs to, if any.
+/// The port a recipe family belongs to, if any. A build without a port
+/// holds none of its recipes ([`recipes`]), so its families are left out of
+/// [`ALL`] too.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Port {
     Always,
+    #[cfg(feature = "amdgpu-port")]
     Amd,
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     Intel,
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     I915,
 }
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-const ALL: [(&str, &[Recipe], Port); 12] = [
+const ALL: &[(&str, &[Recipe], Port)] = &[
     (
         "Wi-Fi regulatory database",
         recipes::REGULATORY,
@@ -97,19 +102,29 @@ const ALL: [(&str, &[Recipe], Port); 12] = [
         Port::Always,
     ),
     ("Intel Bluetooth", recipes::INTEL_RSA, Port::Always),
+    #[cfg(feature = "amdgpu-port")]
     ("AMD GPU", recipes::AMDGPU, Port::Amd),
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     ("Intel graphics", recipes::XE, Port::Intel),
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     ("Older Intel graphics", recipes::I915, Port::I915),
     ("NVIDIA GSP-RM", recipes::GSP, Port::Always),
 ];
 
 /// The recipe families a build with `ports` bundles, in [`ALL`] order.
+#[cfg_attr(
+    not(any(feature = "amdgpu-port", feature = "xe-port", feature = "i915-port")),
+    allow(unused_variables)
+)]
 pub fn families_for(ports: Ports) -> impl Iterator<Item = (&'static str, &'static [Recipe])> {
     ALL.iter()
         .filter(move |(_, _, port)| match port {
             Port::Always => true,
+            #[cfg(feature = "amdgpu-port")]
             Port::Amd => ports.amd,
+            #[cfg(any(feature = "xe-port", feature = "i915-port"))]
             Port::Intel => ports.intel,
+            #[cfg(any(feature = "xe-port", feature = "i915-port"))]
             Port::I915 => ports.i915,
         })
         .map(|&(name, recipes, _)| (name, recipes))
@@ -481,7 +496,8 @@ impl Late {
 /// Intel's GPUs have no entry: an Intel GPU off the bus at the firmware's
 /// exit would be a laptop's discrete Arc, beside an integrated Intel GPU
 /// whose files are selected, so the vendor would count as driven anyway.
-const GPU_FAMILIES: [(&str, u16, Port); 2] = [
+const GPU_FAMILIES: &[(&str, u16, Port)] = &[
+    #[cfg(feature = "amdgpu-port")]
     ("AMD GPU", 0x1002, Port::Amd),
     ("NVIDIA GSP-RM", 0x10de, Port::Always),
 ];
@@ -544,9 +560,17 @@ impl Selection {
 
     /// Each GPU family of `ports` whose GPUs none of the observed
     /// `driven` vendors' functions named, as [`Late`] for `why`.
+    #[cfg_attr(not(feature = "amdgpu-port"), allow(unused_variables))]
     fn add_late(&mut self, ports: Ports, driven: &[u16], why: &str) {
-        for (family, vendor, port) in GPU_FAMILIES {
-            if driven.contains(&vendor) || (port == Port::Amd && !ports.amd) {
+        for &(family, vendor, port) in GPU_FAMILIES {
+            let built = match port {
+                Port::Always => true,
+                #[cfg(feature = "amdgpu-port")]
+                Port::Amd => ports.amd,
+                #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+                Port::Intel | Port::I915 => false,
+            };
+            if driven.contains(&vendor) || !built {
                 continue;
             }
             let Some((_, recipes, _)) = ALL.iter().find(|(name, _, _)| *name == family) else {
@@ -652,12 +676,11 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             continue;
         }
         if function.vendor == 0x1002 && function.class == 0x03 {
-            if !ports.amd {
-                continue;
-            }
             // The files amdgpu may ask this device for; a device it leaves
-            // to an older driver has none.
-            if recipes::require_amdgpu(&mut inventory, function.device).is_ok() {
+            // to an older driver has none. A build without the AMD port has
+            // no driver for it and so no files.
+            #[cfg(feature = "amdgpu-port")]
+            if ports.amd && recipes::require_amdgpu(&mut inventory, function.device).is_ok() {
                 selection.plan(&inventory, &why);
                 driven.push(function.vendor);
             }
@@ -667,6 +690,7 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             // The devices xe drives, in a build with xe, and those i915
             // drives, in a build with i915; another Intel GPU has no driver
             // here and so no files.
+            #[cfg(any(feature = "xe-port", feature = "i915-port"))]
             if (ports.intel && recipes::require_xe(&mut inventory, function.device).is_ok())
                 || (ports.i915 && recipes::require_i915(&mut inventory, function.device).is_ok())
             {

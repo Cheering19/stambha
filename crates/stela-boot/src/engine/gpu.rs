@@ -289,6 +289,7 @@ fn firmware_map() -> Option<&'static FirmwareMap> {
 /// (`Kernel::reads_rom`) gets the `VFCT` image alone, as every claim did.
 fn platform_rom(adapter: &gpu::Adapter, kernel: &gpu::stack::Kernel) -> &'static [u8] {
     let address = adapter.address;
+    #[cfg(feature = "amdgpu")]
     if kernel.reads_rom
         && let Some(image) = atrm_image(adapter, (kernel.integrated)(adapter))
     {
@@ -332,6 +333,7 @@ fn platform_rom(adapter: &gpu::Adapter, kernel: &gpu::stack::Kernel) -> &'static
 /// one its table names and does not flag as an APU, or one it identifies by
 /// discovery whose image names it, as only the probe tells those apart.
 /// Only an ATOM BIOS, as `check_atom_bios` takes one.
+#[cfg(feature = "amdgpu")]
 fn atrm_image(adapter: &gpu::Adapter, integrated: bool) -> Option<&'static [u8]> {
     use stela_boot_core::video_bios;
     use stela_loader::host_firmware::recipes::AmdGpu;

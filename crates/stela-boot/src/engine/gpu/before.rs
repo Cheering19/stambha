@@ -50,7 +50,11 @@ pub(super) struct Searched {
 
 /// The function as a stack's part may read it before its reset.
 pub(super) struct Observed<'a> {
+    /// The platform's services; the AMD and Intel parts read through them.
+    #[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
     pub(super) services: &'a dyn NativeServices,
+    /// The adapter; the AMD and Intel parts name it.
+    #[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
     pub(super) adapter: &'a gpu::Adapter,
     /// The PCI-to-ISA bridges and host bridge functions the probe read,
     /// which the Intel parts show their drivers.
@@ -62,7 +66,9 @@ pub(super) struct Observed<'a> {
     /// The first page of the stack's register BAR, mapped as the stack's
     /// part asks ([`Before::register_page`]).
     pub(super) registers: &'a Mapping,
-    /// The stack's register BAR, for the reads a stack's part maps itself.
+    /// The stack's register BAR, for the reads a stack's part maps itself:
+    /// amdgpu's IP discovery table.
+    #[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
     pub(super) register_bar: &'a owned::Resource,
 }
 
@@ -91,6 +97,7 @@ pub(super) struct Before {
 pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
     match stack.kernel.driver {
         "nouveau" => Some(&NOUVEAU),
+        #[cfg(feature = "amdgpu")]
         "amdgpu" => Some(&AMDGPU),
         #[cfg(feature = "intel")]
         "xe" => Some(&intel::XE),
@@ -149,6 +156,7 @@ static NOUVEAU: Before = Before {
 /// where it cannot be read. The driver loads every engine's firmware
 /// itself, so nothing boots by itself after the reset and nothing waits
 /// here.
+#[cfg(feature = "amdgpu")]
 static AMDGPU: Before = Before {
     admits: |adapter, catalog| {
         use stela_loader::host_firmware::recipes::AmdGpu;
@@ -190,6 +198,7 @@ static AMDGPU: Before = Before {
 };
 
 /// The files amdgpu may ask for on the AMD GPU with PCI device ID `device`.
+#[cfg(feature = "amdgpu")]
 fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
@@ -201,6 +210,7 @@ fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
 /// The files amdgpu asks for on the AMD GPU it identifies by its IP
 /// discovery table: those of the block versions the table names, else
 /// every file named after an IP version, with a line saying which.
+#[cfg(feature = "amdgpu")]
 fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> {
     use stela_boot_core::amd_discovery::{self as discovery, Ip};
     use stela_loader::host_firmware::recipes::{self, DiscoveredIp};
@@ -286,6 +296,7 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
 /// then meets; and for an integrated GPU, the memory it is given: its share
 /// of RAM, the GTT and TTM limits that follow from it, its VRAM carve-out
 /// and the most Metal may tell the guest. One line each.
+#[cfg(feature = "amdgpu")]
 fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_discovery::Ip]>) {
     use stela_boot_core::amd_discovery::{self as discovery};
     let adapter = observed.adapter;
@@ -379,6 +390,7 @@ fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_d
 /// probe ([`stela_boot_core::amd_discovery::read`]): through the `MM_INDEX`
 /// and `MM_DATA` registers of `page`, the BAR's first page mapped
 /// read-write, whose index is put back after.
+#[cfg(feature = "amdgpu")]
 fn ip_discovery(
     services: &dyn NativeServices,
     page: &Mapping,
@@ -443,6 +455,7 @@ fn find<'a>(
 /// missing and why ([`lacks`]), and the refusal [`select_firmware`] would
 /// give for them later.
 /// A file the driver starts without (`recipes::optional`) may be missing.
+#[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
 fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), ServiceError> {
     use stela_loader::host_firmware::recipes;
     let plan = recipes::Plan::select(inventory)
