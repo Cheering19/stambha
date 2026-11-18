@@ -34,6 +34,7 @@ pub mod disk_speed;
 pub mod dmar;
 pub mod doorbell;
 pub mod drivers_turn;
+pub mod drm_calls;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
