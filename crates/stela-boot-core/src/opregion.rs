@@ -220,9 +220,15 @@ pub fn read<E>(
 pub struct Panel {
     /// The table's BDB version.
     pub version: u16,
-    /// The panel's entry, or `None` when the table names none
-    /// (`bdb_lfp_options` absent) or leaves it to the panel's EDID (255).
+    /// The panel's entry, or `None` when the table leaves it to the panel's
+    /// EDID (255), which the display code matches against the table's
+    /// panel IDs (entry 0 when none matches). A table without the LFP
+    /// options block, or with an entry past 15, gives entry 0, the display
+    /// code's fallback (`get_panel_type`), with [`Self::fallback`] set.
     pub panel_type: Option<u8>,
+    /// Whether [`Self::panel_type`] is the display code's fallback, not the
+    /// table's choice.
+    pub fallback: bool,
     /// The panel entry's backlight, when the table has the block.
     pub backlight: Option<Backlight>,
     /// The panel entry's eDP power sequence, in 100 µs units: T1+T3, T8,
@@ -237,14 +243,17 @@ pub enum Backlight {
     /// A PWM signal, of `hertz`, from `method` (`lfp_backlight_control_method`
     /// from BDB 191 on: 0 PMIC, 1 LPSS, 2 the display's own PWM, 3 DSI DCS,
     /// 4 the panel driver, 5 the eDP AUX interface; before 191 the
-    /// display's own PWM) and its controller.
+    /// display's own PWM) and its controller, `active_low` where its duty
+    /// is inverted.
     Pwm {
         method: u8,
         controller: u8,
         hertz: u16,
+        active_low: bool,
     },
-    /// No PWM backlight (another entry type): the display code then drives
-    /// it through the eDP AUX channel when the panel offers that, else not.
+    /// No PWM backlight (another entry type): the display code registers no
+    /// backlight for the panel (`intel_backlight_setup`), so it sets no
+    /// level.
     NoPwm(u8),
 }
 
@@ -293,9 +302,14 @@ pub fn panel(vbt: &[u8]) -> Option<Panel> {
         return None;
     }
     let version = u16::from_le_bytes([*bdb.get(16)?, *bdb.get(17)?]);
-    let panel_type = block(bdb, BDB_LFP_OPTIONS)
-        .and_then(|options| options.first().copied())
-        .filter(|&panel| panel < 16);
+    // The OpRegion's panel type, which the display code asks first, comes
+    // through ACPI, which Stela's Linux does not build.
+    let (panel_type, fallback) =
+        match block(bdb, BDB_LFP_OPTIONS).and_then(|options| options.first().copied()) {
+            Some(panel @ 0..16) => (Some(panel), false),
+            Some(255) => (None, false),
+            _ => (Some(0), true),
+        };
     let backlight = panel_type.and_then(|panel| {
         let panel = usize::from(panel);
         let data = block(bdb, BDB_LFP_BACKLIGHT)?;
@@ -319,6 +333,7 @@ pub fn panel(vbt: &[u8]) -> Option<Panel> {
             method,
             controller,
             hertz,
+            active_low: entry[0] & 4 != 0,
         })
     });
     let power_sequence = panel_type.and_then(|panel| {
@@ -333,6 +348,7 @@ pub fn panel(vbt: &[u8]) -> Option<Panel> {
     Some(Panel {
         version,
         panel_type,
+        fallback,
         backlight,
         power_sequence,
     })
@@ -342,14 +358,19 @@ impl core::fmt::Display for Panel {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "BDB {}: ", self.version)?;
         match self.panel_type {
+            Some(panel) if self.fallback => write!(
+                f,
+                "panel entry {panel}, the display code's fallback, as the table names no valid one"
+            )?,
             Some(panel) => write!(f, "panel entry {panel}")?,
-            None => f.write_str("panel entry chosen by the panel's EDID")?,
+            None => f.write_str("panel entry chosen by the panel's EDID (0 where none matches)")?,
         }
         match self.backlight {
             Some(Backlight::Pwm {
                 method,
                 controller,
                 hertz,
+                active_low,
             }) => {
                 let by = match method {
                     0 => "the PMIC",
@@ -362,14 +383,18 @@ impl core::fmt::Display for Panel {
                 };
                 write!(
                     f,
-                    "; backlight by {by} (method {method}, controller {controller}) at {hertz} Hz"
+                    "; backlight by {by} (method {method}, controller {controller}) at {hertz} Hz{}",
+                    if active_low { ", active low" } else { "" }
                 )?;
             }
             Some(Backlight::NoPwm(kind)) => write!(
                 f,
-                "; no PWM backlight (type {kind}): the eDP AUX channel's, where the panel has one"
+                "; no PWM backlight (type {kind}): the display code registers no backlight and \
+                 sets no level"
             )?,
-            None if self.panel_type.is_some() => f.write_str("; no backlight block")?,
+            None if self.panel_type.is_some() => f.write_str(
+                "; no backlight block: the display code registers no backlight and sets no level",
+            )?,
             None => {}
         }
         match self.power_sequence {
@@ -383,7 +408,7 @@ impl core::fmt::Display for Panel {
                 t11_t12 / 10
             ),
             None if self.panel_type.is_some() => {
-                f.write_str("; no eDP block: the delays the firmware left in the registers")
+                f.write_str("; no eDP block: the registers' delays, or the eDP specification's where they read 0")
             }
             None => Ok(()),
         }
@@ -583,8 +608,8 @@ mod tests {
     fn the_panels_backlight_and_power_delays_are_its_entrys() {
         let mut backlight = vec![6];
         for panel in 0..16u8 {
-            // Panel 3: a PWM of 200 Hz; the others none.
-            let kind = if panel == 3 { 2 } else { 0 };
+            // Panel 3: a PWM of 200 Hz, active low; the others none.
+            let kind = if panel == 3 { 2 | 4 } else { 0 };
             backlight.extend([kind, 200, 0, 0, 0, 0]);
         }
         backlight.extend([0; 16]);
@@ -613,10 +638,12 @@ mod tests {
             Panel {
                 version: 236,
                 panel_type: Some(3),
+                fallback: false,
                 backlight: Some(Backlight::Pwm {
                     method: 5,
                     controller: 1,
-                    hertz: 200
+                    hertz: 200,
+                    active_low: true,
                 }),
                 power_sequence: Some([210, 100, 200, 500, 5000]),
             }
@@ -624,7 +651,8 @@ mod tests {
         assert_eq!(
             alloc::format!("{panel}"),
             "BDB 236: panel entry 3; backlight by the eDP AUX channel (method 5, controller 1) \
-             at 200 Hz; eDP power delays T1+T3 21, T8 10, T9 20, T10 50, T11+T12 500 ms"
+             at 200 Hz, active low; eDP power delays T1+T3 21, T8 10, T9 20, T10 50, T11+T12 \
+             500 ms"
         );
         // Before 191 the PWM is the display's own; a panel the EDID picks
         // has no entry; no data block, no answer.
@@ -645,17 +673,54 @@ mod tests {
             Some(Backlight::Pwm {
                 method: 2,
                 controller: 0,
-                hertz: 10000
+                hertz: 10000,
+                active_low: false,
             })
         );
         assert_eq!(panel.power_sequence, None);
+        assert_eq!(
+            alloc::format!("{panel}"),
+            "BDB 190: panel entry 3; backlight by the display's own PWM (method 2, controller \
+             0) at 10000 Hz; no eDP block: the registers' delays, or the eDP specification's \
+             where they read 0"
+        );
+        // An entry type other than PWM: no backlight at all.
+        let unlit = with_blocks(
+            240,
+            &[
+                (BDB_LFP_OPTIONS, vec![0]),
+                (BDB_LFP_BACKLIGHT, {
+                    let mut data = vec![6];
+                    data.extend([1, 0, 0, 0, 0, 0].repeat(16));
+                    data
+                }),
+            ],
+        );
+        let panel = super::panel(&unlit).unwrap();
+        assert_eq!(panel.backlight, Some(Backlight::NoPwm(1)));
+        assert!(
+            alloc::format!("{panel}")
+                .contains("no PWM backlight (type 1): the display code registers no backlight")
+        );
         let by_edid = with_blocks(240, &[(BDB_LFP_OPTIONS, vec![255])]);
         let panel = super::panel(&by_edid).unwrap();
         assert_eq!((panel.panel_type, panel.backlight), (None, None));
         assert_eq!(
             alloc::format!("{panel}"),
-            "BDB 240: panel entry chosen by the panel's EDID"
+            "BDB 240: panel entry chosen by the panel's EDID (0 where none matches)"
         );
+        // An entry past 15, or no options block, is the fallback's entry 0.
+        for vbt in [
+            with_blocks(240, &[(BDB_LFP_OPTIONS, vec![16])]),
+            with_blocks(240, &[]),
+        ] {
+            let panel = super::panel(&vbt).unwrap();
+            assert_eq!((panel.panel_type, panel.fallback), (Some(0), true));
+            assert!(alloc::format!("{panel}").starts_with(
+                "BDB 240: panel entry 0, the display code's fallback, as the table names no \
+                 valid one; no backlight block"
+            ));
+        }
         let mut broken = by_edid.clone();
         broken[48] = b'X';
         assert_eq!(super::panel(&broken), None);
@@ -663,6 +728,7 @@ mod tests {
         let mut short = with_blocks(240, &[(BDB_LFP_OPTIONS, vec![1])]);
         let last = short.len() - 2;
         short[last] = 0xff;
-        assert_eq!(super::panel(&short).unwrap().panel_type, None);
+        let panel = super::panel(&short).unwrap();
+        assert_eq!((panel.panel_type, panel.fallback), (Some(0), true));
     }
 }
