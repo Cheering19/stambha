@@ -7,6 +7,7 @@
 //! readiness; it only reads and writes a mapped window and waits on it.
 pub mod dmac;
 pub mod efuse;
+pub mod fwdl;
 pub mod io;
 pub mod pci;
 
@@ -14,9 +15,10 @@ pub mod power;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub use fwdl::download;
 pub use io::{
-    AxError, AxIo, NativeAxIo, clear8, clear16, clear32, field8, field16, field32, poll32,
-    poll32_value, set8, set16, set32,
+    AxError, AxIo, NativeAxIo, Polled, clear8, clear16, clear32, field8, field16, field32,
+    poll_sample, poll32, poll32_value, set8, set16, set32,
 };
 pub use pci::{Ch12, Rings, encode_txbd, pre_init};
 pub use power::{power_off, power_on, xtal_si_read, xtal_si_write};

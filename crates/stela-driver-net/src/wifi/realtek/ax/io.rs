@@ -130,9 +130,49 @@ pub fn poll32_value<I: AxIo + ?Sized>(
     interval_us: u64,
     timeout_us: u64,
 ) -> Result<u32, AxError> {
+    let wants_all_ones = mask == u32::MAX && want == u32::MAX;
+    let sample = |io: &mut I| {
+        let value = io.read32(reg)?;
+        if value == u32::MAX && !wants_all_ones {
+            return Err(AxError::AllOnes { register: reg });
+        }
+        Ok(value)
+    };
+    match poll_sample(io, interval_us, timeout_us, sample, |value| {
+        value & mask == want
+    })? {
+        Polled::Met(value) => Ok(value),
+        Polled::Expired(_) => Err(AxError::Timeout {
+            register: reg,
+            mask,
+        }),
+    }
+}
+
+/// How a `poll_sample` wait ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Polled<T> {
+    /// The sample that satisfied the condition.
+    Met(T),
+    /// The timeout passed; the last sample, as `read_poll_timeout` leaves
+    /// it in `val` for a caller that decodes a failure status.
+    Expired(T),
+}
+
+/// The `read_poll_timeout` loop under every poll: take a `sample` every
+/// `interval_us` until `done` accepts one or `timeout_us` of wall time has
+/// passed (one last sample after the deadline). `sample` may refuse a value
+/// with an error, which ends the wait at once. An unchecked stalled clock is
+/// stopped by an independent sample-count guard.
+pub fn poll_sample<I: AxIo + ?Sized, T: Copy>(
+    io: &mut I,
+    interval_us: u64,
+    timeout_us: u64,
+    mut sample: impl FnMut(&mut I) -> Result<T, AxError>,
+    done: impl Fn(T) -> bool,
+) -> Result<Polled<T>, AxError> {
     let start = io.now_us()?;
     let end = start.checked_add(timeout_us).ok_or(AxError::Clock)?;
-    let wants_all_ones = mask == u32::MAX && want == u32::MAX;
     let guard = (timeout_us / interval_us.max(1))
         .saturating_add(3)
         .saturating_mul(2);
@@ -143,18 +183,12 @@ pub fn poll32_value<I: AxIo + ?Sized>(
             return Err(AxError::Clock);
         }
         last = now;
-        let value = io.read32(reg)?;
-        if value == u32::MAX && !wants_all_ones {
-            return Err(AxError::AllOnes { register: reg });
-        }
-        if value & mask == want {
-            return Ok(value);
+        let value = sample(io)?;
+        if done(value) {
+            return Ok(Polled::Met(value));
         }
         if now > end {
-            return Err(AxError::Timeout {
-                register: reg,
-                mask,
-            });
+            return Ok(Polled::Expired(value));
         }
         io.delay_us(interval_us);
         if io.now_us()? <= now {
