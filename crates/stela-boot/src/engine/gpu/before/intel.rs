@@ -239,8 +239,9 @@ fn video_bios_table(
     let address = observed.adapter.address;
     let absent = |why: &dyn core::fmt::Display| {
         output::arguments(format_args!(
-            "GPU {address}: no Video BIOS Table from the OpRegion ({why}): panels are found \
-             by probing only\n"
+            "GPU {address}: no Video BIOS Table from the OpRegion ({why}): the display code \
+             looks in the GPU's own flash (a discrete GPU) and option ROM, and finds panels by \
+             probing only where neither holds one\n"
         ));
     };
     let asls = match observed.function.config().read32(opregion::ASLS) {
