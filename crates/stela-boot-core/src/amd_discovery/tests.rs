@@ -248,3 +248,22 @@ fn a_table_not_taken_says_where_it_was_read_and_what_it_held() {
         "NotReady (MP0 C2PMSG_33 bit 31 is clear: the GPU's firmware has not placed the table)"
     );
 }
+
+#[test]
+fn the_security_processor_state_is_read_in_words() {
+    assert_eq!(
+        security_processor(0x8000_0000, 0x8000_0000, 0x0021_0000),
+        "C2PMSG_33=0x80000000 C2PMSG_64=0x80000000 C2PMSG_81=0x00210000: its boot loader is \
+         ready; its secure OS runs, as the firmware or a previous driver left it; its last \
+         ring command was answered with status 0x0000"
+    );
+    assert_eq!(
+        security_processor(0, 0x0002_0000, 0),
+        "C2PMSG_33=0x00000000 C2PMSG_64=0x00020000 C2PMSG_81=0x00000000: its boot loader is \
+         not ready; no secure OS runs; ring command 0x20000 waits for its answer"
+    );
+    assert_eq!(
+        security_processor(u32::MAX, u32::MAX, u32::MAX),
+        "C2PMSG_33=0xffffffff C2PMSG_64=0xffffffff C2PMSG_81=0xffffffff: it does not answer"
+    );
+}

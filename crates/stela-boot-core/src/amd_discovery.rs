@@ -22,8 +22,15 @@ pub const DRIVER_SCRATCH_1: usize = 0x95 * 4;
 pub const DRIVER_SCRATCH_2: usize = 0x96 * 4;
 pub const RCC_CONFIG_MEMSIZE: usize = 0xde3 * 4;
 pub const MP0_SMN_C2PMSG_33: usize = 0x16061 * 4;
+/// The security processor's ring command and response register, and its
+/// secure OS's sign of life (`psp_v11_0.c`, `psp_v13_0.c`), at the place
+/// amdgpu's discovery reads `C2PMSG_33` on every SOC.
+pub const MP0_SMN_C2PMSG_64: usize = 0x16080 * 4;
+pub const MP0_SMN_C2PMSG_81: usize = 0x16091 * 4;
 /// The register window the read needs.
 pub const REGISTER_BYTES: usize = MP0_SMN_C2PMSG_33 + 4;
+/// The register window the security processor's state needs.
+pub const SECURITY_PROCESSOR_BYTES: usize = MP0_SMN_C2PMSG_81 + 4;
 /// `C2PMSG_33` bit 31: the GPU's firmware finished its start and placed the
 /// table.
 pub const FIRMWARE_READY: u32 = 1 << 31;
@@ -127,6 +134,39 @@ pub fn place(
         offset: (u64::from(vram_mib) << 20).saturating_sub(BELOW_TOP),
         bytes: TABLE_BYTES,
     })
+}
+
+/// The security processor's state as a function's previous owner left it,
+/// from `C2PMSG_33` (its boot loader), `C2PMSG_64` (its ring's command and
+/// answer) and `C2PMSG_81` (its secure OS), in words: what amdgpu's own
+/// start then meets, such as a ring a previous driver made.
+pub fn security_processor(c2pmsg_33: u32, c2pmsg_64: u32, c2pmsg_81: u32) -> alloc::string::String {
+    use alloc::format;
+    let read = format!(
+        "C2PMSG_33={c2pmsg_33:#010x} C2PMSG_64={c2pmsg_64:#010x} C2PMSG_81={c2pmsg_81:#010x}"
+    );
+    if [c2pmsg_33, c2pmsg_64, c2pmsg_81] == [u32::MAX; 3] {
+        return format!("{read}: it does not answer");
+    }
+    let loader = if c2pmsg_33 & FIRMWARE_READY != 0 {
+        "its boot loader is ready"
+    } else {
+        "its boot loader is not ready"
+    };
+    let os = if c2pmsg_81 != 0 {
+        "its secure OS runs, as the firmware or a previous driver left it"
+    } else {
+        "no secure OS runs"
+    };
+    let ring = match c2pmsg_64 {
+        0 => alloc::string::String::from("no ring command waits"),
+        answer if answer & (1 << 31) != 0 => format!(
+            "its last ring command was answered with status {:#06x}",
+            answer & 0xffff
+        ),
+        command => format!("ring command {command:#x} waits for its answer"),
+    };
+    format!("{read}: {loader}; {os}; {ring}")
 }
 
 /// The register BAR's first page: the index registers and the driver

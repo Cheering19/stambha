@@ -68,6 +68,12 @@ pub(crate) fn set_gpu_share(bytes: u64, heap: u64) {
     stela_drivers::gpu::metal::device::share::set_probe(share_state);
 }
 
+/// The bytes of the integrated GPU's share of RAM the loader planned, zero
+/// for a GPU with memory of its own.
+pub(crate) fn gpu_share() -> u64 {
+    GPU_SHARE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// What Linux holds now of the memory an integrated GPU that draws works
 /// in, and that memory's size: the share, from the page catalog's limit. A
 /// plan without one gave the Metal device to a discrete GPU, which did not

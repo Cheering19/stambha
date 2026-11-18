@@ -156,6 +156,7 @@ static AMDGPU: Before = Before {
         let inventory = if recipes::AmdGpu::of(adapter.device) == recipes::AmdGpu::Discovered {
             discovered_files(&observed)?
         } else {
+            amd_claim_notes(&observed, None);
             amdgpu_files(adapter.device)?
         };
         Ok(Identified {
@@ -348,9 +349,11 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
                 "GPU {address}: its IP discovery table was not read before its reset ({why}); \
                  its driver is given every firmware file named after an IP version\n"
             ));
+            amd_claim_notes(observed, None);
             return amdgpu_files(device);
         }
     };
+    amd_claim_notes(observed, Some(&ips));
     // A compute accelerator is refused here, before its reset, as the
     // port's rule leaves out every GPU RADV opens no device on.
     #[cfg(feature = "amdgpu")]
@@ -411,6 +414,93 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
     recipes::require_amdgpu_discovered(&mut inventory, device, &ips)
         .map_err(|_| ServiceError::Refused("the GPU's discovered firmware cannot be selected"))?;
     Ok(inventory)
+}
+
+/// What an AMD GPU's claim reads for its triage, before its reset: where
+/// its IP discovery table lists its security processor (MP0), that
+/// processor's state as the previous owner left it, which amdgpu's own start
+/// then meets; and for an integrated GPU, the memory it is given: its share
+/// of RAM, the GTT and TTM limits that follow from it, its VRAM carve-out
+/// and the most Metal may tell the guest. One line each.
+fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_discovery::Ip]>) {
+    use stela_boot_core::amd_discovery::{self as discovery};
+    let adapter = observed.adapter;
+    let address = adapter.address;
+    let bar = observed.register_bar.physical_span().bytes() as usize;
+    let read = |offset: usize| {
+        if offset + 4 <= bar {
+            read_register(observed.services, observed.register_bar, offset).unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        }
+    };
+    if let Some((major, minor, revision)) =
+        ips.and_then(|ips| discovery::version(ips, discovery::MP0))
+        && bar >= discovery::SECURITY_PROCESSOR_BYTES
+    {
+        output::arguments(format_args!(
+            "GPU {address}: its security processor (MP0 {major}.{minor}.{revision}) before its \
+             reset: {}\n",
+            discovery::security_processor(
+                read(discovery::MP0_SMN_C2PMSG_33),
+                read(discovery::MP0_SMN_C2PMSG_64),
+                read(discovery::MP0_SMN_C2PMSG_81),
+            )
+        ));
+    }
+    // Its kind as the loader took it: the driver's table, else the
+    // graphics version its IP discovery table lists, else integrated.
+    let integrated = GpuStack::select(adapter)
+        .ok()
+        .and_then(|stack| {
+            let discovered = stack.kernel.discovered_integrated;
+            stack
+                .kernel
+                .table_integrated(adapter)
+                .or_else(|| discovered.and_then(|discovered| (discovered.named)(adapter)))
+                .or_else(|| {
+                    let graphics = discovery::version(ips?, discovery::GC)?;
+                    Some((discovered?.graphics)(graphics))
+                })
+        })
+        .unwrap_or(true);
+    if !integrated {
+        return;
+    }
+    let mib = |bytes: u64| bytes >> 20;
+    let carve_out = match read(discovery::RCC_CONFIG_MEMSIZE) {
+        u32::MAX => String::from("was not read (RCC_CONFIG_MEMSIZE reads all ones)"),
+        megabytes => format!("is {megabytes}M (RCC_CONFIG_MEMSIZE), which the share does not count"),
+    };
+    let share = crate::native_memory::gpu_share();
+    if share == 0 {
+        let heap = crate::ALLOCATOR.usage();
+        output::arguments(format_args!(
+            "GPU {address}: integrated, and the memory plan gave it no share of RAM: Linux's \
+             pages for it come from Stela's heap of {}M; its VRAM carve-out {carve_out}\n",
+            mib(heap.total as u64)
+        ));
+        return;
+    }
+    #[cfg(feature = "nvk")]
+    let told = format!(
+        "; Metal tells the guest at most {}M, 0.8M less for each 1M Linux holds as it opens",
+        mib(stela_drivers::gpu::metal::device::share::working_set(
+            stela_drivers::gpu::metal::device::share::ShareState {
+                held: 0,
+                limit: share,
+            }
+        ))
+    );
+    #[cfg(not(feature = "nvk"))]
+    let told = String::new();
+    output::arguments(format_args!(
+        "GPU {address}: integrated: its share of RAM is {}M, the most Linux may hold (the page \
+         catalog's limit); amdgpu caps its GTT at it and TTM's page limit is {}M; its VRAM \
+         carve-out {carve_out}{told}\n",
+        mib(share),
+        mib(share.saturating_mul(2))
+    ));
 }
 
 /// The IP blocks of the AMD GPU whose register BAR is `registers`, from
