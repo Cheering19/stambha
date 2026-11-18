@@ -8,6 +8,7 @@ mod anv;
 mod clc;
 pub mod fetch;
 mod hosted;
+mod image;
 mod llvm;
 mod mesa;
 mod metal_suite;
@@ -114,6 +115,15 @@ pub enum Command {
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
     },
+    /// RADV and ANV as the image compiles them, with its C library and
+    /// defines, built for this machine instead of the image's target and
+    /// run over Mesa's DRM shim: each must make its devices and one
+    /// submission. Run after `nvk`.
+    ImageTest {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+    },
     /// Build RADV for this machine with the image's options and run it on an
     /// amdgpu render node with no GPU behind it: device creation, an ACO
     /// compute pipeline and one submission per device of the test, through
@@ -192,6 +202,7 @@ pub fn run(command: Command) -> Result<()> {
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
         Command::AnvTest { jobs } => anv::test(jobs),
+        Command::ImageTest { jobs } => image::test(jobs),
         Command::RadvTest { jobs, corpus } => radv::test(jobs, &corpus),
         Command::RadvMetal { library, corpus } => {
             radv::metal(&library, &support::third_party("linux"), &corpus)

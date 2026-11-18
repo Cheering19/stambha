@@ -75,7 +75,7 @@ impl Sysroot {
         };
         let units: Vec<_> = LIBC
             .into_iter()
-            .chain(["tests/host"])
+            .chain(["tests/host", "tests/string"])
             .map(|name| c_unit(libc.join(format!("{name}.c")), name))
             .chain(REGEX.map(|name| c_unit(llvm.join(format!("llvm/lib/Support/{name}.c")), name)))
             .collect();
