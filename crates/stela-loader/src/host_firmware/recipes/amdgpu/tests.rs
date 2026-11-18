@@ -72,9 +72,10 @@ fn files_are_pinned_once_in_name_order_under_the_amdgpu_notice() {
     };
     assert_eq!(request("amdgpu/gc_10_3_6_ce.bin", "amd"), Some(263296));
     assert_eq!(
-        request("amdgpu/polaris10_mc.bin", "amd").map(|_| ()),
+        request("amdgpu/vega10_sos.bin", "amd").map(|_| ()),
         Some(())
     );
+    assert_eq!(request("amdgpu/polaris10_mc.bin", "amd"), None);
     assert_eq!(request("amdgpu/gc_10_3_6_ce.bin", "nvidia"), None);
     assert_eq!(request("amdgpu/gc_11_5_4_pfp.bin", "amd"), None);
 }
@@ -165,21 +166,13 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
         assert!(!files.contains(&"amdgpu/vce_1_0_0.bin"));
         assert!(!files.contains(&"amdgpu/banks_k_2_smc.bin"));
     }
-    // Polaris 10 by ID; the ID quirks may make Polaris 11 a Polaris 10.
-    let polaris = names(AmdGpu::of(0x67df));
-    assert!(!polaris.is_empty() && polaris.iter().all(|m| m.starts_with("amdgpu/polaris10_")));
-    assert!(polaris.contains(&"amdgpu/polaris10_k_mc.bin"));
-    // Its video decoder and encoder are left out.
-    assert!(AmdGpu::Named("POLARIS10", None).may_load("amdgpu/polaris10_mc.bin"));
-    for member in ["amdgpu/polaris10_uvd.bin", "amdgpu/polaris10_vce.bin"] {
-        assert!(
-            !AmdGpu::Named("POLARIS10", None).may_load(member),
-            "{member}"
-        );
+    // Vega 10 by ID; its video decoder and encoder are left out.
+    let vega = names(AmdGpu::of(0x6860));
+    assert!(!vega.is_empty() && vega.iter().all(|m| m.starts_with("amdgpu/vega10_")));
+    assert!(vega.contains(&"amdgpu/vega10_sos.bin"));
+    for member in ["amdgpu/vega10_uvd.bin", "amdgpu/vega10_vce.bin"] {
+        assert!(!vega.contains(&member), "{member}");
     }
-    let quirked = names(AmdGpu::of(0x67ff));
-    assert!(quirked.contains(&"amdgpu/polaris11_mc.bin"));
-    assert!(quirked.contains(&"amdgpu/polaris10_mc.bin"));
     // Raven by ID loads Raven 2's and Picasso's by revision, not Renoir's.
     let raven = names(AmdGpu::of(0x15dd));
     for member in [
@@ -220,6 +213,11 @@ fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
         (0x9850, "MULLINS"),
         (0x738c, "ARCTURUS"),
         (0x7408, "ALDEBARAN"),
+        // GFX8, whose Metal device is in no Apple GPU family.
+        (0x6900, "TOPAZ"),
+        (0x67df, "POLARIS10"),
+        (0x9870, "CARRIZO"),
+        (0x694c, "VEGAM"),
     ] {
         let gpu = AmdGpu::of(device);
         assert_eq!(gpu, AmdGpu::LeftOut(chip), "{device:04x}");
@@ -229,7 +227,8 @@ fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
         assert!(require_amdgpu_discovered(&mut Inventory::default(), device, &[]).is_err());
     }
     // The families left out are those of the generations before the first
-    // that serves, and the accelerators; every later family is driven.
+    // whose device is in an Apple family, and the accelerators; every later
+    // family is driven.
     let out: Vec<&str> = CHIPS
         .iter()
         .filter(|(chip, ..)| left_out(chip))
@@ -248,6 +247,15 @@ fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
             "KABINI",
             "HAWAII",
             "MULLINS",
+            "TOPAZ",
+            "TONGA",
+            "FIJI",
+            "CARRIZO",
+            "STONEY",
+            "POLARIS10",
+            "POLARIS11",
+            "POLARIS12",
+            "VEGAM",
             "ARCTURUS",
             "ALDEBARAN"
         ]
@@ -255,11 +263,14 @@ fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
     for (chip, generation, _) in CHIPS {
         assert_eq!(
             left_out(chip),
-            *generation < amd_metal::FIRST_GENERATION
+            *generation < amd_metal::FIRST_APPLE_GENERATION
                 || amd_metal::NO_VULKAN_FAMILIES.contains(chip),
             "{chip}"
         );
     }
+    // The boot says why.
+    let refused = require_amdgpu(&mut Inventory::default(), 0x67df).unwrap_err();
+    assert!(refused.0.contains("Apple GPU family"), "{}", refused.0);
     // Their files, and those alone, are no longer pinned: a file a driven
     // family shares stays.
     for member in [
@@ -269,21 +280,23 @@ fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
         "amdgpu/banks_k_2_smc.bin",
         "amdgpu/kaveri_sdma.bin",
         "amdgpu/arcturus_sos.bin",
+        "amdgpu/topaz_mc.bin",
+        "amdgpu/polaris10_mc.bin",
+        "amdgpu/carrizo_ce.bin",
     ] {
         assert!(left_out_file(member), "{member}");
         assert!(AMDGPU.iter().all(|recipe| recipe.image.member != member));
     }
     for member in [
-        "amdgpu/topaz_mc.bin",
-        "amdgpu/polaris10_mc.bin",
+        "amdgpu/vega10_sos.bin",
         "amdgpu/vega20_sos.bin",
         "amdgpu/gc_10_3_6_pfp.bin",
         "other/tahiti_mc.bin",
     ] {
         assert!(!left_out_file(member), "{member}");
     }
-    // Topaz, the first family of GFX8, is driven.
-    assert_eq!(AmdGpu::of(0x6900), AmdGpu::Named("TOPAZ", None));
+    // Vega 10, the first family of GFX9, is driven.
+    assert_eq!(AmdGpu::of(0x6860), AmdGpu::Named("VEGA10", None));
 }
 
 #[test]

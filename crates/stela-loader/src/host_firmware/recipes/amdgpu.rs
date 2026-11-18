@@ -140,19 +140,26 @@ pub enum AmdGpu {
     /// amdgpu leaves it to an older driver.
     LeftToRadeon,
     /// Its table names the device, of this family, which Stela leaves out:
-    /// RADV's device on it cannot serve the Metal device ([`left_out`]).
-    /// It is not claimed, so it loads no file.
+    /// RADV's device on it cannot serve the Metal device, or not in an
+    /// Apple GPU family ([`left_out`]). It is not claimed, so it loads no
+    /// file.
     LeftOut(&'static str),
 }
 
 /// Whether Stela leaves the family `chip` out, as its Vulkan device cannot
-/// serve the Metal device (`stela_driver_core::amd_metal`): no device of
-/// it is claimed, and none of its files is pinned.
+/// serve the Metal device, or not in an Apple GPU family
+/// (`stela_driver_core::amd_metal::driven`): no device of it is claimed,
+/// and none of its files is pinned.
 pub fn left_out(chip: &str) -> bool {
+    refusal(chip).is_some()
+}
+
+/// Why Stela leaves the family `chip` out ([`left_out`]).
+fn refusal(chip: &str) -> Option<&'static str> {
     CHIPS
         .iter()
         .find(|(known, ..)| *known == chip)
-        .is_some_and(|(_, generation, _)| !amd_metal::serves(chip, *generation))
+        .and_then(|(_, generation, _)| amd_metal::refusal(chip, *generation))
 }
 
 impl AmdGpu {
@@ -402,10 +409,8 @@ pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Erro
             )));
         }
         AmdGpu::LeftOut(chip) => {
-            return Err(Error(format!(
-                "{device:04x} ({chip}) is left out: its Vulkan device cannot serve the Metal \
-                 device"
-            )));
+            let why = refusal(chip).unwrap_or(amd_metal::LEFT_OUT);
+            return Err(Error(format!("{device:04x} ({chip}) is left out: {why}")));
         }
         AmdGpu::Named(..) | AmdGpu::Discovered => {}
     }
@@ -480,46 +485,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/beige_goby_ta.bin",
         259328,
         "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
-    ),
-    file(
-        "amdgpu/carrizo_ce.bin",
-        8832,
-        "332db9aa5d5cd3c20c464036713d68fc7ed0a4d57fad0db5f8c0843c10398e99",
-    ),
-    file(
-        "amdgpu/carrizo_me.bin",
-        17024,
-        "adb926ea4fc46a329d198ea690d8d5e98eb55d7511985561047566b6f80d7a9e",
-    ),
-    file(
-        "amdgpu/carrizo_mec.bin",
-        262784,
-        "f5b1b485bdeb1d966ce6b6c7e0eadd08ce93d88a456944cc5b344869043cc4c1",
-    ),
-    file(
-        "amdgpu/carrizo_mec2.bin",
-        262784,
-        "f5b1b485bdeb1d966ce6b6c7e0eadd08ce93d88a456944cc5b344869043cc4c1",
-    ),
-    file(
-        "amdgpu/carrizo_pfp.bin",
-        17024,
-        "1b49b4f0bc61c12901e4d5d09fa63c4a7b27a8474ce6424da99e80f581e9783a",
-    ),
-    file(
-        "amdgpu/carrizo_rlc.bin",
-        18836,
-        "873b4de251ed22f3d106f23aad3588be53afd44bde658422208327be88439a0d",
-    ),
-    file(
-        "amdgpu/carrizo_sdma.bin",
-        10624,
-        "c8d3eadacddbaf54557690610dcedefb0445eadd3b6e8dbd3cb67602e90110ac",
-    ),
-    file(
-        "amdgpu/carrizo_sdma1.bin",
-        10624,
-        "c8d3eadacddbaf54557690610dcedefb0445eadd3b6e8dbd3cb67602e90110ac",
     ),
     file(
         "amdgpu/cyan_skillfish2_ce.bin",
@@ -665,51 +630,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/dimgrey_cavefish_ta.bin",
         259328,
         "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
-    ),
-    file(
-        "amdgpu/fiji_ce.bin",
-        8852,
-        "615693b2736f13c4ef3cd9220efe4d55df3c5d82fe128d3f1b34a45edba65fbd",
-    ),
-    file(
-        "amdgpu/fiji_me.bin",
-        17044,
-        "953747f5b93bd743bb75747b950be3e4ccbe481ac1f7110a58d399ac840f158a",
-    ),
-    file(
-        "amdgpu/fiji_mec.bin",
-        262824,
-        "cd1133103874ce368c4f46eeb38fe293caad5f77e4fee8567f6f6be9c47687c4",
-    ),
-    file(
-        "amdgpu/fiji_mec2.bin",
-        262824,
-        "cd1133103874ce368c4f46eeb38fe293caad5f77e4fee8567f6f6be9c47687c4",
-    ),
-    file(
-        "amdgpu/fiji_pfp.bin",
-        17044,
-        "91bda514a4d0d846d48321aa4d3c92ff1049fe53cbf3e007686553a29a9018de",
-    ),
-    file(
-        "amdgpu/fiji_rlc.bin",
-        16636,
-        "f0fa903f16502cff35dc073a77c1ef382f4218ec2928f23a173400888f90400d",
-    ),
-    file(
-        "amdgpu/fiji_sdma.bin",
-        10644,
-        "b5cf6b3a3b7e6839a68a92ac8651d53d0ae41e1caee28c68155b2d7865f1cf4c",
-    ),
-    file(
-        "amdgpu/fiji_sdma1.bin",
-        10644,
-        "1c5ab71e854cc59e4998559ed07c436d05b2a97b0df0a51a3924b1c240398949",
-    ),
-    file(
-        "amdgpu/fiji_smc.bin",
-        129604,
-        "fd13fe6b32cef9129f1b75f46b014babcf4075ebc8a715bf19da573be8b68223",
     ),
     file(
         "amdgpu/gc_10_3_6_ce.bin",
@@ -1712,286 +1632,6 @@ pub const AMDGPU: &[Recipe] = &[
         "93063b85f968b3c72ea03ca7fcfe05fd06374937db3817cfedcb4c61eb2687f2",
     ),
     file(
-        "amdgpu/polaris10_ce.bin",
-        8852,
-        "d1664bd98b69bf21c2fb4e6654860e6648d2a202eeb2175e718982ffb7be1dc5",
-    ),
-    file(
-        "amdgpu/polaris10_ce_2.bin",
-        8852,
-        "790ca90f5afa001a858909619a222442bfaec1a1f63c47396d21e0097609e24a",
-    ),
-    file(
-        "amdgpu/polaris10_k2_smc.bin",
-        130228,
-        "b5d34a4b0ea0d0c9c53dddcac93e9e01fe759f0ad9a0b0d0b4905e5a6b254d03",
-    ),
-    file(
-        "amdgpu/polaris10_k_mc.bin",
-        32832,
-        "78a0e88d669cf91c09cd027ac3b5bd0c08ac126a8488092c567ecda21824e9ad",
-    ),
-    file(
-        "amdgpu/polaris10_k_smc.bin",
-        130244,
-        "98fa36d74fa933a73419257daae924fda290a7208aa42584a9dd89e1cc44e05d",
-    ),
-    file(
-        "amdgpu/polaris10_mc.bin",
-        32732,
-        "fff3926e5e5903a87d40d6f6b7c756bd8ecf6fd9c47fced867add1fdc9fe11b6",
-    ),
-    file(
-        "amdgpu/polaris10_me.bin",
-        17044,
-        "db550bf611ed416a93057b207014ee78b0abe90e5474995b56e915133ff4d1b0",
-    ),
-    file(
-        "amdgpu/polaris10_me_2.bin",
-        17044,
-        "35c778c82c006a28f129186c414c37d7acbdb23fefb4cb84c1f705886f372fdd",
-    ),
-    file(
-        "amdgpu/polaris10_mec.bin",
-        262824,
-        "c19c1e2e36b47c4a8c25d601f5ae04a26458d98c3000f851d1be5c3a0a424b07",
-    ),
-    file(
-        "amdgpu/polaris10_mec2.bin",
-        262824,
-        "c19c1e2e36b47c4a8c25d601f5ae04a26458d98c3000f851d1be5c3a0a424b07",
-    ),
-    file(
-        "amdgpu/polaris10_mec2_2.bin",
-        262824,
-        "67546c49317168a5ab33ba85503e9893f2dcd974f995402054a306dac246b64f",
-    ),
-    file(
-        "amdgpu/polaris10_mec_2.bin",
-        262824,
-        "d4914f1166e3b7af212837aaf8f393a155ce3f61f48bb08279c743a2ddea0b6a",
-    ),
-    file(
-        "amdgpu/polaris10_pfp.bin",
-        17044,
-        "066cf60af4cf266eb302c8d327513159d964e1bef9dacbb65a6b07483bbd440a",
-    ),
-    file(
-        "amdgpu/polaris10_pfp_2.bin",
-        17044,
-        "bf1ca44ceefd73df8a8e350540d8758d9041e9e2b9cd0bd77e647ed7151ed9eb",
-    ),
-    file(
-        "amdgpu/polaris10_rlc.bin",
-        23488,
-        "a5d4c2d3acc5c3c4988b95855fe21a5f682552b2b065f76439370835178ccbaf",
-    ),
-    file(
-        "amdgpu/polaris10_sdma.bin",
-        12692,
-        "e27b3ec976f87e32883b9190e653b20d27f9e77da8dd2d77eeb10c35ee9f1e61",
-    ),
-    file(
-        "amdgpu/polaris10_sdma1.bin",
-        12692,
-        "23dd73eb1316d40a681841b4d3d116c5cae6d8317cebe8f5e1f9e5dec6de5c87",
-    ),
-    file(
-        "amdgpu/polaris10_smc.bin",
-        130216,
-        "f7ac568d6e2098a26fc61fc321df1330f9d8952e9b0b47e0309f1d8e6b6727fb",
-    ),
-    file(
-        "amdgpu/polaris10_smc_sk.bin",
-        130196,
-        "09cc712ec2d30cac29e4b0606c3844d7eae15d6663f73d3f48a695e7324491c1",
-    ),
-    file(
-        "amdgpu/polaris11_ce.bin",
-        8852,
-        "d1664bd98b69bf21c2fb4e6654860e6648d2a202eeb2175e718982ffb7be1dc5",
-    ),
-    file(
-        "amdgpu/polaris11_ce_2.bin",
-        8852,
-        "790ca90f5afa001a858909619a222442bfaec1a1f63c47396d21e0097609e24a",
-    ),
-    file(
-        "amdgpu/polaris11_k2_smc.bin",
-        130228,
-        "83dd69a87fdbba335b266d9970cb51c837f89fce33d24b493a8d4db5909d923a",
-    ),
-    file(
-        "amdgpu/polaris11_k_mc.bin",
-        32832,
-        "64a2749ae228a5cd2084a877615519a0d18811068f803411545dd9774549b7cf",
-    ),
-    file(
-        "amdgpu/polaris11_k_smc.bin",
-        130228,
-        "0224af84c74efe8a437ccac8c45f534bca8127ff532cef711ce7157c2ac9bd52",
-    ),
-    file(
-        "amdgpu/polaris11_mc.bin",
-        33104,
-        "b75c34f2b5866128e007c81d4b077f07f21c724cebe8f19b6db5526a02435b6c",
-    ),
-    file(
-        "amdgpu/polaris11_me.bin",
-        17044,
-        "784ecf696e9a59b0baec4f010631c32f6bb0971a7965705660ca9244e728992b",
-    ),
-    file(
-        "amdgpu/polaris11_me_2.bin",
-        17044,
-        "75dbf9d8d38955de4589e6a2fa20ae22815ebbaa7cd4686ea756b5b519db39c4",
-    ),
-    file(
-        "amdgpu/polaris11_mec.bin",
-        262824,
-        "7ad4a0b49e07f1ac9acf1a468385b6fb40f3cf078d048339ff42fbe896306333",
-    ),
-    file(
-        "amdgpu/polaris11_mec2.bin",
-        262824,
-        "7ad4a0b49e07f1ac9acf1a468385b6fb40f3cf078d048339ff42fbe896306333",
-    ),
-    file(
-        "amdgpu/polaris11_mec2_2.bin",
-        262824,
-        "672b3cc2c5cc12d771b73a031a72641072706c23138a3182964e19ab6546a059",
-    ),
-    file(
-        "amdgpu/polaris11_mec_2.bin",
-        262824,
-        "47a976f67dcfb01287e0e8cc1ae252a1e89c1c816e26a4f5f0c8b48b5cbea754",
-    ),
-    file(
-        "amdgpu/polaris11_pfp.bin",
-        17044,
-        "ad2ca7d837f09f94491056af88e2d03de55d773a0f86fac238ebb9e13a0a88f8",
-    ),
-    file(
-        "amdgpu/polaris11_pfp_2.bin",
-        17044,
-        "22bf71e495e2b7d1c05956f59070151b27ac638dcfa6c35d7e71d9d0183cd08b",
-    ),
-    file(
-        "amdgpu/polaris11_rlc.bin",
-        22688,
-        "29fa9e98117f3ade4471987af3398c9d106df04605f8287f045e0950fe6a1fa1",
-    ),
-    file(
-        "amdgpu/polaris11_sdma.bin",
-        12692,
-        "e27b3ec976f87e32883b9190e653b20d27f9e77da8dd2d77eeb10c35ee9f1e61",
-    ),
-    file(
-        "amdgpu/polaris11_sdma1.bin",
-        12692,
-        "23dd73eb1316d40a681841b4d3d116c5cae6d8317cebe8f5e1f9e5dec6de5c87",
-    ),
-    file(
-        "amdgpu/polaris11_smc.bin",
-        130196,
-        "20142b588ada975151efb15e8f3efde254f6e7a453204d99659c314e43954aca",
-    ),
-    file(
-        "amdgpu/polaris11_smc_sk.bin",
-        130196,
-        "efa5e768ad6c7e2f754e6bb6b73248d7bd8e7306798eb9054b0f3f7a14223616",
-    ),
-    file(
-        "amdgpu/polaris12_32_mc.bin",
-        32876,
-        "555a01b4833c9cb62da126f80fb7c5ce15a7ef827ea6b8bc0f725c2a8f4b0ce9",
-    ),
-    file(
-        "amdgpu/polaris12_ce.bin",
-        8852,
-        "5f051f19c5749ecd5daa94d9f542a25cd693274af6e394da048b1a0469bac87e",
-    ),
-    file(
-        "amdgpu/polaris12_ce_2.bin",
-        8852,
-        "a4758bf9e8286d9bae39a59c1f579a0a68c398a37f4720c0c70392461d2d19fe",
-    ),
-    file(
-        "amdgpu/polaris12_k_mc.bin",
-        32832,
-        "d7afe2e7d7800ae9439111e7fe4bc436c4ccf45ab23dcdef5deb02a4a8a56cc4",
-    ),
-    file(
-        "amdgpu/polaris12_k_smc.bin",
-        130388,
-        "3ea2727dad6e11846565410fc5ed8cab133b788f5e24475bfdca4e68e86daff0",
-    ),
-    file(
-        "amdgpu/polaris12_mc.bin",
-        32608,
-        "b0fe44950422879f0509fb62a7f7aa0e75c7f4ddfe6257a8864b2049e72fae78",
-    ),
-    file(
-        "amdgpu/polaris12_me.bin",
-        17044,
-        "d18fd8dda14e0e6527d119866cf74aab143c6d70f6ad0906d6f3b391d79525ce",
-    ),
-    file(
-        "amdgpu/polaris12_me_2.bin",
-        17044,
-        "8953b50da0d365e79b6bec1253e9ad56097451718de01ddaf8d4683b46e4a13c",
-    ),
-    file(
-        "amdgpu/polaris12_mec.bin",
-        262824,
-        "799b3e73fd260b6312821db3f4344be7874824a846511760f9746baebd3832f0",
-    ),
-    file(
-        "amdgpu/polaris12_mec2.bin",
-        262824,
-        "799b3e73fd260b6312821db3f4344be7874824a846511760f9746baebd3832f0",
-    ),
-    file(
-        "amdgpu/polaris12_mec2_2.bin",
-        262824,
-        "11dc9315750b09ef43b5c3d3d59f078b47d054764ad0ce985ec4a3a484f25d9a",
-    ),
-    file(
-        "amdgpu/polaris12_mec_2.bin",
-        262824,
-        "1e0ce977d29288e3f499b0ab0f5e8af43f5cabbef4b36e067a086a976f6e9636",
-    ),
-    file(
-        "amdgpu/polaris12_pfp.bin",
-        17044,
-        "93506a0a72a45b6bb48dd06149a6eebf96d36991f32dc4ed67d3682cda920e22",
-    ),
-    file(
-        "amdgpu/polaris12_pfp_2.bin",
-        17044,
-        "7b80b023b18010fa66ef3af5a19fa556bcee4d72d5eaf5b6aacc263e7c7b3706",
-    ),
-    file(
-        "amdgpu/polaris12_rlc.bin",
-        16660,
-        "f087f8585ec1d4bc12b48caee0adeb9c170aacd99b8ef1505dbb4ad5ccfbb8c1",
-    ),
-    file(
-        "amdgpu/polaris12_sdma.bin",
-        12692,
-        "e27b3ec976f87e32883b9190e653b20d27f9e77da8dd2d77eeb10c35ee9f1e61",
-    ),
-    file(
-        "amdgpu/polaris12_sdma1.bin",
-        12692,
-        "23dd73eb1316d40a681841b4d3d116c5cae6d8317cebe8f5e1f9e5dec6de5c87",
-    ),
-    file(
-        "amdgpu/polaris12_smc.bin",
-        130388,
-        "4b8eb326a7fbd391554fe50bc43cf04a917b01a806884ea324f5c3fe88a6ec77",
-    ),
-    file(
         "amdgpu/psp_13_0_0_sos.bin",
         272400,
         "4a51299f6d0a15bbba9694419f7891e6accc01dbd2dd67c06add7bfd75a45ac6",
@@ -2547,141 +2187,6 @@ pub const AMDGPU: &[Recipe] = &[
         "c9b0cbef51cc2bfcf28238b904b3e9e089e3e43b226b2bae9d5fcd7be76253e5",
     ),
     file(
-        "amdgpu/stoney_ce.bin",
-        8832,
-        "fc3938a445fd744aab16523db079781afe0d064dcb416569a2c243fc256550ca",
-    ),
-    file(
-        "amdgpu/stoney_me.bin",
-        17024,
-        "ad9ff687fe0bf670620ff6317382583bb2240ce65a866c02edb24a8697e47493",
-    ),
-    file(
-        "amdgpu/stoney_mec.bin",
-        262784,
-        "a1c84d90fbf5fcd0b8186b43c0246455dd8c66237ff6c2a03481276ac16fc49a",
-    ),
-    file(
-        "amdgpu/stoney_pfp.bin",
-        17024,
-        "0812c914e5daad0d65ae04651dbe6448004ca726dd18e478bfc45f354b46e8fc",
-    ),
-    file(
-        "amdgpu/stoney_rlc.bin",
-        17236,
-        "ab7d3f9c47d9763795d267a0d51722c89f5a2042aba232db575f4c86eb5638c6",
-    ),
-    file(
-        "amdgpu/stoney_sdma.bin",
-        10624,
-        "c23d03726ffdfb1fe253cfbfe36ab82ce5e69bede0d6c4157de71edb967a5fbb",
-    ),
-    file(
-        "amdgpu/tonga_ce.bin",
-        8852,
-        "b4af0f8d8d3600f4b91b3e7e3021f7fa77eb539bbf6346d4e07d0b47311f6bf7",
-    ),
-    file(
-        "amdgpu/tonga_k_smc.bin",
-        130460,
-        "9669b9e40d794dc4360c0a3d562cef715695b398a29d518378202183fc89b5b8",
-    ),
-    file(
-        "amdgpu/tonga_mc.bin",
-        31352,
-        "c75b7389ba488acb751690b04b383d64358d7ead4d155380442ad691e73f77b5",
-    ),
-    file(
-        "amdgpu/tonga_me.bin",
-        17044,
-        "c350d80cd2ce91f90606ef64e241c70e630056d964a602897cbd1c33758090b7",
-    ),
-    file(
-        "amdgpu/tonga_mec.bin",
-        262824,
-        "101ae242c9d4811af89fe550d9272c2abfc672bd95ee6625b5823a9b3d14369f",
-    ),
-    file(
-        "amdgpu/tonga_mec2.bin",
-        262824,
-        "101ae242c9d4811af89fe550d9272c2abfc672bd95ee6625b5823a9b3d14369f",
-    ),
-    file(
-        "amdgpu/tonga_pfp.bin",
-        17044,
-        "d8735c931a26ded131afc998d4288c012687e1f266b8e8fd010dfe18b5cc9e92",
-    ),
-    file(
-        "amdgpu/tonga_rlc.bin",
-        14756,
-        "2ae481966852b20215ced869f45b4eefd8c78db7302ecee0c9b23265d837dd86",
-    ),
-    file(
-        "amdgpu/tonga_sdma.bin",
-        10644,
-        "6f5c9c79bdfd263dc95e83cdccc6ff0e262b7d0f08ef02cff8e8f43aa0f0384d",
-    ),
-    file(
-        "amdgpu/tonga_sdma1.bin",
-        10644,
-        "3db6b4581bf597648d8ca030624cedad0782ecea0072586240a4daaad9ed13ab",
-    ),
-    file(
-        "amdgpu/tonga_smc.bin",
-        130460,
-        "bc76b51ddf10bcb858944d78e526e31ec4880f6c99df6bf7c357b019f4d7b56c",
-    ),
-    file(
-        "amdgpu/topaz_ce.bin",
-        8832,
-        "39b60959b08623bb085735174360a5f870c55f30bf52f19c89f7f7ccedab348d",
-    ),
-    file(
-        "amdgpu/topaz_k_smc.bin",
-        80544,
-        "46c1332f49582860c7cb64482c357eba48f7c804998d4bfd045f7e5e4001a429",
-    ),
-    file(
-        "amdgpu/topaz_mc.bin",
-        32100,
-        "236df987bcad6f9f8b09e0bd95c7b9c6a257640c01b936177b1dcf22dacdfb02",
-    ),
-    file(
-        "amdgpu/topaz_me.bin",
-        17024,
-        "420ef37021ee1ffb3e4e410c4b6f537ff39895e13775e5ca1171e1bdf9dcf236",
-    ),
-    file(
-        "amdgpu/topaz_mec.bin",
-        262784,
-        "f4545925999f6d75793b84843c8708aa7a247d7e78b6174f70386e6a588c4cca",
-    ),
-    file(
-        "amdgpu/topaz_pfp.bin",
-        17024,
-        "d46247c24064b78443974799e934d01c880818c362788886e734ebca271b4fd3",
-    ),
-    file(
-        "amdgpu/topaz_rlc.bin",
-        8448,
-        "8553ce7b6d172d77a872112607355b95ca921b2d1751f7b93f6f498144eabfba",
-    ),
-    file(
-        "amdgpu/topaz_sdma.bin",
-        8576,
-        "1480cfdd6ce7c28ece8c56f0b393f451276dcd1e341d9849e7eb5a5fc1b396e6",
-    ),
-    file(
-        "amdgpu/topaz_sdma1.bin",
-        8576,
-        "a19f95eadb7656ff5b046c3c64c477d618a63435e7de5895114aece20cbdb8a2",
-    ),
-    file(
-        "amdgpu/topaz_smc.bin",
-        80544,
-        "753b8b9fdaf0b0e1d1468122fc4fb7ea30ce69c42dfe39b017d249584bde095c",
-    ),
-    file(
         "amdgpu/vangogh_asd.bin",
         209408,
         "9b39a722b45f7d7f1090d3651f560e6fafb88f54bc5424aafcaca6fe098074f8",
@@ -2930,51 +2435,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/vega20_ta.bin",
         90880,
         "aea10970b0530e2e11f84a5c0444315c78b109106a02a41b4eeaea3ac96d56dc",
-    ),
-    file(
-        "amdgpu/vegam_ce.bin",
-        8852,
-        "c0d4acb3f1bd1def58cee933103069ce2b6b6d9b6a63591bd811b51a05ac0d67",
-    ),
-    file(
-        "amdgpu/vegam_me.bin",
-        17044,
-        "c63ac86b770df364dc23c50ed6360a4823ad0e37120df12e4fb74bf574e3b536",
-    ),
-    file(
-        "amdgpu/vegam_mec.bin",
-        262824,
-        "dbbe48008aaa667b64e2fbd7e93975200ae89b62aadaa6387b5ef14259701c20",
-    ),
-    file(
-        "amdgpu/vegam_mec2.bin",
-        262824,
-        "97bd777ed7ad8cf6f2825dfdde1ed508c9f4b824db0c336b4e1d4ccc6c1136a5",
-    ),
-    file(
-        "amdgpu/vegam_pfp.bin",
-        17044,
-        "3c088e0cf4dadfe067c525a63337387659e1d81d8a5896ba6b8cbc5b36762950",
-    ),
-    file(
-        "amdgpu/vegam_rlc.bin",
-        16660,
-        "c729f89ade4fcd05c390f7bbf1fcb93eda47ac6911027c707add844181004b47",
-    ),
-    file(
-        "amdgpu/vegam_sdma.bin",
-        12692,
-        "9d964f4896b6713a1e41b8eca5ef665598290e4cc801d58fb2257845b7112040",
-    ),
-    file(
-        "amdgpu/vegam_sdma1.bin",
-        12692,
-        "477f1eb3a796c1248f38fb98ff389e9bb49d7cae746556055484a60668f509a2",
-    ),
-    file(
-        "amdgpu/vegam_smc.bin",
-        130964,
-        "d6d422d2717b59bb7e23597157c2d6978b066475b4872045aff4702f2fee95eb",
     ),
     file(
         "amdgpu/yellow_carp_ce.bin",

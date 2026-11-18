@@ -53,8 +53,10 @@ pub fn discovered_integrated(graphics: (u8, u8, u8)) -> bool {
 }
 
 /// Every device IP discovery identifies is of a generation that serves the
-/// Metal device, so one the table matches by class is claimed.
+/// Metal device in an Apple family, so one the table matches by class is
+/// claimed.
 const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
+const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_APPLE_GENERATION);
 
 /// Whether the table's class entries hold the adapter: any AMD function of
 /// one of these classes, which the driver then identifies by IP discovery.
@@ -65,20 +67,21 @@ fn discovered(adapter: &Adapter) -> bool {
 
 /// Whether Stela drives the adapter with amdgpu: its table holds it, by ID
 /// or by class, the driver does not leave it to radeon, and RADV's device on
-/// its family can serve the Metal device ([`amd_metal::serves`]); the build
-/// holds the support of every family that does. A GPU that cannot serve the
-/// Metal device is left out whole: Stela does not drive it for its displays
-/// alone.
+/// its family can serve the Metal device in an Apple GPU family
+/// ([`amd_metal::driven`]); the build holds the support of every family
+/// whose device can open. A GPU that cannot serve the Metal device is left
+/// out whole, before anything of it changes: Stela does not drive it for
+/// its displays alone.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     if LEFT_TO_RADEON.binary_search(&adapter.device).is_ok() {
         return Err(
             "amdgpu leaves this GPU to an older driver (radeon, r128 or mach64), which is not ported to Stela",
         );
     }
-    if let Some((family, generation)) = generation(adapter.device)
-        && !amd_metal::serves(family, generation)
+    if let Some(why) = generation(adapter.device)
+        .and_then(|(family, generation)| amd_metal::refusal(family, generation))
     {
-        return Err(amd_metal::LEFT_OUT);
+        return Err(why);
     }
     // The build holds amdgpu's support of every family that serves.
     if entry(adapter.device).is_some() || discovered(adapter) {
@@ -410,10 +413,10 @@ mod tests {
         assert_eq!(dma_bits(&unnamed), 44);
         // An unnamed function of another class is not amdgpu's.
         assert!(admits(&adapter(0x0001, [4, 3, 0])).is_err());
-        // Polaris 10, by ID.
-        let polaris = adapter(0x67df, [3, 0, 0]);
-        assert_eq!(admits(&polaris), Ok(()));
-        assert_eq!(dma_bits(&polaris), 40);
+        // Vega 10, by ID.
+        let vega = adapter(0x6860, [3, 0, 0]);
+        assert_eq!(admits(&vega), Ok(()));
+        assert_eq!(dma_bits(&vega), 44);
         // A device of the list amdgpu leaves to radeon, VGA class or not.
         let radeon = adapter(LEFT_TO_RADEON[0], [3, 0, 0]);
         assert!(admits(&radeon).unwrap_err().contains("radeon"));
@@ -437,29 +440,34 @@ mod tests {
             let gpu = adapter(device, [3, 0, 0]);
             assert_eq!(admits(&gpu), Err(amd_metal::LEFT_OUT), "{device:04x}");
         }
-        // Topaz, Polaris 10, Vega 10, Navi 10 and Navi 21 serve it.
-        for (device, generation) in [
-            (0x6900, 8),
-            (0x67df, 8),
-            (0x6860, 9),
-            (0x731f, 9),
-            (0x73bf, 9),
+        // Topaz, Polaris 10 and Carrizo, GFX8, open it in no Apple GPU
+        // family; Vega 10, Navi 10 and Navi 21 serve it.
+        for (device, generation, refusal) in [
+            (0x6900, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x67df, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x9870, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x6860, 9, None),
+            (0x731f, 9, None),
+            (0x73bf, 9, None),
         ] {
             assert_eq!(
                 super::generation(device).map(|(_, generation)| generation),
                 Some(generation),
                 "{device:04x}"
             );
-            assert_eq!(admits(&adapter(device, [3, 0, 0])), Ok(()), "{device:04x}");
+            assert_eq!(
+                admits(&adapter(device, [3, 0, 0])).err(),
+                refusal,
+                "{device:04x}"
+            );
         }
         // Every device of the table is admitted exactly where the rule
-        // says its family serves. The build fails unless the profile holds
-        // amdgpu's support for exactly the generations that serve.
+        // says Stela drives its family. The build fails unless the profile
+        // holds amdgpu's support for exactly the generations that serve.
         for &(device, family, generation, ..) in DEVICES {
-            let serves = amd_metal::serves(family, generation);
             assert_eq!(
                 admits(&adapter(device, [3, 0, 0])).is_ok(),
-                serves,
+                amd_metal::driven(family, generation),
                 "{device:04x} {family}"
             );
         }

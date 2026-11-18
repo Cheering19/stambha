@@ -8,6 +8,10 @@
 //! the boot reports it once as it reports any GPU it has no driver for, and
 //! its firmware is neither pinned nor bundled.
 //!
+//! A device that meets them is still left out where it can be in no Apple
+//! GPU family ([`FIRST_APPLE_GENERATION`]): macOS's window server draws its
+//! framebuffers through Metal only on such a device.
+//!
 //! The generation is the major version of amdgpu's graphics block
 //! (`gfx_v6_0.c` to `gfx_v12_0.c`), which Mesa calls `GFX6` to `GFX12`.
 //! `cargo xtask gpu radv-test` opens RADV on every chip it drives and fails
@@ -57,6 +61,43 @@ pub fn serves(family: &str, generation: u8) -> bool {
     generation >= FIRST_GENERATION && !NO_VULKAN_FAMILIES.contains(&family)
 }
 
+/// The first generation whose Metal device is in an Apple GPU family.
+/// Apple3, which every later Apple family contains, reads the framebuffer in
+/// a fragment function in draw order, which takes raster order groups:
+/// RADV's fragment shader interlock, which runs on the hardware's
+/// primitive-ordered pixel shading from GFX9 on (`radv_has_pops`). Before
+/// it the device is in Mac2 alone, and Core Animation maps the window
+/// server's two-plane framebuffers to a Metal format only on an Apple3
+/// device (stela-driver-gpu's `metal::capabilities`).
+pub const FIRST_APPLE_GENERATION: u8 = 9;
+
+/// Whether Stela drives a GPU of amdgpu's family `family`, of graphics
+/// generation `generation`: its Metal device can open ([`serves`]) and is
+/// in an Apple GPU family.
+pub fn driven(family: &str, generation: u8) -> bool {
+    serves(family, generation) && generation >= FIRST_APPLE_GENERATION
+}
+
+/// Why Stela does not drive such a GPU, as the boot reports it, or `None`
+/// where it does ([`driven`]).
+pub fn refusal(family: &str, generation: u8) -> Option<&'static str> {
+    if !serves(family, generation) {
+        Some(LEFT_OUT)
+    } else if generation < FIRST_APPLE_GENERATION {
+        Some(NO_APPLE_FAMILY)
+    } else {
+        None
+    }
+}
+
+/// Why the port leaves out a GPU of a generation before
+/// [`FIRST_APPLE_GENERATION`], as the boot reports it.
+pub const NO_APPLE_FAMILY: &str = "on this GPU's graphics generation (GFX8) Stela's Metal device \
+                                   is in no Apple GPU family: RADV has no raster order groups \
+                                   before GFX9, which the framebuffer reads of Apple3 need, and \
+                                   macOS draws its window server's framebuffers only on an Apple3 \
+                                   device";
+
 /// Why the port leaves out a GPU [`serves`] refuses, as the boot reports
 /// it.
 pub const LEFT_OUT: &str = "RADV, its Vulkan driver, cannot give Stela's Metal device what it \
@@ -88,6 +129,22 @@ mod tests {
         // The report names each late requirement.
         for (name, _) in LATE_REQUIREMENTS {
             assert!(LEFT_OUT.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_generation_is_driven_once_its_device_is_in_an_apple_family() {
+        assert_eq!(FIRST_APPLE_GENERATION, 9);
+        // Polaris and Carrizo open the Metal device in Mac2 alone.
+        assert!(serves("POLARIS10", 8) && !driven("POLARIS10", 8));
+        assert_eq!(refusal("CARRIZO", 8), Some(NO_APPLE_FAMILY));
+        assert!(NO_APPLE_FAMILY.contains("GFX8"));
+        // A generation that cannot open it reports that first.
+        assert_eq!(refusal("TAHITI", 6), Some(LEFT_OUT));
+        assert_eq!(refusal("ARCTURUS", 9), Some(LEFT_OUT));
+        for generation in 9..=12 {
+            assert!(driven("NAVI10", generation));
+            assert_eq!(refusal("NAVI10", generation), None);
         }
     }
 }
