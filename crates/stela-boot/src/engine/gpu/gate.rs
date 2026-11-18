@@ -489,8 +489,9 @@ fn driver_message(text: &str) {
 /// Logs what a guest call made or met, such as a render pipeline, once for
 /// each distinct note, with the heap's live bytes, its size and its
 /// high-water mark after it: a compile that raised the mark shows it against
-/// the note before, and an integrated GPU's memory note against the heap
-/// that memory comes from.
+/// the note before. An integrated GPU's memory note names its share of RAM
+/// itself; the heap's figures weigh it only where it has no share and its
+/// memory is the heap's.
 fn note(text: &str) {
     static SEEN: Seen<512> = Seen::new();
     if let Some(unheld) = SEEN.first_time(text) {

@@ -6067,14 +6067,38 @@ fn held_work_of_another_connection_keeps_no_memory() {
     device.poll().unwrap();
 }
 
-/// An integrated GPU's note says its memory is system memory from Stela's
-/// heap, which a log of a heap that ran out is read against.
+/// An integrated GPU's note says its memory is the GPU's share of RAM and
+/// ends with what Linux holds of it; with no share, that it is system
+/// memory from Stela's heap, which a log of a heap that ran out is read
+/// against.
 #[test]
-fn an_integrated_gpus_memory_note_says_it_shares_the_heap() {
-    let mut backend = MockBackend::new();
-    backend.physical.as_mut().unwrap().identity.device_type =
-        crate::metal::vulkan::PhysicalDeviceType::IntegratedGpu;
-    let mut device = device_on(backend);
+fn an_integrated_gpus_memory_note_names_where_its_memory_comes_from() {
+    use super::share::ShareState;
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: 480 << 20,
+            limit: 2560 << 20,
+        })
+    }
+    let integrated = || {
+        let mut backend = MockBackend::new();
+        backend.physical.as_mut().unwrap().identity.device_type =
+            crate::metal::vulkan::PhysicalDeviceType::IntegratedGpu;
+        device_on(backend)
+    };
+    let mut device = integrated();
+    device.share_memory(state);
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    assert!(
+        first.starts_with("SHARED MEMORY (the GPU's share of RAM) holds 0M of the "),
+        "{first}"
+    );
+    assert!(
+        first.ends_with("; the GPU's share of RAM: Linux holds 480M of 2560M"),
+        "{first}"
+    );
+    let mut device = integrated();
     device.note_memory_step();
     let first = device.take_memory_note().unwrap();
     assert!(
