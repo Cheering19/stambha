@@ -88,6 +88,24 @@ pub struct Kernel {
     /// that processor, so a stop there leaves its firmware running, as
     /// every such stop did; a stop on another processor unloads it.
     pub unloads_on_boot_cpu: bool,
+    /// Whether the heap's own need beside this driver and its Vulkan driver
+    /// was measured (`host_memory::HEAP_OWN`, beside amdgpu and RADV), so
+    /// that where no share is planned Linux's pages may be held to what the
+    /// heap holds past it ([`pages_bounded`]). nouveau's pages beside NVK
+    /// were not: its GSP-RM image and buffers, NVK's GART buffers (most of
+    /// a GPU's mapped memory where its BAR 1 is not resized) and its
+    /// evictions from VRAM keep the whole heap as Linux's RAM and TTM's own
+    /// limit, half of it, as every boot gave them.
+    pub pages_bounded: bool,
+}
+
+/// Whether the memory plan holds Linux's pages to what the heap holds past
+/// its own need where no share is planned (`host_memory::GpuPlan::bounded`):
+/// some GPU starts, and every one that does has a driver that need was
+/// measured beside ([`Kernel::pages_bounded`]).
+pub fn pages_bounded<'a>(kernels: impl IntoIterator<Item = &'a Kernel>) -> bool {
+    let mut kernels = kernels.into_iter().peekable();
+    kernels.peek().is_some() && kernels.all(|kernel| kernel.pages_bounded)
 }
 
 /// The driver among `kernels`, those of the bound GPUs, whose unload a
@@ -256,6 +274,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         version: versions::NOUVEAU,
         reads_rom: false,
         unloads_on_boot_cpu: false,
+        pages_bounded: false,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
@@ -304,6 +323,7 @@ pub static AMD: GpuStack = GpuStack {
         version: versions::AMDGPU,
         reads_rom: true,
         unloads_on_boot_cpu: true,
+        pages_bounded: true,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
@@ -357,6 +377,7 @@ pub static INTEL: GpuStack = GpuStack {
         version: versions::XE,
         reads_rom: true,
         unloads_on_boot_cpu: false,
+        pages_bounded: false,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
@@ -967,6 +988,24 @@ mod tests {
         }
         #[cfg(feature = "xe-port")]
         assert_eq!(kept_from_boot_cpu_unload([&INTEL.kernel]), Some("xe"));
+    }
+
+    /// Linux's pages are held to the heap's spare only where every GPU that
+    /// starts has a driver the heap's own need was measured beside: an
+    /// NVIDIA GPU, alone or beside an AMD one, keeps what every boot gave
+    /// it, and with no GPU there is nothing to bound.
+    #[test]
+    fn pages_are_bounded_only_beside_drivers_the_heap_was_measured_with() {
+        assert!(!pages_bounded(core::iter::empty()));
+        assert!(!pages_bounded([&NVIDIA.kernel]));
+        #[cfg(feature = "amdgpu-port")]
+        {
+            assert!(pages_bounded([&AMD.kernel]));
+            assert!(pages_bounded([&AMD.kernel, &AMD.kernel]));
+            assert!(!pages_bounded([&NVIDIA.kernel, &AMD.kernel]));
+        }
+        #[cfg(feature = "xe-port")]
+        assert!(!pages_bounded([&INTEL.kernel]));
     }
 
     /// Every stack names its driver's DRM version without a client: the

@@ -1,5 +1,5 @@
 use super::*;
-use alloc::string::ToString;
+use alloc::{format, string::ToString};
 
 /// Free RAM a PC of `installed` GiB shows Stela: firmware keeps about 3 %.
 fn free(installed: u64) -> u64 {
@@ -742,8 +742,13 @@ fn the_plans_line_states_its_rule() {
         gpu: DISPLAY_SHARE,
         ..sizes(10842 * MIB, 8, 8, GpuMemory::Own).unwrap()
     };
+    let bounded = |memory| GpuPlan {
+        memory,
+        aperture: 0,
+        bounded: true,
+    };
     assert_eq!(
-        GpuMemory::Display.describe(&display),
+        bounded(GpuMemory::Display).describe(&display),
         "a discrete GPU draws and the integrated GPU shows the display: the heap takes 256M \
          more for the integrated GPU's driver and scanout; Linux's pages, the discrete GPU's \
          system-memory buffers among them, are at most 892M, what the 3316M heap holds past \
@@ -755,7 +760,7 @@ fn the_plans_line_states_its_rule() {
         ..display
     };
     assert!(
-        GpuMemory::Shared
+        bounded(GpuMemory::Shared)
             .describe(&shared)
             .contains("share of 2560M")
     );
@@ -766,7 +771,7 @@ fn the_plans_line_states_its_rule() {
         ..display
     };
     assert_eq!(
-        GpuMemory::Own.describe(&own),
+        bounded(GpuMemory::Own).describe(&own),
         "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory buffers and \
          its evictions from VRAM among them, come from the heap, at most 876M of them, what \
          the 3300M heap holds past its own 2424M (at least 384M); TTM's limit is the same, \
@@ -775,10 +780,58 @@ fn the_plans_line_states_its_rule() {
     );
 }
 
+/// Linux's pages are held to the bound only where every GPU that starts has
+/// a driver the heap's own need was measured beside: an NVIDIA PC keeps the
+/// whole heap as Linux's RAM and TTM's own limit, as before the bound, and
+/// says so; an integrated GPU's share holds Linux whatever the drivers.
+#[test]
+fn a_bound_holds_linux_only_where_its_heap_need_was_measured() {
+    for installed in [8, 16, 32] {
+        for memory in [GpuMemory::Own, GpuMemory::Display, GpuMemory::Shared] {
+            let sizes = sizes(free(installed), 8, 8, memory).unwrap();
+            for bounded in [false, true] {
+                let plan = GpuPlan {
+                    memory,
+                    aperture: 0,
+                    bounded,
+                };
+                let held = held_bound(&sizes, plan);
+                match (memory, bounded) {
+                    (GpuMemory::Shared, _) => assert_eq!(held, Some(sizes.gpu)),
+                    (_, true) => assert_eq!(held, Some(page_bound(&sizes, memory))),
+                    (_, false) => assert_eq!(held, None, "{installed} {memory:?}"),
+                }
+            }
+        }
+    }
+    // The plan's line says the pages have no bound of their own, and an
+    // integrated GPU that draws in a discrete one's place is budgeted by it.
+    let own = sizes(free(16), 8, 8, GpuMemory::Own).unwrap();
+    let unbounded = GpuPlan::from(GpuMemory::Own);
+    assert!(!unbounded.bounded);
+    assert_eq!(
+        unbounded.describe(&own),
+        "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory buffers and \
+         its evictions from VRAM among them, come from the heap with no bound of their own: \
+         Linux takes the heap as its RAM and TTM its own limit, half of it, as the heap's own \
+         need was not measured beside every driver that starts"
+    );
+    let display = sizes(free(16), 8, 8, GpuMemory::Display).unwrap();
+    assert!(
+        GpuPlan::from(GpuMemory::Display)
+            .describe(&display)
+            .ends_with(&format!(
+                "its Metal device budgets its allocations to {}M, what the {}M heap holds past \
+                 its own 2424M (at least 384M)",
+                page_bound(&display, GpuMemory::Display) >> 20,
+                (display.heap + display.gpu) >> 20
+            ))
+    );
+}
+
 /// Where no share is planned, Linux's pages are held to the heap's spare
-/// past its own needs, at least [`PAGES_LEAST`], which is far above what
-/// nouveau and NVK hold: the bound only makes explicit what the heap could
-/// give them.
+/// past its own needs, at least [`PAGES_LEAST`], where the plan holds them
+/// to it ([`held_bound`]).
 #[test]
 fn a_discrete_gpus_pages_are_held_to_the_heaps_spare() {
     // The NVIDIA floor heap, at its window: the least.
@@ -793,8 +846,6 @@ fn a_discrete_gpus_pages_are_held_to_the_heaps_spare() {
         ..floor
     };
     assert_eq!(page_bound(&small, GpuMemory::Own), PAGES_LEAST);
-    // NVK's host heap held 16 MiB, nouveau's GSP image is about 61 MiB.
-    const { assert!(PAGES_LEAST >= 4 * (16 + 61) * MIB) };
     // Every host's plan: the bound leaves the heap at least its floor less
     // the least, and an integrated GPU's share is its own bound.
     for installed in [8, 12, 16, 32, 64, 128] {
@@ -829,6 +880,7 @@ fn an_apertures_page_tables_grow_the_heap() {
             let plan = GpuPlan {
                 memory,
                 aperture: aperture_tables(16 * GIB),
+                bounded: true,
             };
             let grown = sizes(free(installed) + plan.aperture, 8, 8, plan).unwrap();
             assert_eq!(

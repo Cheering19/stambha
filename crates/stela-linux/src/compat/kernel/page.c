@@ -88,6 +88,8 @@ static struct {
 	 * the whole ordinary inventory), which it reports as its RAM. */
 	size_t ordinary_live;
 	size_t page_limit;
+	/* The first request the limit refused was said (`say_limit`). */
+	bool limit_said;
 	/* One bit per section of descriptors, set once its descriptors and
 	 * page states are initialized. Registration initializes none of an
 	 * ordinary extent's: a section is made ready when the provider first
@@ -272,11 +274,25 @@ int stela_linux_page_catalog_limit(u64 generation, size_t pages)
 	if (catalog.ordinary_live > pages)
 		return -EBUSY;
 	catalog.page_limit = pages;
+	catalog.limit_said = false;
 	/* The RAM Linux's sizing reads (si_meminfo, the zone's managed pages)
 	 * is what it may hold, so TTM's and the drivers' limits derive from it. */
 	atomic_long_set(&contig_page_data.node_zones[ZONE_NORMAL].managed_pages, (long)pages);
 	atomic_long_set(&_totalram_pages, (long)pages);
 	return 0;
+}
+
+/* The first request of `count` pages the limit refuses is said once, with
+ * the numbers: Linux's pages reached the bound the memory plan set, and the
+ * allocation fails as a full GPU memory's does. */
+static void say_limit(size_t count)
+{
+	if (catalog.limit_said)
+		return;
+	catalog.limit_said = true;
+	pr_warn("stela: Linux's pages reached the bound the memory plan set: %zu pages (%zuM) held of %zu (%zuM); a request of %zu pages failed, and later ones past it fail too, as the GPU's memory being full\n",
+		catalog.ordinary_live, catalog.ordinary_live >> (20 - PAGE_SHIFT), catalog.page_limit,
+		catalog.page_limit >> (20 - PAGE_SHIFT), count);
 }
 
 /* The ordinary pages Linux holds and its limit, 0 for none, read from any
@@ -1461,6 +1477,8 @@ exhausted:
 		retried = true;
 		goto retry;
 	}
+	if (!within_limit((size_t)1 << order))
+		say_limit((size_t)1 << order);
 	return NULL;
 }
 
@@ -2245,7 +2263,10 @@ static void page_limit(void)
 	unsigned long available = 0;
 	assert(!stela_linux_available_page_frames(&available) && available == 2);
 	unsigned int allocations = fixture.allocations;
+	assert(!catalog.limit_said);
 	assert(!alloc_pages(GFP_KERNEL, 2) && fixture.allocations == allocations);
+	/* The first refusal at the limit is said, once. */
+	assert(catalog.limit_said);
 	struct page *pair = alloc_pages(GFP_KERNEL, 1);
 	assert(pair && fixture.allocations == allocations + 1);
 	assert(!alloc_page(GFP_KERNEL) && fixture.allocations == allocations + 1);
@@ -2259,6 +2280,7 @@ static void page_limit(void)
 	stela_linux_pages_finish();
 	assert(!catalog.ordinary_live);
 	catalog.page_limit = 0;
+	catalog.limit_said = false;
 	atomic_long_set(&zone->managed_pages, TEST_PAGES);
 	atomic_long_set(&_totalram_pages, TEST_PAGES);
 }

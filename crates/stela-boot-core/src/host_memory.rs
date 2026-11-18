@@ -160,19 +160,17 @@ pub const DISPLAY_SHARE: u64 = 256 * MIB;
 
 /// What the heap's own allocations held at most beside an integrated GPU's
 /// pages: a 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of the driver's
-/// heaps in it. Where no share is planned, Linux's pages (a discrete GPU's
-/// system-memory buffers, its evictions from VRAM, an integrated GPU that
-/// draws because the discrete one did not start) are held to what the heap
-/// holds past this ([`page_bound`]).
+/// heaps in it, beside amdgpu and RADV. Where no share is planned and every
+/// GPU that starts has a driver this was measured beside
+/// ([`GpuPlan::bounded`]), Linux's pages (a discrete GPU's system-memory
+/// buffers, its evictions from VRAM, an integrated GPU that draws because
+/// the discrete one did not start) are held to what the heap holds past
+/// this ([`page_bound`]).
 pub const HEAP_OWN: u64 = 2424 * MIB;
 
 /// The least of the heap Linux's pages may hold where no share is planned,
 /// for heaps whose spare past [`HEAP_OWN`] is less (a floor heap at a small
-/// code window). nouveau and NVK hold far less: sessions on the 12 GiB VM
-/// (heap about 3300 MiB) held 16 MiB of NVK's host heap, and nouveau's GSP
-/// firmware image is about 61 MiB, the largest of its system-memory
-/// buffers; the whole heap of those sessions peaked under 2400 MiB, Linux's
-/// pages within it.
+/// code window).
 pub const PAGES_LEAST: u64 = 384 * MIB;
 
 /// The page tables a driver's mapping of a whole device-memory aperture of
@@ -186,13 +184,22 @@ pub fn aperture_tables(bytes: u64) -> u64 {
 }
 
 /// What the memory plan knows of the GPUs before the parts are sized: how
-/// they use the host's RAM, and the page tables of the device-memory
-/// apertures their drivers map whole ([`aperture_tables`]), which the heap
-/// grows by.
+/// they use the host's RAM, the page tables of the device-memory apertures
+/// their drivers map whole ([`aperture_tables`]), which the heap grows by,
+/// and whether Linux's pages are held to [`page_bound`] where no share is
+/// planned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuPlan {
     pub memory: GpuMemory,
     pub aperture: u64,
+    /// Every GPU that starts has a driver whose heap need beside it was
+    /// measured ([`HEAP_OWN`]), so Linux's pages are held to [`page_bound`]
+    /// where no share is planned ([`held_bound`]). Otherwise, as beside
+    /// nouveau and NVK, Linux takes the whole heap as its RAM and TTM keeps
+    /// its own limit, half of that, as every boot gave them before the
+    /// bound: a bound measured beside another driver could fail a session
+    /// that ran.
+    pub bounded: bool,
 }
 
 impl From<GpuMemory> for GpuPlan {
@@ -200,16 +207,19 @@ impl From<GpuMemory> for GpuPlan {
         Self {
             memory,
             aperture: 0,
+            bounded: false,
         }
     }
 }
 
-/// The most bytes of pages Linux holds at once under `sizes`, planned for
-/// `memory`: an integrated GPU's share where it draws ([`GpuMemory::Shared`]);
-/// otherwise what the heap region (its display reserve with it) holds past
-/// [`HEAP_OWN`], at least [`PAGES_LEAST`], so that a discrete GPU's
-/// system-memory pages fail their allocation before the heap runs out.
-/// The page catalog refuses more, and TTM's limit is the same.
+/// The most bytes of pages Linux may hold at once under `sizes`, planned
+/// for `memory`: an integrated GPU's share where it draws
+/// ([`GpuMemory::Shared`]); otherwise what the heap region (its display
+/// reserve with it) holds past [`HEAP_OWN`], at least [`PAGES_LEAST`], so
+/// that a discrete GPU's system-memory pages fail their allocation before
+/// the heap runs out. Where [`held_bound`] holds Linux to it, the page
+/// catalog refuses more and TTM's limit is the same; an integrated GPU that
+/// draws without a share budgets its Metal device by it either way.
 pub fn page_bound(sizes: &Sizes, memory: GpuMemory) -> u64 {
     match memory {
         GpuMemory::Shared => sizes.gpu,
@@ -224,13 +234,24 @@ pub fn page_bound(sizes: &Sizes, memory: GpuMemory) -> u64 {
     }
 }
 
+/// The bound the page catalog and TTM hold Linux's pages to under `sizes`
+/// for `plan`: the share where an integrated GPU draws, [`page_bound`] where
+/// no share is planned and the plan is [`GpuPlan::bounded`], else none.
+pub fn held_bound(sizes: &Sizes, plan: GpuPlan) -> Option<u64> {
+    match plan.memory {
+        GpuMemory::Shared => Some(sizes.gpu),
+        GpuMemory::Own | GpuMemory::Display => plan.bounded.then(|| page_bound(sizes, plan.memory)),
+    }
+}
+
 /// How the GPUs that start use the host's RAM, as the PCI census and the
 /// GPU stacks know it before the parts are sized (the selection's rule,
 /// `stela_driver_gpu::selection::memory`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuMemory {
     /// No integrated GPU starts: a discrete GPU's system-memory pages come
-    /// from the heap, bounded by [`page_bound`].
+    /// from the heap, bounded by [`page_bound`] where the plan is
+    /// [`GpuPlan::bounded`].
     Own,
     /// An integrated GPU draws, sharing the host's RAM: the plan gives it a
     /// share of its own beside the heap ([`Sizes::gpu`]), which bounds all
@@ -238,7 +259,8 @@ pub enum GpuMemory {
     Shared,
     /// An integrated GPU only shows the display beside a discrete GPU that
     /// draws: the heap grows by [`DISPLAY_SHARE`] ([`Sizes::gpu`]), and
-    /// Linux's pages are bounded by [`page_bound`], not by that reserve.
+    /// Linux's pages are bounded by [`page_bound`] where the plan is
+    /// [`GpuPlan::bounded`], never by that reserve.
     Display,
 }
 
@@ -248,40 +270,56 @@ impl GpuMemory {
     pub fn limits_pages(self) -> bool {
         self == Self::Shared
     }
+}
 
+impl GpuPlan {
     /// The rule for the plan's line, for `sizes`.
-    pub fn describe(self, sizes: &Sizes) -> alloc::string::String {
+    pub fn describe(&self, sizes: &Sizes) -> alloc::string::String {
         let mib = |bytes: u64| bytes >> 20;
-        let bound = page_bound(sizes, self);
-        let rule = match self {
-            Self::Own => alloc::format!(
+        let bound = page_bound(sizes, self.memory);
+        let past = alloc::format!(
+            "what the {}M heap holds past its own {}M (at least {}M)",
+            mib(sizes.heap + sizes.gpu),
+            mib(HEAP_OWN),
+            mib(PAGES_LEAST)
+        );
+        const UNBOUNDED: &str = "Linux takes the heap as its RAM and TTM its own limit, half of \
+            it, as the heap's own need was not measured beside every driver that starts";
+        let rule = match (self.memory, self.bounded) {
+            (GpuMemory::Own, true) => alloc::format!(
                 "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory \
                  buffers and its evictions from VRAM among them, come from the heap, at most \
-                 {}M of them, what the {}M heap holds past its own {}M (at least {}M); TTM's \
-                 limit is the same, and an allocation past it fails as the GPU's memory being \
-                 full",
+                 {}M of them, {past}; TTM's limit is the same, and an allocation past it fails \
+                 as the GPU's memory being full",
                 mib(bound),
-                mib(sizes.heap + sizes.gpu),
-                mib(HEAP_OWN),
-                mib(PAGES_LEAST)
             ),
-            Self::Shared => alloc::format!(
+            (GpuMemory::Own, false) => alloc::format!(
+                "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory \
+                 buffers and its evictions from VRAM among them, come from the heap with no \
+                 bound of their own: {UNBOUNDED}"
+            ),
+            (GpuMemory::Shared, _) => alloc::format!(
                 "the integrated GPU draws: its share of {}M bounds all of Linux's pages, and \
                  TTM's limit is twice it, so amdgpu's or xe's GTT is the share",
                 mib(sizes.gpu)
             ),
-            Self::Display => alloc::format!(
+            (GpuMemory::Display, true) => alloc::format!(
                 "a discrete GPU draws and the integrated GPU shows the display: the heap takes \
                  {}M more for the integrated GPU's driver and scanout; Linux's pages, the \
-                 discrete GPU's system-memory buffers among them, are at most {}M, what the \
-                 {}M heap holds past its own {}M (at least {}M), TTM's limit the same; should \
-                 the discrete GPU not start and the integrated one draw, its Metal device \
-                 works in those {}M",
+                 discrete GPU's system-memory buffers among them, are at most {}M, {past}, \
+                 TTM's limit the same; should the discrete GPU not start and the integrated \
+                 one draw, its Metal device works in those {}M",
                 mib(sizes.gpu),
                 mib(bound),
-                mib(sizes.heap + sizes.gpu),
-                mib(HEAP_OWN),
-                mib(PAGES_LEAST),
+                mib(bound)
+            ),
+            (GpuMemory::Display, false) => alloc::format!(
+                "a discrete GPU draws and the integrated GPU shows the display: the heap takes \
+                 {}M more for the integrated GPU's driver and scanout; Linux's pages, the \
+                 discrete GPU's system-memory buffers among them, have no bound of their own: \
+                 {UNBOUNDED}; should the discrete GPU not start and the integrated one draw, \
+                 its Metal device budgets its allocations to {}M, {past}",
+                mib(sizes.gpu),
                 mib(bound)
             ),
         };

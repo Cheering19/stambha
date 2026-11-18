@@ -370,8 +370,9 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
     }
     let screen = crate::console::Framebuffer::firmware_function();
     let mut found = Vec::new();
-    // The BAR each GPU's driver maps whole, where it does.
+    // The BAR each GPU's driver maps whole, where it does, and its kernel.
     let mut apertures = Vec::new();
+    let mut kernels = Vec::new();
     for identity in functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)
@@ -398,6 +399,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
                     firmware_screen,
                 });
                 apertures.push(None);
+                kernels.push(None);
                 continue;
             }
         };
@@ -423,13 +425,21 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
             firmware_screen,
         });
         apertures.push(stack.kernel.aperture.map(|bar| (adapter.address, bar)));
+        kernels.push(Some(&stack.kernel));
     }
-    let aperture: u64 = stela_drivers::gpu::selection::started(&found)
-        .into_iter()
-        .filter_map(|index| apertures[index])
+    let started = stela_drivers::gpu::selection::started(&found);
+    let aperture: u64 = started
+        .iter()
+        .filter_map(|&index| apertures[index])
         .map(|(address, bar)| aperture_tables(address, bar))
         .sum();
     GPU_APERTURE.store(aperture, core::sync::atomic::Ordering::Relaxed);
+    GPU_BOUNDED.store(
+        stela_drivers::gpu::stack::pages_bounded(
+            started.iter().filter_map(|&index| kernels[index]),
+        ),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let memory = match stela_drivers::gpu::selection::memory(&found) {
         Memory::Own => GpuMemory::Own,
         Memory::Shared => GpuMemory::Shared,
@@ -531,11 +541,16 @@ static GPU_MEMORY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 /// The page tables of the apertures the started GPUs' drivers map whole.
 static GPU_APERTURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Whether every GPU that starts has a driver whose heap need was measured
+/// (`GpuPlan::bounded`).
+static GPU_BOUNDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// [`plan_gpu_memory`]'s answer with the apertures' tables.
 pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {
     stela_boot_core::host_memory::GpuPlan {
         memory: gpu_memory(),
         aperture: GPU_APERTURE.load(core::sync::atomic::Ordering::Relaxed),
+        bounded: GPU_BOUNDED.load(core::sync::atomic::Ordering::Relaxed),
     }
 }
 

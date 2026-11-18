@@ -33,9 +33,12 @@ pub(super) struct EngineMemory {
     /// as for a display's pages beside a discrete GPU, which only grow the
     /// heap.
     pub gpu: u64,
-    /// The most bytes of pages Linux holds at once (`host_memory::page_bound`):
-    /// the share, or what the heap holds past its own needs.
+    /// The most bytes of pages Linux may hold at once
+    /// (`host_memory::page_bound`): the share, or what the heap holds past
+    /// its own needs.
     pub pages: u64,
+    /// The plan holds Linux to `pages` (`host_memory::held_bound`).
+    pub pages_held: bool,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -144,9 +147,10 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let gpu = plan.memory;
     let sizes = stela_boot_core::host_memory::sizes(free, cores, cores, plan)?;
     let pages = stela_boot_core::host_memory::page_bound(&sizes, gpu);
+    let held = stela_boot_core::host_memory::held_bound(&sizes, plan);
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M aperture={}M \
-         pages={}M\n",
+         pages={}\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
@@ -154,9 +158,12 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         sizes.guest >> 20,
         sizes.gpu >> 20,
         sizes.aperture >> 20,
-        pages >> 20,
+        match held {
+            Some(bytes) => format!("{}M", bytes >> 20),
+            None => String::from("unbounded"),
+        },
     ));
-    output::arguments(format_args!("HOST MEMORY gpu: {}\n", gpu.describe(&sizes)));
+    output::arguments(format_args!("HOST MEMORY gpu: {}\n", plan.describe(&sizes)));
     if gpu.limits_pages() && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
         output::arguments(format_args!(
             "HOST MEMORY the integrated GPU gets {}M of this PC's RAM, under the {}M a macOS \
@@ -240,6 +247,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         heap,
         gpu: if gpu.limits_pages() { sizes.gpu } else { 0 },
         pages,
+        pages_held: held.is_some(),
         native_resources,
         native_task_allocations,
         stack,

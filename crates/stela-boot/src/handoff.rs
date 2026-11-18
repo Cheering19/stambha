@@ -123,11 +123,14 @@ pub struct Handoff {
     /// (`host_memory::Sizes::gpu`), zero for a GPU with memory of its own:
     /// Linux holds at most this many bytes of pages at once.
     pub(crate) gpu_share: u64,
-    /// The most bytes of pages Linux holds at once
+    /// The most bytes of pages Linux may hold at once
     /// (`host_memory::page_bound`): `gpu_share` where it is set, else what
     /// the heap holds past its own needs. The page catalog's limit, and
-    /// TTM's where no share is set.
+    /// TTM's where no share is set, when `gpu_pages_held`; an integrated GPU
+    /// that draws without a share budgets its Metal device by it either way.
     pub(crate) gpu_pages: u64,
+    /// The plan holds Linux to `gpu_pages` (`host_memory::held_bound`).
+    pub(crate) gpu_pages_held: bool,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,
