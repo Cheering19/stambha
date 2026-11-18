@@ -2573,7 +2573,10 @@ pub(super) fn started(
     if let Some(gpu) = installed() {
         let bound = &gpu.start.bound;
         let chosen = gate::metal_choice(bound, None);
-        let drawer = chosen.serve.first().map(|&index| bound[index].market.as_str());
+        let drawer = chosen
+            .serve
+            .first()
+            .map(|&index| bound[index].market.as_str());
         let failed: Vec<String> = refused
             .iter()
             .filter(|gpu| gpu.draws)

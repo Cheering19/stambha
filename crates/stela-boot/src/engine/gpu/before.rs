@@ -470,7 +470,9 @@ fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_d
     let mib = |bytes: u64| bytes >> 20;
     let carve_out = match read(discovery::RCC_CONFIG_MEMSIZE) {
         u32::MAX => String::from("was not read (RCC_CONFIG_MEMSIZE reads all ones)"),
-        megabytes => format!("is {megabytes}M (RCC_CONFIG_MEMSIZE), which the share does not count"),
+        megabytes => {
+            format!("is {megabytes}M (RCC_CONFIG_MEMSIZE), which the share does not count")
+        }
     };
     let share = crate::native_memory::gpu_share();
     if share == 0 {

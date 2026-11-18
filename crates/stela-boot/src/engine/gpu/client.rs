@@ -1818,7 +1818,11 @@ pub(super) fn describe(index: u32, stack: &GpuStack) -> alloc::string::String {
             None => version,
         })
         .unwrap_or_default();
-    if let Some(facts) = stack.kernel.describe.and_then(|describe| describe(&mut control)) {
+    if let Some(facts) = stack
+        .kernel
+        .describe
+        .and_then(|describe| describe(&mut control))
+    {
         if !text.is_empty() {
             text.push(' ');
         }

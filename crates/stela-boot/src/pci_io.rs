@@ -840,20 +840,17 @@ pub(crate) fn amd_graphics_version(
                 registers,
                 refused: None,
             };
-            graphics_version(&mut bar, || {
-                format!("its BAR {registers} at {start:#x}")
-            })
+            graphics_version(&mut bar, || format!("its BAR {registers} at {start:#x}"))
         }
-        Err(undescribed) => {
-            by_address(&handles, address, &header, registers).and_then(|(start, mut bar)| {
+        Err(undescribed) => by_address(&handles, address, &header, registers)
+            .and_then(|(start, mut bar)| {
                 let result = graphics_version(&mut bar, || {
                     format!("its BAR {registers} read by address at {start:#x}")
                 });
                 bar.restore();
                 result
             })
-            .map_err(|why| format!("{undescribed}; by its address: {why}"))
-        }
+            .map_err(|why| format!("{undescribed}; by its address: {why}")),
     };
     if !decoding {
         restore_memory(io);
@@ -899,9 +896,8 @@ pub(crate) fn bar_bytes(
         // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
         // configuration dword into the writable local; a refused read leaves
         // all ones, which ends the capability walk.
-        let _ = unsafe {
-            (io.config_read)(&mut *io, 2, u32::from(offset), 1, (&raw mut value).cast())
-        };
+        let _ =
+            unsafe { (io.config_read)(&mut *io, 2, u32::from(offset), 1, (&raw mut value).cast()) };
         value
     };
     stela_boot_core::aperture::resizable_bar_bytes(read, bar)
@@ -934,7 +930,8 @@ fn enable_memory(io: &mut PciIo, header: &[u8; 64]) -> Result<bool, Status> {
     }
     // SAFETY: live boot protocol; Enable takes the attribute bits and no
     // result pointer.
-    let status = unsafe { (io.attributes)(io, ATTRIBUTE_ENABLE, ATTRIBUTE_MEMORY, ptr::null_mut()) };
+    let status =
+        unsafe { (io.attributes)(io, ATTRIBUTE_ENABLE, ATTRIBUTE_MEMORY, ptr::null_mut()) };
     if status.is_success() {
         Ok(false)
     } else {
@@ -1027,7 +1024,11 @@ impl AddressedBar {
 
 impl RegisterWindow for AddressedBar {
     fn read(&mut self, offset: usize) -> u32 {
-        match self.root.memory().read_one::<u32>(self.start + offset as u64) {
+        match self
+            .root
+            .memory()
+            .read_one::<u32>(self.start + offset as u64)
+        {
             Ok(value) => value,
             Err(error) => {
                 if self.refused.is_none() {
