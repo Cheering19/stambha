@@ -398,6 +398,11 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 	}
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
+	/* pci_device_add's DMA parameters, which drivers read and change
+	 * (amdgpu sets its largest segment). */
+	dev->dev.dma_parms = &dev->dma_parms;
+	dma_set_max_seg_size(&dev->dev, 65536);
+	dma_set_seg_boundary(&dev->dev, 0xffffffff);
 	dev->dev.release = release;
 	set_dma_ops(&dev->dev, &mapping_ops);
 	device_initialize(&dev->dev);
@@ -676,6 +681,13 @@ int main(void)
 	struct pci_dev other = {.bus = dev->bus, .devfn = PCI_DEVFN(2, 0)};
 
 	assert(pci_read_config_dword(&other, 0, &value) == PCIBIOS_DEVICE_NOT_FOUND);
+
+	/* The DMA parameters Linux's PCI core gives every function. */
+	assert(dev->dev.dma_parms == &dev->dma_parms);
+	assert(dma_get_max_seg_size(&dev->dev) == 65536);
+	assert(dma_get_seg_boundary(&dev->dev) == 0xffffffff);
+	dma_set_max_seg_size(&dev->dev, UINT_MAX);
+	assert(dma_get_max_seg_size(&dev->dev) == UINT_MAX);
 
 	/* A mask must cover what the owner hands out. */
 	assert(dma_set_mask(&dev->dev, DMA_BIT_MASK(39)) == -EIO);
