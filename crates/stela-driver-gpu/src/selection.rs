@@ -26,7 +26,10 @@
 //! - A GPU no stack drives is left with the firmware; its picture, if the
 //!   firmware's is on it, keeps showing macOS by copy.
 //! - When a GPU's claim is refused, the next one takes its place: a GPU left
-//!   out only beside it is started instead.
+//!   out only beside it is started instead. So does a GPU that started and
+//!   cannot draw after all, its driver's probe failed or its Metal device
+//!   did not open ([`fall_back`]): every GPU a stack drives gets its turn,
+//!   in this order, before the boot goes on without one.
 use crate::bus::pci::Address;
 use crate::stack::{drawing_kind, may_only_show_frames_of, only_shows_frames_of};
 use alloc::{format, string::String, vec::Vec};
@@ -138,6 +141,41 @@ pub fn select(found: &[Found], mut claim: impl FnMut(usize) -> bool) -> Selectio
         };
     }
     Selection { choices, claimed }
+}
+
+/// The selection again once the GPUs of `failed`, by census index, could
+/// not draw after all: their drivers did not bind them, or bound them and
+/// opened no Metal device. Each counts as a GPU whose claim was refused, so
+/// the rule picks again with them out: a GPU claimed before stays claimed,
+/// one whose claim was refused before is not asked again, and a GPU left with
+/// the firmware only beside a failed one is claimed now (`claim`, which
+/// answers whether it was), as [`select`] would have claimed it in the failed
+/// one's place. The GPUs newly claimed are [`newly_claimed`]'s.
+pub fn fall_back(
+    found: &[Found],
+    before: &Selection,
+    failed: &[usize],
+    mut claim: impl FnMut(usize) -> bool,
+) -> Selection {
+    select(found, |index| {
+        if failed.contains(&index) || before.choices.get(index) == Some(&Choice::Refused) {
+            false
+        } else if before.claimed.contains(&index) {
+            true
+        } else {
+            claim(index)
+        }
+    })
+}
+
+/// The GPUs `after` claimed that `before` had not, in the claim order.
+pub fn newly_claimed(before: &Selection, after: &Selection) -> Vec<usize> {
+    after
+        .claimed
+        .iter()
+        .copied()
+        .filter(|index| !before.claimed.contains(index))
+        .collect()
 }
 
 /// How the GPUs that start use this PC's RAM, for the memory plan, which
@@ -469,6 +507,81 @@ mod tests {
             index == 1
         });
         assert_eq!(chosen.choices, [Choice::Refused, Choice::First]);
+    }
+
+    /// A GPU that was started and could not draw (its driver did not bind
+    /// it, or opened no Metal device on it) gives way as a refused one does:
+    /// the GPU left with the firmware beside it is claimed, and each GPU
+    /// gets its chance in the rule's order until none is left.
+    #[test]
+    fn a_gpu_that_fails_after_its_claim_gives_way_to_the_next() {
+        // A desktop's monitor on its card: the integrated GPU was left.
+        let found = [gpu(INTEGRATED, false), gpu(DISCRETE, true)];
+        let first = all(&found);
+        assert_eq!(first.choices, [Choice::Left { beside: 1 }, Choice::First]);
+        let mut asked = Vec::new();
+        let after = fall_back(&found, &first, &[1], |index| {
+            asked.push(index);
+            true
+        });
+        assert_eq!(asked, [0]);
+        assert_eq!(after.choices, [Choice::First, Choice::Refused]);
+        assert_eq!(newly_claimed(&first, &after), [0]);
+        // Its claim refused in turn: nothing is left to start.
+        let refused = fall_back(&found, &first, &[1], |_| false);
+        assert!(newly_claimed(&first, &refused).is_empty());
+        assert_eq!(refused.choices, [Choice::Refused, Choice::Refused]);
+        // Once it failed too, nothing is asked again.
+        let none = fall_back(&found, &after, &[0, 1], |_| panic!("asked again"));
+        assert!(none.claimed.is_empty());
+
+        // The monitor on the motherboard, or a laptop's panel on its
+        // integrated GPU: that one was started already and draws now,
+        // without a claim of its own.
+        let found = [gpu(INTEGRATED, true), gpu(DISCRETE, false)];
+        let first = all(&found);
+        let after = fall_back(&found, &first, &[1], |_| panic!("claimed again"));
+        assert_eq!(after.choices, [Choice::First, Choice::Refused]);
+        assert!(newly_claimed(&first, &after).is_empty());
+
+        // Two cards: the second keeps drawing; an integrated GPU left beside
+        // both stays left while one of them draws.
+        let found = [
+            gpu(INTEGRATED, false),
+            gpu(DISCRETE, true),
+            gpu(DISCRETE, false),
+        ];
+        let first = all(&found);
+        assert_eq!(first.claimed, [1, 2]);
+        let after = fall_back(&found, &first, &[1], |_| panic!("claimed"));
+        assert_eq!(
+            after.choices,
+            [Choice::Left { beside: 2 }, Choice::Refused, Choice::First]
+        );
+        // Both cards failed: the integrated GPU is the last chance.
+        let last = fall_back(&found, &after, &[1, 2], |_| true);
+        assert_eq!(newly_claimed(&after, &last), [0]);
+
+        // A card whose claim was refused at the start is not asked again,
+        // and an adapter no stack drives never starts.
+        let found = [
+            unsupported(true),
+            gpu(INTEGRATED, false),
+            gpu(DISCRETE, false),
+            gpu(DISCRETE, true),
+        ];
+        let first = select(&found, |index| index != 2);
+        assert_eq!(
+            first.choices[1..],
+            [Choice::Left { beside: 3 }, Choice::Refused, Choice::First]
+        );
+        let after = fall_back(&found, &first, &[3], |index| {
+            assert_eq!(index, 1);
+            true
+        });
+        assert_eq!(newly_claimed(&first, &after), [1]);
+        assert!(matches!(after.choices[0], Choice::Unused(_)));
+        assert_eq!(after.choices[2..], [Choice::Refused, Choice::Refused]);
     }
 
     #[test]
