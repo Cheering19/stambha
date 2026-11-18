@@ -9,9 +9,9 @@ use stela_c_build::linux_capture::{self as initcalls, Captured, Projection, Unit
 
 /// Ordinals of the image's units after the common cohort: DRM's own level
 /// (its core, helpers and buses) holds 5 to 31, and each driver one from 32
-/// on: nouveau 32, i915 33, xe 36 and its display parameters 37, amdgpu
-/// 38, with the ordinals between a driver's and the next's left for its
-/// parameter units. Linux offers a device to the drivers in this order, so
+/// on: nouveau 32, i915 33 and its parameters 34 and 35, xe 36 and its
+/// display parameters 37, amdgpu 38, with the ordinals between a driver's
+/// and the next's for its parameter units. Linux offers a device to the drivers in this order, so
 /// i915 comes before xe.
 pub const FIRST_DRIVER_ORDINAL: u32 = 32;
 

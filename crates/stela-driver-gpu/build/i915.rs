@@ -96,8 +96,8 @@ const OPEN: super::image::Open = &[
 /// The unit of i915's own `module_init`. It registers before xe's (36), so
 /// Linux offers i915 a device both tables hold first, as upstream binds
 /// Tiger Lake to Meteor Lake, DG1 and DG2 to i915 by default, and xe gets
-/// the device when i915's probe fails. Ordinals 34 and 35 are left for
-/// i915's parameter units.
+/// the device when i915's probe fails. Ordinals 34 and 35 are i915's
+/// parameter units ([`PARAMETERS`], [`DISPLAY_PARAMETERS`]).
 const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
@@ -113,6 +113,38 @@ const INITCALLS: UnitSpec = UnitSpec {
 fn initcalls_unit() -> Unit {
     INITCALLS.into()
 }
+
+/// The unit of i915's own parameters (`i915.huc_firmware_path` and
+/// `i915.gsc_firmware_path` among them), captured so the command line sets
+/// them, as in Linux, where they are the module `i915`'s.
+const PARAMETERS: UnitSpec = UnitSpec {
+    scope: stela_c_build::linux_capture::Scope {
+        slice: "gpu",
+        group: "i915",
+        group_ordinal: 33,
+        unit_ordinal: 2,
+        global_ordinal: 34,
+    },
+    source: "drivers/gpu/drm/i915/i915_params",
+    module: MODULE.name,
+    file: MODULE.file,
+};
+
+/// i915's build of the display parameters it shares with xe
+/// (`i915.vbt_firmware` among them), captured as xe's build of them is. Its
+/// globals take [`SHARED_PREFIX`] with the rest of i915's display objects.
+const DISPLAY_PARAMETERS: UnitSpec = UnitSpec {
+    scope: stela_c_build::linux_capture::Scope {
+        slice: "gpu",
+        group: "i915",
+        group_ordinal: 33,
+        unit_ordinal: 3,
+        global_ordinal: 35,
+    },
+    source: "drivers/gpu/drm/i915/display/intel_display_params",
+    module: MODULE.name,
+    file: MODULE.file,
+};
 
 /// Whether Stela's Kconfig header sets `symbol`.
 fn defined(autoconf: &str, symbol: &str) -> bool {
@@ -184,13 +216,26 @@ pub fn port(linux: &Linux, others: &[PathBuf]) -> super::image::Driver {
     );
     assert!(!kbuild.werror, "i915's Makefile selects -Werror");
     let registering = initcalls_unit().path();
+    let captured_units = [
+        registering.clone(),
+        Unit::from(PARAMETERS).path(),
+        Unit::from(DISPLAY_PARAMETERS).path(),
+    ];
     let sources = kbuild
         .objects(COMPOSITE)
         .unwrap_or_else(|error| panic!("{error}"))
         .iter()
         .map(|object| Path::new(I915).join(object).with_extension("c"))
-        .filter(|source| *source != registering)
+        .filter(|source| !captured_units.contains(source))
         .collect::<Vec<_>>();
+    assert_eq!(
+        sources.len() + captured_units.len(),
+        kbuild
+            .objects(COMPOSITE)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .len(),
+        "i915's composite no longer holds each captured unit"
+    );
     let mut includes = kbuild.includes.clone();
     includes.extend(
         kbuild
@@ -276,9 +321,31 @@ pub fn port(linux: &Linux, others: &[PathBuf]) -> super::image::Driver {
         INITCALLS,
         &placement,
     );
+    let more = [PARAMETERS, DISPLAY_PARAMETERS]
+        .into_iter()
+        .map(|spec| {
+            let placement = initcalls::Placement::new(
+                &Unit::from(spec).path(),
+                &stela_c_build::linux_build::out_dir(),
+                &[
+                    Path::new("../.."),
+                    compiler.parent().expect("compiler root"),
+                ],
+            )
+            .expect("i915 parameters placement");
+            let unit = initcalls::compile(
+                &build,
+                Path::new("../stela-linux/src/compat/stela/registration.h"),
+                spec,
+                &placement,
+            );
+            (spec, unit)
+        })
+        .collect::<Vec<_>>();
     build
         .objects(results.into_iter().flatten().flatten())
         .object(captured.object())
+        .objects(more.iter().map(|(_, unit)| unit.object()))
         .compile("stela-i915");
     let archive = stela_c_build::linux_build::out_dir().join("libstela-i915.a");
     share(
@@ -295,7 +362,7 @@ pub fn port(linux: &Linux, others: &[PathBuf]) -> super::image::Driver {
         name: MODULE.name,
         spec: INITCALLS,
         captured,
-        more: Vec::new(),
+        more,
         archive,
         open: OPEN,
     }

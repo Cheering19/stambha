@@ -155,12 +155,12 @@ impl Drivers {
         ];
         for driver in drivers.into_iter().flatten() {
             if table {
-                words.push(format!("{driver}.vbt_firmware={VBT}"));
+                words.push(gpu::command_line::video_bios_table(driver, VBT));
             }
             if controllers.is_some() {
-                words.push(format!("{driver}.huc_firmware_path="));
+                words.push(gpu::command_line::without_huc(driver));
                 if kept.is_none() {
-                    words.push(format!("{driver}.gsc_firmware_path="));
+                    words.push(gpu::command_line::without_gsc(driver));
                 }
             }
         }
