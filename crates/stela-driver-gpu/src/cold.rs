@@ -64,6 +64,16 @@ pub enum Reset {
     Driver,
 }
 
+impl Reset {
+    /// Whether the claim reset the GPU itself, by a function-local or a
+    /// secondary bus reset, which puts its BARs back to the sizes firmware
+    /// gave them and ends the picture it scanned out. A driver's own reset
+    /// ([`Self::Driver`]) comes only at its probe.
+    pub fn by_claim(self) -> bool {
+        matches!(self, Self::Function(_) | Self::SecondaryBus)
+    }
+}
+
 /// The original CPU framebuffer/register writers and their translation owners.
 ///
 /// # Safety

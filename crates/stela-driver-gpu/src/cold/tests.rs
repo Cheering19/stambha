@@ -539,6 +539,10 @@ fn a_driver_that_resets_its_gpu_comes_after_the_function_reset_and_before_the_bu
             .quiesce_and_bind()
             .unwrap_or_else(|error| panic!("{:?}", error.error));
         assert_eq!(ready.reset(), Some(expected));
+        // A function-local reset of the claim's own ends what the GPU
+        // scanned out; the driver's comes only at its probe.
+        assert_eq!(expected.by_claim(), flr);
+        assert!(Reset::SecondaryBus.by_claim());
         let events = state.borrow().events.clone();
         if flr {
             assert_eq!(events, ["views-seal", "flr", "root-drain", "bind"]);

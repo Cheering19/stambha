@@ -1643,10 +1643,13 @@ fn claim(
         .collect();
     let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
     // Only a reset of the boot's restores the BARs' firmware sizes.
-    let reset = matches!(
-        ready.reset(),
-        Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
-    );
+    let reset = ready.reset().is_some_and(gpu::cold::Reset::by_claim);
+    if reset {
+        // It ended the firmware's picture too, also on a GPU whose driver
+        // would have reset it at its probe: a function-local reset comes
+        // first wherever the GPU has one.
+        screen.end(None);
+    }
     match ready.reset() {
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
