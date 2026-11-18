@@ -31,6 +31,8 @@ pub enum AxError {
     Firmware(&'static str),
     Dma(&'static str),
     SecureBootUnsupported,
+    /// `rtw89_mac_reset_pwr_state_ax`: the MAC is already powered on (-EBUSY).
+    AlreadyPowered,
 }
 
 impl fmt::Display for AxError {
@@ -50,6 +52,7 @@ impl fmt::Display for AxError {
             Self::Firmware(what) => write!(f, "firmware: {what}"),
             Self::Dma(what) => write!(f, "dma: {what}"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
+            Self::AlreadyPowered => f.write_str("MAC has already powered on"),
         }
     }
 }

@@ -5,7 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{ptr::NonNull, sync::atomic::AtomicU32};
 use model::{Op, RegisterModel};
 
-mod model;
+pub(crate) mod model;
 
 #[test]
 fn field32_shifts_value_into_mask() {
