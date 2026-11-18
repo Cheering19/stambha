@@ -24,6 +24,9 @@ use stela_loader::host_firmware::requirements::Inventory;
 /// probe reads; and the HuC and GSC turned off. Nothing of the GPU's boots
 /// by itself after a reset: the driver loads all of it.
 pub(super) static INTEL: Before = Before {
+    // The Video BIOS Table's word needs the OpRegion, which only the claim
+    // reads; without it the drivers read the table from the OpRegion.
+    ahead: |adapter| Drivers::of(adapter).words(adapter.device, false),
     admits: |adapter, catalog| {
         on_usb(
             &files(adapter.device)?,
@@ -148,22 +151,7 @@ impl Drivers {
     ) -> alloc::string::String {
         let controllers = gpu::xe::firmware(device);
         let kept = stela_loader::host_firmware::recipes::intel_gsc(device);
-        let mut words = Vec::new();
-        let drivers = [
-            self.i915.is_some().then_some("i915"),
-            self.xe.then_some("xe"),
-        ];
-        for driver in drivers.into_iter().flatten() {
-            if table {
-                words.push(gpu::command_line::video_bios_table(driver, VBT));
-            }
-            if controllers.is_some() {
-                words.push(gpu::command_line::without_huc(driver));
-                if kept.is_none() {
-                    words.push(gpu::command_line::without_gsc(driver));
-                }
-            }
-        }
+        let words = self.words(device, table);
         // i915 loads a HuC on every platform of xe's table it is handed but
         // Tiger and Rocket Lake, DG2's (through its GSC) among them, which
         // xe's table names none for.
@@ -193,6 +181,30 @@ impl Drivers {
             ));
         }
         words.join(" ")
+    }
+
+    /// The words of [`Drivers::parameters`], without its lines; `table` is
+    /// whether the OpRegion holds a Video BIOS Table.
+    fn words(&self, device: u16, table: bool) -> Vec<alloc::string::String> {
+        let controllers = gpu::xe::firmware(device);
+        let kept = stela_loader::host_firmware::recipes::intel_gsc(device);
+        let mut words = Vec::new();
+        let drivers = [
+            self.i915.is_some().then_some("i915"),
+            self.xe.then_some("xe"),
+        ];
+        for driver in drivers.into_iter().flatten() {
+            if table {
+                words.push(gpu::command_line::video_bios_table(driver, VBT));
+            }
+            if controllers.is_some() {
+                words.push(gpu::command_line::without_huc(driver));
+                if kept.is_none() {
+                    words.push(gpu::command_line::without_gsc(driver));
+                }
+            }
+        }
+        words
     }
 }
 

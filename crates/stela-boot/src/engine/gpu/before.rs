@@ -91,6 +91,11 @@ pub(super) struct Before {
     /// done. The register BAR is the resource.
     pub(super) settle:
         fn(&dyn NativeServices, &owned::Resource, &Identified) -> Result<(), ServiceError>,
+    /// The words of Linux's command line the driver needs for the device,
+    /// as far as its PCI identity tells them, for a GPU that may be claimed
+    /// after Linux started, in place of one that could not draw: Linux reads
+    /// its command line once, at its start.
+    pub(super) ahead: fn(&gpu::Adapter) -> Vec<String>,
 }
 
 /// The part for `stack`'s kernel driver, if the boot has one.
@@ -109,6 +114,7 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
 /// nouveau: the chip is `PMC_BOOT_0`'s, its GSP-RM files are that chip's, and
 /// a Turing-to-Ada GPU's own firmware must have booted again after the reset.
 static NOUVEAU: Before = Before {
+    ahead: |_| Vec::new(),
     // Its files are the chip's, which only its registers name.
     admits: |_, _| Ok(()),
     identify: |observed, catalog| {
@@ -157,6 +163,7 @@ static NOUVEAU: Before = Before {
 /// here.
 #[cfg(feature = "amdgpu")]
 static AMDGPU: Before = Before {
+    ahead: |_| Vec::new(),
     admits: |adapter, catalog| {
         use stela_loader::host_firmware::recipes::AmdGpu;
         let files = amdgpu_files(adapter.device)?;

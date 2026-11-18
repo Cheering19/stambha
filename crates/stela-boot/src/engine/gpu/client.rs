@@ -161,7 +161,7 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     let minors = match unsafe { MINORS.load(Ordering::Acquire).as_ref() } {
         Some(minors) => minors,
         None => {
-            let found = Box::into_raw(Box::new(find_minors()?));
+            let found = Box::into_raw(Box::new(find_minors(&[])?));
             match MINORS.compare_exchange(
                 ptr::null_mut(),
                 found,
@@ -182,8 +182,26 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     minors.get(index).copied().flatten()
 }
 
-/// Each bound GPU's primary minor, by the PCI function its master names.
-fn find_minors() -> Option<Vec<Option<u32>>> {
+/// Finds the minors of the GPUs a fallback bound after [`minor`] found the
+/// others' ([`super::start_more`]): the nodes found already are not opened
+/// again, as the display may hold one as its master. The minors found
+/// before stay, so a reader keeps them.
+pub(super) fn find_new_minors() {
+    // SAFETY: published below or by `minor`, and leaked.
+    let Some(known) = (unsafe { MINORS.load(Ordering::Acquire).as_ref() }) else {
+        // None found yet: the first `minor` finds every GPU's.
+        return;
+    };
+    if let Some(found) = find_minors(known)
+        && found.len() > known.len()
+    {
+        MINORS.store(Box::into_raw(Box::new(found)), Ordering::Release);
+    }
+}
+
+/// Each bound GPU's primary minor, by the PCI function its master names;
+/// `known` gives the first GPUs', whose nodes are not opened again.
+fn find_minors(known: &[Option<u32>]) -> Option<Vec<Option<u32>>> {
     let bound = &installed()?.start.bound;
     // A function by its bus, slot and function; DRM puts its domain first.
     let functions: Vec<_> = bound
@@ -197,8 +215,12 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             )
         })
         .collect();
-    let mut minors = alloc::vec![None; bound.len()];
+    let mut minors = known.to_vec();
+    minors.resize(bound.len().max(known.len()), None);
     for minor in 0..PRIMARY_MINORS {
+        if known.contains(&Some(minor)) {
+            continue;
+        }
         let Some(fd) = open_node(minor) else {
             continue;
         };
@@ -214,12 +236,13 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             continue;
         };
         if let Some(index) = functions.iter().position(|name| name == function)
+            && index >= known.len()
             && minors[index].is_none()
         {
             minors[index] = Some(minor);
         }
     }
-    for (gpu, minor) in bound.iter().zip(&minors) {
+    for (gpu, minor) in bound.iter().zip(&minors).skip(known.len()) {
         if minor.is_none() {
             output::arguments(format_args!(
                 "GPU {}: its driver bound it, but no DRM node of it was found\n",
