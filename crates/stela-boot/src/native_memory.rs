@@ -50,6 +50,26 @@ pub unsafe fn initialize(cpu: usize, physical: u64, bytes: usize, table_offset: 
     unsafe { SOURCE.initialize(cpu, physical, bytes, table_offset) }
 }
 
+/// The bytes of the heap kept for an integrated GPU's pages, zero for a GPU
+/// with memory of its own (`Handoff::gpu_share`).
+static GPU_SHARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records the integrated GPU's share of the heap the loader planned.
+pub(crate) fn set_gpu_share(bytes: u64) {
+    GPU_SHARE.store(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ordinary pages Linux may hold at once: an integrated GPU's share of
+/// the heap, in pages, so that its driver's pages never take the heap's
+/// own; `None` for a GPU with memory of its own, whose system memory pages
+/// come from the heap as the floor was measured with.
+pub(crate) fn gpu_page_limit() -> Option<usize> {
+    let bytes = GPU_SHARE.load(core::sync::atomic::Ordering::Relaxed);
+    usize::try_from(bytes / PAGE as u64)
+        .ok()
+        .filter(|&pages| pages != 0)
+}
+
 /// Keeps the same boot heap generation registered through every consumer.
 pub(crate) struct HeapPin {
     registration: Registration,

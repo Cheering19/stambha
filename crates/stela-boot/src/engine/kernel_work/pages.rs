@@ -149,10 +149,12 @@ impl KernelWork {
         let pages = self.task_pages()?;
         // SAFETY: exact retained heap and slot allocations on the loader root.
         let (provider, extents) = unsafe { pages.into_inventory() }?;
+        // An integrated GPU's pages are held to its share of the heap.
+        let limit = crate::native_memory::gpu_page_limit();
         // SAFETY: exact claimed owner on this taskless dispatcher before
         // Initial. Provider keeps the actual backing through publication.
         let catalog =
-            unsafe { Catalog::register_annotated_bootstrap(kernel, provider, extents, None) }
+            unsafe { Catalog::register_annotated_bootstrap(kernel, provider, extents, limit) }
                 .map_err(Error::Pages)?;
         Ok(&*Box::leak(Box::new(catalog)))
     }

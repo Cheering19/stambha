@@ -22,6 +22,8 @@ use uefi::{
 type Read = unsafe extern "efiapi" fn(*mut PciIo, u32, u32, usize, *mut c_void) -> Status;
 /// `EFI_PCI_IO_PROTOCOL_IO_MEM`: width, BAR, offset in it, count, buffer.
 type MemRead = unsafe extern "efiapi" fn(*mut PciIo, u32, u8, u64, usize, *mut c_void) -> Status;
+/// The same, writing.
+type MemWrite = unsafe extern "efiapi" fn(*mut PciIo, u32, u8, u64, usize, *const c_void) -> Status;
 type Location =
     unsafe extern "efiapi" fn(*mut PciIo, *mut usize, *mut usize, *mut usize, *mut usize) -> Status;
 type BarAttributes =
@@ -31,7 +33,8 @@ type BarAttributes =
 pub struct PciIo {
     poll_mem_poll_io: [usize; 2],
     mem_read: MemRead,
-    mem_write_io: [usize; 3],
+    mem_write: MemWrite,
+    io_read_write: [usize; 2],
     config_read: Read,
     config_write_copy_map_unmap_alloc_free_flush: [usize; 7],
     location: Location,
@@ -46,6 +49,7 @@ const _: () = {
     assert!(size_of::<usize>() == 8);
     assert!(size_of::<PciIo>() == 160);
     assert!(offset_of!(PciIo, mem_read) == 16);
+    assert!(offset_of!(PciIo, mem_write) == 24);
     assert!(offset_of!(PciIo, config_read) == 48);
     assert!(offset_of!(PciIo, location) == 112);
     assert!(offset_of!(PciIo, bar_attributes) == 128);
@@ -754,6 +758,95 @@ pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
         }
     }
     found
+}
+
+/// The version (major, minor, revision) of the graphics block that the AMD
+/// GPU at `address` lists in its IP discovery table, read through the
+/// firmware's protocol from the GPU's register BAR `registers` as amdgpu
+/// reads it at its probe ([`stela_boot_core::amd_discovery`]): through the
+/// `MM_INDEX` and `MM_DATA` registers, one dword at a time, whose index is
+/// put back after. Only the indirect window is written; the firmware's
+/// driver keeps the GPU and its picture.
+pub(crate) fn amd_graphics_version(
+    address: Address,
+    registers: u8,
+) -> Result<(u8, u8, u8), alloc::string::String> {
+    use alloc::{format, string::String};
+    use stela_boot_core::amd_discovery::{self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI};
+    let handles = boot::find_handles::<PciIo>().map_err(|error| format!("{error:?}"))?;
+    let mut found = None;
+    for handle in handles {
+        let Ok(mut io) = get_protocol::<PciIo>(handle) else {
+            continue;
+        };
+        if io.address().is_ok_and(|at| at == address) {
+            found = Some(io);
+            break;
+        }
+    }
+    let mut io = found.ok_or_else(|| String::from("the firmware lists no PCI protocol for it"))?;
+    let io: &mut PciIo = &mut io;
+    let read = |io: &mut PciIo, offset: usize| -> u32 {
+        let mut value = u32::MAX;
+        // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
+        // dword of the register BAR into the writable local. A refused read
+        // leaves all ones, which the table's reader takes as no answer.
+        let _ =
+            unsafe { (io.mem_read)(io, 2, registers, offset as u64, 1, (&raw mut value).cast()) };
+        value
+    };
+    let write = |io: &mut PciIo, offset: usize, value: u32| -> bool {
+        // SAFETY: live boot protocol; one dword written from a local.
+        unsafe {
+            (io.mem_write)(
+                io,
+                2,
+                registers,
+                offset as u64,
+                1,
+                (&raw const value).cast(),
+            )
+        }
+        .is_success()
+    };
+    let index = (read(io, MM_INDEX), read(io, MM_INDEX_HI));
+    let result = {
+        let vram = |io: &mut PciIo, position: u64| -> u32 {
+            if write(io, MM_INDEX, position as u32 | 0x8000_0000)
+                && write(io, MM_INDEX_HI, (position >> 31) as u32)
+            {
+                read(io, MM_DATA)
+            } else {
+                u32::MAX
+            }
+        };
+        let place = {
+            let io = core::cell::RefCell::new(&mut *io);
+            discovery::place(
+                |offset| read(&mut io.borrow_mut(), offset),
+                |position| vram(&mut io.borrow_mut(), position),
+            )
+        };
+        place
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|place| {
+                let mut binary = Vec::new();
+                binary
+                    .try_reserve_exact(place.bytes)
+                    .map_err(|_| String::from("no memory for the table"))?;
+                for at in (0..place.bytes as u64).step_by(4) {
+                    binary.extend_from_slice(&vram(io, place.offset + at).to_le_bytes());
+                }
+                discovery::parse(&binary).map_err(|error| format!("{error:?}"))
+            })
+            .and_then(|ips| {
+                discovery::version(&ips, discovery::GC)
+                    .ok_or_else(|| String::from("its table lists no graphics block"))
+            })
+    };
+    write(io, MM_INDEX, index.0);
+    write(io, MM_INDEX_HI, index.1);
+    result
 }
 
 /// The firmware's map of every PCI function ([`stela_boot_core::pci_map`]):

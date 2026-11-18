@@ -345,6 +345,110 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
     GPU_NOTICE.store(notice as u8, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// What the GPU that will serve the Metal device works in, as the census
+/// and the GPU stacks know it before any GPU is claimed
+/// ([`stela_drivers::gpu::stack::metal_shares_memory`]), for the memory
+/// plan: each GPU whose stack draws is integrated as its driver's table
+/// says, or, for a driver that decides by the GPU's IP discovery table, as
+/// the graphics version that table lists says, read here through the
+/// firmware. A GPU whose kind stays unknown counts as integrated: a share
+/// a discrete GPU leaves unused costs the guest that memory, where a heap
+/// short of an integrated GPU's pages stops the boot. Once per boot.
+fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
+    use stela_boot_core::host_memory::GpuMemory;
+    use stela_drivers::gpu::{Adapter, Vendor, stack::GpuStack};
+    if GPU_MEMORY.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return;
+    }
+    let mut drawing = Vec::new();
+    for identity in functions
+        .iter()
+        .map(crate::pci_io::FunctionObservation::identity)
+        .filter(|identity| identity.class[0] == 0x03)
+    {
+        let adapter = Adapter {
+            address: identity.address,
+            vendor: Vendor::from_pci(identity.vendor),
+            device: identity.device,
+            class: identity.class,
+        };
+        let Some(stack) = GpuStack::select(&adapter)
+            .ok()
+            .filter(|stack| stack.draws())
+        else {
+            continue;
+        };
+        let table = stack.kernel.table_integrated(&adapter).or_else(|| {
+            stack
+                .kernel
+                .discovered_integrated
+                .and_then(|discovered| (discovered.named)(&adapter))
+        });
+        let (integrated, how) = match table {
+            Some(integrated) => (
+                integrated,
+                alloc::format!("{}'s table", stack.kernel.driver),
+            ),
+            None => match stack.kernel.discovered_integrated.map(|discovered| {
+                let registers = (stack.kernel.registers)(&adapter) as u8;
+                crate::pci_io::amd_graphics_version(adapter.address, registers)
+                    .map(|graphics| ((discovered.graphics)(graphics), graphics))
+            }) {
+                Some(Ok((integrated, (major, minor, revision)))) => (
+                    integrated,
+                    alloc::format!("graphics {major}.{minor}.{revision} by its IP discovery table"),
+                ),
+                Some(Err(why)) => (
+                    true,
+                    alloc::format!(
+                        "not known: its IP discovery table was not read ({why}); taken as \
+                         integrated"
+                    ),
+                ),
+                None => (
+                    true,
+                    alloc::string::String::from("not known; taken as integrated"),
+                ),
+            },
+        };
+        output::arguments(format_args!(
+            "HOST GPU {} {}: {how}\n",
+            adapter.address,
+            if integrated {
+                "integrated, sharing this PC's RAM"
+            } else {
+                "with memory of its own"
+            }
+        ));
+        drawing.push(integrated);
+    }
+    let memory = if stela_drivers::gpu::stack::metal_shares_memory(&drawing) {
+        GpuMemory::Shared
+    } else {
+        GpuMemory::Own
+    };
+    GPU_MEMORY.store(
+        match memory {
+            GpuMemory::Own => 1,
+            GpuMemory::Shared => 2,
+        },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// [`plan_gpu_memory`]'s answer: [`GpuMemory::Own`] where no census ran.
+///
+/// [`GpuMemory::Own`]: stela_boot_core::host_memory::GpuMemory::Own
+pub fn gpu_memory() -> stela_boot_core::host_memory::GpuMemory {
+    match GPU_MEMORY.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => stela_boot_core::host_memory::GpuMemory::Shared,
+        _ => stela_boot_core::host_memory::GpuMemory::Own,
+    }
+}
+
+/// [`plan_gpu_memory`]'s answer: 0 before it ran, 1 own memory, 2 shared.
+static GPU_MEMORY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 const NVIDIA: u16 = 0x10de;
 /// The [`NvidiaNotice`] the census chose, as its discriminant.
 static GPU_NOTICE: core::sync::atomic::AtomicU8 =
@@ -444,6 +548,7 @@ pub fn discover() -> Result<Handoff> {
                 ));
             }
             report_census(&census.functions);
+            plan_gpu_memory(&census.functions);
             for function in census.functions {
                 let identity = function.identity();
                 if !stela_drivers::probe::claims_identity(&identity) {

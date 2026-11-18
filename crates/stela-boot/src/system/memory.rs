@@ -26,7 +26,11 @@ pub(super) struct EngineImage {
 
 /// Firmware-owned allocations kept by the engine and its native workers.
 pub(super) struct EngineMemory {
+    /// The engine heap, with an integrated GPU's share at its end.
     pub heap: Region,
+    /// The integrated GPU's share of `heap` (`host_memory::Sizes::gpu`):
+    /// the most its driver's pages hold at once.
+    pub gpu: u64,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -131,15 +135,33 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         },
     };
     let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
+    let gpu = crate::storage::gpu_memory();
+    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores, gpu)?;
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M\n",
+        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
+        sizes.gpu >> 20,
     ));
+    if sizes.gpu != 0 && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
+        output::arguments(format_args!(
+            "HOST MEMORY the integrated GPU gets {}M of this PC's RAM, under the {}M a macOS \
+             desktop needs beside the guest's floor: its allocations past it fail as a full \
+             GPU's do\n",
+            sizes.gpu >> 20,
+            stela_boot_core::host_memory::GPU_FLOOR >> 20,
+        ));
+        let tenths = sizes.gpu / 100_000_000;
+        crate::status::warning(&format!(
+            "this PC's RAM leaves the graphics built into its processor {}.{} GB; some windows \
+             may not draw",
+            tenths / 10,
+            tenths % 10
+        ));
+    }
     // Each claimed core owns a full native part. Check both ends before allocation.
     for slot in [0, cores - 1] {
         let part = crate::native_smp::resources::partition(
@@ -151,7 +173,9 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         )?;
         crate::native_smp::resources::code_part_bytes(part.code_bytes, sizes.code.parts)?;
     }
-    let heap = allocate(sizes.heap)?;
+    // The GPU's pages come from the heap's allocator, held to their share
+    // by Linux's page limit, so the share lies in the same region.
+    let heap = allocate(sizes.heap + sizes.gpu)?;
     // The engine allocator uses this existing physmap directly. Prove the
     // complete firmware reservation is covered before publishing the handoff.
     if !ram.iter().any(|&(start, end)| {
@@ -202,6 +226,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let root = loader_tables.root();
     Ok(EngineMemory {
         heap,
+        gpu: sizes.gpu,
         native_resources,
         native_task_allocations,
         stack,

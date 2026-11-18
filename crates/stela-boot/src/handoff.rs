@@ -119,6 +119,10 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// The bytes at `heap`'s end kept for an integrated GPU's pages
+    /// (`host_memory::Sizes::gpu`), zero for a GPU with memory of its own:
+    /// Linux holds at most this many bytes of pages at once.
+    pub(crate) gpu_share: u64,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,

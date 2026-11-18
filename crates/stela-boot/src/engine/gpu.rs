@@ -1989,11 +1989,12 @@ struct Setup {
 
 impl Setup {
     fn of(claimed: &[Claimed]) -> Self {
-        let command_line = claimed
+        let mut words: Vec<String> = claimed
             .iter()
-            .filter_map(|claimed| claimed.parameters.as_deref())
-            .collect::<Vec<_>>()
-            .join(" ");
+            .filter_map(|claimed| claimed.parameters.clone())
+            .collect();
+        words.extend(gpu_share_parameter(crate::native_memory::gpu_page_limit()));
+        let command_line = words.join(" ");
         let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
         for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
             if !searched
@@ -2008,6 +2009,16 @@ impl Setup {
             searched,
         }
     }
+}
+
+/// The word that lets an integrated GPU's driver place its whole share
+/// (`Handoff::gpu_share`, `pages` pages) in system memory: TTM's own limit,
+/// whose default of half the RAM Linux sees amdgpu takes as its GTT's size.
+/// Linux holds no more pages than the share at once (the page catalog's
+/// limit), so the share is its RAM, and the GPU may take all of it, as the
+/// guest is told it works in. Nothing for a GPU with memory of its own.
+fn gpu_share_parameter(pages: Option<usize>) -> Option<String> {
+    pages.map(|pages| format!("ttm.pages_limit={pages}"))
 }
 
 struct Started {

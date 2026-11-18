@@ -20,7 +20,7 @@ fn every_host_size_keeps_the_parts_in_bounds_and_the_guest_above_its_floor() {
         (2048, 64),
     ] {
         let free = free(installed);
-        let sizes = sizes(free, runners, runners).unwrap();
+        let sizes = sizes(free, runners, runners, GpuMemory::Own).unwrap();
         let floor = HEAP_FLOOR + sizes.code.window - FLOOR_WINDOW;
         assert!((floor..=HEAP_CEILING.max(floor)).contains(&sizes.heap));
         assert!(sizes.guest >= GUEST_FLOOR);
@@ -46,7 +46,7 @@ fn every_host_size_keeps_the_parts_in_bounds_and_the_guest_above_its_floor() {
 
 #[test]
 fn an_8_gib_host_gives_the_guest_what_the_parts_leave() {
-    let sizes = sizes(free(8), 8, 8).unwrap();
+    let sizes = sizes(free(8), 8, 8, GpuMemory::Own).unwrap();
     // The floor less the 16 MiB the 496 MiB window lacks of 512 MiB.
     assert_eq!(sizes.code.window, 496 * MIB);
     assert_eq!(sizes.heap, HEAP_FLOOR - 16 * MIB);
@@ -58,7 +58,7 @@ fn an_8_gib_host_gives_the_guest_what_the_parts_leave() {
 
 #[test]
 fn a_16_gib_host_takes_a_sixteenth_for_its_window_and_the_heap_target() {
-    let sizes = sizes(free(16), 8, 8).unwrap();
+    let sizes = sizes(free(16), 8, 8, GpuMemory::Own).unwrap();
     // A sixteenth of its 15.5 GiB free (992 MiB, past 8 runners' 96 MiB
     // each), and each executor's 2 MiB of its own.
     assert_eq!(sizes.code.window, 992 * MIB);
@@ -78,7 +78,7 @@ fn the_window_follows_the_hosts_memory_not_its_pes() {
     for (installed, window) in [(16, 992), (32, 1984), (48, 2048), (128, 2048)] {
         for runners in [1, 2, 4, 6, 8, 12] {
             let free = free(installed);
-            let sizes = sizes(free, runners, runners).unwrap();
+            let sizes = sizes(free, runners, runners, GpuMemory::Own).unwrap();
             assert_eq!(
                 sizes.code.window,
                 window * MIB,
@@ -95,7 +95,7 @@ fn the_window_follows_the_hosts_memory_not_its_pes() {
     // An 8 GiB host's guest is under its room: each runner's share, or the
     // host's where that is less, as before.
     for (runners, window) in [(2, 192), (4, 384), (8, 496)] {
-        let sizes = sizes(free(8), runners, runners).unwrap();
+        let sizes = sizes(free(8), runners, runners, GpuMemory::Own).unwrap();
         assert_eq!(sizes.code.window, window * MIB, "{runners} PEs");
     }
 }
@@ -113,7 +113,7 @@ fn a_window_past_its_runners_share_leaves_the_guest_its_room() {
     for runners in [1, 2, 4, 8, 16, 24] {
         let (mut last, mut grown) = (0, 0);
         for free in (6 * GIB..72 * GIB).step_by(61 * MIB as usize) {
-            let Ok(sizes) = sizes(free, runners, runners) else {
+            let Ok(sizes) = sizes(free, runners, runners, GpuMemory::Own) else {
                 continue;
             };
             let window = sizes.code.window;
@@ -146,7 +146,7 @@ fn a_window_past_its_runners_share_leaves_the_guest_its_room() {
 /// until the guest has only its room.
 #[test]
 fn a_12_gib_8_core_host_takes_a_larger_window_and_heap_from_its_guest() {
-    let sizes = sizes(11514 * MIB, 8, 8).unwrap();
+    let sizes = sizes(11514 * MIB, 8, 8, GpuMemory::Own).unwrap();
     assert_eq!(
         [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB),
         [3940, 720, 710, 6144]
@@ -169,7 +169,7 @@ fn a_host_short_of_the_larger_window_falls_back_to_the_smaller() {
             large.guest < GUEST_FLOOR && small.guest >= GUEST_FLOOR
         })
         .expect("a host the fallback lets boot");
-    let sizes = sizes(short, 2, 2).unwrap();
+    let sizes = sizes(short, 2, 2, GpuMemory::Own).unwrap();
     assert_eq!(sizes.code.window, 2 * SMALL_WINDOW_PER_RUNNER);
     assert!(sizes.guest >= GUEST_FLOOR);
     // With a little more RAM the larger window fits.
@@ -178,12 +178,12 @@ fn a_host_short_of_the_larger_window_falls_back_to_the_smaller() {
 }
 
 fn sizes_of(free: u64) -> Sizes {
-    sizes(free, 2, 2).unwrap()
+    sizes(free, 2, 2, GpuMemory::Own).unwrap()
 }
 
 #[test]
 fn a_64_gib_host_grows_the_heap_with_its_share_window_and_pes() {
-    let sizes = sizes(free(64), 8, 8).unwrap();
+    let sizes = sizes(free(64), 8, 8, GpuMemory::Own).unwrap();
     let heap = free(64) / HEAP_SHARE + HEAP_PER_WINDOW * 2048 * MIB + 8 * PE_HEAP;
     assert_eq!(sizes.heap, heap / ALIGNMENT * ALIGNMENT);
     assert!(HEAP_FLOOR < sizes.heap && sizes.heap < HEAP_CEILING);
@@ -221,7 +221,7 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
         (64, 30, Some([6784, 2048, 2048, 19840])),
         (64, 128, Some([16384, 2176, 2048, 110464])),
     ] {
-        let actual = sizes(free * GIB, runners, runners)
+        let actual = sizes(free * GIB, runners, runners, GpuMemory::Own)
             .ok()
             .map(|sizes| [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB));
         assert_eq!(actual, expected, "{runners} PEs, {free} GiB");
@@ -257,7 +257,7 @@ fn measured_boots_split_as_expected() {
         (15710, [4560, 992, 750, 9408]),
         (30242, [5796, 1904, 892, 21650]),
     ] {
-        let sizes = sizes(free * MIB, 8, 8).unwrap();
+        let sizes = sizes(free * MIB, 8, 8, GpuMemory::Own).unwrap();
         assert_eq!(
             [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB),
             expected,
@@ -283,7 +283,7 @@ fn host_sizes_split_as_expected() {
         (64, 8, [10112, 2064, 1226, 50086], 49784),
         (128, 8, [16384, 2064, 1888, 106640], 106012),
     ] {
-        let sizes = sizes(free(installed), cores, cores).unwrap();
+        let sizes = sizes(free(installed), cores, cores, GpuMemory::Own).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
         assert_eq!(split, expected, "{installed} GiB, {cores} cores");
         assert!(split[3] >= before, "{installed} GiB, {cores} cores");
@@ -303,7 +303,7 @@ fn host_sizes_split_as_expected() {
 /// the guest keeps its room.
 #[test]
 fn a_16_gib_pc_takes_the_heap_target_from_its_guest() {
-    let sizes = sizes(13590 * MIB, 8, 8).unwrap();
+    let sizes = sizes(13590 * MIB, 8, 8, GpuMemory::Own).unwrap();
     assert_eq!(sizes.code.window, 848 * MIB);
     assert_eq!(sizes.heap, HEAP_TARGET + 336 * MIB);
     assert!(sizes.heap >= 3168 * MIB + GIB);
@@ -328,7 +328,7 @@ fn hosts_past_the_guests_room_hold_a_long_sessions_heap_peak() {
     for installed in [8, 12, 16, 24, 32, 64] {
         for cores in [4, 8, 12, 16, 24, 32] {
             let free = free(installed);
-            let sizes = sizes(free, cores, cores).unwrap();
+            let sizes = sizes(free, cores, cores, GpuMemory::Own).unwrap();
             assert_eq!(
                 sizes.heap + sizes.code.bytes + sizes.pool + sizes.guest,
                 free
@@ -353,7 +353,7 @@ fn hosts_past_the_guests_room_hold_a_long_sessions_heap_peak() {
     }
     // The 16 GiB host on 8 PEs is on the target, moved from the session's
     // window to its share's.
-    let sizes = sizes(free(16), 8, 8).unwrap();
+    let sizes = sizes(free(16), 8, 8, GpuMemory::Own).unwrap();
     let moved = HEAP_PER_WINDOW * (sizes.code.window - PEAK_WINDOW);
     assert_eq!(
         sizes.heap - (LONG_SESSION_PEAK + LARGEST_ASKED + moved),
@@ -367,7 +367,7 @@ fn hosts_past_the_guests_room_hold_a_long_sessions_heap_peak() {
 fn the_heap_target_leaves_the_guest_its_room() {
     for runners in [1, 2, 4, 8, 16, 24, 64] {
         for free in (6 * GIB..40 * GIB).step_by(61 * MIB as usize) {
-            let Ok(sizes) = sizes(free, runners, runners) else {
+            let Ok(sizes) = sizes(free, runners, runners, GpuMemory::Own) else {
                 continue;
             };
             let shared = shared_heap(free, runners, sizes.code.window);
@@ -391,7 +391,7 @@ fn the_heap_target_leaves_the_guest_its_room() {
 #[test]
 fn an_8_gib_host_keeps_its_heap_floor() {
     for runners in [2, 4, 8] {
-        let sizes = sizes(free(8), runners, runners).unwrap();
+        let sizes = sizes(free(8), runners, runners, GpuMemory::Own).unwrap();
         assert_eq!(sizes.heap, shared_heap(free(8), runners, sizes.code.window));
         assert!(sizes.guest < GUEST_ROOM);
     }
@@ -399,7 +399,7 @@ fn an_8_gib_host_keeps_its_heap_floor() {
 
 #[test]
 fn a_2_tib_host_caps_every_part() {
-    let sizes = sizes(free(2048), 8, 8).unwrap();
+    let sizes = sizes(free(2048), 8, 8, GpuMemory::Own).unwrap();
     assert_eq!(sizes.heap, HEAP_CEILING);
     assert_eq!(sizes.code.bytes, 2064 * MIB);
     assert_eq!(sizes.pool, 8 * POOL_PER_RUNNER);
@@ -408,31 +408,31 @@ fn a_2_tib_host_caps_every_part() {
 
 #[test]
 fn the_heap_grows_with_the_host_between_its_bounds() {
-    let small = sizes(free(32), 8, 8).unwrap().heap;
-    let large = sizes(free(64), 8, 8).unwrap().heap;
+    let small = sizes(free(32), 8, 8, GpuMemory::Own).unwrap().heap;
+    let large = sizes(free(64), 8, 8, GpuMemory::Own).unwrap().heap;
     assert!(HEAP_FLOOR < small && small < large && large < HEAP_CEILING);
 }
 
 #[test]
 fn too_little_ram_says_how_much_is_needed() {
-    let refusal = sizes(4 * GIB, 8, 8).unwrap_err();
+    let refusal = sizes(4 * GIB, 8, 8, GpuMemory::Own).unwrap_err();
     assert_eq!(
         refusal.to_string(),
         "this PC has 4.0 GB of RAM free; Stela needs at least 7 GB free: \
          3 GB for macOS and the rest for its own memory"
     );
-    let two_cores = sizes(5 * GIB, 2, 2).unwrap_err();
+    let two_cores = sizes(5 * GIB, 2, 2, GpuMemory::Own).unwrap_err();
     assert!(
         two_cores.to_string().contains("at least 6 GB"),
         "{two_cores}"
     );
-    assert!(sizes(6 * GIB, 2, 2).is_ok());
-    assert!(sizes(free(8), 2, 2).is_ok());
+    assert!(sizes(6 * GIB, 2, 2, GpuMemory::Own).is_ok());
+    assert!(sizes(free(8), 2, 2, GpuMemory::Own).is_ok());
 }
 
 #[test]
 fn parked_executors_add_only_their_reserves() {
-    let parked = sizes(free(16), 12, 8).unwrap();
+    let parked = sizes(free(16), 12, 8, GpuMemory::Own).unwrap();
     let rest = free(16) - parked.heap - parked.code.bytes;
     let share = 8 * rest / (POOL_SHARE + 8);
     let grown = 8 * (2048 * (LOWER_BASE + UPPER_BASE) + 3 * rest) / (2048 + 3 * 8);
@@ -446,26 +446,26 @@ const HOST_8_GB: u64 = 7544 * MIB;
 
 #[test]
 fn an_8_gb_pc_keeps_a_sixteenth_for_the_pack() {
-    let budget = pack_budget(HOST_8_GB, 8, 8);
+    let budget = pack_budget(HOST_8_GB, 8, 8, GpuMemory::Own);
     assert_eq!(budget, 470 * MIB);
     // An 845 MB pack, which stopped such a host's boots, no longer fits whole,
     // and what is read of it leaves the parts and the guest's floor.
     assert!(budget < 845_496_619);
-    let sizes = sizes(HOST_8_GB - budget - PACK_MARGIN, 8, 8).unwrap();
+    let sizes = sizes(HOST_8_GB - budget - PACK_MARGIN, 8, 8, GpuMemory::Own).unwrap();
     assert!(sizes.guest > GUEST_FLOOR + 200 * MIB, "{sizes:?}");
-    assert_eq!(pack_budget(free(8), 8, 8), 496 * MIB);
+    assert_eq!(pack_budget(free(8), 8, 8, GpuMemory::Own), 496 * MIB);
 }
 
 #[test]
 fn a_16_gb_pc_keeps_about_a_gigabyte_for_the_pack() {
-    assert_eq!(pack_budget(free(16), 8, 8), 992 * MIB);
+    assert_eq!(pack_budget(free(16), 8, 8, GpuMemory::Own), 992 * MIB);
 }
 
 #[test]
 fn a_128_gb_pc_keeps_more_for_the_pack() {
-    let budget = pack_budget(free(128), 16, 16);
+    let budget = pack_budget(free(128), 16, 16, GpuMemory::Own);
     assert_eq!(budget, 7936 * MIB);
-    let sizes = sizes(free(128) - budget - PACK_MARGIN, 16, 16).unwrap();
+    let sizes = sizes(free(128) - budget - PACK_MARGIN, 16, 16, GpuMemory::Own).unwrap();
     assert!(sizes.guest > 72 * GIB, "{sizes:?}");
 }
 
@@ -475,25 +475,44 @@ fn the_pack_gets_only_what_the_parts_and_the_guest_leave() {
     // share; below it, nothing, and the boot goes on without a pack.
     let needed = (6000..7200)
         .map(|mib| mib * MIB)
-        .find(|&free| sizes(free, 8, 8).is_ok())
+        .find(|&free| sizes(free, 8, 8, GpuMemory::Own).is_ok())
         .unwrap();
-    assert_eq!(pack_budget(needed, 8, 8), 0);
+    assert_eq!(pack_budget(needed, 8, 8, GpuMemory::Own), 0);
     // 100 MiB more leaves the pack about that much, less the margin: the
     // most that still fits.
-    let budget = pack_budget(needed + 100 * MIB, 8, 8);
+    let budget = pack_budget(needed + 100 * MIB, 8, 8, GpuMemory::Own);
     assert!((PACK_FLOOR..=100 * MIB).contains(&budget), "{budget}");
-    assert!(sizes(needed + 100 * MIB - budget - PACK_MARGIN, 8, 8).is_ok());
-    assert!(sizes(needed + 100 * MIB - budget - ALIGNMENT - PACK_MARGIN, 8, 8).is_err());
-    assert_eq!(pack_budget(4 * GIB, 8, 8), 0);
+    assert!(
+        sizes(
+            needed + 100 * MIB - budget - PACK_MARGIN,
+            8,
+            8,
+            GpuMemory::Own
+        )
+        .is_ok()
+    );
+    assert!(
+        sizes(
+            needed + 100 * MIB - budget - ALIGNMENT - PACK_MARGIN,
+            8,
+            8,
+            GpuMemory::Own
+        )
+        .is_err()
+    );
+    assert_eq!(pack_budget(4 * GIB, 8, 8, GpuMemory::Own), 0);
     for cores in [1, 2, 4, 8, 16, 64] {
         for free in (2 * GIB..40 * GIB).step_by(37 * MIB as usize) {
-            let budget = pack_budget(free, cores, cores);
+            let budget = pack_budget(free, cores, cores, GpuMemory::Own);
             assert!(budget.is_multiple_of(ALIGNMENT));
             assert!(budget <= free / PACK_SHARE);
             if budget != 0 {
                 assert!(budget >= PACK_FLOOR);
                 let left = free - budget - PACK_MARGIN;
-                assert!(sizes(left, cores, cores).is_ok(), "{free} {cores}");
+                assert!(
+                    sizes(left, cores, cores, GpuMemory::Own).is_ok(),
+                    "{free} {cores}"
+                );
             }
         }
     }
@@ -527,7 +546,7 @@ fn each_runners_pool_gives_the_kernel_half_what_it_needs_and_the_user_half_the_r
     const PAGE: u64 = 4096;
     const ROOTS: u64 = 64 * PAGE;
     for (installed, sized) in [(8, false), (12, true), (16, true), (64, true)] {
-        let sizes = sizes(free(installed), 8, 8).unwrap();
+        let sizes = sizes(free(installed), 8, 8, GpuMemory::Own).unwrap();
         let shadow = sizes.pool / 8 / PAGE * PAGE - ROOTS;
         let upper = upper_half(shadow, sizes.guest, PAGE);
         let lower = shadow - upper;
@@ -551,9 +570,128 @@ fn each_runners_pool_gives_the_kernel_half_what_it_needs_and_the_user_half_the_r
     }
     // The 16 GiB host's kernel half: 32 MiB and a MiB per GiB of its
     // 9.7 GiB guest.
-    let sizes = sizes(free(16), 8, 8).unwrap();
+    let sizes = sizes(free(16), 8, 8, GpuMemory::Own).unwrap();
     let upper = upper_half(sizes.pool / 8 / 4096 * 4096 - ROOTS, sizes.guest, PAGE);
     assert!((41..=42).contains(&(upper / MIB)));
     // A tiny pool's halves never go below a page each.
     assert_eq!(upper_half(2 * PAGE, 64 * GIB, PAGE), PAGE);
+}
+
+/// Heap, code, pool, guest and GPU share MiB for hosts whose Metal device is
+/// an integrated GPU, at 8 PEs:
+/// - the 8 GiB VM (`HOST MEMORY free=7354M`) and an 8 GiB host keep the
+///   guest's floor and give the GPU what is left above it, 780 and 1362 MiB,
+///   short of [`GPU_FLOOR`];
+/// - the 12 GiB VM of the AMD port's first run (`free=10842M heap=3300M
+///   code=688M pool=710M guest=6144M`, where the heap ran out holding the
+///   GPU's pages) gives it the floor, 2 GiB, beside its 512 MiB carve-out;
+///   its heap is that of a host with 8.6 GiB free, the floor at its window.
+///   A 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of driver heaps in
+///   a session of seven app launches, so its own part held 2.4 GiB, or up
+///   to 2.9 GiB where the carve-out held some of the driver's buffers;
+/// - 16 and 32 GiB hosts give it a sixth, the heap its target and the guest
+///   its room.
+#[test]
+fn integrated_gpu_hosts_split_as_expected() {
+    let hosts = [7354 * MIB, free(8), 10842 * MIB, free(16), free(32)];
+    let split: alloc::vec::Vec<_> = hosts
+        .iter()
+        .map(|&free| {
+            let sizes = sizes(free, 8, 8, GpuMemory::Shared).unwrap();
+            [
+                sizes.heap,
+                sizes.code.bytes,
+                sizes.pool,
+                sizes.guest,
+                sizes.gpu,
+            ]
+            .map(|b| b / MIB)
+        })
+        .collect();
+    assert_eq!(
+        split,
+        [
+            [2704, 416, 382, 3072, 780],
+            [2704, 416, 382, 3072, 1362],
+            [2848, 560, 598, 4788, 2048],
+            [4400, 832, 724, 7272, 2644],
+            [5232, 1664, 858, 18700, 5290],
+        ]
+    );
+    // The same hosts with a GPU of its own give it nothing.
+    for free in hosts {
+        assert_eq!(sizes(free, 8, 8, GpuMemory::Own).unwrap().gpu, 0);
+    }
+}
+
+/// On every host an integrated GPU takes a sixth within its bounds, the
+/// parts are sized as on a host with that much less, and the share is short
+/// of its target only where more would put the guest under its floor.
+#[test]
+fn an_integrated_gpus_share_comes_beside_the_parts() {
+    for runners in [2, 4, 8, 16, 24] {
+        for free in (6 * GIB..140 * GIB).step_by(173 * MIB as usize) {
+            let Ok(shared) = sizes(free, runners, runners, GpuMemory::Shared) else {
+                continue;
+            };
+            let gpu = shared.gpu;
+            assert!((GPU_LEAST..=GPU_CEILING).contains(&gpu), "{runners} {free}");
+            assert!(gpu.is_multiple_of(ALIGNMENT));
+            assert!(shared.guest >= GUEST_FLOOR);
+            assert_eq!(
+                shared.heap + shared.code.bytes + shared.pool + shared.guest + gpu,
+                free
+            );
+            let rest = sizes(free - gpu, runners, runners, GpuMemory::Own).unwrap();
+            assert_eq!(Sizes { gpu, ..rest }, shared, "{runners} {free}");
+            let target = (free / GPU_SHARE / ALIGNMENT * ALIGNMENT).clamp(GPU_FLOOR, GPU_CEILING);
+            assert!(gpu <= target);
+            if gpu < target {
+                let more = estimate(free - gpu - ALIGNMENT, runners, runners).unwrap();
+                assert!(more.guest < GUEST_FLOOR, "{runners} {free}");
+            }
+        }
+    }
+    assert_eq!(gpu_target(free(128)), GPU_CEILING);
+}
+
+/// A host that cannot give an integrated GPU its least share beside the
+/// guest's floor is refused, saying how much it needs, as one short of the
+/// guest's floor is; it needs a little more than with a discrete GPU.
+#[test]
+fn a_host_short_of_an_integrated_gpus_least_share_is_refused() {
+    let needed = (6000..8000)
+        .map(|mib| mib * MIB)
+        .find(|&free| sizes(free, 8, 8, GpuMemory::Shared).is_ok())
+        .unwrap();
+    assert_eq!(
+        sizes(needed, 8, 8, GpuMemory::Shared).unwrap().gpu,
+        GPU_LEAST
+    );
+    let own = (6000..8000)
+        .map(|mib| mib * MIB)
+        .find(|&free| sizes(free, 8, 8, GpuMemory::Own).is_ok())
+        .unwrap();
+    assert!(needed > own && needed - own <= GPU_LEAST + ALIGNMENT * 8);
+    let refusal = sizes(6 * GIB, 8, 8, GpuMemory::Shared).unwrap_err();
+    assert_eq!(
+        refusal.to_string(),
+        "this PC has 6.0 GB of RAM free; Stela needs at least 7 GB free: 3 GB for macOS \
+         and the rest for its own memory and the graphics built into the processor"
+    );
+}
+
+/// The pack never takes from an integrated GPU's share: what it leaves still
+/// gives the GPU its whole target.
+#[test]
+fn the_pack_leaves_an_integrated_gpu_its_share() {
+    for free in [free(8), 10842 * MIB + 554 * MIB, free(16), free(32)] {
+        let budget = pack_budget(free, 8, 8, GpuMemory::Shared);
+        assert!(budget <= pack_budget(free, 8, 8, GpuMemory::Own));
+        if budget != 0 {
+            let left = free - budget - PACK_MARGIN;
+            let sizes = sizes(left, 8, 8, GpuMemory::Shared).unwrap();
+            assert_eq!(sizes.gpu, gpu_target(left), "{free}");
+        }
+    }
 }

@@ -725,7 +725,8 @@ fn translation_store(
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
-    let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
+    let budget =
+        stela_boot_core::host_memory::pack_budget(free, cores, cores, crate::storage::gpu_memory());
     let Some(store) = crate::engine::translations::read(budget) else {
         crate::status::done("none on this USB");
         return (files, storage);
@@ -862,6 +863,7 @@ fn load(
     } = image;
     let memory::EngineMemory {
         heap,
+        gpu,
         native_resources,
         native_task_allocations,
         stack,
@@ -1148,6 +1150,7 @@ fn load(
             native_mmio_capture,
             inactive_firmware_units,
             amd_tables,
+            gpu_share: gpu,
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

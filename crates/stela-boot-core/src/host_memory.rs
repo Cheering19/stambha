@@ -117,6 +117,45 @@ pub const PACK_FLOOR: u64 = 64 * MIB;
 /// reserving the parts, beyond the pack itself: the pack's placement page,
 /// the storage drivers' rings and the firmware ranges' rounding to 2 MiB.
 const PACK_MARGIN: u64 = 16 * MIB;
+/// Free host RAM bytes per byte of the share an integrated GPU, which has
+/// no memory of its own past its carve-out, takes for its pages. Linux and
+/// Windows let such a GPU map up to half of RAM, and macOS on Apple silicon
+/// about two thirds, but those are limits on memory the system takes back
+/// under pressure; here the share is held from the guest for the boot, so
+/// it is a sixth: 2.6 GiB on a 16 GB PC, 5.2 GiB on a 32 GB PC, and the
+/// floor's 2 GiB below about 12 GiB free.
+const GPU_SHARE: u64 = 6;
+/// The share a macOS desktop needs. A 16 GiB VM's AMD integrated GPU (512
+/// MiB carve-out, 3272 MiB of GTT) held 2058 MiB of RADV's heaps after a
+/// sign-in and seven app launches (`driver heaps use/budget/size:
+/// 277/1176/1176M/host 1781/2352/2352M/local`), and the 12 GiB VM's 1635 MiB
+/// one minute in, with only WindowServer and loginwindow presenting. RADV's
+/// heaps are the GTT and the carve-out's CPU-visible part (256 MiB there), so
+/// 2 GiB of share tells the guest about 2.3 GiB. A host that leaves the
+/// guest its floor only with less gets less, down to [`GPU_LEAST`], and says
+/// so.
+pub const GPU_FLOOR: u64 = 2 * GIB;
+/// The most an integrated GPU's share grows to. A GPU whose firmware gives
+/// it a large carve-out (up to many GiB on recent processors) works in that
+/// beside the share; the guest keeps the rest of a large host.
+const GPU_CEILING: u64 = 8 * GIB;
+/// The least share Stela boots an integrated GPU's Metal device with:
+/// twice the 129 MiB of RADV's host heap the desktop above held, for its
+/// command buffers, uploads and mapped buffers. A host that cannot give it
+/// with the guest's floor is refused, as one short of the guest's floor is.
+const GPU_LEAST: u64 = 256 * MIB;
+
+/// The memory of the GPU that serves the Metal device, as the PCI census
+/// and the GPU stacks know it before the parts are sized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuMemory {
+    /// Memory of its own (a discrete GPU), or no GPU serves Metal: its
+    /// system memory pages come from the heap as before.
+    Own,
+    /// It shares the host's RAM (an integrated GPU): the plan gives it a
+    /// share of its own beside the heap ([`Sizes::gpu`]).
+    Shared,
+}
 
 /// The parts' sizes and the guest DRAM left after them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +163,14 @@ pub struct Sizes {
     pub heap: u64,
     pub code: CodeReservation,
     pub pool: u64,
-    /// Free RAM after the three parts; Stela's stacks, tables and image
-    /// take a few more MiB of it.
+    /// Free RAM after the three parts and the GPU's share; Stela's stacks,
+    /// tables and image take a few more MiB of it.
     pub guest: u64,
+    /// The share of an integrated GPU ([`GpuMemory::Shared`]), zero for one
+    /// with memory of its own: the most system memory its driver's pages
+    /// hold at once, reserved beside the heap and taken from the same
+    /// region, on top of what the heap itself needs.
+    pub gpu: u64,
 }
 
 /// The DRAM the guest Mac reports and the host RAM it does not see.
@@ -158,11 +202,13 @@ pub fn guest_dram(installed: u64, backed: u64) -> GuestDram {
     }
 }
 
-/// Too little RAM for the guest's floor: `free` bytes, of `needed`.
+/// Too little RAM for the guest's floor (and an integrated GPU's least
+/// share): `free` bytes, of `needed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shortfall {
     pub free: u64,
     pub needed: u64,
+    pub gpu: GpuMemory,
 }
 
 impl Shortfall {
@@ -172,14 +218,25 @@ impl Shortfall {
         let needed = self.needed.div_ceil(GIB);
         let free = alloc::format!("{}.{}", self.free / GIB, self.free % GIB * 10 / GIB);
         let floor = GUEST_FLOOR / GIB;
+        let rest = match self.gpu {
+            GpuMemory::Own => "its own memory",
+            GpuMemory::Shared => "its own memory and the graphics built into the processor",
+        };
         refuse!(
             "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free: \
-             {floor} GB for macOS and the rest for its own memory",
+             {floor} GB for macOS and the rest for {rest}",
             free = %free,
             needed = %needed,
-            floor = %floor
+            floor = %floor,
+            rest = %rest
         )
     }
+}
+
+/// The share an integrated GPU would take of `free` bytes with the guest's
+/// floor left aside: a [`GPU_SHARE`]th, within [`GPU_FLOOR`]..=[`GPU_CEILING`].
+fn gpu_target(free: u64) -> u64 {
+    (free / GPU_SHARE / ALIGNMENT * ALIGNMENT).clamp(GPU_FLOOR, GPU_CEILING)
 }
 
 /// The sizes for `free` host bytes and `runners` of the `cores` executors
@@ -202,17 +259,49 @@ impl Shortfall {
 ///   code - pool) / 64`, solved for `pool`; at least [`POOL_RUNNER_FLOOR`] per
 ///   runner, at most [`POOL_PER_RUNNER`] per sharer.
 ///
+/// A GPU that shares the host's RAM ([`GpuMemory::Shared`]) first takes its
+/// share ([`gpu_target`]), and the parts are sized as on a host with that
+/// much less: the GPU's memory is no more Stela's to translate in than the
+/// guest's. Where that leaves the guest under its floor, the share is the
+/// most that does not, down to [`GPU_LEAST`].
+///
 /// A guest share under [`GUEST_FLOOR`] is a [`Shortfall`].
-pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
-    let estimate = estimate(free, cores, runners)?;
-    if estimate.guest >= GUEST_FLOOR {
-        return Ok(estimate);
+pub fn sizes(free: u64, cores: usize, runners: usize, gpu: GpuMemory) -> Result<Sizes> {
+    if let Some(sizes) = plan(free, cores, runners, gpu)? {
+        return Ok(sizes);
     }
     let mut needed = free.next_multiple_of(NEEDED_STEP);
-    while estimate_guest(needed, cores, runners)? < GUEST_FLOOR {
+    while plan(needed, cores, runners, gpu)?.is_none() {
         needed += NEEDED_STEP;
     }
-    Err(Shortfall { free, needed }.refusal())
+    Err(Shortfall { free, needed, gpu }.refusal())
+}
+
+/// [`sizes`], or `None` where the guest's floor (and the GPU's least
+/// share) does not fit.
+fn plan(free: u64, cores: usize, runners: usize, gpu: GpuMemory) -> Result<Option<Sizes>> {
+    let with_share = |share: u64| -> Result<Option<Sizes>> {
+        let sizes = estimate(free.saturating_sub(share), cores, runners)?;
+        Ok((sizes.guest >= GUEST_FLOOR).then_some(Sizes {
+            gpu: share,
+            ..sizes
+        }))
+    };
+    let target = match gpu {
+        GpuMemory::Own => return with_share(0),
+        GpuMemory::Shared => gpu_target(free),
+    };
+    // The most share up to the target that leaves the guest its floor, in
+    // whole alignments; the guest grows with the RAM the parts are sized
+    // for, so the first found from the top is the most.
+    let mut share = target;
+    while share >= GPU_LEAST {
+        if let Some(sizes) = with_share(share)? {
+            return Ok(Some(sizes));
+        }
+        share -= ALIGNMENT;
+    }
+    Ok(None)
 }
 
 /// The bytes of persistent translation pack the loader may read for
@@ -222,10 +311,16 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 /// the guest's floor, after the pack and a margin for the loader's other
 /// allocations. Zero, below [`PACK_FLOOR`]: the parts and the guest come
 /// first, and the pack never makes a boot fail.
-pub fn pack_budget(free: u64, cores: usize, runners: usize) -> u64 {
+///
+/// An integrated GPU's whole share ([`gpu_target`] of what the pack leaves)
+/// comes before the pack: the pack never makes the GPU's share smaller.
+pub fn pack_budget(free: u64, cores: usize, runners: usize, gpu: GpuMemory) -> u64 {
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
     while budget >= PACK_FLOOR {
-        let left = free.saturating_sub(budget + PACK_MARGIN);
+        let mut left = free.saturating_sub(budget + PACK_MARGIN);
+        if gpu == GpuMemory::Shared {
+            left = left.saturating_sub(gpu_target(left));
+        }
         if estimate_guest(left, cores, runners).is_ok_and(|guest| guest >= GUEST_FLOOR) {
             return budget;
         }
@@ -346,6 +441,7 @@ fn split(free: u64, heap: u64, code: CodeReservation, cores: usize, runners: usi
         code,
         pool,
         guest: rest.saturating_sub(pool),
+        gpu: 0,
     }
 }
 
