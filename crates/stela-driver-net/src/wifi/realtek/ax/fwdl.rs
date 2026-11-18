@@ -20,8 +20,10 @@
 //! chip before it gets here, so no MSS key is inserted and the idmem share
 //! mode is not recorded. This module does not grant the retry loop of
 //! `rtw89_fw_download` (`fw.c:2043`), the failure dump
-//! `rtw89_fw_dl_fail_dump`, any H2C after the download, or anything past
-//! the firmware's own ready status: no C2H, scan or radio state.
+//! `rtw89_fw_dl_fail_dump` past its first read (the whole
+//! `R_AX_WCPU_FW_CTRL`, kept in the error), any H2C after the download, or
+//! anything past the firmware's own ready status: no C2H, scan or radio
+//! state.
 use super::io::{AxError, AxIo, Polled, clear32, field16, poll_sample_atomic, set32};
 use super::pci::{Ch12, FWCMD_SLOT_BYTES};
 use crate::wifi::realtek::firmware::{AxImage, AxSection};
@@ -174,10 +176,10 @@ pub unsafe fn download<I: AxIo + ?Sized>(
     // before touching the chip.
     let sections = image
         .sections()
-        .map_err(|_| AxError::Firmware("image sections"))?;
+        .map_err(|_| AxError::Firmware("image sections unreadable"))?;
     let header = header_packet(image, H2C_SEQ_AT_DOWNLOAD);
     if header.len() > FWCMD_SLOT_BYTES {
-        return Err(AxError::Firmware("header packet too long"));
+        return Err(AxError::Firmware("header packet longer than a CH12 slot"));
     }
 
     disable_cpu(io)?;
@@ -279,7 +281,8 @@ fn fw_ctrl8<I: AxIo + ?Sized>(io: &mut I) -> Result<u8, AxError> {
     Ok(value)
 }
 
-/// `rtw89_fwdl_check_path_ready_ax` (`mac.c:7419`) on PCIe.
+/// `rtw89_fwdl_check_path_ready_ax` (`mac.c:7419`) on PCIe; on expiry, the
+/// whole register is read once more for the error.
 fn path_ready<I: AxIo + ?Sized>(io: &mut I, check: u8) -> Result<(), AxError> {
     match poll_sample_atomic(
         io,
@@ -290,10 +293,27 @@ fn path_ready<I: AxIo + ?Sized>(io: &mut I, check: u8) -> Result<(), AxError> {
         |value| value & check != 0,
     )? {
         Polled::Met(_) => Ok(()),
-        Polled::Expired(_) => Err(AxError::Timeout {
+        Polled::Expired(_) => Err(expired(
+            io,
+            if check == B_AX_H2C_PATH_RDY {
+                "H2C path not ready"
+            } else {
+                "FWDL path not ready"
+            },
+        )),
+    }
+}
+
+/// The error of a download wait that expired: `what`, with the whole
+/// `R_AX_WCPU_FW_CTRL` read once more, as `rtw89_fw_dl_fail_dump`
+/// (`fw.c:1943`) reads it first. All ones there means the device is gone.
+fn expired<I: AxIo + ?Sized>(io: &mut I, what: &'static str) -> AxError {
+    match io.read32(R_AX_WCPU_FW_CTRL) {
+        Ok(u32::MAX) => AxError::AllOnes {
             register: R_AX_WCPU_FW_CTRL,
-            mask: u32::from(check),
-        }),
+        },
+        Ok(fw_ctrl) => AxError::FirmwareStatus { what, fw_ctrl },
+        Err(error) => error,
     }
 }
 
@@ -304,7 +324,7 @@ fn fwdl_status(value: u8) -> u8 {
 
 /// `rtw89_fw_check_rdy(RTW89_FWDL_CHECK_FREERTOS_DONE)` (`fw.c:106`): wait
 /// the whole 400 ms for `RTW89_FWDL_WCPU_FW_INIT_RDY`, then name the last
-/// status.
+/// status, with the whole register read after the wait.
 fn check_ready<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     match poll_sample_atomic(
         io,
@@ -315,12 +335,15 @@ fn check_ready<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
         |value| fwdl_status(value) == RTW89_FWDL_WCPU_FW_INIT_RDY,
     )? {
         Polled::Met(_) => Ok(()),
-        Polled::Expired(value) => Err(AxError::Firmware(match fwdl_status(value) {
-            RTW89_FWDL_CHECKSUM_FAIL => "checksum",
-            RTW89_FWDL_SECURITY_FAIL => "security",
-            RTW89_FWDL_CV_NOT_MATCH => "cut mismatch",
-            _ => "not ready",
-        })),
+        Polled::Expired(value) => Err(expired(
+            io,
+            match fwdl_status(value) {
+                RTW89_FWDL_CHECKSUM_FAIL => "checksum failed",
+                RTW89_FWDL_SECURITY_FAIL => "security check failed",
+                RTW89_FWDL_CV_NOT_MATCH => "cut mismatch",
+                _ => "not ready",
+            },
+        )),
     }
 }
 

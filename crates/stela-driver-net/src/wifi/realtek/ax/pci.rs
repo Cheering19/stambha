@@ -461,9 +461,8 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
     }
     clear32(io, R_AX_PCIE_IO_RCY_S1, B_AX_PCIE_IO_RCY_WDT_MODE)?;
 
-    // pci.c:3114-3123.
-    set32(io, R_AX_HAXI_DMA_STOP1, B_AX_STOP_WPDMA)?;
-    ctrl_dma_all(io, false)?;
+    // pci.c:3113-3123.
+    stop_dma(io)?;
     poll_dma_all_idle(io)?;
     clr_idx_all(io)?;
     mode_op(io)?;
@@ -478,6 +477,15 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
     ctrl_dma_all(io, true)?;
     rings.ch12_ready.set(true);
     Ok(())
+}
+
+/// Stop the PCIe side's DMA as `rtw89_pci_ops_mac_pre_init_ax` does first
+/// (`pci.c:3113-3116`): `B_AX_STOP_WPDMA` in `R_AX_HAXI_DMA_STOP1`, then
+/// `rtw89_pci_ctrl_dma_all(false)`: AXI master stopped and the TX/RX HCI
+/// DMA disabled. Nothing is waited for.
+pub(crate) fn stop_dma<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    set32(io, R_AX_HAXI_DMA_STOP1, B_AX_STOP_WPDMA)?;
+    ctrl_dma_all(io, false)
 }
 
 /// `rtw89_pci_ctrl_dma_all` (`pci.c:2114`): `dma_io_stop`, then the
@@ -631,7 +639,7 @@ impl Ch12<'_> {
             return Err(AxError::Dma("CH12 is stopped"));
         }
         if packet.is_empty() || packet.len() > FWCMD_SLOT_BYTES {
-            return Err(AxError::Dma("CH12 packet length"));
+            return Err(AxError::Dma("CH12 packet length out of range"));
         }
         let slot = usize::from(rings.ch12_host.get());
         let at = slot * FWCMD_SLOT_BYTES;

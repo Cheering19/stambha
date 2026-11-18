@@ -16,7 +16,7 @@ pub mod power;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use bringup::{BringUpError, Running, bring_up};
+pub use bringup::{BringUpError, Earlier, Running, bring_up, quiesce};
 pub use fwdl::download;
 pub use io::{
     AxError, AxIo, NativeAxIo, Polled, clear8, clear16, clear32, field8, field16, field32,

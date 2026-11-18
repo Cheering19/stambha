@@ -460,7 +460,7 @@ fn submit_refuses_before_pre_init_and_bad_lengths() {
     start(&mut io, 2, &rings).unwrap();
     assert!(!rings.ch12_stopped());
     io.trace.clear();
-    let length = Err(AxError::Dma("CH12 packet length"));
+    let length = Err(AxError::Dma("CH12 packet length out of range"));
     assert_eq!(send(&mut rings, &mut io, &[]), length);
     assert_eq!(send(&mut rings, &mut io, &[0; 4097]), length);
     assert!(io.trace.is_empty());

@@ -4,7 +4,7 @@ use crate::wifi::realtek::ax::pci::{Rings, pre_init};
 use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
@@ -351,9 +351,9 @@ fn download_sequence() {
 fn ready_error_codes() {
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
-    for (status, error) in [
-        (2, "checksum"),
-        (3, "security"),
+    for (status, what) in [
+        (2, "checksum failed"),
+        (3, "security check failed"),
         (4, "cut mismatch"),
         (1, "not ready"),
         (6, "not ready"),
@@ -361,10 +361,19 @@ fn ready_error_codes() {
         let (_m, mut rings, mut io, _sent) = running();
         wcpu(&mut io, 5, Arc::new(AtomicU8::new(status)));
         watchdog(&mut io);
+        // The error carries the whole 0x01E0, read once after the wait:
+        // FWDL_EN, both path bits and the status in [7:5].
         assert_eq!(
             run(&mut rings, &mut io, &fw.image),
-            Err(AxError::Firmware(error)),
+            Err(AxError::FirmwareStatus {
+                what,
+                fw_ctrl: 0x07 | u32::from(status) << 5,
+            }),
             "status {status}"
+        );
+        assert_eq!(
+            io.trace[io.trace.len() - 2..],
+            [Op::R8(0x01E0), Op::R32(0x01E0)]
         );
         // rtw89_fw_check_rdy waits for ready for FWDL_WAIT_CNT (400 ms) of
         // `read_poll_timeout_atomic` budget (iopoll.h: 399_602 samples, so
@@ -389,7 +398,10 @@ fn retry_after_ready_failure_starts_over() {
     watchdog(&mut io);
     assert_eq!(
         run(&mut rings, &mut io, &fw.image),
-        Err(AxError::Firmware("checksum"))
+        Err(AxError::FirmwareStatus {
+            what: "checksum failed",
+            fw_ctrl: 0x0000_0047,
+        })
     );
     // Linux's next __rtw89_fw_download starts with disable_cpu; the queue
     // continues at slot 5 and the WCPU reports ready this time.
@@ -435,11 +447,12 @@ fn path_ready_timeout_sends_nothing() {
     let (_m, mut rings, mut io, sent) = running();
     watchdog(&mut io);
     let began = io.now;
+    // FWDL_EN alone, as rtw89_mac_enable_cpu_ax left it.
     assert_eq!(
         run(&mut rings, &mut io, &fw.image),
-        Err(AxError::Timeout {
-            register: 0x01E0,
-            mask: 1 << 1
+        Err(AxError::FirmwareStatus {
+            what: "H2C path not ready",
+            fw_ctrl: 0x0000_0001,
         })
     );
     // read_poll_timeout_atomic: 399_601 waits of 1 us with free reads.
@@ -500,6 +513,46 @@ fn submit_failure_stops_the_download() {
         1
     );
     assert!(!io.trace.contains(&Op::Delay(5000)));
+}
+
+#[test]
+fn an_expired_wait_reads_the_whole_status_register_once() {
+    let mut m = RegisterModel::new();
+    m.set32(0x01E0, 0x0000_0C01);
+    assert_eq!(
+        path_ready(&mut m, 1 << 2),
+        Err(AxError::FirmwareStatus {
+            what: "FWDL path not ready",
+            fw_ctrl: 0x0000_0C01,
+        })
+    );
+    assert_eq!(m.trace.last(), Some(&Op::R32(0x01E0)));
+    assert_eq!(
+        m.trace.iter().filter(|op| **op == Op::R32(0x01E0)).count(),
+        1
+    );
+    assert_eq!(
+        AxError::FirmwareStatus {
+            what: "FWDL path not ready",
+            fw_ctrl: 0x0000_0C01,
+        }
+        .to_string(),
+        "FWDL path not ready (0x01E0=0x00000c01)"
+    );
+    // A device gone by then reads all ones there: that is the error.
+    let mut m = RegisterModel::new();
+    let mut reads = 0;
+    m.on_read(
+        0x01E0,
+        Box::new(move |_: &mut RegisterModel| {
+            reads += 1;
+            if reads > 399_602 { u32::MAX } else { 0 }
+        }),
+    );
+    assert_eq!(
+        check_ready(&mut m),
+        Err(AxError::AllOnes { register: 0x01E0 })
+    );
 }
 
 /// Reads of `R_AX_WCPU_FW_CTRL` (the 8-bit sample).

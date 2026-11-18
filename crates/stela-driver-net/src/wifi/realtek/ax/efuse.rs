@@ -176,9 +176,7 @@ pub fn secure_boot<I: AxIo + ?Sized>(io: &mut I) -> Result<SecureBoot, AxError> 
 /// from physical index 4. Linux's `-EINVAL` returns are `AxError::Efuse`.
 pub fn logical_map(physical: &[u8]) -> Result<Vec<u8>, AxError> {
     if physical.len() < PHYSICAL_EFUSE_SIZE {
-        return Err(AxError::Efuse(
-            "physical efuse map is shorter than 1216 bytes",
-        ));
+        return Err(AxError::Efuse("physical map is shorter than 1216 bytes"));
     }
     let mut log = vec![0xFFu8; LOGICAL_EFUSE_SIZE];
     let end = PHYSICAL_EFUSE_SIZE - SEC_CTRL_EFUSE_SIZE;
@@ -198,7 +196,7 @@ pub fn logical_map(physical: &[u8]) -> Result<Vec<u8>, AxError> {
             }
             let log_idx = (blk_idx << 3) + (i << 1);
             if phy_idx + 1 > end - 1 || log_idx + 1 > LOGICAL_EFUSE_SIZE {
-                return Err(AxError::Efuse("efuse logical map out of range"));
+                return Err(AxError::Efuse("logical map out of range"));
             }
             log[log_idx] = physical[phy_idx];
             log[log_idx + 1] = physical[phy_idx + 1];

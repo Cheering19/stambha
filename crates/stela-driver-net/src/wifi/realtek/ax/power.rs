@@ -173,6 +173,26 @@ fn reset_pwr_state<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     Ok(())
 }
 
+/// `MAC_AX_MAC_OFF` (`reg.h:332`).
+pub(crate) const MAC_AX_MAC_OFF: u8 = 0;
+/// `MAC_AX_MAC_LPS` (`reg.h:334`): firmware-managed power save, WCPU alive.
+pub(crate) const MAC_AX_MAC_LPS: u8 = 2;
+/// `MAC_AX_MAC_ON` (`reg.h:333`), as a field value.
+pub(crate) const MAC_AX_MAC_ON_STATE: u8 = MAC_AX_MAC_ON as u8;
+
+/// The MAC power state field, `R_AX_IC_PWR_STATE[9:8]`, that
+/// `rtw89_mac_reset_pwr_state_ax` reads. A register that reads all ones
+/// (the device is not answering) is an error, not a state.
+pub(crate) fn mac_state<I: AxIo + ?Sized>(io: &mut I) -> Result<u8, AxError> {
+    let state = io.read32(R_AX_IC_PWR_STATE)?;
+    if state == u32::MAX {
+        return Err(AxError::AllOnes {
+            register: R_AX_IC_PWR_STATE,
+        });
+    }
+    Ok(((state & B_AX_WLMAC_PWR_STE_MASK) >> 8) as u8)
+}
+
 /// `rtw89_mac_power_switch(true)` for PCIe: the already-on check, then
 /// `rtw8852c_pwr_on_func`. No scoreboard or efuse work (those follow in the
 /// caller).
@@ -181,22 +201,30 @@ fn power_on_once<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     pwr_on_func(io)
 }
 
-/// `rtw89_mac_pwr_on`: on any failure, power off (its result ignored) and
-/// try the power switch once more.
 /// `rtw89_mac_power_switch(false)`: `rtw8852c_pwr_off_func`, then, only if it
 /// succeeded, `rtw89_mac_update_scoreboard(MAC_AX_NOTIFY_PWR_MAJOR)`, i.e.
 /// write8 `R_AX_SCOREBOARD + 3` = 0x80 (`mac.c:1580`, `btc_sb` of rtw8852c).
-fn power_switch_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+pub(crate) fn power_switch_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     power_off(io)?;
     io.write8(R_AX_SCOREBOARD + 3, MAC_AX_NOTIFY_PWR_MAJOR)
 }
 
-pub fn power_on<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    if power_on_once(io).is_ok() {
+/// Both failures of a [`power_on`] whose retry failed too. Linux returns only
+/// the retry's; the first is kept as the likelier root cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerOnError {
+    pub first: AxError,
+    pub retry: AxError,
+}
+
+/// `rtw89_mac_pwr_on`: on any failure, power off (its result ignored) and
+/// try the power switch once more.
+pub fn power_on<I: AxIo + ?Sized>(io: &mut I) -> Result<(), PowerOnError> {
+    let Err(first) = power_on_once(io) else {
         return Ok(());
-    }
+    };
     let _ = power_switch_off(io);
-    power_on_once(io)
+    power_on_once(io).map_err(|retry| PowerOnError { first, retry })
 }
 
 /// `rtw8852c_pwr_on_func` (`rtw8852c.c:327-437`), PCIe.
@@ -606,11 +634,50 @@ mod tests {
     fn power_on_still_on_after_retry_is_an_error() {
         let mut m = settled();
         m.on_read(0x03F0, Box::new(|_m: &mut RegisterModel| 0x100));
-        assert_eq!(power_on(&mut m), Err(AxError::AlreadyPowered));
+        assert_eq!(
+            power_on(&mut m),
+            Err(PowerOnError {
+                first: AxError::AlreadyPowered,
+                retry: AxError::AlreadyPowered,
+            })
+        );
         // Exactly one power-off ran; the power-on body never started.
         let mut expected = off_trace();
         expected.push(Op::W8(0x00AF, 0x80));
         assert_eq!(m.writes(), expected);
+    }
+
+    #[test]
+    fn power_on_keeps_the_first_error_when_the_retry_fails_differently() {
+        // The MAC reads on at first; after the power-off it reads off, but
+        // RDY_SYSPWR never comes up.
+        let mut m = RegisterModel::new();
+        m.on_read(
+            0x0004,
+            Box::new(|m: &mut RegisterModel| m.get32(0x0004) & !(1 << 17 | 1 << 8 | 1 << 9)),
+        );
+        m.on_read(
+            0x0270,
+            Box::new(|m: &mut RegisterModel| m.get32(0x0270) & 0x7FFF_FFFF),
+        );
+        let mut reads = 0;
+        m.on_read(
+            0x03F0,
+            Box::new(move |_m: &mut RegisterModel| {
+                reads += 1;
+                if reads == 1 { 0x100 } else { 0 }
+            }),
+        );
+        assert_eq!(
+            power_on(&mut m),
+            Err(PowerOnError {
+                first: AxError::AlreadyPowered,
+                retry: AxError::Timeout {
+                    register: 0x0004,
+                    mask: 1 << 17
+                },
+            })
+        );
     }
 
     #[test]

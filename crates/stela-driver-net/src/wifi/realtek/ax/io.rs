@@ -28,13 +28,32 @@ pub enum AxError {
     },
     /// Uncalibrated, retired or non-advancing time source.
     Clock,
+    /// The firmware download refused or failed; the message says why.
     Firmware(&'static str),
+    /// The WCPU never reached the download state waited on: `what` names the
+    /// state, and `fw_ctrl` is the whole `R_AX_WCPU_FW_CTRL` (0x01E0) read
+    /// once the wait expired, as `rtw89_fw_dl_fail_dump` (`fw.c:1943`)
+    /// logs it.
+    FirmwareStatus {
+        what: &'static str,
+        fw_ctrl: u32,
+    },
+    /// The firmware file itself is missing or unusable; the message names it.
+    FirmwareFile(&'static str),
+    /// The PCI function is not the chip this bring-up drives; the message
+    /// says what it is instead.
+    Identity(&'static str),
+    /// The rings or the CH12 queue failed; the message says how.
     Dma(&'static str),
     SecureBootUnsupported,
     /// The efuse could not be parsed (`-EINVAL` in `efuse.c`).
     Efuse(&'static str),
     /// `rtw89_mac_reset_pwr_state_ax`: the MAC is already powered on (-EBUSY).
     AlreadyPowered,
+    /// `R_AX_IC_PWR_STATE[9:8]` read a state in which the chip cannot be
+    /// taken as stopped: 2 (`MAC_AX_MAC_LPS`, its firmware alive) or 3
+    /// (undefined).
+    MacPowerState(u8),
 }
 
 impl fmt::Display for AxError {
@@ -51,11 +70,25 @@ impl fmt::Display for AxError {
                 write!(f, "register {register:#x} is outside the usable window")
             }
             Self::Clock => f.write_str("time source unavailable or not advancing"),
-            Self::Firmware(what) => write!(f, "firmware: {what}"),
-            Self::Dma(what) => write!(f, "dma: {what}"),
+            // The bring-up step already names the subsystem, so these print
+            // their message alone.
+            Self::Firmware(what)
+            | Self::FirmwareFile(what)
+            | Self::Identity(what)
+            | Self::Dma(what)
+            | Self::Efuse(what) => f.write_str(what),
+            Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
-            Self::Efuse(what) => write!(f, "efuse: {what}"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),
+            Self::MacPowerState(2) => f.write_str(
+                "the MAC is in firmware-managed low power (LPS), so its firmware may still run; \
+                 Bus Master stays off; power the machine fully off (not restart) and boot again",
+            ),
+            Self::MacPowerState(state) => write!(
+                f,
+                "the MAC power state reads {state}, which rtw89 does not define; Bus Master \
+                 stays off"
+            ),
         }
     }
 }
