@@ -362,7 +362,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
     use stela_boot_core::host_memory::GpuMemory;
     use stela_drivers::gpu::{
         Adapter, Vendor,
-        selection::{Driven, Found, Memory},
+        selection::{self, Found, Memory, Planned},
         stack::GpuStack,
     };
     if GPU_MEMORY.load(core::sync::atomic::Ordering::Relaxed) != 0 {
@@ -373,6 +373,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
     // The BAR each GPU's driver maps whole, where it does, and its kernel.
     let mut apertures = Vec::new();
     let mut kernels = Vec::new();
+    let mut addresses = Vec::new();
     for identity in functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)
@@ -391,6 +392,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
             Ok(None) => false,
             Err(()) => true,
         };
+        addresses.push(adapter.address);
         let stack = match GpuStack::select(&adapter) {
             Ok(stack) => stack,
             Err(_) => {
@@ -417,11 +419,10 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
                 false => ", shows only",
             }
         ));
+        // The engine's census takes the same kind from the plan
+        // (`Planned`), so both select the same GPUs.
         found.push(Found {
-            stack: Ok(Driven {
-                draws: stack.draws(),
-                integrated: Some(integrated),
-            }),
+            stack: Ok(selection::driven(stack, &adapter, Some(integrated))),
             firmware_screen,
         });
         apertures.push(stack.kernel.aperture.map(|bar| (adapter.address, bar)));
@@ -440,7 +441,16 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
         ),
         core::sync::atomic::Ordering::Relaxed,
     );
-    let memory = match stela_drivers::gpu::selection::memory(&found) {
+    let planned_memory = selection::memory(&found);
+    let mut planned = Planned::new(planned_memory);
+    for (&address, found) in addresses.iter().zip(&found) {
+        planned.see(
+            address,
+            found.stack.ok().and_then(|driven| driven.integrated),
+        );
+    }
+    GPU_CENSUS.try_with(|census| *census = Some(planned));
+    let memory = match planned_memory {
         Memory::Own => GpuMemory::Own,
         Memory::Shared => GpuMemory::Shared,
         Memory::Display => GpuMemory::Display,
@@ -544,6 +554,18 @@ static GPU_APERTURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// Whether every GPU that starts has a driver whose heap need was measured
 /// (`GpuPlan::bounded`).
 static GPU_BOUNDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// What [`plan_gpu_memory`] saw of the display controllers, for the
+/// engine's census (`Handoff::gpu_census`).
+static GPU_CENSUS: stela_boot_core::screen::Exclusive<
+    Option<stela_drivers::gpu::selection::Planned>,
+> = stela_boot_core::screen::Exclusive::new(None);
+
+/// The display controllers the memory plan saw and the kinds it took for
+/// them; `None` where no census ran.
+pub fn gpu_census() -> Option<stela_drivers::gpu::selection::Planned> {
+    GPU_CENSUS.try_with(|census| *census).flatten()
+}
 
 /// [`plan_gpu_memory`]'s answer with the apertures' tables.
 pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {

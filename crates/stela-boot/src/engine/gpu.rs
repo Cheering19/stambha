@@ -254,6 +254,22 @@ pub(super) unsafe fn keep_pci_map(region: crate::handoff::Region, root: u64) {
     FIRMWARE_MAP.store(Box::into_raw(Box::new(map)), Ordering::Release);
 }
 
+/// What the memory plan saw of the display controllers (`Handoff::gpu_census`).
+static CENSUS: AtomicPtr<stela_drivers::gpu::selection::Planned> = AtomicPtr::new(ptr::null_mut());
+
+/// Keeps what the memory plan saw of the display controllers, so the
+/// census takes the kinds it took. Called once, before any claim.
+pub(super) fn keep_census(census: Option<stela_drivers::gpu::selection::Planned>) {
+    if let Some(census) = census {
+        CENSUS.store(Box::into_raw(Box::new(census)), Ordering::Release);
+    }
+}
+
+fn planned_census() -> Option<&'static stela_drivers::gpu::selection::Planned> {
+    // SAFETY: stored once before any claim and never freed.
+    unsafe { CENSUS.load(Ordering::Acquire).as_ref() }
+}
+
 fn firmware_map() -> Option<&'static FirmwareMap> {
     // SAFETY: stored once before any claim and never freed.
     unsafe { FIRMWARE_MAP.load(Ordering::Acquire).as_ref() }
@@ -2053,7 +2069,7 @@ pub(super) fn claim_all(
     port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
-    use stela_drivers::gpu::selection::{self, Choice, Driven, Found};
+    use stela_drivers::gpu::selection::{self, Choice, Found};
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
         vendor: adapter.vendor,
         name: adapter.name(),
@@ -2095,13 +2111,19 @@ pub(super) fn claim_all(
             return (claimed, refused);
         }
     };
+    // Each GPU's kind as the memory plan took it, so the selection here and
+    // the plan's agree.
+    let planned = planned_census();
     let found: Vec<Found> = adapters
         .iter()
         .zip(&stacks)
         .map(|(adapter, stack)| Found {
-            stack: stack.map(|stack| Driven {
-                draws: stack.draws(),
-                integrated: stack.kernel.table_integrated(adapter),
+            stack: stack.map(|stack| {
+                selection::driven(
+                    stack,
+                    adapter,
+                    planned.and_then(|planned| planned.kind(adapter.address)),
+                )
             }),
             firmware_screen: may_show_screen(source, adapter.address),
         })
@@ -2146,6 +2168,25 @@ pub(super) fn claim_all(
         }
     });
     report_selection(adapters, &found, &chosen);
+    if let Some(planned) = planned {
+        let addresses: Vec<_> = adapters.iter().map(|adapter| adapter.address).collect();
+        for index in selection::unplanned(planned, &addresses, &chosen) {
+            output::arguments(format_args!(
+                "GPU MEMORY {} starts, which the memory plan did not see (its port was powered \
+                 on after the firmware's exit): the plan, made as {}, stands for this boot{}\n",
+                adapters[index].address,
+                planned.memory.describe(),
+                match planned.memory {
+                    selection::Memory::Shared => format!(
+                        ", so the integrated GPU's share of {}M is kept from the guest while \
+                         this GPU may draw",
+                        crate::native_memory::gpu_share() >> 20
+                    ),
+                    _ => String::new(),
+                }
+            ));
+        }
+    }
     for (function, &index) in claimed.iter_mut().zip(&chosen.claimed) {
         function.later = matches!(chosen.choices[index], Choice::Later { .. });
     }

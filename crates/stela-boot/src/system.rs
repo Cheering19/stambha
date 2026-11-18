@@ -1155,6 +1155,7 @@ fn load(
             gpu_share: gpu,
             gpu_pages: pages,
             gpu_pages_held: pages_held,
+            gpu_census: storage::gpu_census(),
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

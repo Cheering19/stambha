@@ -131,6 +131,10 @@ pub struct Handoff {
     pub(crate) gpu_pages: u64,
     /// The plan holds Linux to `gpu_pages` (`host_memory::held_bound`).
     pub(crate) gpu_pages_held: bool,
+    /// The display controllers the memory plan saw and the kinds it took
+    /// for them, which the engine's census takes so that both select the
+    /// same GPUs; `None` where no census ran.
+    pub(crate) gpu_census: Option<stela_drivers::gpu::selection::Planned>,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,

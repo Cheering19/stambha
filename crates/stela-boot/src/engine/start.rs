@@ -2967,6 +2967,7 @@ fn start_platform(
     unsafe { super::gpu::keep_video_bios_table(handoff.rsdp, handoff.root) };
     // SAFETY: as above; the loader root maps the pages the boot kept.
     unsafe { super::gpu::keep_pci_map(handoff.pci_map, handoff.root) };
+    super::gpu::keep_census(handoff.gpu_census);
     // The IOAPICs are the operating system's after ExitBootServices, as
     // every OS takes them: firmware and SMM program no routes at runtime.
     if let Some(pci) = &contained_pci {

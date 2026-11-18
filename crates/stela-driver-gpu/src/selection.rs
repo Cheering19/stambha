@@ -27,6 +27,7 @@
 //!   firmware's is on it, keeps showing macOS by copy.
 //! - When a GPU's claim is refused, the next one takes its place: a GPU left
 //!   out only beside it is started instead.
+use crate::bus::pci::Address;
 use crate::stack::{drawing_kind, may_only_show_frames_of, only_shows_frames_of};
 use alloc::{format, string::String, vec::Vec};
 
@@ -182,6 +183,104 @@ pub fn memory(found: &[Found]) -> Memory {
         Memory::Display
     } else {
         Memory::Own
+    }
+}
+
+/// What `stack` says of the display controller `adapter` before its start,
+/// the same for the loader's memory plan and the engine's census: whether
+/// it draws, and its kind as its driver's table gives it, else `told`, the
+/// kind the loader read before the plan (an AMD GPU's IP discovery table, or
+/// integrated where nothing told it), which the engine takes from the plan
+/// ([`Planned::kind`]). So both select the same GPUs for the same census.
+pub fn driven(
+    stack: &crate::stack::GpuStack,
+    adapter: &crate::Adapter,
+    told: Option<bool>,
+) -> Driven {
+    Driven {
+        draws: stack.draws(),
+        integrated: stack.kernel.table_integrated(adapter).or(told),
+    }
+}
+
+/// The display controllers the memory plan saw, at most this many.
+const PLANNED: usize = 16;
+
+/// What the loader's memory plan saw of the display controllers, which the
+/// engine's census takes so that both select alike: each controller's PCI
+/// address and the kind the plan took for it ([`driven`]'s `told`), and the
+/// memory planned. A controller the plan did not see, as a GPU below a port
+/// powered on after the firmware's exit, is told apart ([`Self::saw`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Planned {
+    seen: [(Address, Option<bool>); PLANNED],
+    count: usize,
+    pub memory: Memory,
+}
+
+impl Planned {
+    pub const fn new(memory: Memory) -> Self {
+        const NONE: Address = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        Self {
+            seen: [(NONE, None); PLANNED],
+            count: 0,
+            memory,
+        }
+    }
+
+    /// The plan saw the controller at `address` and took `kind` for it.
+    /// Past [`PLANNED`] controllers the rest are not kept, and the engine
+    /// tells their kinds as before the plan.
+    pub fn see(&mut self, address: Address, kind: Option<bool>) {
+        if self.count < PLANNED {
+            self.seen[self.count] = (address, kind);
+            self.count += 1;
+        }
+    }
+
+    fn find(&self, address: Address) -> Option<Option<bool>> {
+        self.seen[..self.count]
+            .iter()
+            .find(|(seen, _)| *seen == address)
+            .map(|&(_, kind)| kind)
+    }
+
+    /// The kind the plan took for the controller at `address`.
+    pub fn kind(&self, address: Address) -> Option<bool> {
+        self.find(address).flatten()
+    }
+
+    /// Whether the plan saw the controller at `address`.
+    pub fn saw(&self, address: Address) -> bool {
+        self.find(address).is_some()
+    }
+}
+
+/// The started GPUs of `chosen`, by census index, at `addresses`, that the
+/// plan did not see: the plan's memory then stands for GPUs it did not
+/// count, which the engine says.
+pub fn unplanned(planned: &Planned, addresses: &[Address], chosen: &Selection) -> Vec<usize> {
+    chosen
+        .claimed
+        .iter()
+        .copied()
+        .filter(|&index| !planned.saw(addresses[index]))
+        .collect()
+}
+
+impl Memory {
+    /// The memory in words, for a line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Own => "no integrated GPU starts",
+            Self::Shared => "an integrated GPU draws in a share of RAM",
+            Self::Display => "an integrated GPU only shows the display beside a discrete GPU",
+        }
     }
 }
 
@@ -492,5 +591,147 @@ mod tests {
                 "integrated, shows only: this image has no Vulkan driver for it"
             ]
         );
+    }
+
+    /// The loader's memory plan and the engine's census tell each GPU's kind
+    /// alike ([`driven`], the plan's kinds passed on in [`Planned`]), so on
+    /// the same census they start the same GPUs and agree on the memory; a
+    /// GPU the plan did not see, below a port powered on after the
+    /// firmware's exit, is named.
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn the_plan_and_the_engine_select_alike_over_one_census() {
+        use crate::{
+            Adapter,
+            stack::{AMD, GpuStack, NVIDIA},
+        };
+        fn at(bus: u8, vendor: crate::Vendor, device: u16) -> Adapter {
+            Adapter {
+                address: Address {
+                    segment: 0,
+                    bus,
+                    device: 0,
+                    function: 0,
+                },
+                vendor,
+                device,
+                class: [0x03, 0x00, 0x00],
+                revision: 0,
+            }
+        }
+        // As images with the Vulkan drivers: this test binary links none.
+        let drawn = |driven: Driven| Driven {
+            draws: true,
+            ..driven
+        };
+        // A GPU, the kind its IP discovery table gives the loader (None
+        // where its driver's table tells), and whether the firmware's
+        // picture is on it.
+        type Gpu = (Adapter, &'static GpuStack, Option<bool>, bool);
+        let nvidia = at(1, crate::Vendor::Nvidia, 0x2c02);
+        // amdgpu takes these by class; only IP discovery tells their kind.
+        let igpu = at(0x65, crate::Vendor::Amd, 0x13c0);
+        let dgpu = at(3, crate::Vendor::Amd, 0x744c);
+        assert_eq!(AMD.kernel.table_integrated(&igpu), None);
+        let plan = |census: &[Gpu]| -> (Planned, Vec<Found>) {
+            let found: Vec<Found> = census
+                .iter()
+                .map(|&(adapter, stack, discovered, screen)| Found {
+                    // The loader takes a GPU it cannot tell as integrated.
+                    stack: Ok(drawn(driven(
+                        stack,
+                        &adapter,
+                        Some(discovered.unwrap_or(true)),
+                    ))),
+                    firmware_screen: screen,
+                })
+                .collect();
+            let mut planned = Planned::new(memory(&found));
+            for (&(adapter, ..), found) in census.iter().zip(&found) {
+                planned.see(adapter.address, found.stack.ok().and_then(|d| d.integrated));
+            }
+            (planned, found)
+        };
+        let engine = |census: &[Gpu], planned: &Planned| -> Vec<Found> {
+            census
+                .iter()
+                .map(|&(adapter, stack, _, screen)| Found {
+                    stack: Ok(drawn(driven(
+                        stack,
+                        &adapter,
+                        planned.kind(adapter.address),
+                    ))),
+                    firmware_screen: screen,
+                })
+                .collect()
+        };
+        let addresses =
+            |census: &[Gpu]| -> Vec<Address> { census.iter().map(|gpu| gpu.0.address).collect() };
+        let alike = |census: &[Gpu]| {
+            let (planned, found) = plan(census);
+            let now = engine(census, &planned);
+            let chosen = all(&now);
+            assert_eq!(all(&found), chosen);
+            assert_eq!(memory(&now), planned.memory);
+            assert!(unplanned(&planned, &addresses(census), &chosen).is_empty());
+            (planned.memory, chosen.choices)
+        };
+        // An NVIDIA card with the monitor, an AMD iGPU without: the iGPU is
+        // left for both, and the plan reserves nothing for it. Told by its
+        // driver's table alone, the engine claimed it (the defect).
+        assert_eq!(
+            alike(&[
+                (igpu, &AMD, Some(true), false),
+                (nvidia, &NVIDIA, None, true)
+            ]),
+            (Memory::Own, vec![Choice::Left { beside: 1 }, Choice::First])
+        );
+        assert_eq!(
+            all(&[
+                gpu(drawn(driven(&AMD, &igpu, None)), false),
+                gpu(drawn(driven(&NVIDIA, &nvidia, None)), true)
+            ])
+            .choices[0],
+            Choice::Later { beside: 1 }
+        );
+        // The panel on the iGPU: it shows the card's frames for both.
+        assert_eq!(
+            alike(&[
+                (igpu, &AMD, Some(true), true),
+                (nvidia, &NVIDIA, None, false)
+            ]),
+            (
+                Memory::Display,
+                vec![Choice::Later { beside: 1 }, Choice::First]
+            )
+        );
+        // An AMD card beside the AMD iGPU, both told by IP discovery.
+        assert_eq!(
+            alike(&[
+                (igpu, &AMD, Some(true), true),
+                (dgpu, &AMD, Some(false), false)
+            ]),
+            (
+                Memory::Display,
+                vec![Choice::Later { beside: 1 }, Choice::First]
+            )
+        );
+        // The iGPU alone draws in its share.
+        assert_eq!(
+            alike(&[(igpu, &AMD, Some(true), true)]),
+            (Memory::Shared, vec![Choice::First])
+        );
+        // A laptop whose discrete GPU's port was off at the loader's census:
+        // the plan saw the iGPU alone and gave it a share; the engine's
+        // census, after the port's power-on, starts the card too, which the
+        // plan did not count, and names it.
+        for card in [(nvidia, &NVIDIA), (dgpu, &AMD)] {
+            let (planned, _) = plan(&[(igpu, &AMD, Some(true), true)]);
+            assert_eq!(planned.memory, Memory::Shared);
+            let census: [Gpu; 2] = [(igpu, &AMD, None, true), (card.0, card.1, None, false)];
+            let chosen = all(&engine(&census, &planned));
+            assert!(chosen.claimed.contains(&1));
+            assert_eq!(unplanned(&planned, &addresses(&census), &chosen), [1]);
+        }
     }
 }
