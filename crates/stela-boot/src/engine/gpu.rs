@@ -618,16 +618,15 @@ struct MsiSource {
     msi: Msi,
     /// The function the route was attached for, which only it may program.
     requester: stela_drivers::bus::pci::requester::RequesterId,
-    programmed: bool,
     event: stela_linux::service::IrqEvent,
     environment: *const Environment,
     line: u32,
 }
 
 // SAFETY: the function was stopped when claimed, with no route of its own.
-// Nothing here frees: config/capability stay with the registration. Terminal
-// engine/payload/Linux-work joining is unavailable, so a programmed route's
-// close refuses and retains owners even if nouveau masked its local source.
+// Nothing here frees: config/capability stay with the registration. A close
+// turns the message off and reads it back before the registry drains the
+// vector, and joins Linux's work for the line (`quiesce`, `synchronize`).
 unsafe impl Source for MsiSource {
     fn mask(&mut self) -> Result<(), IrqError> {
         let command = self.config.read16(4)?;
@@ -646,12 +645,20 @@ unsafe impl Source for MsiSource {
         }
         Ok(())
     }
+    /// The function sends no message after this: `mask` turns MSI off and
+    /// reads the capability back. That read's completion cannot pass a
+    /// posted write the function sent before (PCIe ordering; a message
+    /// write carries no Relaxed Ordering), so every earlier message has
+    /// reached the root complex when it returns, and the registry then
+    /// waits for the vector's request and in-flight count to drain. Linux's
+    /// `free_irq` waits for no more. Linux's own work for the line is joined
+    /// in `synchronize`.
     fn quiesce(&mut self) -> Result<(), IrqError> {
-        if self.programmed {
-            // GPU engine/payload and Linux service work have no independent
-            // joined terminal acknowledgement here. Retain the old route.
-            return Err(IrqError::Unsupported);
-        }
+        self.mask()
+    }
+    /// As [`Self::quiesce`]: the function has one message and no other
+    /// producer of it, and the read back is its payload drain.
+    fn quiesce_for_fabric_fence(&mut self) -> Result<(), IrqError> {
         self.mask()
     }
     fn route_kind(&self) -> stela_drivers::bus::irq::RouteKind {
@@ -668,7 +675,6 @@ unsafe impl Source for MsiSource {
             return Err(IrqError::Route);
         };
         let data = u16::try_from(message.data).map_err(|_| IrqError::Route)?;
-        self.programmed = true;
         self.msi
             .program(&mut self.config, message.address, data)
             .map_err(IrqError::from)
@@ -1057,7 +1063,6 @@ impl Platform for Host {
             config: line.config.clone(),
             msi,
             requester: line.custody.requester().clone(),
-            programmed: false,
             event: event.clone(),
             environment: self.environment.get(),
             line: irq,
@@ -1164,11 +1169,13 @@ impl Platform for Host {
                 Err(EOPNOTSUPP)
             }
             Ok(retired) => {
-                // GPU has no original endpoint/entry delivery factory or
-                // custody transfer yet. Do not return completed free_irq from
-                // a future partial source implementation; keep typed owners.
+                // The action is closed: the function sends no message, the
+                // vector drained and Linux's work for it joined
+                // (`MsiSource::quiesce`, `synchronize`), so Linux may free
+                // it. The retired owners stay with the line, which no later
+                // request routes again (`irq_enable` refuses it).
                 line.retired = Some(retired);
-                Err(EOPNOTSUPP)
+                Ok(())
             }
         }
     }
