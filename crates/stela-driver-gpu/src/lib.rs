@@ -118,7 +118,7 @@ impl Adapter {
         })
     }
 
-    /// Its market name, or its maker and IDs ([`names::name`]).
+    /// Its market name, or its maker alone ([`names::name`]).
     pub fn name(&self) -> alloc::string::String {
         names::name(self.vendor, self.device, self.revision)
     }

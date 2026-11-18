@@ -4,8 +4,9 @@
 //! names` from pinned sources (`xtask/src/gpu/names.rs`): the PCI ID
 //! database, libdrm's `amdgpu.ids`, which names AMD devices by revision,
 //! Mesa's Intel device tables and amdgpu's own table for the processors'
-//! GPUs. A device none of them names is called by its maker and IDs
-//! ("NVIDIA GPU 10de:2c02").
+//! GPUs. A device none of them names is called by its maker alone ("NVIDIA
+//! GPU"): its PCI IDs tell a user nothing, and the log's `GPU SELECT` line
+//! holds them.
 use crate::Vendor;
 use alloc::{format, string::String};
 
@@ -41,16 +42,13 @@ pub fn market_name(vendor: Vendor, device: u16, revision: u8) -> Option<String> 
     Some(format!("{maker} {name}"))
 }
 
-/// [`market_name`], else the maker and the PCI IDs: "NVIDIA GPU 10de:2c02",
-/// or "display adapter" for a maker without a GPU stack, whose IDs tell a
-/// user nothing: the log's `GPU SELECT` line holds them.
+/// [`market_name`], else the maker alone: "NVIDIA GPU", or "display
+/// adapter" for a maker without a GPU stack. PCI IDs tell a user nothing:
+/// the log's `GPU SELECT` line holds them.
 pub fn name(vendor: Vendor, device: u16, revision: u8) -> String {
-    market_name(vendor, device, revision).unwrap_or_else(|| {
-        let ids = format!("{:04x}:{device:04x}", vendor.pci_id());
-        match maker(vendor) {
-            Some(maker) => format!("{maker} GPU {ids}"),
-            None => String::from("display adapter"),
-        }
+    market_name(vendor, device, revision).unwrap_or_else(|| match maker(vendor) {
+        Some(maker) => format!("{maker} GPU"),
+        None => String::from("display adapter"),
     })
 }
 
@@ -112,11 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_device_is_named_by_its_maker_and_ids() {
+    fn an_unknown_device_is_named_by_its_maker_alone() {
         assert_eq!(market_name(Vendor::Nvidia, 0xfffe, 0), None);
-        assert_eq!(name(Vendor::Nvidia, 0xfffe, 0), "NVIDIA GPU 10de:fffe");
-        assert_eq!(name(Vendor::Amd, 0xfffe, 0xc1), "AMD GPU 1002:fffe");
-        assert_eq!(name(Vendor::Intel, 0xfffe, 0), "Intel GPU 8086:fffe");
+        assert_eq!(name(Vendor::Nvidia, 0xfffe, 0), "NVIDIA GPU");
+        assert_eq!(name(Vendor::Amd, 0xfffe, 0xc1), "AMD GPU");
+        assert_eq!(name(Vendor::Intel, 0xfffe, 0), "Intel GPU");
         // ASPEED's BMC display: no maker's name.
         assert_eq!(market_name(Vendor::Other(0x1a03), 0x2000, 0x52), None);
         assert_eq!(name(Vendor::Other(0x1a03), 0x2000, 0x52), "display adapter");

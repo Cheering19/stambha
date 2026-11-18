@@ -1644,7 +1644,7 @@ pub(super) struct Claimed {
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
-    /// Its market name, or its maker and IDs.
+    /// Its market name, or its maker alone.
     market: String,
     /// Its probe waits for the first turn's: it may only show the frames
     /// another GPU draws ([`stela_drivers::gpu::selection::Choice::Later`]).
@@ -2282,7 +2282,7 @@ fn cold_refusal(
 /// (`stela_boot_core::gpu_status`).
 pub(super) struct Refused {
     pub(super) vendor: gpu::Vendor,
-    /// Its market name, or its maker and IDs.
+    /// Its market name, or its maker alone.
     pub(super) name: String,
     /// Its stack draws, so it would have drawn macOS.
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
@@ -2498,7 +2498,7 @@ fn may_show_screen(
 #[cfg(feature = "nvk")]
 struct Bound {
     name: String,
-    /// Its market name, or its maker and IDs.
+    /// Its market name, or its maker alone.
     market: String,
     /// Whether it may be the GPU that showed the firmware's screen, when the
     /// screen's function is unknown.
@@ -2585,7 +2585,7 @@ fn gpu_page_parameter(share: u64, pages: Option<usize>) -> Option<String> {
 /// A claimed GPU no driver bound.
 struct Unbound {
     name: String,
-    /// Its market name, or its maker and IDs.
+    /// Its market name, or its maker alone.
     market: String,
     driver: &'static str,
     /// What became of the firmware's picture on it.
@@ -3032,7 +3032,7 @@ pub(super) fn drawing_name() -> Option<&'static str> {
 }
 
 /// The market name of the bound GPU at `index` (the claims' order, which
-/// DRM minors and [`gate::served_gpu`] use), or its maker and IDs where the
+/// DRM minors and [`gate::served_gpu`] use), or its maker alone where the
 /// table has no name.
 #[cfg(feature = "nvk")]
 pub(super) fn market_name(index: usize) -> Option<&'static str> {
