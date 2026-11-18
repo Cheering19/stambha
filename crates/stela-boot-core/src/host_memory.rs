@@ -150,16 +150,72 @@ const GPU_CEILING: u64 = 8 * GIB;
 /// with the guest's floor is refused, as one short of the guest's floor is.
 const GPU_LEAST: u64 = 256 * MIB;
 
-/// The memory of the GPU that serves the Metal device, as the PCI census
-/// and the GPU stacks know it before the parts are sized.
+/// What an integrated GPU that only shows the display (beside a discrete
+/// GPU that draws) takes of the heap beside its own needs: its driver's
+/// pages that its carve-out does not hold, and a few scanout and cursor
+/// buffers, 32 MiB each at 3840x2160. Linux's pages are not bounded then:
+/// the discrete GPU's system-memory buffers (TTM's system pages, a GTT,
+/// page tables) come from the heap as its floor was measured with.
+pub const DISPLAY_SHARE: u64 = 256 * MIB;
+
+/// What the heap's own allocations held at most beside an integrated GPU's
+/// pages: a 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of the driver's
+/// heaps in it. An integrated GPU that draws without a share of its own
+/// (the discrete GPU the plan gave the Metal device to did not start) is
+/// budgeted by what the heap holds past this.
+pub const HEAP_OWN: u64 = 2424 * MIB;
+
+/// How the GPUs that start use the host's RAM, as the PCI census and the
+/// GPU stacks know it before the parts are sized (the selection's rule,
+/// `stela_driver_gpu::selection::memory`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuMemory {
-    /// Memory of its own (a discrete GPU), or no GPU serves Metal: its
-    /// system memory pages come from the heap as before.
+    /// No integrated GPU starts: a discrete GPU's system-memory pages come
+    /// from the heap as before.
     Own,
-    /// It shares the host's RAM (an integrated GPU): the plan gives it a
-    /// share of its own beside the heap ([`Sizes::gpu`]).
+    /// An integrated GPU draws, sharing the host's RAM: the plan gives it a
+    /// share of its own beside the heap ([`Sizes::gpu`]), which bounds all
+    /// of Linux's pages.
     Shared,
+    /// An integrated GPU only shows the display beside a discrete GPU that
+    /// draws: the heap grows by [`DISPLAY_SHARE`] ([`Sizes::gpu`]), and
+    /// Linux's pages are not bounded.
+    Display,
+}
+
+impl GpuMemory {
+    /// Whether [`Sizes::gpu`] bounds Linux's pages (the page catalog's
+    /// limit and TTM's).
+    pub fn limits_pages(self) -> bool {
+        self == Self::Shared
+    }
+
+    /// The rule for the plan's line, with `gpu` [`Sizes::gpu`] and `heap`
+    /// the heap's own size.
+    pub fn describe(self, gpu: u64, heap: u64) -> alloc::string::String {
+        let mib = |bytes: u64| bytes >> 20;
+        match self {
+            Self::Own => alloc::string::String::from(
+                "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory \
+                 buffers among them, come from the heap, unbounded",
+            ),
+            Self::Shared => alloc::format!(
+                "the integrated GPU draws: its share of {}M bounds all of Linux's pages, and \
+                 TTM's limit is twice it, so amdgpu's or xe's GTT is the share",
+                mib(gpu)
+            ),
+            Self::Display => alloc::format!(
+                "a discrete GPU draws and the integrated GPU shows the display: the heap takes \
+                 {}M more for the integrated GPU's driver and scanout, and Linux's pages are \
+                 not bounded, as the discrete GPU's system-memory buffers come from the heap; \
+                 should the discrete GPU not start and the integrated one draw, its Metal \
+                 device works in what the heap holds past its own {}M, about {}M",
+                mib(gpu),
+                mib(HEAP_OWN),
+                mib((heap + gpu).saturating_sub(HEAP_OWN))
+            ),
+        }
+    }
 }
 
 /// The parts' sizes and the guest DRAM left after them.
@@ -171,10 +227,11 @@ pub struct Sizes {
     /// Free RAM after the three parts and the GPU's share; Stela's stacks,
     /// tables and image take a few more MiB of it.
     pub guest: u64,
-    /// The share of an integrated GPU ([`GpuMemory::Shared`]), zero for one
-    /// with memory of its own: the most system memory its driver's pages
-    /// hold at once, reserved beside the heap and taken from the same
-    /// region, on top of what the heap itself needs.
+    /// The share of an integrated GPU ([`GpuMemory::Shared`]): the most
+    /// system memory Linux's pages hold at once, reserved beside the heap
+    /// and taken from the same region, on top of what the heap itself
+    /// needs. For one that only shows ([`GpuMemory::Display`]) its pages'
+    /// part of the heap, unbounded; zero with no integrated GPU.
     pub gpu: u64,
 }
 
@@ -224,7 +281,7 @@ impl Shortfall {
         let free = alloc::format!("{}.{}", self.free / GIB, self.free % GIB * 10 / GIB);
         let floor = GUEST_FLOOR / GIB;
         let rest = match self.gpu {
-            GpuMemory::Own => "its own memory",
+            GpuMemory::Own | GpuMemory::Display => "its own memory",
             GpuMemory::Shared => "its own memory and the graphics built into the processor",
         };
         refuse!(
@@ -295,6 +352,12 @@ fn plan(free: u64, cores: usize, runners: usize, gpu: GpuMemory) -> Result<Optio
     let target = match gpu {
         GpuMemory::Own => return with_share(0),
         GpuMemory::Shared => gpu_target(free),
+        // The display's pages where the guest keeps its floor beside them;
+        // a host too small for both gives them none, and they come from
+        // the heap.
+        GpuMemory::Display => {
+            return Ok(with_share(DISPLAY_SHARE)?.or(with_share(0)?));
+        }
     };
     // The most share up to the target that leaves the guest its floor, in
     // whole alignments; the guest grows with the RAM the parts are sized
@@ -323,8 +386,10 @@ pub fn pack_budget(free: u64, cores: usize, runners: usize, gpu: GpuMemory) -> u
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
     while budget >= PACK_FLOOR {
         let mut left = free.saturating_sub(budget + PACK_MARGIN);
-        if gpu == GpuMemory::Shared {
-            left = left.saturating_sub(gpu_target(left));
+        match gpu {
+            GpuMemory::Shared => left = left.saturating_sub(gpu_target(left)),
+            GpuMemory::Display => left = left.saturating_sub(DISPLAY_SHARE),
+            GpuMemory::Own => {}
         }
         if estimate_guest(left, cores, runners).is_ok_and(|guest| guest >= GUEST_FLOOR) {
             return budget;

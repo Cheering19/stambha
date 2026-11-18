@@ -28,8 +28,10 @@ pub(super) struct EngineImage {
 pub(super) struct EngineMemory {
     /// The engine heap, with an integrated GPU's share at its end.
     pub heap: Region,
-    /// The integrated GPU's share of `heap` (`host_memory::Sizes::gpu`):
-    /// the most its driver's pages hold at once.
+    /// The integrated GPU's share of `heap` (`host_memory::Sizes::gpu`) when
+    /// it bounds Linux's pages, the most they hold at once; zero otherwise,
+    /// as for a display's pages beside a discrete GPU, which only grow the
+    /// heap.
     pub gpu: u64,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
@@ -146,7 +148,11 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         sizes.guest >> 20,
         sizes.gpu >> 20,
     ));
-    if sizes.gpu != 0 && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
+    output::arguments(format_args!(
+        "HOST MEMORY gpu: {}\n",
+        gpu.describe(sizes.gpu, sizes.heap)
+    ));
+    if gpu.limits_pages() && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
         output::arguments(format_args!(
             "HOST MEMORY the integrated GPU gets {}M of this PC's RAM, under the {}M a macOS \
              desktop needs beside the guest's floor: its allocations past it fail as a full \
@@ -226,7 +232,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let root = loader_tables.root();
     Ok(EngineMemory {
         heap,
-        gpu: sizes.gpu,
+        gpu: if gpu.limits_pages() { sizes.gpu } else { 0 },
         native_resources,
         native_task_allocations,
         stack,

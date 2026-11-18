@@ -139,6 +139,48 @@ pub fn select(found: &[Found], mut claim: impl FnMut(usize) -> bool) -> Selectio
     Selection { choices, claimed }
 }
 
+/// How the GPUs that start use this PC's RAM, for the memory plan, which
+/// is made before any GPU is claimed ([`memory`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Memory {
+    /// No integrated GPU starts: Linux's pages, a discrete GPU's
+    /// system-memory buffers among them, come from the heap.
+    Own,
+    /// An integrated GPU gives the Metal device: it takes its memory from
+    /// a share of this PC's RAM, which bounds Linux's pages.
+    Shared,
+    /// An integrated GPU starts only to show the display, beside a discrete
+    /// GPU that draws (or with no drawing GPU at all): its driver and
+    /// scanout buffers need some pages, the discrete GPU's buffers many,
+    /// and neither may be bounded by a share sized for the other.
+    Display,
+}
+
+/// The memory the GPUs of `found` use, as [`select`] starts them when every
+/// claim succeeds: the loader's question, asked before any claim. A kind
+/// left to a GPU's probe counts as integrated, as the loader takes a GPU it
+/// could not tell. Should the discrete GPU fail to start, the integrated one
+/// draws after all on a plan of [`Memory::Display`] or [`Memory::Own`]; the
+/// platform then budgets its Metal device by what the heap holds past its
+/// own needs.
+pub fn memory(found: &[Found]) -> Memory {
+    let chosen = select(found, |_| true);
+    let started: Vec<Driven> = chosen
+        .claimed
+        .iter()
+        .filter_map(|&index| found[index].stack.ok())
+        .collect();
+    let integrated = |driven: &Driven| driven.integrated.unwrap_or(true);
+    let discrete_draws = started.iter().any(|gpu| gpu.draws && !integrated(gpu));
+    if !discrete_draws && started.iter().any(|gpu| gpu.draws && integrated(gpu)) {
+        Memory::Shared
+    } else if started.iter().any(integrated) {
+        Memory::Display
+    } else {
+        Memory::Own
+    }
+}
+
 impl Driven {
     /// Its kind and whether it draws, in words.
     pub fn describe(self) -> String {
@@ -350,6 +392,72 @@ mod tests {
                 Choice::First
             ]
         );
+    }
+
+    /// The memory plan follows the selection: a share where an integrated
+    /// GPU draws, a display reserve where one only shows beside a drawing
+    /// discrete GPU, the heap alone where no integrated GPU starts.
+    #[test]
+    fn the_memory_plan_follows_which_gpus_start() {
+        // A desktop card; two cards.
+        assert_eq!(memory(&[gpu(DISCRETE, true)]), Memory::Own);
+        assert_eq!(
+            memory(&[gpu(DISCRETE, false), gpu(DISCRETE, true)]),
+            Memory::Own
+        );
+        // An integrated GPU alone draws, whether its table or its probe
+        // tells its kind.
+        assert_eq!(memory(&[gpu(INTEGRATED, true)]), Memory::Shared);
+        assert_eq!(memory(&[gpu(PROBED, true)]), Memory::Shared);
+        // The commonest laptop: an NVIDIA GPU (NVK) draws, the AMD or Intel
+        // graphics drives the panel. Its driver's pages are a display's, and
+        // the NVIDIA GPU's system-memory buffers must not be held to them.
+        for integrated in [INTEGRATED, SHOWS] {
+            let laptop = [gpu(integrated, true), gpu(DISCRETE, false)];
+            assert_eq!(memory(&laptop), Memory::Display);
+        }
+        // A mux set to the discrete GPU: the integrated one is left.
+        let muxed = [gpu(INTEGRATED, false), gpu(DISCRETE, true)];
+        assert_eq!(memory(&muxed), Memory::Own);
+        // An integrated GPU the loader could not tell starts beside a card.
+        let desktop = [gpu(PROBED, false), gpu(DISCRETE, true)];
+        assert_eq!(memory(&desktop), Memory::Display);
+        // A discrete GPU whose stack does not draw (no NVK in the image)
+        // beside an integrated one that does: the integrated one draws.
+        let shows = Driven {
+            draws: false,
+            integrated: Some(false),
+        };
+        assert_eq!(
+            memory(&[gpu(INTEGRATED, true), gpu(shows, false)]),
+            Memory::Shared
+        );
+        // Only a display-only integrated GPU: no Metal device, its pages a
+        // display's.
+        assert_eq!(memory(&[gpu(SHOWS, true)]), Memory::Display);
+        // An integrated GPU no stack drives beside a card.
+        assert_eq!(
+            memory(&[unsupported(true), gpu(DISCRETE, false)]),
+            Memory::Own
+        );
+        // Where GPUs draw, the plan shares memory exactly when the GPU that
+        // `metal_devices` will serve the Metal device with is integrated.
+        for kinds in [&[true][..], &[true, false], &[false, true], &[true, true]] {
+            let found: Vec<Found> = kinds
+                .iter()
+                .map(|&integrated| gpu(if integrated { INTEGRATED } else { DISCRETE }, true))
+                .collect();
+            let candidates: Vec<_> = kinds
+                .iter()
+                .map(|&integrated| crate::stack::Candidate {
+                    draws: true,
+                    integrated,
+                    drives_display: false,
+                })
+                .collect();
+            let serves = crate::stack::metal_devices(&candidates).serve[0];
+            assert_eq!(memory(&found) == Memory::Shared, kinds[serves], "{kinds:?}");
+        }
     }
 
     #[test]

@@ -695,3 +695,63 @@ fn the_pack_leaves_an_integrated_gpu_its_share() {
         }
     }
 }
+
+/// An integrated GPU that only shows the display beside a drawing discrete
+/// GPU adds its pages' part to the heap, as a host with that much less would
+/// size the rest, and bounds nothing; a host too small for both keeps the
+/// guest's floor and gives it none.
+#[test]
+fn a_display_only_integrated_gpu_adds_its_pages_to_the_heap() {
+    for free in [7354 * MIB, free(8), 10842 * MIB, free(16), free(32)] {
+        let display = sizes(free, 8, 8, GpuMemory::Display).unwrap();
+        match display.gpu {
+            DISPLAY_SHARE => {
+                let rest = sizes(free - DISPLAY_SHARE, 8, 8, GpuMemory::Own).unwrap();
+                assert_eq!(
+                    Sizes {
+                        gpu: DISPLAY_SHARE,
+                        ..rest
+                    },
+                    display,
+                    "{free}"
+                );
+            }
+            gpu => {
+                assert_eq!(gpu, 0, "{free}");
+                assert_eq!(display, sizes(free, 8, 8, GpuMemory::Own).unwrap());
+            }
+        }
+    }
+    // The 12 GiB VM's plan beside a drawing discrete GPU.
+    let display = sizes(10842 * MIB, 8, 8, GpuMemory::Display).unwrap();
+    assert_eq!(
+        [display.heap, display.guest, display.gpu].map(|b| b / MIB),
+        [3060, 6144, 256]
+    );
+    assert!(!GpuMemory::Display.limits_pages());
+    assert!(!GpuMemory::Own.limits_pages());
+    assert!(GpuMemory::Shared.limits_pages());
+}
+
+/// The plan's line states the rule it chose.
+#[test]
+fn the_plans_line_states_its_rule() {
+    assert_eq!(
+        GpuMemory::Display.describe(DISPLAY_SHARE, 3300 * MIB),
+        "a discrete GPU draws and the integrated GPU shows the display: the heap takes 256M \
+         more for the integrated GPU's driver and scanout, and Linux's pages are not bounded, \
+         as the discrete GPU's system-memory buffers come from the heap; should the discrete \
+         GPU not start and the integrated one draw, its Metal device works in what the heap \
+         holds past its own 2424M, about 1132M"
+    );
+    assert!(
+        GpuMemory::Shared
+            .describe(2560 * MIB, 2816 * MIB)
+            .contains("share of 2560M")
+    );
+    assert!(
+        GpuMemory::Own
+            .describe(0, 0)
+            .starts_with("no integrated GPU starts")
+    );
+}

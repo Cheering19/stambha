@@ -505,15 +505,6 @@ pub fn metal_devices(candidates: &[Candidate]) -> MetalDevices {
     }
 }
 
-/// Whether the GPU [`metal_devices`] will choose to serve the Metal device
-/// shares the host's RAM, for the memory plan before any GPU is claimed:
-/// `drawing` says of each GPU whose stack draws whether it is integrated. A
-/// drawing discrete GPU serves where there is one; an integrated GPU only
-/// where none is. With no drawing GPU nothing serves.
-pub fn metal_shares_memory(drawing: &[bool]) -> bool {
-    !drawing.is_empty() && drawing.iter().all(|&integrated| integrated)
-}
-
 /// The drawing GPU, among those already claimed, whose frames a GPU would
 /// only show, if any, as [`metal_devices`] will choose: any drawing GPU for
 /// one whose stack draws nothing, a discrete one for an integrated one.
@@ -565,30 +556,6 @@ mod tests {
     use super::*;
     use crate::bus::pci::Address;
     use alloc::vec;
-
-    /// The plan's answer follows [`metal_devices`]' choice: the GPU that
-    /// serves is integrated only where no discrete GPU draws.
-    #[test]
-    fn the_metal_gpu_shares_memory_only_where_no_discrete_gpu_draws() {
-        for drawing in [&[][..], &[false], &[true, false], &[false, true]] {
-            assert!(!metal_shares_memory(drawing), "{drawing:?}");
-        }
-        for drawing in [&[true][..], &[true, true]] {
-            assert!(metal_shares_memory(drawing), "{drawing:?}");
-        }
-        for drawing in [&[true][..], &[true, false], &[false, true], &[true, true]] {
-            let candidates: alloc::vec::Vec<_> = drawing
-                .iter()
-                .map(|&integrated| Candidate {
-                    draws: true,
-                    integrated,
-                    drives_display: false,
-                })
-                .collect();
-            let first = metal_devices(&candidates).serve[0];
-            assert_eq!(metal_shares_memory(drawing), drawing[first], "{drawing:?}");
-        }
-    }
 
     #[test]
     fn a_gpu_shows_frames_only_beside_a_more_capable_drawing_gpu() {
