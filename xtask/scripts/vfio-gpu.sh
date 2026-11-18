@@ -124,6 +124,21 @@ bind() {
   fi
 }
 
+# What the host's IOMMU driver left enabled on a lent function. VFIO drops a
+# guest's writes to these controls and shows it the card's own values, so a
+# guest that stops a function before it drives it cannot switch them off. A
+# host booted with pci=noats never enables ATS.
+requester_controls() {
+  local function=$1 control value
+  for control in ATS+6 PRI+4 PASID+6; do
+    value=$(setpci -s "$function" "ECAP_$control.w" 2>/dev/null) || continue
+    echo "vfio-gpu: $function ${control%+*} control reads $value" >&2
+    if [[ $control == ATS+6 ]] && ((0x$value & 0x8000)); then
+      echo "vfio-gpu: the host keeps ATS enabled on $function and the guest cannot switch it off; boot the host with pci=noats" >&2
+    fi
+  done
+}
+
 release() {
   local function=$1
   [[ " ${kept[*]} " == *" $function "* ]] && return
@@ -210,6 +225,7 @@ run() {
   fi
   local function
   for function in "${members[@]}"; do bind "$function"; done
+  for function in "${members[@]}"; do requester_controls "$function"; done
   local group
   for group in $(groups "${members[@]}"); do chown "$owner" "/dev/vfio/$group"; done
   # The host's ACPI VFCT table, where firmware publishes an integrated AMD
