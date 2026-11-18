@@ -106,6 +106,7 @@ pub mod ram;
 pub mod random;
 pub mod record;
 pub mod remapping;
+pub mod repeated_lines;
 #[cfg(target_arch = "x86_64")]
 pub mod requester;
 pub mod reset_reason;

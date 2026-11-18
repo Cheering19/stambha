@@ -784,6 +784,9 @@ struct Host {
     lines: RefCell<Vec<Line>>,
     /// The unsupported operations already reported.
     reported: RefCell<BTreeSet<String>>,
+    /// Linux's last line and its repeats in a row, which are counted, not
+    /// written again ([`stela_boot_core::repeated_lines`]).
+    repeats: RefCell<stela_boot_core::repeated_lines::Repeats>,
     /// The first error Linux reported, which a stop before the start
     /// finished names as the reason the GPU did not start.
     first_error: RefCell<Option<String>>,
@@ -822,7 +825,28 @@ impl Host {
     }
 
     fn report(&self, line: core::fmt::Arguments<'_>) {
-        output::arguments(format_args!("LINUX {line}\n"));
+        use stela_boot_core::repeated_lines::Verdict;
+        // A report made while one is being counted is written as it is.
+        let verdict = self
+            .repeats
+            .try_borrow_mut()
+            .map_or(Verdict::Write { repeated: None }, |mut repeats| {
+                repeats.line(line)
+            });
+        match verdict {
+            Verdict::Write { repeated } => {
+                if let Some(count) = repeated {
+                    output::arguments(format_args!(
+                        "LINUX the line before came {count} more times in all\n"
+                    ));
+                }
+                output::arguments(format_args!("LINUX {line}\n"));
+            }
+            Verdict::Repeat { count: Some(count) } => output::arguments(format_args!(
+                "LINUX the line before came {count} more times so far\n"
+            )),
+            Verdict::Repeat { count: None } => {}
+        }
     }
 
     /// Whether Linux runs on a processor in the boot CPU's place, which
@@ -2754,6 +2778,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         devices: RefCell::new(BTreeMap::new()),
         lines: RefCell::new(lines),
         reported: RefCell::new(BTreeSet::new()),
+        repeats: RefCell::new(Default::default()),
         first_error: RefCell::new(None),
         gsp_start: RefCell::new(Default::default()),
         gpus: claimed
