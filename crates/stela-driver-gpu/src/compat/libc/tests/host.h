@@ -17,4 +17,8 @@ extern unsigned int waited_value;
 /* The host's render nodes, descriptors 3 onwards, and opens of any node. */
 extern struct stela_libc_drm_device drm_devices[2];
 extern unsigned int drm_device_count, drm_opens;
+/* While `logging` is set, the log's text goes here instead of to stderr. */
+extern int logging;
+extern char logged[4096];
+extern size_t logged_bytes;
 #endif

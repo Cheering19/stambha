@@ -133,9 +133,11 @@ const LIBDRM_AMDGPU: Library = Library {
     // What libdrm's configuration (its `config.h`) and its amdgpu build set
     // for a Linux target with GCC's atomic builtins. The table of marketing
     // names lies under its data directory; the image holds no file system,
-    // so a device has no marketing name and libdrm says once per device
-    // which file it lacks.
+    // so a device has no marketing name. What the library prints goes
+    // through `compat/mesa/drm.c`, which names its lines and says once per
+    // boot which files it lacks.
     defines: &[
+        "fprintf=libdrm_amdgpu_report",
         "HAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
         "HAVE_LIB_ATOMIC_OPS=0",
         "HAVE_ALLOCA_H=1",

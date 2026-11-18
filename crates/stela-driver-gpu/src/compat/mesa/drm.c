@@ -425,3 +425,36 @@ int drmSyncobjTransfer(int fd, uint32_t destination, uint64_t destination_point,
 	};
 	return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &transfer);
 }
+
+/* What libdrm_amdgpu prints, which its units send here in place of fprintf
+ * (`xtask/src/gpu/nvk.rs`): each line named for the boot log. The two files
+ * it reads, its marketing-name table and /proc/cpuinfo, are not in the
+ * image; their reports, a path and the error or the error alone, repeat for
+ * every device it opens and become one line, once per boot. */
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...);
+
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...)
+{
+	char text[256];
+	va_list arguments;
+	va_start(arguments, format);
+	int size = vsnprintf(text, sizeof(text), format, arguments);
+	va_end(arguments);
+	if (size < 0)
+		return size;
+	size_t length = strnlen(text, sizeof(text));
+	while (length && text[length - 1] == '\n')
+		text[--length] = 0;
+	const char *missing = strerror(ENOENT);
+	size_t missing_length = strlen(missing);
+	if (length >= missing_length && !strcmp(text + length - missing_length, missing)) {
+		static int said;
+		if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+			fprintf(stream, "GPU libdrm_amdgpu: no marketing-name table or /proc/cpuinfo "
+					"in the image, so it gives no AMD GPU a marketing name (first: %s)\n",
+				text);
+		return size;
+	}
+	fprintf(stream, "GPU libdrm_amdgpu: %s\n", text);
+	return size;
+}

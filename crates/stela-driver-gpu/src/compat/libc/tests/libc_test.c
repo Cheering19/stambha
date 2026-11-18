@@ -316,6 +316,37 @@ static void test_primary_node_names(void)
 	drm_device_count = 0;
 }
 
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...);
+
+static unsigned int occurrences(const char *text, const char *part)
+{
+	unsigned int count = 0;
+	for (const char *at = strstr(text, part); at; at = strstr(at + 1, part))
+		count++;
+	return count;
+}
+
+static void test_libdrm_amdgpu_lines(void)
+{
+	/* What libdrm_amdgpu prints for each AMD device it opens: the table it
+	 * lacks, then /proc/cpuinfo's error alone. One named line says both,
+	 * once; any other line is named. */
+	logging = 1;
+	logged_bytes = 0;
+	for (int device = 0; device < 3; device++) {
+		libdrm_amdgpu_report(stderr, "%s: %s\n", "/usr/share/libdrm/amdgpu.ids",
+				     strerror(ENOENT));
+		libdrm_amdgpu_report(stderr, "%s\n", strerror(ENOENT));
+	}
+	libdrm_amdgpu_report(stderr, "%s: amdgpu_get_auth (1) failed (%i)\n", "init", -13);
+	fflush(stderr);
+	logging = 0;
+	CHECK(occurrences(logged, "\n") == 2);
+	CHECK(occurrences(logged, "GPU libdrm_amdgpu: ") == 2);
+	CHECK(occurrences(logged, "/usr/share/libdrm/amdgpu.ids") == 1);
+	CHECK(strstr(logged, "GPU libdrm_amdgpu: init: amdgpu_get_auth (1) failed (-13)\n"));
+}
+
 static void test_refusals(void)
 {
 	struct pollfd file = { .fd = 0, .events = POLLIN };
@@ -809,6 +840,7 @@ int main(void)
 	test_meminfo();
 	test_render_node_status();
 	test_primary_node_names();
+	test_libdrm_amdgpu_lines();
 	test_refusals();
 	test_loading();
 	test_futex();

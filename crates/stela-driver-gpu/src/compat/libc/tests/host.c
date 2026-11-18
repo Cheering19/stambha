@@ -49,9 +49,19 @@ void stela_libc_release(void *pointer, size_t size, size_t alignment)
 	live_blocks--;
 }
 
+int logging;
+char logged[4096];
+size_t logged_bytes;
+
 void stela_libc_log(const char *text, size_t size)
 {
-	linux_call(LINUX_WRITE, 2, (long)text, (long)size);
+	if (!logging) {
+		linux_call(LINUX_WRITE, 2, (long)text, (long)size);
+		return;
+	}
+	for (size_t at = 0; at < size && logged_bytes + 1 < sizeof(logged); at++)
+		logged[logged_bytes++] = text[at];
+	logged[logged_bytes] = 0;
 }
 
 _Noreturn void stela_libc_fatal(const char *message)
