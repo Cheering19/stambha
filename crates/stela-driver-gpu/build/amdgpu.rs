@@ -440,6 +440,9 @@ pub fn tables() {
     // queues, on which RADV opens no device (`radv_is_gpu_supported`).
     let compute_only = compute_only(&source("amdgpu_discovery.c"), &source)
         .unwrap_or_else(|error| panic!("amdgpu's graphics blocks: {error}"));
+    // The graphics versions IP discovery flags as built into the processor.
+    let apus = apu_graphics(&source("amdgpu_discovery.c"))
+        .unwrap_or_else(|error| panic!("amdgpu's integrated graphics blocks: {error}"));
     let mut text = String::from(
         "/// amdgpu's `pciidlist` entries that name a device: its ID, its family\n\
          /// (`CHIP_*` without the prefix), its graphics generation (the oldest\n\
@@ -480,7 +483,10 @@ pub fn tables() {
          pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n\
          /// The graphics versions (major, minor, revision) whose block\n\
          /// IP discovery adds has no graphics queue: compute accelerators.\n\
-         pub(crate) const COMPUTE_ONLY: &[(u8, u8, u8)] = &{compute_only:?};\n",
+         pub(crate) const COMPUTE_ONLY: &[(u8, u8, u8)] = &{compute_only:?};\n\
+         /// The graphics versions (major, minor, revision) of a GPU IP\n\
+         /// discovery identifies that amdgpu flags `AMD_IS_APU`.\n\
+         pub(crate) const DISCOVERED_APUS: &[(u8, u8, u8)] = &{apus:?};\n",
         window.newer
     ));
     text.push_str(
@@ -894,6 +900,32 @@ fn compute_only(
     versions.sort_unstable();
     versions.dedup();
     Ok(versions)
+}
+
+/// The graphics IP versions `amdgpu_discovery_set_ip_blocks` flags
+/// `AMD_IS_APU`: the cases of its switch on the graphics block's version
+/// whose only statement sets the flag.
+fn apu_graphics(discovery: &str) -> Result<Vec<(u8, u8, u8)>, String> {
+    let marker = "switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {";
+    for (at, _) in discovery.match_indices(marker) {
+        let mut versions = Vec::new();
+        for line in discovery[at + marker.len()..].lines().map(str::trim) {
+            if let Some(version) = line.strip_prefix("case ").and_then(ip_version) {
+                versions.push(version);
+            } else if line.is_empty() {
+                continue;
+            } else {
+                if line == "adev->flags |= AMD_IS_APU;" && !versions.is_empty() {
+                    versions.sort_unstable();
+                    return Ok(versions);
+                }
+                break;
+            }
+        }
+    }
+    Err(String::from(
+        "no switch on the graphics version sets AMD_IS_APU",
+    ))
 }
 
 /// The version of an `IP_VERSION(major, minor, revision)` that `text`

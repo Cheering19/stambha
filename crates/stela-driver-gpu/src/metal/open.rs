@@ -506,6 +506,7 @@ mod tests {
                 dma_bits: crate::xe::dma_bits,
                 integrated: crate::xe::integrated,
                 probed_integrated: None,
+                discovered_integrated: None,
                 chip: crate::xe::query::chip,
                 memory_bytes: crate::xe::query::memory_bytes,
                 reset: None,

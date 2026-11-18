@@ -43,6 +43,10 @@ pub struct Kernel {
     /// [`Self::integrated`] stands. [`metal_devices`] reads the bound GPU's
     /// answer.
     pub probed_integrated: Option<fn(Control) -> Option<bool>>,
+    /// For a driver that decides [`Self::probed_integrated`] during its
+    /// probe, what the boot can tell before the memory plan, where no driver
+    /// has probed yet.
+    pub discovered_integrated: Option<Discovered>,
     /// The driver's own identifier of the bound chip, by its query ioctl.
     pub chip: fn(Control) -> Option<u32>,
     /// The bytes of device memory the driver makes available.
@@ -51,6 +55,20 @@ pub struct Kernel {
     /// close of its files, how it tells whether it reset the GPU, so a GPU
     /// it reset during its first work is left unreleased.
     pub reset: Option<Reset>,
+}
+
+/// How a driver that decides whether a GPU is integrated during its probe
+/// decides it, for the boot to tell before any probe.
+#[derive(Clone, Copy)]
+pub struct Discovered {
+    /// Its kind as the driver's own table gives it for a device the table
+    /// names (`AMD_IS_APU` on amdgpu's entries); `None` for one it takes by
+    /// class and identifies by the device's IP discovery table.
+    pub named: fn(&Adapter) -> Option<bool>,
+    /// For one it identifies by its IP discovery table, whether the graphics
+    /// block version that table lists (major, minor, revision) is one the
+    /// driver flags built into the processor.
+    pub graphics: fn((u8, u8, u8)) -> bool,
 }
 
 /// A kernel driver's watch for resets: a context on a file of its own,
@@ -175,6 +193,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         // built-in GPUs are platform devices, not PCI functions.
         integrated: |_| false,
         probed_integrated: None,
+        discovered_integrated: None,
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
         reset: None,
@@ -208,6 +227,10 @@ pub static AMD: GpuStack = GpuStack {
         // device's answer decides for them.
         integrated: crate::amdgpu::integrated,
         probed_integrated: Some(crate::amdgpu::query::integrated),
+        discovered_integrated: Some(Discovered {
+            named: crate::amdgpu::named_integrated,
+            graphics: crate::amdgpu::discovered_integrated,
+        }),
         chip: crate::amdgpu::query::family,
         memory_bytes: crate::amdgpu::query::memory_bytes,
         // A hung GPU's recovery holds back the VM work every later close of
@@ -259,6 +282,7 @@ pub static INTEL: GpuStack = GpuStack {
         // The platform's `is_dgfx`.
         integrated: crate::xe::integrated,
         probed_integrated: None,
+        discovered_integrated: None,
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
         reset: None,
@@ -397,6 +421,15 @@ pub fn metal_devices(candidates: &[Candidate]) -> MetalDevices {
     }
 }
 
+/// Whether the GPU [`metal_devices`] will choose to serve the Metal device
+/// shares the host's RAM, for the memory plan before any GPU is claimed:
+/// `drawing` says of each GPU whose stack draws whether it is integrated. A
+/// drawing discrete GPU serves where there is one; an integrated GPU only
+/// where none is. With no drawing GPU nothing serves.
+pub fn metal_shares_memory(drawing: &[bool]) -> bool {
+    !drawing.is_empty() && drawing.iter().all(|&integrated| integrated)
+}
+
 /// The drawing GPU, among those already claimed, whose frames a GPU would
 /// only show, if any, as [`metal_devices`] will choose: any drawing GPU for
 /// one whose stack draws nothing, a discrete one for an integrated one.
@@ -448,6 +481,30 @@ mod tests {
     use super::*;
     use crate::bus::pci::Address;
     use alloc::vec;
+
+    /// The plan's answer follows [`metal_devices`]' choice: the GPU that
+    /// serves is integrated only where no discrete GPU draws.
+    #[test]
+    fn the_metal_gpu_shares_memory_only_where_no_discrete_gpu_draws() {
+        for drawing in [&[][..], &[false], &[true, false], &[false, true]] {
+            assert!(!metal_shares_memory(drawing), "{drawing:?}");
+        }
+        for drawing in [&[true][..], &[true, true]] {
+            assert!(metal_shares_memory(drawing), "{drawing:?}");
+        }
+        for drawing in [&[true][..], &[true, false], &[false, true], &[true, true]] {
+            let candidates: alloc::vec::Vec<_> = drawing
+                .iter()
+                .map(|&integrated| Candidate {
+                    draws: true,
+                    integrated,
+                    drives_display: false,
+                })
+                .collect();
+            let first = metal_devices(&candidates).serve[0];
+            assert_eq!(metal_shares_memory(drawing), drawing[first], "{drawing:?}");
+        }
+    }
 
     #[test]
     fn a_gpu_shows_frames_only_beside_a_more_capable_drawing_gpu() {

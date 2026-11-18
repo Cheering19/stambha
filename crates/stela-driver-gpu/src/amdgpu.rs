@@ -43,6 +43,15 @@ pub fn discovered_serves(graphics: (u8, u8, u8)) -> Result<(), &'static str> {
     }
 }
 
+/// Whether a GPU amdgpu identifies by IP discovery, whose discovery table
+/// gives its graphics block the version `graphics`, is built into the
+/// processor and shares its memory: amdgpu flags it `AMD_IS_APU` by that
+/// version alone (`amdgpu_discovery_set_ip_blocks`), as the build read it.
+/// Its PCI ID table says nothing of such a GPU ([`integrated`]).
+pub fn discovered_integrated(graphics: (u8, u8, u8)) -> bool {
+    DISCOVERED_APUS.contains(&graphics)
+}
+
 /// Every device IP discovery identifies is of a generation that serves the
 /// Metal device, so one the table matches by class is claimed.
 const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
@@ -92,6 +101,15 @@ pub fn dma_bits(adapter: &Adapter) -> u8 {
 /// device IP discovery identifies).
 pub fn registers(_: &Adapter) -> usize {
     usize::from(REGISTERS)
+}
+
+/// Whether the adapter is built into the processor, for a device amdgpu's
+/// table names: its `AMD_IS_APU` flag, which amdgpu's IP discovery keeps
+/// for every named family. `None` for a device the table takes by class,
+/// whose kind its IP discovery table's graphics version gives
+/// ([`discovered_integrated`]).
+pub fn named_integrated(adapter: &Adapter) -> Option<bool> {
+    entry(adapter.device).map(|(_, apu)| apu)
 }
 
 /// Whether amdgpu's table flags the adapter `AMD_IS_APU`. It flags only
@@ -390,6 +408,28 @@ mod tests {
         for graphics in [(9, 4, 0), (10, 3, 6), (11, 0, 0), (11, 5, 1), (12, 0, 1)] {
             assert_eq!(discovered_serves(graphics), Ok(()), "{graphics:?}");
         }
+    }
+
+    /// Raphael and Mendocino (graphics 10.3.6, the AMD port's first
+    /// hardware), Phoenix (11.0.1) and Strix (11.5.0) are built into the
+    /// processor; Navi 21 (10.3.0), Navi 31 (11.0.0) and Navi 48 (12.0.1)
+    /// are discrete. The build reads the list from amdgpu's switch.
+    #[test]
+    fn a_discovered_gpu_is_integrated_by_its_graphics_version() {
+        for graphics in [(10, 3, 6), (11, 0, 1), (11, 5, 0), (9, 1, 0)] {
+            assert!(discovered_integrated(graphics), "{graphics:?}");
+        }
+        for graphics in [(10, 3, 0), (11, 0, 0), (12, 0, 1), (9, 4, 3)] {
+            assert!(!discovered_integrated(graphics), "{graphics:?}");
+        }
+        assert_eq!(DISCOVERED_APUS.len(), 19);
+        assert!(DISCOVERED_APUS.windows(2).all(|pair| pair[0] < pair[1]));
+        // A device the table names keeps the table's flag: Renoir is an
+        // APU, Polaris 10 and Navi 21 are not, and Raphael is not named.
+        assert_eq!(named_integrated(&adapter(0x1636, [3, 0, 0])), Some(true));
+        assert_eq!(named_integrated(&adapter(0x67df, [3, 0, 0])), Some(false));
+        assert_eq!(named_integrated(&adapter(0x73bf, [3, 0, 0])), Some(false));
+        assert_eq!(named_integrated(&adapter(0x13c0, [3, 0, 0])), None);
     }
 
     /// Each requirement the rule names is one the Metal device checks, so a
