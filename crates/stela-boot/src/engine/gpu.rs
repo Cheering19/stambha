@@ -1195,7 +1195,15 @@ impl Platform for Host {
         };
         match registration.retire() {
             Err(error) => {
-                self.report(format_args!("interrupt {irq} action retained: {error:?}"));
+                // What retirement lacked, at which of its steps: Linux keeps
+                // the action and the line stays registered.
+                let step = registration.retire_step();
+                self.report(format_args!(
+                    "interrupt {irq} action retained: {error:?} ({error}){}{} on vector {:#x}",
+                    if step.is_empty() { "" } else { " at " },
+                    step,
+                    registration.vector(),
+                ));
                 Err(EOPNOTSUPP)
             }
             Ok(retired) => {
