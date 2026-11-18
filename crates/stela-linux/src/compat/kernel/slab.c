@@ -81,9 +81,8 @@ static bool request_supported(gfp_t flags)
 		__GFP_NORETRY | __GFP_RETRY_MAYFAIL;
 	if (!IS_ENABLED(CONFIG_MEMCG))
 		allowed |= __GFP_ACCOUNT;
-	bool quiescent = stela_linux_quiescent();
 	bool may_block = gfpflags_allow_blocking(flags);
-	if ((flags & ~allowed) || (may_block && !quiescent)) {
+	if ((flags & ~allowed) || (may_block && !stela_linux_blocking_allocation_allowed())) {
 		stela_linux_unsupported("kmalloc allocation policy or context");
 		return false;
 	}
@@ -275,6 +274,7 @@ void *kmemdup_array(const void *src, size_t count, size_t element_size, gfp_t gf
 
 #ifdef STELA_LINUX_SLAB_TEST
 #include <linux/bottom_half.h>
+#include <linux/fpu.h>
 #include <linux/irqflags.h>
 #include <linux/preempt.h>
 #include <linux/rcupdate.h>
@@ -324,6 +324,28 @@ static void policy_and_context(void)
 	unsigned long irq = arch_local_irq_save();
 	check_refusal(GFP_KERNEL);
 	arch_local_irq_restore(irq);
+	/* A kernel FPU section admits blocking requests, as amdgpu's display
+	 * core makes them there, also nested in DC's own preemption counts;
+	 * not with interrupts off or bottom halves disabled inside it. */
+	preempt_disable();
+	kernel_fpu_begin();
+	preempt_disable();
+	void *in_section = __kmalloc_noprof(96, GFP_KERNEL);
+	assert(in_section);
+	kfree(in_section);
+	irq = arch_local_irq_save();
+	check_refusal(GFP_KERNEL);
+	arch_local_irq_restore(irq);
+	local_bh_disable();
+	check_refusal(GFP_KERNEL);
+	local_bh_enable();
+	preempt_enable();
+	kernel_fpu_end();
+	preempt_enable();
+	/* Outside a section, a held preemption count still refuses. */
+	preempt_disable();
+	check_refusal(GFP_KERNEL);
+	preempt_enable();
 	const gfp_t admitted[] = {
 		GFP_KERNEL, GFP_KERNEL | __GFP_ZERO, GFP_KERNEL | __GFP_NOWARN,
 		GFP_KERNEL | __GFP_NOMEMALLOC, GFP_KERNEL | __GFP_NORETRY,
