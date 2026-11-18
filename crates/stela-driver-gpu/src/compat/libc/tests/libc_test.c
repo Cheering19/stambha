@@ -298,6 +298,24 @@ static void test_render_node_status(void)
 	drm_device_count = 0;
 }
 
+/* compat/mesa/drm.c's, which the test links. */
+char *drmGetPrimaryDeviceNameFromFd(int fd);
+
+static void test_primary_node_names(void)
+{
+	list_two_gpus();
+	/* Two GPUs' descriptors name two primary nodes: libdrm_amdgpu takes two
+	 * descriptors whose names match, or that have none, for one device. */
+	char *first = drmGetPrimaryDeviceNameFromFd(3);
+	char *second = drmGetPrimaryDeviceNameFromFd(4);
+	CHECK(first && !strcmp(first, "/dev/dri/card0"));
+	CHECK(second && !strcmp(second, "/dev/dri/card1"));
+	CHECK(!drmGetPrimaryDeviceNameFromFd(5));
+	free(first);
+	free(second);
+	drm_device_count = 0;
+}
+
 static void test_refusals(void)
 {
 	struct pollfd file = { .fd = 0, .events = POLLIN };
@@ -790,6 +808,7 @@ int main(void)
 	test_anonymous_files();
 	test_meminfo();
 	test_render_node_status();
+	test_primary_node_names();
 	test_refusals();
 	test_loading();
 	test_futex();

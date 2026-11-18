@@ -1366,32 +1366,47 @@ pub fn build(jobs: u16) -> Result<()> {
     Ok(())
 }
 
-/// Builds `compat/libc/tests/libc_test.c` with the C library as a static Linux
-/// program, and runs it.
+/// Builds `compat/libc/tests/libc_test.c` with the C library and libdrm's
+/// stand-in (`compat/mesa/drm.c`) as a static Linux program, and runs it.
 fn test_libc(toolchain: &Toolchain, sysroot: &Sysroot, directory: &Path) -> Result<()> {
     let libc = gpu().join("compat/libc");
     let output = directory.join("libc-test");
     fs::create_dir_all(&output)?;
     let resource = format!("{}/include", resource_directory(&toolchain.clang)?);
-    let test = output.join("libc_test.o");
-    exec(
-        Command::new(&toolchain.clang)
-            .args(LIBC_TEST_FLAGS)
-            .arg("-isystem")
-            .arg(&libc)
-            .arg("-isystem")
-            .arg(&resource)
-            .arg("-c")
-            .arg(libc.join("tests/libc_test.c"))
-            .arg("-o")
-            .arg(&test),
-    )?;
+    let libdrm = third_party("libdrm");
+    let mut objects = Vec::new();
+    for source in [
+        libc.join("tests/libc_test.c"),
+        gpu().join("compat/mesa/drm.c"),
+    ] {
+        let object = output.join(
+            source
+                .with_extension("o")
+                .file_name()
+                .context("a test source")?,
+        );
+        exec(
+            Command::new(&toolchain.clang)
+                .args(LIBC_TEST_FLAGS)
+                .arg("-isystem")
+                .arg(&libc)
+                .arg("-isystem")
+                .arg(&resource)
+                .arg(format!("-I{}", libdrm.display()))
+                .arg(format!("-I{}", libdrm.join("include/drm").display()))
+                .arg("-c")
+                .arg(&source)
+                .arg("-o")
+                .arg(&object),
+        )?;
+        objects.push(object);
+    }
     let program = output.join("libc_test");
     exec(
         Command::new(&toolchain.linker)
             .args(["-static", "-o"])
             .arg(&program)
-            .arg(&test)
+            .args(&objects)
             .arg(sysroot.libc()),
     )?;
     exec(&mut Command::new(&program)).context("the C library's test failed")

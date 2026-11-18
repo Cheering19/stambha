@@ -237,11 +237,22 @@ int drmGetNodeTypeFromFd(int fd)
 	return DRM_NODE_RENDER;
 }
 
-/* The host offers render nodes only, so no device has a primary node. */
+/* The name of the primary node Linux gives the device behind `fd`,
+ * /dev/dri/card<minor>, which nothing here opens: the host offers render
+ * nodes only. libdrm_amdgpu compares these names to find one device behind
+ * two descriptors, and takes any two descriptors without a name for one
+ * device, which would hand a second GPU the first one's. */
 char *drmGetPrimaryDeviceNameFromFd(int fd)
 {
-	(void)fd;
-	return NULL;
+	struct stat status;
+	if (fstat(fd, &status) || major(status.st_rdev) != DRM_MAJOR ||
+	    minor(status.st_rdev) < RENDER_MINOR)
+		return NULL;
+	char *name = malloc(sizeof(DRM_DIR_NAME "/card") + 10);
+	if (name)
+		snprintf(name, sizeof(DRM_DIR_NAME "/card") + 10, DRM_DIR_NAME "/card%u",
+			 minor(status.st_rdev) - RENDER_MINOR);
+	return name;
 }
 
 /* A format modifier's name, for debug prints only. libdrm spells out each
