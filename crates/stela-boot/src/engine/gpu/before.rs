@@ -94,6 +94,8 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
         "amdgpu" => Some(&AMDGPU),
         #[cfg(feature = "intel")]
         "xe" => Some(&intel::XE),
+        #[cfg(feature = "intel")]
+        "i915" => Some(&intel::I915),
         _ => None,
     }
 }
