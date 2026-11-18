@@ -374,7 +374,7 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
     .collect();
     output::arguments(format_args!(
         "GPU {address}: its IP discovery table names {}; its driver is given those blocks' \
-         firmware\n",
+         firmware but the media engines' (VCN, VPE), which it leaves out\n",
         named.join(", ")
     ));
     let ips: Vec<DiscoveredIp> = ips

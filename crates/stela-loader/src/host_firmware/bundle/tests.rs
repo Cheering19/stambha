@@ -1,9 +1,9 @@
 use super::*;
 
 /// amdgpu's recipes whose bytes another holds, and the bundle's files and
-/// bytes with the AMD port: 567 files, 254.1 MiB.
-const AMD_SHARED: usize = 95;
-const AMD_TOTAL: (usize, usize) = (567, 266_471_680);
+/// bytes with the AMD port: 533 files, 244.5 MiB.
+const AMD_SHARED: usize = 77;
+const AMD_TOTAL: (usize, usize) = (533, 256_368_624);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]
@@ -215,7 +215,8 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     assert_eq!(found.len(), USB.len() + digests.len());
     assert!(ryzen.unknown.is_empty());
     // The files amdgpu loaded on an RX 9070 XT (Navi 48) and an RX 6800 XT
-    // (Navi 21) under Stela, display core included, are among theirs.
+    // (Navi 21) under Stela, display core included, are among theirs, but
+    // the video engine's, which Stela now leaves out.
     for (device, loaded) in [
         (
             0x7550,
@@ -230,7 +231,6 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
                 "psp_14_0_3_ta",
                 "sdma_7_0_1",
                 "smu_14_0_3",
-                "vcn_5_0_0",
                 "dcn_4_0_1_dmcub",
             ],
         ),
@@ -247,7 +247,6 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
                 "sienna_cichlid_smc",
                 "sienna_cichlid_sos",
                 "sienna_cichlid_ta",
-                "sienna_cichlid_vcn",
                 "sienna_cichlid_dmcub",
             ],
         ),

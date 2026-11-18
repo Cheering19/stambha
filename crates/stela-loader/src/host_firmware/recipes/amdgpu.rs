@@ -96,10 +96,31 @@ const CHIPS: &[(&str, u8, &[&str])] = &[
 
 /// The IP blocks whose files amdgpu names after the version discovery
 /// reports, `<block>_<major>_<minor>[_<revision>]`: graphics, security
-/// processor, power management, DMA, video, video processing, the display
-/// microcontroller and the media scheduler (`amdgpu_ucode_ip_version_decode`,
-/// `amdgpu_dm.c`, `amdgpu_umsch_mm.c`).
-const IP_BLOCKS: &[&str] = &["gc", "psp", "smu", "sdma", "vcn", "vpe", "dcn", "umsch_mm"];
+/// processor, power management, DMA and the display microcontroller
+/// (`amdgpu_ucode_ip_version_decode`, `amdgpu_dm.c`).
+const IP_BLOCKS: &[&str] = &["gc", "psp", "smu", "sdma", "dcn"];
+
+/// The media engines' blocks named after a version: video decode and
+/// encode (VCN, and the first video encoder's `vce_1_0_0.bin`), video
+/// processing (VPE) and the media scheduler (`amdgpu_umsch_mm.c`).
+const MEDIA_BLOCKS: &[&str] = &["vcn", "vce", "vpe", "umsch_mm"];
+
+/// Whether the file `name` (without `amdgpu/`) is a media engine's: one of
+/// [`MEDIA_BLOCKS`] by version, or a family's video decoder or encoder
+/// (`<family>_uvd.bin`, `_vce.bin`, `_vcn.bin`; JPEG runs on VCN's file).
+/// Stela's amdgpu leaves those engines out at early init
+/// (`0222-the-media-engines.patch`): the Metal device uses none, so amdgpu
+/// asks for none of their files and none is pinned.
+fn media(name: &str) -> bool {
+    ["_uvd.bin", "_vce.bin", "_vcn.bin"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        || MEDIA_BLOCKS.iter().any(|block| {
+            name.strip_prefix(block)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+}
 
 /// The `revision` quirks of amdgpu's table that give a device another
 /// family than its entry (`asic_type_quirks`): device 0x67ff is Polaris 11
@@ -155,7 +176,7 @@ impl AmdGpu {
 
     /// Whether amdgpu may ask this device for `member`.
     pub fn may_load(self, member: &str) -> bool {
-        let Some(name) = member.strip_prefix("amdgpu/") else {
+        let Some(name) = member.strip_prefix("amdgpu/").filter(|name| !media(name)) else {
             return false;
         };
         let family = |chip: &str| {
@@ -225,21 +246,15 @@ pub struct DiscoveredIp {
 
 /// Each block of [`IP_BLOCKS`] named after one block's version, with that
 /// block's hardware ID: graphics (GC), the security processor (MP0), power
-/// management (MP1), DMA (SDMA0), video (VCN), video processing (VPE) and
-/// the display microcontroller (DMU, `amdgpu_dm.c`'s DCN version).
+/// management (MP1), DMA (SDMA0) and the display microcontroller (DMU,
+/// `amdgpu_dm.c`'s DCN version).
 const BLOCK_IPS: &[(&str, u16)] = &[
     ("gc", 11),
     ("psp", 255),
     ("smu", 1),
     ("sdma", 42),
-    ("vcn", 12),
-    ("vpe", 21),
     ("dcn", 271),
 ];
-
-/// The media scheduler's file, which `amdgpu_umsch_mm.c` loads for VCN
-/// 4.0.5 and 4.0.6.
-const UMSCH: (&str, u16, &[(u8, u8, u8)]) = ("umsch_mm_4_0_0", 12, &[(4, 0, 5), (4, 0, 6)]);
 
 /// The families only discovery reaches, with the graphics version
 /// amdgpu's discovery gives that family by (`amdgpu_discovery.c`:
@@ -260,23 +275,17 @@ fn file_version(rest: &str) -> Option<(u8, u8, u8)> {
 
 /// Whether amdgpu asks a device whose discovery table lists `ips` for
 /// `member`: a file named after a block's version when the table lists
-/// that block at that version, the media scheduler's for its VCN versions,
-/// and a discovery-only family's files when its graphics version is the
-/// table's.
+/// that block at that version, and a discovery-only family's files when
+/// its graphics version is the table's; never a media engine's
+/// ([`media`]).
 pub fn discovered_may_load(ips: &[DiscoveredIp], member: &str) -> bool {
-    let Some(name) = member.strip_prefix("amdgpu/") else {
+    let Some(name) = member.strip_prefix("amdgpu/").filter(|name| !media(name)) else {
         return false;
     };
     let listed = |hw_id: u16, version: (u8, u8, u8)| {
         ips.iter()
             .any(|ip| ip.hw_id == hw_id && (ip.major, ip.minor, ip.revision) == version)
     };
-    let (umsch, umsch_ip, umsch_versions) = UMSCH;
-    if named(name, umsch) {
-        return umsch_versions
-            .iter()
-            .any(|&version| listed(umsch_ip, version));
-    }
     for &(block, hw_id) in BLOCK_IPS {
         if let Some(rest) = name
             .strip_prefix(block)
@@ -378,7 +387,7 @@ pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Erro
 
 /// Every file amdgpu's built units declare (`MODULE_FIRMWARE`) that
 /// linux-firmware holds at the pin, by name, but those only families Stela
-/// leaves out load ([`left_out`]).
+/// leaves out load ([`left_out`]) and the media engines' ([`media`]).
 pub const AMDGPU: &[Recipe] = &[
     file(
         "amdgpu/beige_goby_ce.bin",
@@ -436,11 +445,6 @@ pub const AMDGPU: &[Recipe] = &[
         "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
     ),
     file(
-        "amdgpu/beige_goby_vcn.bin",
-        582800,
-        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
-    ),
-    file(
         "amdgpu/carrizo_ce.bin",
         8832,
         "332db9aa5d5cd3c20c464036713d68fc7ed0a4d57fad0db5f8c0843c10398e99",
@@ -479,16 +483,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/carrizo_sdma1.bin",
         10624,
         "c8d3eadacddbaf54557690610dcedefb0445eadd3b6e8dbd3cb67602e90110ac",
-    ),
-    file(
-        "amdgpu/carrizo_uvd.bin",
-        271712,
-        "02ff77ca171a9ccb2f051fe7580f86e76b3474430e70d22ffd41908c438864e2",
-    ),
-    file(
-        "amdgpu/carrizo_vce.bin",
-        175840,
-        "a962c43e1143d1719f097760de4a21290c370b3c1878edd2a59e9131dea88293",
     ),
     file(
         "amdgpu/cyan_skillfish2_ce.bin",
@@ -636,11 +630,6 @@ pub const AMDGPU: &[Recipe] = &[
         "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
     ),
     file(
-        "amdgpu/dimgrey_cavefish_vcn.bin",
-        582800,
-        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
-    ),
-    file(
         "amdgpu/fiji_ce.bin",
         8852,
         "615693b2736f13c4ef3cd9220efe4d55df3c5d82fe128d3f1b34a45edba65fbd",
@@ -684,16 +673,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/fiji_smc.bin",
         129604,
         "fd13fe6b32cef9129f1b75f46b014babcf4075ebc8a715bf19da573be8b68223",
-    ),
-    file(
-        "amdgpu/fiji_uvd.bin",
-        266768,
-        "b7401cfda1087ee5cf71acef19163f311c71775802b331ca82b9177119e4d97b",
-    ),
-    file(
-        "amdgpu/fiji_vce.bin",
-        161024,
-        "0fe1a2e4e2e4f6f8d5600d8c13cb60a8bc87089cd37c766fef2f95ccd5e277ac",
     ),
     file(
         "amdgpu/gc_10_3_6_ce.bin",
@@ -1366,11 +1345,6 @@ pub const AMDGPU: &[Recipe] = &[
         "53ad33b376b85b90f858c8cc3b4bc6c709135b4bd37340ed69b1f00fecd6626b",
     ),
     file(
-        "amdgpu/green_sardine_vcn.bin",
-        407232,
-        "5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98",
-    ),
-    file(
         "amdgpu/navi10_asd.bin",
         209408,
         "e0474d0afa4c284d6429c384fb4a6a88576e302d04444549fe5c2c02be89f665",
@@ -1429,11 +1403,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/navi10_ta.bin",
         37632,
         "9e566ad3a6c6de678ea0e77d37e8a1c5630296ea62a1b162e03766a432f5cea4",
-    ),
-    file(
-        "amdgpu/navi10_vcn.bin",
-        407232,
-        "20cda63482852a8b58e63077fd48a500130642b09a2e0829e1c6edba29ae539b",
     ),
     file(
         "amdgpu/navi12_asd.bin",
@@ -1504,11 +1473,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/navi12_ta.bin",
         37632,
         "9e566ad3a6c6de678ea0e77d37e8a1c5630296ea62a1b162e03766a432f5cea4",
-    ),
-    file(
-        "amdgpu/navi12_vcn.bin",
-        407232,
-        "20cda63482852a8b58e63077fd48a500130642b09a2e0829e1c6edba29ae539b",
     ),
     file(
         "amdgpu/navi14_asd.bin",
@@ -1596,11 +1560,6 @@ pub const AMDGPU: &[Recipe] = &[
         "9e566ad3a6c6de678ea0e77d37e8a1c5630296ea62a1b162e03766a432f5cea4",
     ),
     file(
-        "amdgpu/navi14_vcn.bin",
-        407232,
-        "20cda63482852a8b58e63077fd48a500130642b09a2e0829e1c6edba29ae539b",
-    ),
-    file(
         "amdgpu/navy_flounder_ce.bin",
         263296,
         "6d62d58b9996135852e33610108906ba3c4f69026f20cfa4f455f0d50af23fca",
@@ -1654,11 +1613,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/navy_flounder_ta.bin",
         259328,
         "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
-    ),
-    file(
-        "amdgpu/navy_flounder_vcn.bin",
-        582800,
-        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
     ),
     file(
         "amdgpu/picasso_asd.bin",
@@ -1719,11 +1673,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/picasso_ta.bin",
         46080,
         "93063b85f968b3c72ea03ca7fcfe05fd06374937db3817cfedcb4c61eb2687f2",
-    ),
-    file(
-        "amdgpu/picasso_vcn.bin",
-        369376,
-        "d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb",
     ),
     file(
         "amdgpu/polaris10_ce.bin",
@@ -1821,16 +1770,6 @@ pub const AMDGPU: &[Recipe] = &[
         "09cc712ec2d30cac29e4b0606c3844d7eae15d6663f73d3f48a695e7324491c1",
     ),
     file(
-        "amdgpu/polaris10_uvd.bin",
-        375424,
-        "e05664b587a1585d98db3097cf4a55119ee4af2da68e65d3d43b3f57065a95fb",
-    ),
-    file(
-        "amdgpu/polaris10_vce.bin",
-        166816,
-        "3a6bffa5f94054b3593bbe1ad1ba07bde62fa3c4f0734c8cb9f39d901331b810",
-    ),
-    file(
         "amdgpu/polaris11_ce.bin",
         8852,
         "d1664bd98b69bf21c2fb4e6654860e6648d2a202eeb2175e718982ffb7be1dc5",
@@ -1926,16 +1865,6 @@ pub const AMDGPU: &[Recipe] = &[
         "efa5e768ad6c7e2f754e6bb6b73248d7bd8e7306798eb9054b0f3f7a14223616",
     ),
     file(
-        "amdgpu/polaris11_uvd.bin",
-        375424,
-        "e05664b587a1585d98db3097cf4a55119ee4af2da68e65d3d43b3f57065a95fb",
-    ),
-    file(
-        "amdgpu/polaris11_vce.bin",
-        166816,
-        "3a6bffa5f94054b3593bbe1ad1ba07bde62fa3c4f0734c8cb9f39d901331b810",
-    ),
-    file(
         "amdgpu/polaris12_32_mc.bin",
         32876,
         "555a01b4833c9cb62da126f80fb7c5ce15a7ef827ea6b8bc0f725c2a8f4b0ce9",
@@ -2024,16 +1953,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/polaris12_smc.bin",
         130388,
         "4b8eb326a7fbd391554fe50bc43cf04a917b01a806884ea324f5c3fe88a6ec77",
-    ),
-    file(
-        "amdgpu/polaris12_uvd.bin",
-        375424,
-        "e05664b587a1585d98db3097cf4a55119ee4af2da68e65d3d43b3f57065a95fb",
-    ),
-    file(
-        "amdgpu/polaris12_vce.bin",
-        166816,
-        "3a6bffa5f94054b3593bbe1ad1ba07bde62fa3c4f0734c8cb9f39d901331b810",
     ),
     file(
         "amdgpu/psp_13_0_0_sos.bin",
@@ -2301,11 +2220,6 @@ pub const AMDGPU: &[Recipe] = &[
         "bc7a8b0fe15faa97fa6f7822263218ca94b387c16304bad7d674c166899a3a97",
     ),
     file(
-        "amdgpu/raven2_vcn.bin",
-        369376,
-        "d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb",
-    ),
-    file(
         "amdgpu/raven_asd.bin",
         193024,
         "d14657147433c7d1d94b90b0ffa2e1e08e23c1af78a237d104bf8c6320166b11",
@@ -2371,11 +2285,6 @@ pub const AMDGPU: &[Recipe] = &[
         "1a069344915518494bc9ebd33ea80fd1838e0d533630e84ebed59e8b853c6b8e",
     ),
     file(
-        "amdgpu/raven_vcn.bin",
-        369376,
-        "d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb",
-    ),
-    file(
         "amdgpu/renoir_asd.bin",
         209408,
         "ebe32baa51bc1fa04dc4df6d7e1f90a3ebb6b0e8931aeb40fc838e0ba2e2c192",
@@ -2419,11 +2328,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/renoir_ta.bin",
         46080,
         "6a35ce07ed4b19d3e9929d0c34266bc38e604d28a130f1df4fd296c510c6811e",
-    ),
-    file(
-        "amdgpu/renoir_vcn.bin",
-        407232,
-        "5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98",
     ),
     file(
         "amdgpu/sdma_4_4_2.bin",
@@ -2561,11 +2465,6 @@ pub const AMDGPU: &[Recipe] = &[
         "dc28d6a9abc3e3a1e9e8c4f787fc179a3e02bd1d5d6a72f178f88b1ad5e61569",
     ),
     file(
-        "amdgpu/sienna_cichlid_vcn.bin",
-        582800,
-        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
-    ),
-    file(
         "amdgpu/smu_13_0_0.bin",
         292452,
         "3551e1ef1f0cf542d1a728bdff123142e7cf86b550974d229668b01804c3992d",
@@ -2641,16 +2540,6 @@ pub const AMDGPU: &[Recipe] = &[
         "c23d03726ffdfb1fe253cfbfe36ab82ce5e69bede0d6c4157de71edb967a5fbb",
     ),
     file(
-        "amdgpu/stoney_uvd.bin",
-        277216,
-        "f7474c77bd185b6c2df3c7d24cb656e8e0edb24f1e296cb09447e3e41501a498",
-    ),
-    file(
-        "amdgpu/stoney_vce.bin",
-        166816,
-        "e763aa4f281bc7b2f8b435bb95601e691cc1a7737c10aaa27e59a9b15e94cfdb",
-    ),
-    file(
         "amdgpu/tonga_ce.bin",
         8852,
         "b4af0f8d8d3600f4b91b3e7e3021f7fa77eb539bbf6346d4e07d0b47311f6bf7",
@@ -2706,16 +2595,6 @@ pub const AMDGPU: &[Recipe] = &[
         "bc76b51ddf10bcb858944d78e526e31ec4880f6c99df6bf7c357b019f4d7b56c",
     ),
     file(
-        "amdgpu/tonga_uvd.bin",
-        325312,
-        "52c6c703e3f2eea67469c5c28353a9a10316b8d89be773c7b1a9c30ce6e20eda",
-    ),
-    file(
-        "amdgpu/tonga_vce.bin",
-        161024,
-        "a5b0d7bcaab9798f775aab23dbdbec66ecbdb8a6832e69b338530411a3bcafe8",
-    ),
-    file(
         "amdgpu/topaz_ce.bin",
         8832,
         "39b60959b08623bb085735174360a5f870c55f30bf52f19c89f7f7ccedab348d",
@@ -2766,11 +2645,6 @@ pub const AMDGPU: &[Recipe] = &[
         "753b8b9fdaf0b0e1d1468122fc4fb7ea30ce69c42dfe39b017d249584bde095c",
     ),
     file(
-        "amdgpu/umsch_mm_4_0_0.bin",
-        386656,
-        "6062fdd774e89251d5990df6bf4eb0cf546ce8e26beae1667bcdbdfc6f93c7f8",
-    ),
-    file(
         "amdgpu/vangogh_asd.bin",
         209408,
         "9b39a722b45f7d7f1090d3651f560e6fafb88f54bc5424aafcaca6fe098074f8",
@@ -2819,66 +2693,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/vangogh_toc.bin",
         1792,
         "2ca90c91f7e1756d5c1bd5443007768c692fbe14a228eb5a87e47953c62f5d75",
-    ),
-    file(
-        "amdgpu/vangogh_vcn.bin",
-        575056,
-        "3d282b29bff2ea1833e00cfb08bb6dd9b379f7e58090e0e87aaccb4c2a35d732",
-    ),
-    file(
-        "amdgpu/vcn_3_1_2.bin",
-        575056,
-        "31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4",
-    ),
-    file(
-        "amdgpu/vcn_4_0_0.bin",
-        403856,
-        "5633a5212d41e1f3932c1e7e630b1f2c8c4d27bc53ce8149c3be75d1d832053c",
-    ),
-    file(
-        "amdgpu/vcn_4_0_2.bin",
-        403856,
-        "5633a5212d41e1f3932c1e7e630b1f2c8c4d27bc53ce8149c3be75d1d832053c",
-    ),
-    file(
-        "amdgpu/vcn_4_0_3.bin",
-        359824,
-        "205d8ef5c3ab19070b226abf82c5c39617233136a6d44ad056334fbf269b3cda",
-    ),
-    file(
-        "amdgpu/vcn_4_0_4.bin",
-        403856,
-        "5633a5212d41e1f3932c1e7e630b1f2c8c4d27bc53ce8149c3be75d1d832053c",
-    ),
-    file(
-        "amdgpu/vcn_4_0_5.bin",
-        403856,
-        "4481b9b377bc7c06727032b826456f3e8b9f896792c696de77f9bf8018b164c9",
-    ),
-    file(
-        "amdgpu/vcn_4_0_6.bin",
-        403856,
-        "4481b9b377bc7c06727032b826456f3e8b9f896792c696de77f9bf8018b164c9",
-    ),
-    file(
-        "amdgpu/vcn_4_0_6_1.bin",
-        403856,
-        "c5e9a4ef05d3c4afa77c5a8fabe5987bf8272907823ae5463f97e93a818a1566",
-    ),
-    file(
-        "amdgpu/vcn_5_0_0.bin",
-        440400,
-        "9a0ab35bf157c835cbbc4a207ba819ea0111e2a65fe7f8c20910ffff3122f903",
-    ),
-    file(
-        "amdgpu/vcn_5_0_1.bin",
-        218256,
-        "1ab656611d9aa9650e7a0c811adf30bbc9f95b93f5af54eba4842d73d99fae86",
-    ),
-    file(
-        "amdgpu/vcn_5_3_0.bin",
-        449296,
-        "a52ba1fb434c41516621eba63e3c46c51786b6300b61f28a31974ac132fec634",
     ),
     file(
         "amdgpu/vega10_acg_smc.bin",
@@ -2951,16 +2765,6 @@ pub const AMDGPU: &[Recipe] = &[
         "083a03f42eb5098d5a7b9037bbd0c9f177fd555035cdc073089f59c7eb4f8ca5",
     ),
     file(
-        "amdgpu/vega10_uvd.bin",
-        380832,
-        "88c76158c9937e22c94ffc6b18ae9a43e4305904809b96ec697e350f4753da66",
-    ),
-    file(
-        "amdgpu/vega10_vce.bin",
-        173856,
-        "e6c98b3855db3f998aaa2fd4b2a91a12d950655424108c90a9b9131023eb3b85",
-    ),
-    file(
         "amdgpu/vega12_asd.bin",
         205312,
         "c1cfd36cfe96b44abb87887ff59edaba7af643012771fb8c66ee63e1b5e2e04f",
@@ -3024,16 +2828,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/vega12_sos.bin",
         166800,
         "54064ac7997437541f85781103077f291db60a57f481c25df4a6e62103fbf008",
-    ),
-    file(
-        "amdgpu/vega12_uvd.bin",
-        380832,
-        "b43add6b8702a8152330c54340029088da489974d0482a998b29851d304ae186",
-    ),
-    file(
-        "amdgpu/vega12_vce.bin",
-        173856,
-        "1e850cff69b9ba7998fa1dd01558b4dfd885ec66859d77f0fa01984cd6a9cd55",
     ),
     file(
         "amdgpu/vega20_asd.bin",
@@ -3101,16 +2895,6 @@ pub const AMDGPU: &[Recipe] = &[
         "aea10970b0530e2e11f84a5c0444315c78b109106a02a41b4eeaea3ac96d56dc",
     ),
     file(
-        "amdgpu/vega20_uvd.bin",
-        383520,
-        "c04901f4ea6b3545446601eb2cd58121c371200b0588d6bb937ccaf36f1705df",
-    ),
-    file(
-        "amdgpu/vega20_vce.bin",
-        173856,
-        "e6c98b3855db3f998aaa2fd4b2a91a12d950655424108c90a9b9131023eb3b85",
-    ),
-    file(
         "amdgpu/vegam_ce.bin",
         8852,
         "c0d4acb3f1bd1def58cee933103069ce2b6b6d9b6a63591bd811b51a05ac0d67",
@@ -3154,36 +2938,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/vegam_smc.bin",
         130964,
         "d6d422d2717b59bb7e23597157c2d6978b066475b4872045aff4702f2fee95eb",
-    ),
-    file(
-        "amdgpu/vegam_uvd.bin",
-        375424,
-        "e05664b587a1585d98db3097cf4a55119ee4af2da68e65d3d43b3f57065a95fb",
-    ),
-    file(
-        "amdgpu/vegam_vce.bin",
-        166816,
-        "b063be1f8093b41f527eecc7c592ff92c06d1c9bd5d2b4560e9dcd065f49898a",
-    ),
-    file(
-        "amdgpu/vpe_2_0_0.bin",
-        34688,
-        "7792566da5e7c94b84e20678807b74f78c64482ff2522afce65d70c57cec8ed4",
-    ),
-    file(
-        "amdgpu/vpe_6_1_0.bin",
-        25984,
-        "10a900e43e8633bc1ebe03d2d88f9b3e2f96a43c1961b190023fa1d26423a41a",
-    ),
-    file(
-        "amdgpu/vpe_6_1_1.bin",
-        25984,
-        "e0422f7fccecd2e33ca1b1c58ed188230ea67f9c957ba73fa57ef80df64ead51",
-    ),
-    file(
-        "amdgpu/vpe_6_1_3.bin",
-        25984,
-        "e4545e48016f8cce1d41aef39e00d81c3c11a72a14f0ca4e0bd1a18f43b84bb9",
     ),
     file(
         "amdgpu/yellow_carp_ce.bin",
@@ -3235,16 +2989,12 @@ pub const AMDGPU: &[Recipe] = &[
         1792,
         "9fc8da2f6106bf657222ca4bcca687e66e657e5710278c694d9d0e862221758d",
     ),
-    file(
-        "amdgpu/yellow_carp_vcn.bin",
-        575056,
-        "31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4",
-    ),
 ];
 
 /// The files amdgpu's built units declare that linux-firmware does not hold
-/// at the pin, nor at its newest commit of 2026-11-16: a GPU whose IP blocks
-/// ask for one of them fails amdgpu's probe there, as on Linux.
+/// at the pin, nor at its newest commit of 2026-11-16, but the media
+/// engines' ([`media`]): a GPU whose IP blocks ask for one of them fails
+/// amdgpu's probe there, as on Linux.
 pub const UNPUBLISHED: &[&str] = &[
     "amdgpu/cyan_skillfish_gpu_info.bin",
     "amdgpu/dcn_4_2_1_dmcub.bin",
@@ -3279,9 +3029,7 @@ pub const UNPUBLISHED: &[&str] = &[
     "amdgpu/sdma_6_4_0.bin",
     "amdgpu/sdma_7_1_0.bin",
     "amdgpu/sienna_cichlid_cap.bin",
-    "amdgpu/vcn_5_0_2.bin",
     "amdgpu/vega10_cap.bin",
-    "amdgpu/vpe_2_2_0.bin",
 ];
 
 /// `pciidlist`'s entries that name a device: its ID and its family

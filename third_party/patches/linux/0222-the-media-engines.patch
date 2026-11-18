@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:10:36 +0000
+Subject: [PATCH] fix(amdgpu): the media engines (UVD, VCE, VCN, JPEG, VPE and
+ the media scheduler) are left out at early init as ip_block_mask leaves a
+ block out, where they took firmware and start time Stela's Metal device never
+ uses and a video decoder a previous owner left running failed the whole start
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 27 ++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index ea9a6ed4bcc9c24e4dd6ee12483822b84048f7c9..13bfc05e4607f8f6d3bc3beb1d188c25e7286f31 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2071,6 +2071,28 @@ static void amdgpu_device_init_pcie_links(struct amdgpu_device *adev)
+  * is the first stage in initializing the asic.
+  * Returns 0 on success, negative error code on failure.
+  */
++/*
++ * Stela: the media engines (video decode and encode, JPEG, video
++ * processing and the media scheduler) are left out as ip_block_mask leaves
++ * a block out. Stela's Metal device runs on graphics, compute and DMA only;
++ * these blocks would only add firmware, start time and ways for the start
++ * to fail, such as a decoder a previous owner left running.
++ */
++static bool amdgpu_device_ip_left_out(enum amd_ip_block_type type)
++{
++	switch (type) {
++	case AMD_IP_BLOCK_TYPE_UVD:
++	case AMD_IP_BLOCK_TYPE_VCE:
++	case AMD_IP_BLOCK_TYPE_VCN:
++	case AMD_IP_BLOCK_TYPE_JPEG:
++	case AMD_IP_BLOCK_TYPE_VPE:
++	case AMD_IP_BLOCK_TYPE_UMSCH_MM:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static int amdgpu_device_ip_early_init(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ip_block *ip_block;
+@@ -2195,6 +2217,11 @@ static int amdgpu_device_ip_early_init(struct amdgpu_device *adev)
+ 			dev_warn(adev->dev, "disabled ip block: %d <%s>\n", i,
+ 				 adev->ip_blocks[i].version->funcs->name);
+ 			adev->ip_blocks[i].status.valid = false;
++		} else if (amdgpu_device_ip_left_out(ip_block->version->type)) {
++			dev_info(adev->dev,
++				 "left out ip block: %d <%s>: Stela uses no media engine\n",
++				 i, adev->ip_blocks[i].version->funcs->name);
++			adev->ip_blocks[i].status.valid = false;
+ 		} else if (ip_block->version->funcs->early_init) {
+ 			r = ip_block->version->funcs->early_init(ip_block);
+ 			if (r == -ENOENT) {

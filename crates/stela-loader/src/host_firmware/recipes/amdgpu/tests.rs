@@ -18,6 +18,12 @@ fn left_out_file(member: &str) -> bool {
         && !CHIPS.iter().any(|chip| !left_out(chip.0) && names(chip))
 }
 
+/// Whether `member` is a media engine's file, which amdgpu no longer asks
+/// for.
+fn media_file(member: &str) -> bool {
+    member.strip_prefix("amdgpu/").is_some_and(media)
+}
+
 fn names(gpu: AmdGpu) -> Vec<&'static str> {
     gpu.files().map(|recipe| recipe.image.member).collect()
 }
@@ -44,11 +50,16 @@ fn files_are_pinned_once_in_name_order_under_the_amdgpu_notice() {
             "{member}"
         );
         assert!(!UNPUBLISHED.contains(&member), "{member}");
-        // No file only a family Stela leaves out loads is pinned.
-        assert!(!left_out_file(member), "{member}");
+        // No file only a family Stela leaves out loads is pinned, nor a
+        // media engine's.
+        assert!(!left_out_file(member) && !media_file(member), "{member}");
     }
     assert!(UNPUBLISHED.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(!UNPUBLISHED.iter().any(|member| left_out_file(member)));
+    assert!(
+        !UNPUBLISHED
+            .iter()
+            .any(|member| left_out_file(member) || media_file(member))
+    );
     // A request is answered by its exact name and amdgpu's target only.
     let request = |name: &str, hardware: &str| {
         let json = serde_json::json!({"schema":1,"complete":true,"requirements":[{
@@ -121,9 +132,9 @@ fn tables_are_sorted_and_every_family_has_its_names() {
 #[test]
 fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
     // The 9800X3D's and the 7000 series' graphics, matched by class: their
-    // IP blocks' files (graphics 10.3.6, PSP 13.0.5, SDMA 5.2.6, DCN 3.1.5,
-    // VCN 3.1.2) are among every versioned file, beside Van Gogh's, which
-    // only discovery reaches; no family's own files are.
+    // IP blocks' files (graphics 10.3.6, PSP 13.0.5, SDMA 5.2.6, DCN 3.1.5)
+    // are among every versioned file, beside Van Gogh's, which only
+    // discovery reaches; no family's own files are, nor any media engine's.
     for device in [0x13c0, 0x164e] {
         let gpu = AmdGpu::of(device);
         assert_eq!(gpu, AmdGpu::Discovered);
@@ -140,13 +151,12 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
             "amdgpu/psp_13_0_5_ta.bin",
             "amdgpu/sdma_5_2_6.bin",
             "amdgpu/dcn_3_1_5_dmcub.bin",
-            "amdgpu/vcn_3_1_2.bin",
             "amdgpu/dcn_3_5_dmcub.bin",
-            "amdgpu/umsch_mm_4_0_0.bin",
             "amdgpu/vangogh_pfp.bin",
         ] {
             assert!(files.contains(&member), "{member}");
         }
+        assert!(!files.iter().any(|member| media_file(member)), "{files:?}");
         assert!(
             !files
                 .iter()
@@ -159,6 +169,14 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
     let polaris = names(AmdGpu::of(0x67df));
     assert!(!polaris.is_empty() && polaris.iter().all(|m| m.starts_with("amdgpu/polaris10_")));
     assert!(polaris.contains(&"amdgpu/polaris10_k_mc.bin"));
+    // Its video decoder and encoder are left out.
+    assert!(AmdGpu::Named("POLARIS10", None).may_load("amdgpu/polaris10_mc.bin"));
+    for member in ["amdgpu/polaris10_uvd.bin", "amdgpu/polaris10_vce.bin"] {
+        assert!(
+            !AmdGpu::Named("POLARIS10", None).may_load(member),
+            "{member}"
+        );
+    }
     let quirked = names(AmdGpu::of(0x67ff));
     assert!(quirked.contains(&"amdgpu/polaris11_mc.bin"));
     assert!(quirked.contains(&"amdgpu/polaris10_mc.bin"));
@@ -180,6 +198,7 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
             .iter()
             .all(|m| m.starts_with("amdgpu/sienna_cichlid_"))
     );
+    assert!(!navi21.contains(&"amdgpu/sienna_cichlid_vcn.bin"));
     // A device amdgpu leaves to radeon loads none of its files.
     let radeon = AmdGpu::of(LEFT_TO_RADEON[0]);
     assert_eq!(radeon, AmdGpu::LeftToRadeon);
@@ -296,7 +315,7 @@ fn the_largest_set_fits_one_boots_firmware() {
             .sum();
         largest = largest.max((plan.selections().len(), bytes));
     }
-    // The discovered set: about 220 files, 49 MiB, which leaves room for a
+    // The discovered set: about 200 files, 49 MiB, which leaves room for a
     // second GPU's and the network's files in one boot's budget.
     assert!(largest.0 <= MAX_IMAGES / 2, "{largest:?}");
     assert!(largest.1 <= MAX_TOTAL_BYTES / 4, "{largest:?}");
@@ -535,13 +554,20 @@ fn every_file_amdgpus_built_units_declare_is_pinned_or_unpublished() {
     }
     // The files only a family Stela leaves out loads are declared by
     // units amdgpu builds for the others too (`amdgpu_uvd.c`), and are
-    // pinned nowhere.
+    // pinned nowhere; nor are the media engines', whose units amdgpu
+    // builds but leaves out at early init.
     assert!(names.iter().any(|name| left_out_file(name)));
+    assert!(names.iter().any(|name| media_file(name)));
     let ours: BTreeSet<String> = AMDGPU
         .iter()
         .map(|recipe| String::from(recipe.image.member))
         .chain(UNPUBLISHED.iter().map(|name| String::from(*name)))
-        .chain(names.iter().filter(|name| left_out_file(name)).cloned())
+        .chain(
+            names
+                .iter()
+                .filter(|name| left_out_file(name) || media_file(name))
+                .cloned(),
+        )
         .collect();
     let missing: Vec<_> = names.difference(&ours).collect();
     let extra: Vec<_> = ours.difference(&names).collect();
@@ -557,7 +583,10 @@ fn every_file_amdgpus_built_units_declare_is_pinned_or_unpublished() {
             .chain([AmdGpu::Discovered])
             .any(|gpu| gpu.may_load(name));
         assert!(
-            loaded || name.ends_with("/ip_discovery.bin") || left_out_file(name),
+            loaded
+                || name.ends_with("/ip_discovery.bin")
+                || left_out_file(name)
+                || media_file(name),
             "{name} is no device's"
         );
     }
@@ -607,7 +636,7 @@ fn discovered(ips: &[(u16, u8, u8, u8)]) -> Vec<&'static str> {
 #[test]
 fn a_discovered_device_gets_only_its_blocks_versions_files() {
     // Raphael: GC 10.3.6, PSP and SMU 13.0.5, SDMA 5.2.6, VCN 3.1.2,
-    // DCN 3.1.5.
+    // DCN 3.1.5; its video engine's file is left out.
     let raphael = discovered(&[
         (11, 10, 3, 6),
         (255, 13, 0, 5),
@@ -621,7 +650,6 @@ fn a_discovered_device_gets_only_its_blocks_versions_files() {
         "amdgpu/gc_10_3_6_rlc.bin",
         "amdgpu/psp_13_0_5_toc.bin",
         "amdgpu/sdma_5_2_6.bin",
-        "amdgpu/vcn_3_1_2.bin",
         "amdgpu/dcn_3_1_5_dmcub.bin",
     ] {
         assert!(raphael.contains(&member), "{member}");
@@ -633,7 +661,6 @@ fn a_discovered_device_gets_only_its_blocks_versions_files() {
                 "psp_13_0_5_",
                 "smu_13_0_5",
                 "sdma_5_2_6",
-                "vcn_3_1_2",
                 "dcn_3_1_5_",
             ]
             .iter()
@@ -641,7 +668,8 @@ fn a_discovered_device_gets_only_its_blocks_versions_files() {
         }),
         "{raphael:?}"
     );
-    // Strix Point: a two-number DCN name, VPE and the media scheduler.
+    // Strix Point: a two-number DCN name; its VCN, VPE and media
+    // scheduler are left out.
     let strix = discovered(&[
         (11, 11, 5, 0),
         (255, 14, 0, 0),
@@ -654,13 +682,32 @@ fn a_discovered_device_gets_only_its_blocks_versions_files() {
         "amdgpu/gc_11_5_0_me.bin",
         "amdgpu/psp_14_0_0_toc.bin",
         "amdgpu/sdma_6_1_0.bin",
-        "amdgpu/vcn_4_0_5.bin",
-        "amdgpu/vpe_6_1_0.bin",
         "amdgpu/dcn_3_5_dmcub.bin",
-        "amdgpu/umsch_mm_4_0_0.bin",
     ] {
         assert!(strix.contains(&member), "{member}");
     }
+    for member in [
+        "amdgpu/vcn_4_0_5.bin",
+        "amdgpu/vpe_6_1_0.bin",
+        "amdgpu/umsch_mm_4_0_0.bin",
+    ] {
+        let ips = [
+            DiscoveredIp {
+                hw_id: 12,
+                major: 4,
+                minor: 0,
+                revision: 5,
+            },
+            DiscoveredIp {
+                hw_id: 21,
+                major: 6,
+                minor: 1,
+                revision: 0,
+            },
+        ];
+        assert!(!discovered_may_load(&ips, member), "{member}");
+    }
+    assert!(!strix.iter().any(|member| media_file(member)), "{strix:?}");
     assert!(!strix.contains(&"amdgpu/dcn_3_5_1_dmcub.bin"));
     assert!(!strix.iter().any(|member| member.contains("vangogh")));
     // Van Gogh's files by its graphics version.
@@ -682,13 +729,12 @@ fn every_discovered_file_is_attributed_to_a_block_or_a_family() {
                 .and_then(|rest| rest.strip_prefix('_'))
                 .and_then(file_version)
                 .is_some()
-        }) || named(name, UMSCH.0)
-            || DISCOVERED_CHIPS.iter().any(|(chip, _)| {
-                CHIPS
-                    .iter()
-                    .find(|(known, ..)| known == chip)
-                    .is_some_and(|(_, _, stems)| stems.iter().any(|stem| named(name, stem)))
-            });
+        }) || DISCOVERED_CHIPS.iter().any(|(chip, _)| {
+            CHIPS
+                .iter()
+                .find(|(known, ..)| known == chip)
+                .is_some_and(|(_, _, stems)| stems.iter().any(|stem| named(name, stem)))
+        });
         assert!(attributed, "{member}");
     }
     // Every family only discovery reaches has its graphics version here.
