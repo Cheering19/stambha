@@ -512,6 +512,10 @@ mod tests {
                 memory_bytes: crate::xe::query::memory_bytes,
                 reset: None,
                 describe: None,
+                version: None,
+                reads_rom: true,
+                unloads_on_boot_cpu: false,
+                pages_bounded: false,
             },
             metal: Some(intel::ADMISSION),
         };
