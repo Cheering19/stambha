@@ -52,6 +52,8 @@ fn main() {
     // Active ports declare their native source inputs below. Without this
     // baseline Cargo watches every vendored file even when no C port is used.
     println!("cargo:rerun-if-changed=build.rs");
+    // and its modules, which derive the ports' tables.
+    println!("cargo:rerun-if-changed=build");
     #[cfg(feature = "amdgpu-port")]
     amdgpu::tables();
     #[cfg(feature = "xe-port")]
