@@ -304,6 +304,43 @@ pub fn discovered_may_load(ips: &[DiscoveredIp], member: &str) -> bool {
     })
 }
 
+/// A block's name, its hardware ID and whether a file is its own.
+type RequiredBlock = (&'static str, u16, fn(&str) -> bool);
+
+/// The blocks whose firmware amdgpu requires on every GPU it identifies by
+/// IP discovery, each with its hardware ID and the file of it that
+/// selection must hold: the graphics block's RLC microcode (`gfx_v10_0.c`,
+/// `gfx_v11_0.c` and `gfx_v12_0.c` request `<prefix>_rlc.bin` as
+/// `AMDGPU_UCODE_REQUIRED`) and the DMA engine's (`amdgpu_sdma.c` requests
+/// `<prefix>.bin` the same way), named after the block's version or, for a
+/// discovery-only family, after the family.
+const REQUIRED_BLOCKS: &[RequiredBlock] = &[
+    ("GC", 11, |name| name.ends_with("_rlc.bin")),
+    ("SDMA", 42, |name| {
+        name.starts_with("sdma_") || name.ends_with("_sdma.bin")
+    }),
+];
+
+/// The first block a device whose discovery table lists `ips` has that
+/// amdgpu cannot start with the pinned files ([`REQUIRED_BLOCKS`]): its
+/// name and version, when the table lists it and no pinned file
+/// [`discovered_may_load`] selects is that block's. amdgpu's probe would
+/// fail there, on a block whose firmware linux-firmware does not publish
+/// at the pin or a version newer than the pinned driver knows.
+pub fn discovered_lacks(ips: &[DiscoveredIp]) -> Option<(&'static str, (u8, u8, u8))> {
+    REQUIRED_BLOCKS
+        .iter()
+        .find_map(|&(block, hw_id, is_block_file)| {
+            let ip = ips.iter().find(|ip| ip.hw_id == hw_id)?;
+            let held = AMDGPU.iter().any(|recipe| {
+                let member = recipe.image.member;
+                discovered_may_load(ips, member)
+                    && member.strip_prefix("amdgpu/").is_some_and(is_block_file)
+            });
+            (!held).then_some((block, (ip.major, ip.minor, ip.revision)))
+        })
+}
+
 /// Requires the files amdgpu asks for on the AMD GPU with PCI device ID
 /// `device` whose IP discovery table lists `ips`: [`require_amdgpu`] for a
 /// device its table names, which loads its family's files whatever its

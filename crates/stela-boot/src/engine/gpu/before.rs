@@ -394,6 +394,19 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
             },
         )
         .collect();
+    // A block amdgpu requires and cannot start would fail its probe after
+    // the reset; refused here, the GPU keeps what the firmware left.
+    if let Some((block, (major, minor, revision))) = recipes::discovered_lacks(&ips) {
+        output::arguments(format_args!(
+            "GPU {address}: its IP discovery table names {block} {major}.{minor}.{revision}, \
+             and no pinned amdgpu firmware file is that block's (linux-firmware does not \
+             publish it, or the block is newer than the pinned driver); amdgpu could not start \
+             it, so it stays as the firmware left it\n"
+        ));
+        return Err(ServiceError::Refused(
+            "no pinned amdgpu firmware for a block the GPU's IP discovery table names",
+        ));
+    }
     let mut inventory = Inventory::default();
     recipes::require_amdgpu_discovered(&mut inventory, device, &ips)
         .map_err(|_| ServiceError::Refused("the GPU's discovered firmware cannot be selected"))?;

@@ -748,3 +748,76 @@ fn every_discovered_file_is_attributed_to_a_block_or_a_family() {
         );
     }
 }
+
+fn table(ips: &[(u16, u8, u8, u8)]) -> Vec<DiscoveredIp> {
+    ips.iter()
+        .map(|&(hw_id, major, minor, revision)| DiscoveredIp {
+            hw_id,
+            major,
+            minor,
+            revision,
+        })
+        .collect()
+}
+
+#[test]
+fn a_discovered_device_whose_required_blocks_have_files_lacks_none() {
+    for ips in [
+        // Raphael, the chip the port ran on.
+        &[
+            (11, 10, 3, 6),
+            (255, 13, 0, 5),
+            (1, 13, 0, 5),
+            (42, 5, 2, 6),
+        ][..],
+        // Navi 31, Navi 48, Strix Point, Van Gogh (files by its family).
+        &[
+            (11, 11, 0, 0),
+            (255, 13, 0, 0),
+            (1, 13, 0, 0),
+            (42, 6, 0, 0),
+        ],
+        &[
+            (11, 12, 0, 1),
+            (255, 14, 0, 3),
+            (1, 14, 0, 3),
+            (42, 7, 0, 1),
+        ],
+        &[(11, 11, 5, 0), (255, 14, 0, 0), (42, 6, 1, 0)],
+        &[(11, 10, 3, 1), (255, 11, 5, 0), (42, 5, 2, 1)],
+    ] {
+        assert_eq!(discovered_lacks(&table(ips)), None, "{ips:?}");
+    }
+}
+
+#[test]
+fn a_discovered_device_lacks_a_required_block_without_published_files() {
+    // A graphics version linux-firmware does not publish at the pin, and
+    // one newer than the pinned driver knows.
+    let unpublished = table(&[(11, 11, 5, 4), (255, 14, 0, 0), (42, 6, 1, 0)]);
+    assert_eq!(discovered_lacks(&unpublished), Some(("GC", (11, 5, 4))));
+    let newer = table(&[(11, 13, 0, 0), (42, 8, 0, 0)]);
+    assert_eq!(discovered_lacks(&newer), Some(("GC", (13, 0, 0))));
+    // A served graphics block beside a DMA engine without files.
+    let dma = table(&[(11, 11, 5, 0), (42, 7, 1, 0)]);
+    assert_eq!(discovered_lacks(&dma), Some(("SDMA", (7, 1, 0))));
+    // Every unpublished graphics RLC or DMA file makes its version lack.
+    for name in UNPUBLISHED {
+        let name = &name["amdgpu/".len()..];
+        let (hw_id, rest) = if let Some(rest) = name.strip_prefix("gc_")
+            && name.ends_with("_rlc.bin")
+        {
+            (11, rest)
+        } else if let Some(rest) = name.strip_prefix("sdma_") {
+            (42, rest)
+        } else {
+            continue;
+        };
+        let (major, minor, revision) = file_version(rest).unwrap();
+        let lacks = discovered_lacks(&table(&[(hw_id, major, minor, revision)]));
+        assert_eq!(
+            lacks.map(|(_, version)| version),
+            Some((major, minor, revision))
+        );
+    }
+}
