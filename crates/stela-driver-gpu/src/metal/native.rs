@@ -214,12 +214,11 @@ struct Messenger {
 }
 
 impl Messenger {
-    /// # Safety
-    ///
-    /// `instance` was created from `entry` with `VK_EXT_debug_utils`.
-    unsafe fn new(entry: &ash::Entry, instance: &ash::Instance, log: fn(&str)) -> Option<Self> {
-        let fns = ext::debug_utils::Instance::new(entry, instance);
-        let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+    /// What a messenger forwarding to `log` is made with; chained into the
+    /// instance's create info too, so the driver's messages while it
+    /// creates the instance reach `log` before any messenger exists.
+    fn info(log: fn(&str)) -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+        vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                     | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
@@ -230,7 +229,15 @@ impl Messenger {
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
             )
             .pfn_user_callback(Some(forward))
-            .user_data(log as *mut c_void);
+            .user_data(log as *mut c_void)
+    }
+
+    /// # Safety
+    ///
+    /// `instance` was created from `entry` with `VK_EXT_debug_utils`.
+    unsafe fn new(entry: &ash::Entry, instance: &ash::Instance, log: fn(&str)) -> Option<Self> {
+        let fns = ext::debug_utils::Instance::new(entry, instance);
+        let info = Self::info(log);
         // SAFETY: the instance enables the extension; `forward` reads the
         // user data as the `fn(&str)` given here, which is 'static.
         let handle = unsafe { fns.create_debug_utils_messenger(&info, None) }.ok()?;
@@ -754,6 +761,9 @@ impl NativeBackend {
         let device = match unsafe { instance.create_device(physical, &info, None) } {
             Ok(device) => device,
             Err(error) => {
+                (loader.log)(&format!(
+                    "Vulkan device not created for the GPU at {pci:?}: {error:?}"
+                ));
                 destroy_instance(&instance);
                 return Err(failure(error));
             }
@@ -928,11 +938,22 @@ impl NativeBackend {
                     .any(|offer| offer.extension_name_as_c_str() == Ok(ext::debug_utils::NAME))
             });
         let names = [ext::debug_utils::NAME.as_ptr()];
-        let info = vk::InstanceCreateInfo::default()
+        let mut capture = Messenger::info(loader.log);
+        let mut info = vk::InstanceCreateInfo::default()
             .application_info(&application)
             .enabled_extension_names(if debug_utils { &names } else { &[] });
-        // SAFETY: the create info and its application info outlive the call.
-        let instance = unsafe { entry.create_instance(&info, None) }.map_err(failure)?;
+        if debug_utils {
+            info = info.push_next(&mut capture);
+        }
+        // SAFETY: the create info, its application info and the chained
+        // messenger info outlive the call.
+        let instance = match unsafe { entry.create_instance(&info, None) } {
+            Ok(instance) => instance,
+            Err(error) => {
+                (loader.log)(&format!("Vulkan instance not created: {error:?}"));
+                return Err(failure(error));
+            }
+        };
         // SAFETY: the instance enables the extension when the driver offers it.
         let messenger = debug_utils
             .then(|| unsafe { Messenger::new(&entry, &instance, loader.log) })
