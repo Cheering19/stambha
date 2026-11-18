@@ -787,6 +787,9 @@ struct Host {
     /// Linux's last line and its repeats in a row, which are counted, not
     /// written again ([`stela_boot_core::repeated_lines`]).
     repeats: RefCell<stela_boot_core::repeated_lines::Repeats>,
+    /// How often each `WARN` site fired: a site that fires on every
+    /// interrupt or frame prints at its first and each power of two.
+    warned: RefCell<stela_boot_core::gpu_triage::Repeats>,
     /// The first error Linux reported, which a stop before the start
     /// finished names as the reason the GPU did not start.
     first_error: RefCell<Option<String>>,
@@ -969,7 +972,10 @@ impl Platform for Host {
     fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>) {
         let file = file.to_str().unwrap_or("(not UTF-8)");
         let condition = condition.and_then(|text| text.to_str().ok()).unwrap_or("");
-        self.report(format_args!("WARN {file}:{line} {condition}"));
+        let Some(repeats) = self.warned.borrow_mut().count(&format!("{file}:{line}")) else {
+            return;
+        };
+        self.report(format_args!("WARN {file}:{line} {condition}{repeats}"));
     }
 
     fn unsupported(&self, operation: &CStr) {
@@ -2779,6 +2785,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         lines: RefCell::new(lines),
         reported: RefCell::new(BTreeSet::new()),
         repeats: RefCell::new(Default::default()),
+        warned: RefCell::new(stela_boot_core::gpu_triage::Repeats::new()),
         first_error: RefCell::new(None),
         gsp_start: RefCell::new(Default::default()),
         gpus: claimed
