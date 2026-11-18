@@ -595,6 +595,7 @@ mod tests {
             vendor: Vendor::from_pci(vendor),
             device: 0x1234,
             class: [3, 0, 0],
+            revision: 0,
         }
     }
 

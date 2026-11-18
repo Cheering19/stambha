@@ -508,6 +508,7 @@ mod tests {
             vendor,
             device,
             class: [3, 0, 0],
+            revision: 0,
         };
         let amd = at(3, Vendor::Amd, 0x744c);
         let intel = at(0, Vendor::Intel, 0xa780);
@@ -660,6 +661,7 @@ mod tests {
             vendor,
             device,
             class: [3, 0, 0],
+            revision: 0,
         };
         // An RTX 4060 (AD107) beside an Intel iGPU.
         let found = [at(0, Vendor::Intel, 0xa780), at(1, Vendor::Nvidia, 0x2882)];

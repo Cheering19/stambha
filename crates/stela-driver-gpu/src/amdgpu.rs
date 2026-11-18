@@ -269,6 +269,7 @@ mod tests {
             vendor: Vendor::from_pci(0x1002),
             device,
             class,
+            revision: 0,
         }
     }
 

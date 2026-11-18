@@ -156,6 +156,7 @@ fn adapter(address: Address, class: [u8; 3]) -> Adapter {
         vendor: crate::gpu::Vendor::Amd,
         device: 0x1638,
         class,
+        revision: 0,
     }
 }
 

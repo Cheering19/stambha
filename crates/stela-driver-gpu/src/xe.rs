@@ -205,6 +205,7 @@ mod tests {
             vendor: crate::Vendor::Intel,
             device,
             class: [3, 0, 0],
+            revision: 0,
         };
         assert!(integrated(&adapter(0x9a49)));
         assert!(!integrated(&adapter(0x56a0)));

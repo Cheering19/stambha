@@ -11,6 +11,7 @@ mod hosted;
 mod llvm;
 mod mesa;
 mod metal_suite;
+mod names;
 mod nvk;
 mod radv;
 mod support;
@@ -144,6 +145,14 @@ pub enum Command {
     /// prove them on a Mac, carry them to a guest and check its results.
     #[command(subcommand)]
     MetalSuite(metal_suite::Command),
+    /// Write the market names of NVIDIA, AMD and Intel display controllers
+    /// that the boot screen shows (`crates/stela-driver-gpu/src/names`) from
+    /// the pinned `pci.ids` release and the libdrm and Mesa pins.
+    Names {
+        /// The PCI ID database's `pci.ids` of the pinned release.
+        #[arg(long, default_value = "/usr/share/hwdata/pci.ids")]
+        pci_ids: PathBuf,
+    },
     /// Compile LLVM and libc++ for `stela.efi`, which `nvk` also does.
     Llvm {
         /// Maximum parallel native compiler processes.
@@ -188,6 +197,7 @@ pub fn run(command: Command) -> Result<()> {
             radv::metal(&library, &support::third_party("linux"), &corpus)
         }
         Command::MetalSuite(command) => metal_suite::run(command),
+        Command::Names { pci_ids } => names::generate(&pci_ids),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::discover()?, jobs, test),
     }
 }

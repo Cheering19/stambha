@@ -308,6 +308,7 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
                 vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
                 device: identity.device,
                 class: identity.class,
+                revision: 0,
             })
             .ok()
             .filter(|stack| stack.draws())

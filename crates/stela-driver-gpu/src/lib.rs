@@ -18,6 +18,7 @@ pub mod xe;
 
 pub mod cold;
 pub mod gsp_perf;
+pub mod names;
 pub mod nouveau_chip;
 pub mod stack;
 
@@ -90,6 +91,8 @@ pub struct Adapter {
     pub vendor: Vendor,
     pub device: u16,
     pub class: [u8; 3],
+    /// The revision ID, which tells some products of one device apart.
+    pub revision: u8,
 }
 
 impl Adapter {
@@ -101,7 +104,13 @@ impl Adapter {
             vendor: Vendor::from_pci(function.vendor),
             device: function.device,
             class: function.class,
+            revision: function.revision,
         })
+    }
+
+    /// Its market name, or its maker and IDs ([`names::name`]).
+    pub fn name(&self) -> alloc::string::String {
+        names::name(self.vendor, self.device, self.revision)
     }
 
     /// Every discovered adapter remains unbound until a real port exists.

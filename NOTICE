@@ -64,6 +64,12 @@ contributors)
 Spleen 2.1.0 font (Frederic        BSD-2-Clause                       stela.efi
 Cambus)
 Arm AARCHMRS data (Arm Limited)    BSD-3-Clause                       stela.efi, stela
+GPU market names: PCI ID           GPL-2.0-or-later OR BSD-3-Clause   stela.efi
+database pci.ids 2026.02.12        (used under GPL-2.0-or-later);
+(Martin Mares, Albert Pool),       MIT (amdgpu.ids, Mesa)
+libdrm data/amdgpu.ids, Mesa
+include/pci_ids (generated into
+crates/stela-driver-gpu/src/names)
 corsix/amx (Peter Cawley)          MIT                                stela.efi, stela
 Rust standard library and          MIT OR Apache-2.0 (MIT used)       stela.efi, stela
 RustCrypto portions in

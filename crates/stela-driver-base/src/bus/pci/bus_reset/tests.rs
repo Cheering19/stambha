@@ -173,6 +173,7 @@ fn child(at: Address, command: u32) -> Function<Child> {
         vendor: 0x10de,
         device: 0x1234,
         class: [3, 0, 0],
+        revision: 0,
         config: Child(Rc::new(State {
             words: RefCell::new(words),
             silence: Cell::new(0),
