@@ -151,8 +151,9 @@ impl KernelWork {
         let (provider, extents) = unsafe { pages.into_inventory() }?;
         // SAFETY: exact claimed owner on this taskless dispatcher before
         // Initial. Provider keeps the actual backing through publication.
-        let catalog = unsafe { Catalog::register_annotated_bootstrap(kernel, provider, extents) }
-            .map_err(Error::Pages)?;
+        let catalog =
+            unsafe { Catalog::register_annotated_bootstrap(kernel, provider, extents, None) }
+                .map_err(Error::Pages)?;
         Ok(&*Box::leak(Box::new(catalog)))
     }
 }

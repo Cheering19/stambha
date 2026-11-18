@@ -84,6 +84,10 @@ static struct {
 	size_t free_records;
 	size_t retired;
 	size_t live_pages;
+	/* Ordinary pages held now, and the most Linux may hold at once (zero:
+	 * the whole ordinary inventory), which it reports as its RAM. */
+	size_t ordinary_live;
+	size_t page_limit;
     size_t stack_admissions;
     bool kernel_roots;
     bool hosted;
@@ -199,11 +203,9 @@ static void require_catalog(void)
 		__builtin_trap();
 }
 
-unsigned long stela_linux_page_boot_capacity(void)
+static size_t ordinary_pages(void)
 {
-	require_quiescence();
-	require_catalog();
-	unsigned long pages = 0;
+	size_t pages = 0;
 
 	for (size_t i = 0; i < catalog.extent_count; i++) {
 		const struct registered_extent *extent = catalog.extents + i;
@@ -212,6 +214,38 @@ unsigned long stela_linux_page_boot_capacity(void)
 			pages += extent->page_count;
 	}
 	return pages;
+}
+
+unsigned long stela_linux_page_boot_capacity(void)
+{
+	require_quiescence();
+	require_catalog();
+	size_t pages = ordinary_pages();
+	return catalog.page_limit ? min(pages, catalog.page_limit) : pages;
+}
+
+/* Whether `count` more ordinary pages stay within the limit. */
+static bool within_limit(size_t count)
+{
+	return !catalog.page_limit ||
+	       (count <= catalog.page_limit && catalog.ordinary_live <= catalog.page_limit - count);
+}
+
+int stela_linux_page_catalog_limit(u64 generation, size_t pages)
+{
+	require_quiescence();
+	if (!catalog.pages || catalog.generation != generation)
+		return -EINVAL;
+	if (!pages || pages > ordinary_pages())
+		return -EINVAL;
+	if (catalog.ordinary_live > pages)
+		return -EBUSY;
+	catalog.page_limit = pages;
+	/* The RAM Linux's sizing reads (si_meminfo, the zone's managed pages)
+	 * is what it may hold, so TTM's and the drivers' limits derive from it. */
+	atomic_long_set(&contig_page_data.node_zones[ZONE_NORMAL].managed_pages, (long)pages);
+	atomic_long_set(&_totalram_pages, (long)pages);
+	return 0;
 }
 
 int stela_linux_page_owner_context(const struct stela_linux_owner *expected)
@@ -769,6 +803,9 @@ int stela_linux_available_page_frames(unsigned long *available)
 			return error;
 		total += count;
 	}
+	if (catalog.page_limit)
+		total = min(total, (unsigned long)(catalog.page_limit -
+						   min(catalog.page_limit, catalog.ordinary_live)));
 	*available = total;
 	return 0;
 }
@@ -1253,7 +1290,7 @@ retry:
 	}
 	if (!atomic)
 		stela_linux_pages_finish();
-	if (catalog.free_records == NO_INDEX)
+	if (catalog.free_records == NO_INDEX || !within_limit((size_t)1 << order))
 		goto exhausted;
 	size_t record_index = catalog.free_records;
 	struct allocation_record *record = catalog.allocations + record_index;
@@ -1307,6 +1344,7 @@ retry:
 		};
 	}
 	catalog.live_pages += count;
+	catalog.ordinary_live += count;
 	struct page *page = catalog.pages + first;
 	set_page_count(page, 1);
 	if (gfp & __GFP_ZERO)
@@ -1453,6 +1491,8 @@ static void retire_pages(size_t first, size_t count)
 	}
 	record->live -= count;
 	catalog.live_pages -= count;
+	if (!record->external_nonce)
+		catalog.ordinary_live -= count;
 	if (!record->live) {
         if (record->external_nonce) {
             /* Original free_thread_stack/__free_pages ended logical pages.
@@ -2063,6 +2103,43 @@ static void capacity(void)
 	assert(page && fixture.releases == releases + TEST_PAGES);
 	__free_page(page);
 	stela_linux_pages_finish();
+}
+
+/* A limit holds Linux to fewer pages than the inventory: a request past it
+ * fails before the provider is asked, freed pages make room again, and the
+ * RAM Linux reads is the limit. */
+static void page_limit(void)
+{
+	struct zone *zone = &contig_page_data.node_zones[ZONE_NORMAL];
+	assert(totalram_pages() == TEST_PAGES && zone_managed_pages(zone) == TEST_PAGES);
+	assert(stela_linux_page_catalog_limit(catalog.generation + 1, 4) == -EINVAL);
+	assert(stela_linux_page_catalog_limit(catalog.generation, 0) == -EINVAL);
+	assert(stela_linux_page_catalog_limit(catalog.generation, TEST_PAGES + 1) == -EINVAL);
+	struct page *held = alloc_pages(GFP_KERNEL, 2);
+	assert(held);
+	assert(stela_linux_page_catalog_limit(catalog.generation, 3) == -EBUSY);
+	assert(!stela_linux_page_catalog_limit(catalog.generation, 6));
+	assert(totalram_pages() == 6 && zone_managed_pages(zone) == 6);
+	assert(stela_linux_page_boot_capacity() == 6);
+	unsigned long available = 0;
+	assert(!stela_linux_available_page_frames(&available) && available == 2);
+	unsigned int allocations = fixture.allocations;
+	assert(!alloc_pages(GFP_KERNEL, 2) && fixture.allocations == allocations);
+	struct page *pair = alloc_pages(GFP_KERNEL, 1);
+	assert(pair && fixture.allocations == allocations + 1);
+	assert(!alloc_page(GFP_KERNEL) && fixture.allocations == allocations + 1);
+	assert(!stela_linux_available_page_frames(&available) && !available);
+	__free_pages(held, 2);
+	stela_linux_pages_finish();
+	struct page *again = alloc_pages(GFP_KERNEL, 2);
+	assert(again);
+	__free_pages(again, 2);
+	__free_pages(pair, 1);
+	stela_linux_pages_finish();
+	assert(!catalog.ordinary_live);
+	catalog.page_limit = 0;
+	atomic_long_set(&zone->managed_pages, TEST_PAGES);
+	atomic_long_set(&_totalram_pages, TEST_PAGES);
 }
 
 static void sg_markers_and_traversal(void)
@@ -2866,6 +2943,7 @@ int main(void)
 	compound_and_split();
 	stela_linux_enter(&owner);
 	capacity();
+	page_limit();
 	sg_markers_and_traversal();
 	sg_iterator_geometry();
 	sg_chained_allocation();

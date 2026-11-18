@@ -161,6 +161,13 @@ void stela_linux_pages_finish(void);
 
 /* Ordinary page inventory available to the Linux boot allocator. */
 unsigned long stela_linux_page_boot_capacity(void);
+/* Quiescent entered owner, registered `generation` only. Linux holds at most
+ * `pages` ordinary pages at once from then on, as a machine with that much
+ * RAM: a request past it fails as an exhausted inventory does, after one
+ * slab reclaim pass, and totalram and the zone's managed pages read `pages`.
+ * -EINVAL for zero or more than the ordinary inventory, -EBUSY when more is
+ * held already. */
+int stela_linux_page_catalog_limit(u64 generation, size_t pages);
 /* Publish the ordinary free-frame snapshot only on success. */
 int stela_linux_available_page_frames(unsigned long *available);
 /* Entered serialized owner only. Pin one live aligned physical page's actual

@@ -253,6 +253,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn stela_linux_page_catalog_unregister(generation: u64) -> c_int;
     fn stela_linux_page_catalog_verify(generation: u64) -> c_int;
+    fn stela_linux_page_catalog_limit(generation: u64, pages: usize) -> c_int;
     fn stela_linux_page_owner_context(owner: *const super::owner::RawOwner) -> c_int;
     fn stela_linux_kernel_catalogue_active() -> bool;
     fn stela_linux_page_request_basic(gfp: u32) -> bool;
@@ -686,7 +687,9 @@ impl<P: Provider> Catalog<P> {
         // SAFETY: caller supplies original composed inventory and current owner.
         unsafe { Self::register_current_inventory(kernel, provider, extents, true) }
     }
-    /// Publish the page inventory on the canonical dispatcher before Initial.
+    /// Publish the page inventory on the canonical dispatcher before Initial,
+    /// with Linux held to `page_limit` ordinary pages at once when it is
+    /// given ([`Self::limit_current`]).
     ///
     /// # Safety
     /// On the exact kernel's admitted native dispatcher CPU/root, with no
@@ -698,6 +701,7 @@ impl<P: Provider> Catalog<P> {
         kernel: &super::kernel::KernelOwner<K, N>,
         provider: P,
         extents: Vec<Extent>,
+        page_limit: Option<usize>,
     ) -> Result<Self, Error> {
         kernel
             .environment()
@@ -707,7 +711,34 @@ impl<P: Provider> Catalog<P> {
         // already-claimed canonical owner. No task/current is published.
         let _entered = unsafe { Entered::try_with(kernel.raw().cast()) }?;
         // SAFETY: exact entered bootstrap owner and kept provider above.
-        unsafe { Self::register_annotated_current(kernel, provider, extents) }
+        let catalog = unsafe { Self::register_annotated_current(kernel, provider, extents) }?;
+        if let Some(pages) = page_limit {
+            // SAFETY: the same entered owner, quiescent, before Initial.
+            unsafe { catalog.limit_current(kernel, pages) }?;
+        }
+        Ok(catalog)
+    }
+
+    /// Holds Linux to `pages` ordinary pages at once, as a machine with that
+    /// much RAM: a request past it fails as an exhausted inventory does, and
+    /// the RAM Linux reads (`si_meminfo`, the zone's managed pages), from
+    /// which TTM and the GPU drivers size their limits, is `pages`.
+    ///
+    /// # Safety
+    /// Already entered in its actual canonical process task/CPU/root, quiescent.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn limit_current<K: super::owner::Platform, const N: usize>(
+        &self,
+        kernel: &super::kernel::KernelOwner<K, N>,
+        pages: usize,
+    ) -> Result<(), Error> {
+        let context = self.context.as_ref().ok_or(Error::InvalidReservation)?;
+        context.entry.check(kernel)?;
+        // SAFETY: same retained generation and actual already-entered owner.
+        match unsafe { stela_linux_page_catalog_limit(self.generation, pages) } {
+            0 => Ok(()),
+            status => Err(Error::Native(status)),
+        }
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn register_current_inventory<K: super::owner::Platform, const N: usize>(
