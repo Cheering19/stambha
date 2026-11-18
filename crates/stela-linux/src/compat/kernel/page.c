@@ -163,6 +163,13 @@ void si_meminfo(struct sysinfo *info)
 	*info = (struct sysinfo){.totalram = totalram_pages(), .mem_unit = PAGE_SIZE};
 }
 
+/* The RAM Linux sees, in pages, as si_meminfo reports it: a plain read for
+ * any processor. */
+u64 stela_linux_ram_pages(void)
+{
+	return totalram_pages();
+}
+
 #ifdef STELA_LINUX_PAGE_TEST
 static size_t metadata_fail_after = NO_INDEX;
 static size_t metadata_live;

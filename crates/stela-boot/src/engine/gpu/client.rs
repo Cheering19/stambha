@@ -2041,9 +2041,17 @@ unsafe extern "C" fn stela_libc_fatal(message: *const c_char) -> ! {
     output::fatal(text(message))
 }
 
+/// The system's RAM, as Linux would tell a process (`_SC_PHYS_PAGES`,
+/// `MemTotal`): the RAM Linux sees, which the kernel drivers report as
+/// system memory too. ANV compares the two on xe (`anv_restrict_sys_heap_size`)
+/// and keeps all of xe's system memory for its heap when xe reports at most
+/// 60% of this, which on Linux means an older xe that halved it already; at
+/// the same figure it takes three quarters, as it does on i915. With the
+/// heap's capacity here instead, the share an integrated GPU's Linux sees
+/// against a larger heap fell under 60% and ANV took all of it on xe.
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_memory_bytes() -> u64 {
-    installed().map_or(0, |gpu| gpu.heap_bytes)
+    installed().map_or(0, |_| stela_linux::pages::ram_bytes())
 }
 
 #[unsafe(no_mangle)]
