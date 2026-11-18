@@ -89,6 +89,11 @@ pub(super) fn control(fd: c_int, request: u32, input: Option<&Input>, result: i6
     if result == ETIME && request & 0xff == 0xca && (request >> 8) & 0xff == DRM {
         return;
     }
+    // A driver's normal answer to a probe of what the GPU has.
+    let query = input.map(|input| input.u32(12));
+    if stela_boot_core::gpu_requests::probe_answer(request, query, result) {
+        return;
+    }
     if !turn() {
         return;
     }
