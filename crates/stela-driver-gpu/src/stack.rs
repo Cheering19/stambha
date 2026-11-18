@@ -381,7 +381,7 @@ pub static INTEL: GpuStack = GpuStack {
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
         reset: None,
-        describe: None,
+        describe: Some(crate::xe::query::describe),
         version: versions::XE,
         reads_rom: true,
         unloads_on_boot_cpu: false,
@@ -446,7 +446,7 @@ pub static INTEL_I915: GpuStack = GpuStack {
         chip: crate::i915::query::chip,
         memory_bytes: crate::i915::query::memory_bytes,
         reset: None,
-        describe: None,
+        describe: Some(crate::i915::query::describe),
         version: versions::I915,
         // The display code's VBT falls back to the PCI ROM through
         // `intel_rom_pci` (`intel_bios.c`), as xe's does.

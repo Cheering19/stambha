@@ -178,6 +178,80 @@ pub mod query {
         (control(DEVICE_QUERY, (&raw mut request).cast::<c_void>()) == 0).then_some(words)
     }
 
+    const QUERY_GT_LIST: u32 = 3;
+    const QUERY_UC_FW_VERSION: u32 = 7;
+    /// `struct drm_xe_gt` in 64-bit words.
+    const GT_WORDS: usize = 12;
+    /// `XE_QUERY_UC_TYPE_GUC_SUBMISSION`. The HuC is left out (the boot
+    /// sets `xe.huc_firmware_path=`), so its version is not asked.
+    const GUC_SUBMISSION: u64 = 0;
+
+    /// The version xe reports of the micro-controller firmware `uc_type`
+    /// (`struct drm_xe_query_uc_fw_version`, which the query reads the type
+    /// from and writes the version into), as `major.minor.patch`.
+    fn firmware(control: Control, uc_type: u64) -> Option<alloc::string::String> {
+        let mut answer = [0u64; 4];
+        answer[0] = uc_type;
+        let mut request = DeviceQuery {
+            query: QUERY_UC_FW_VERSION,
+            size: size_of::<[u64; 4]>() as u32,
+            data: answer.as_mut_ptr() as u64,
+            ..DeviceQuery::default()
+        };
+        if control(DEVICE_QUERY, (&raw mut request).cast::<c_void>()) != 0 {
+            return None;
+        }
+        // `uc_type`, `pad` and `branch_ver`, then major and minor, then
+        // patch.
+        let (major, minor, patch) = (answer[1] as u32, answer[1] >> 32, answer[2] as u32);
+        (major != 0 || minor != 0 || patch != 0).then(|| alloc::format!("{major}.{minor}.{patch}"))
+    }
+
+    /// What xe says of the bound GPU, for the boot log's summary of it: its
+    /// device ID and revision, each GT's graphics or media IP version, the
+    /// GuC submission interface version it runs (as i915's summary gives
+    /// it; the GuC's own release is xe's `Using GuC firmware` line), and
+    /// the memory it manages.
+    pub fn describe(control: Control) -> Option<alloc::string::String> {
+        use alloc::format;
+        let config = ask(control, QUERY_CONFIG)?;
+        let identity = *config.get(1 + CONFIG_REV_AND_DEVICE_ID)?;
+        let mut text = format!(
+            "device={:#06x} rev={:#x}",
+            identity & 0xffff,
+            identity >> 16 & 0xff
+        );
+        if let Some(list) = ask(control, QUERY_GT_LIST) {
+            let count = (*list.first().unwrap_or(&0) & 0xffff_ffff) as usize;
+            let gts = list
+                .get(1..1 + count.saturating_mul(GT_WORDS))
+                .unwrap_or(&[]);
+            for gt in gts.as_chunks::<GT_WORDS>().0 {
+                // `type`, then at byte 32 the IP's major, minor and revision.
+                let kind = if gt[0] as u16 == 1 {
+                    "media"
+                } else {
+                    "graphics"
+                };
+                let version = gt[4];
+                text.push_str(&format!(
+                    " {kind}={}.{}.{}",
+                    version & 0xffff,
+                    version >> 16 & 0xffff,
+                    version >> 32 & 0xffff
+                ));
+            }
+        }
+        match firmware(control, GUC_SUBMISSION) {
+            Some(version) => text.push_str(&format!("; guc={version}")),
+            None => text.push_str("; guc=none"),
+        }
+        if let Some(bytes) = memory_bytes(control) {
+            text.push_str(&format!("; memory={}M", bytes >> 20));
+        }
+        Some(text)
+    }
+
     /// The bound GPU's PCI device ID, from the configuration query.
     pub fn chip(control: Control) -> Option<u32> {
         // `num_params` and `pad`, then the parameters.
@@ -530,5 +604,68 @@ mod tests {
         for device in [0x64a0, 0xe20b, 0x8a56] {
             assert!(!force_probed(device), "{device:04x}");
         }
+    }
+
+    /// The summary names the device and revision, each GT's IP version, the
+    /// GuC submission interface version (`none` where xe answers no
+    /// version) and the memory, as a GPU with a media GT answers them.
+    #[test]
+    fn the_summary_names_ip_versions_firmware_and_memory() {
+        let config = [5u64, 0x0004_9a49, 0, 1 << 16, 48, 2];
+        let mut gts = vec![2u64];
+        for (kind, version) in [(0u64, 12 | 10 << 16), (1, 13 | 1 << 32)] {
+            let mut gt = [0u64; 12];
+            gt[0] = kind;
+            gt[4] = version;
+            gts.extend(gt);
+        }
+        let mut regions = vec![1u64];
+        let mut system = [0u64; 11];
+        system[1] = 16 << 30;
+        regions.extend(system);
+        let mut answer = |request: u32, argument: *mut core::ffi::c_void| {
+            assert_eq!(request, 0xc028_6440);
+            // SAFETY: the query passes its `struct drm_xe_device_query`.
+            let query = unsafe { &mut *argument.cast::<[u64; 5]>() };
+            let (kind, size) = (query[1] as u32, (query[1] >> 32) as u32);
+            let words: &[u64] = match kind {
+                1 => &regions,
+                2 => &config,
+                3 => &gts,
+                7 => {
+                    assert_eq!(size, 32);
+                    // SAFETY: the query's buffer holds 32 bytes.
+                    let data = unsafe { &mut *(query[2] as *mut [u64; 4]) };
+                    // Only the GuC submission interface is asked for.
+                    assert_eq!(data[0], 0);
+                    data[1] = 1 | 13 << 32;
+                    data[2] = 4;
+                    return 0;
+                }
+                _ => return -22,
+            };
+            if size == 0 {
+                query[1] |= ((words.len() * 8) as u64) << 32;
+            } else {
+                // SAFETY: the query's buffer holds `size` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        words.as_ptr(),
+                        query[2] as *mut u64,
+                        words.len(),
+                    )
+                };
+            }
+            0
+        };
+        assert_eq!(
+            query::describe(&mut answer).as_deref(),
+            Some(
+                "device=0x9a49 rev=0x4 graphics=12.10.0 media=13.0.1; guc=1.13.4; \
+                 memory=16384M"
+            )
+        );
+        let mut refuse = |_: u32, _: *mut core::ffi::c_void| -22;
+        assert_eq!(query::describe(&mut refuse), None);
     }
 }

@@ -120,13 +120,58 @@ pub mod query {
 
     /// The bound GPU's PCI device ID (`I915_PARAM_CHIPSET_ID`).
     pub fn chip(control: Control) -> Option<u32> {
+        param(control, PARAM_CHIPSET_ID).map(|value| value & 0xffff)
+    }
+
+    /// `I915_PARAM_REVISION` and `I915_PARAM_EU_TOTAL`.
+    const PARAM_REVISION: i32 = 32;
+    const PARAM_EU_TOTAL: i32 = 34;
+
+    /// A positive answer to `I915_GETPARAM` for `param`.
+    fn param(control: Control, param: i32) -> Option<u32> {
         let mut value = 0i32;
         let mut request = GetParam {
-            param: PARAM_CHIPSET_ID,
+            param,
             value: &raw mut value,
         };
         (control(GETPARAM, (&raw mut request).cast::<c_void>()) == 0 && value > 0)
-            .then_some(value as u32 & 0xffff)
+            .then_some(value as u32)
+    }
+
+    /// `DRM_I915_QUERY_GUC_SUBMISSION_VERSION`.
+    const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
+
+    /// What i915 says of the bound GPU, for the boot log's summary of it:
+    /// its device ID, revision and execution units, the GuC submission
+    /// interface version where i915 submits through the GuC (Alder Lake P,
+    /// Raptor Lake S, DG1, DG2 and Meteor Lake by default; `guc=none`
+    /// elsewhere, where it submits by execlists), and the memory it manages.
+    /// The display's DMC version is i915's own line at its load.
+    pub fn describe(control: Control) -> Option<alloc::string::String> {
+        use alloc::format;
+        let chip = chip(control)?;
+        let mut text = format!("device={chip:#06x}");
+        if let Some(revision) = param(control, PARAM_REVISION) {
+            text.push_str(&format!(" rev={revision:#x}"));
+        }
+        if let Some(units) = param(control, PARAM_EU_TOTAL) {
+            text.push_str(&format!(" eus={units}"));
+        }
+        // `struct drm_i915_query_guc_submission_version`: branch, major,
+        // minor and patch, 32 bits each; an item error where no GuC submits.
+        match ask(control, QUERY_GUC_SUBMISSION_VERSION).as_deref() {
+            Some(&[branch_major, minor_patch, ..]) => text.push_str(&format!(
+                "; guc={}.{}.{}",
+                branch_major >> 32,
+                minor_patch & 0xffff_ffff,
+                minor_patch >> 32
+            )),
+            _ => text.push_str("; guc=none"),
+        }
+        if let Some(bytes) = memory_bytes(control) {
+            text.push_str(&format!("; memory={}M", bytes >> 20));
+        }
+        Some(text)
     }
 
     /// What one query item answers, in 64-bit words: asked for its length,
@@ -411,5 +456,60 @@ mod tests {
         discrete.extend(region(1, 8 << 30));
         assert_eq!(query::memory_bytes(&mut regions(&discrete)), Some(8 << 30));
         assert_eq!(query::memory_bytes(&mut regions(&[3, 0])), None);
+    }
+
+    /// The summary names the device, revision and execution units; the
+    /// memory query refused here leaves the memory out.
+    #[test]
+    fn the_summary_names_the_device_revision_and_units() {
+        let mut driver = |request: u32, argument: *mut core::ffi::c_void| {
+            if request != 0xc010_6446 {
+                return -22;
+            }
+            // SAFETY: the query passes its `drm_i915_getparam_t`.
+            let param = unsafe { &mut *argument.cast::<(i32, *mut i32)>() };
+            let value = match param.0 {
+                4 => 0x3e92,
+                32 => 2,
+                34 => 24,
+                _ => return -22,
+            };
+            // SAFETY: the parameter's value points at an int.
+            unsafe { *param.1 = value };
+            0
+        };
+        assert_eq!(
+            query::describe(&mut driver).as_deref(),
+            Some("device=0x3e92 rev=0x2 eus=24; guc=none")
+        );
+        // A GPU i915 submits to through the GuC answers its interface
+        // version in the query item.
+        let mut guc = |request: u32, argument: *mut core::ffi::c_void| {
+            if request != 0xc010_6479 {
+                return driver(request, argument);
+            }
+            // SAFETY: the query passes its `struct drm_i915_query`.
+            let query = unsafe { &mut *argument.cast::<[u64; 2]>() };
+            // SAFETY: with one `struct drm_i915_query_item`.
+            let item = unsafe { &mut *(query[1] as *mut [u64; 3]) };
+            if item[0] != 7 {
+                item[1] = (-19i32) as u32 as u64;
+                return 0;
+            }
+            if item[1] as i32 == 0 {
+                item[1] = 16;
+            } else {
+                // SAFETY: the item's buffer holds its 16 bytes.
+                let data = unsafe { &mut *(item[2] as *mut [u32; 4]) };
+                *data = [0, 1, 13, 4];
+            }
+            0
+        };
+        assert_eq!(
+            query::describe(&mut guc).as_deref(),
+            Some("device=0x3e92 rev=0x2 eus=24; guc=1.13.4")
+        );
+        let mut refusing = |_: u32, _: *mut core::ffi::c_void| -22;
+        assert_eq!(query::describe(&mut refusing), None);
     }
 }
