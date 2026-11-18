@@ -5,10 +5,11 @@ const BASE: (usize, usize) = (88, 185_584_904);
 /// What each port adds to the bundle, as files and bytes, and how many of
 /// its recipes hold another's bytes. amdgpu: 349 files, 60.6 MiB; `mec2`
 /// and `mec` of most families and a revision's files that did not change
-/// are one file. xe: 20 files, 3.2 MiB (GuC and display programs; no HuC
-/// or GSC). i915: 5 files, 59.5 KiB.
+/// are one file. xe: 22 files, 5.4 MiB (GuC and display programs, and the
+/// GSC images Meteor Lake's and Lunar Lake's media C6 needs; no HuC). i915:
+/// 5 files, 59.5 KiB.
 const AMD: (usize, usize, usize) = (349, 63_515_756, 62);
-const INTEL: (usize, usize, usize) = (20, 3_381_836, 0);
+const INTEL: (usize, usize, usize) = (22, 5_687_884, 0);
 const I915: (usize, usize, usize) = (5, 60_900, 0);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 

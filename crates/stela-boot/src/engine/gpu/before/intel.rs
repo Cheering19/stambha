@@ -127,15 +127,19 @@ impl Drivers {
     /// needs: the file it finds the PC's Video BIOS Table under, when the
     /// OpRegion holds one (the display code asks the firmware service for it
     /// before it looks anywhere else, `intel_bios.c`), and, on a platform of
-    /// xe's table, an empty path for the HuC and GSC images, which turns
-    /// those controllers off. Stela runs no media engine and no content
-    /// protection, so neither image is on the USB; an empty path makes xe
-    /// and i915 mark each disabled at a debug level and start without it:
-    /// no fetch, no HuC authentication and no GSC proxy to wait for. The GuC
-    /// loads without the GSC on every platform, Meteor Lake and later
-    /// included. The older platforms' i915 loads neither (its default
-    /// `enable_guc` is 0 there). One line for each controller a driver would
-    /// load there.
+    /// xe's table, an empty path for the HuC image and, except where the
+    /// media GT's C6 needs it, the GSC image, which turns those controllers
+    /// off. Stela runs no media engine and no content protection, so
+    /// neither image is on the USB; an empty path makes xe and i915 mark
+    /// each disabled at a debug level and start without it: no fetch and no
+    /// HuC authentication to wait for. The GuC loads without the GSC on
+    /// every platform. On Meteor Lake, Arrow Lake and Lunar Lake the GSC
+    /// stays: its power well never sleeps without its firmware, so the
+    /// media GT never enters C6 (`intel_engine_cs.c`, `xe_gsc_init`); it
+    /// loads asynchronously and its proxy, which needs the MEI driver Linux
+    /// here does not build, is refused at once without a wait. The older
+    /// platforms' i915 loads neither (its default `enable_guc` is 0 there).
+    /// One line for each controller a driver would load there.
     fn parameters(
         &self,
         device: u16,
@@ -143,6 +147,7 @@ impl Drivers {
         address: impl core::fmt::Display,
     ) -> alloc::string::String {
         let controllers = gpu::xe::firmware(device);
+        let kept = stela_loader::host_firmware::recipes::intel_gsc(device);
         let mut words = Vec::new();
         let drivers = [
             self.i915.is_some().then_some("i915"),
@@ -154,7 +159,9 @@ impl Drivers {
             }
             if controllers.is_some() {
                 words.push(format!("{driver}.huc_firmware_path="));
-                words.push(format!("{driver}.gsc_firmware_path="));
+                if kept.is_none() {
+                    words.push(format!("{driver}.gsc_firmware_path="));
+                }
             }
         }
         // i915 loads a HuC on every platform of xe's table it is handed but
@@ -167,12 +174,21 @@ impl Drivers {
                     .then_some("media controller (HuC): Stela runs no video engine"),
                 files
                     .gsc
+                    .filter(|_| kept.is_none())
                     .map(|_| "security controller (GSC): Stela runs no content protection"),
             ]
         });
         for engine in left_out.flatten() {
             output::arguments(format_args!(
                 "GPU {address}: {} leaves out its {engine}\n",
+                self.names()
+            ));
+        }
+        if let Some(file) = kept {
+            output::arguments(format_args!(
+                "GPU {address}: {} loads its security controller (GSC) firmware {file} only so \
+                 its media GT can enter its C6 power state; content protection stays off, as \
+                 Linux here has no MEI driver\n",
                 self.names()
             ));
         }

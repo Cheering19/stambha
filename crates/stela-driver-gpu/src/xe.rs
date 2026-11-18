@@ -445,15 +445,32 @@ mod tests {
             .map(|recipe| recipe.image.member)
             .collect();
         for (platform, files) in FIRMWARE {
-            // The GuC is pinned; the HuC and GSC images are left out, as
-            // the boot turns both controllers off (`xe.huc_firmware_path=`,
-            // `xe.gsc_firmware_path=`).
+            // The GuC is pinned; the HuC images are left out, as the boot
+            // turns the HuC off (`xe.huc_firmware_path=`), and so are the
+            // GSC images but where the platform's media GT enters C6 only
+            // once the GSC runs: the platforms before Battlemage
+            // (`xe_gsc_init`), Meteor Lake (with Arrow Lake) and Lunar Lake.
             if let Some(file) = files[0] {
                 assert!(pinned.contains(file), "{platform}: {file} has no recipe");
             }
-            for file in files[1..].iter().flatten() {
+            if let Some(file) = files[1] {
                 assert!(!pinned.contains(file), "{platform}: {file} is pinned");
             }
+            if let Some(file) = files[2] {
+                assert_eq!(
+                    pinned.contains(file),
+                    matches!(*platform, "METEORLAKE" | "LUNARLAKE"),
+                    "{platform}: {file}"
+                );
+            }
+        }
+        // xe's GSC on each platform with one is the one the recipes keep.
+        for device in [0x7d55, 0x64a0, 0xb080] {
+            assert_eq!(
+                recipes::intel_gsc(device),
+                firmware(device).unwrap().gsc.filter(|_| device != 0xb080),
+                "{device:04x}"
+            );
         }
         // Display version 35's program is asked for only by Nova Lake, which
         // xe gives no GuC image and so refuses; nothing is pinned for it.
@@ -521,10 +538,24 @@ mod tests {
                 .iter()
                 .partition(|name| DISPLAY_FIRMWARE.contains(name));
             // xe's GuC first; Alder Lake N also holds the GuC i915 names
-            // for it, Alder Lake P's, as i915 binds it first.
+            // for it, Alder Lake P's, as i915 binds it first; Meteor Lake
+            // and Lunar Lake end with xe's GSC image, kept for media C6.
             assert_eq!(images.first(), files.guc.as_ref(), "{device:04x} ({name})");
             let i915_guc = usize::from(*name == "ALDERLAKE_N");
-            assert_eq!(images.len(), 1 + i915_guc, "{device:04x} ({name})");
+            let gsc = recipes::intel_gsc(*device);
+            assert_eq!(
+                gsc.is_some(),
+                matches!(*name, "METEORLAKE" | "LUNARLAKE"),
+                "{device:04x} ({name})"
+            );
+            if gsc.is_some() {
+                assert_eq!(images.last().copied(), files.gsc, "{device:04x} ({name})");
+            }
+            assert_eq!(
+                images.len(),
+                1 + i915_guc + usize::from(gsc.is_some()),
+                "{device:04x} ({name})"
+            );
             // One display program where the platform has a display engine.
             assert_eq!(
                 programs.len(),

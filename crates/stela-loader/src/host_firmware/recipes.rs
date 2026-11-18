@@ -1121,7 +1121,7 @@ mod intel;
 #[cfg(any(feature = "xe-port", feature = "i915-port"))]
 pub use intel::{
     I915, I915_PLATFORMS, I915_TARGET, XE, XE_REVISION, i915_platform, intel_gpu_platform,
-    require_i915, require_xe,
+    intel_gsc, require_i915, require_xe,
 };
 
 /// Whether the driver starts without the file `request` names when it is
