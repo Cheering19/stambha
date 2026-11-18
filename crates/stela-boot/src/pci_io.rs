@@ -26,6 +26,8 @@ type MemRead = unsafe extern "efiapi" fn(*mut PciIo, u32, u8, u64, usize, *mut c
 type MemWrite = unsafe extern "efiapi" fn(*mut PciIo, u32, u8, u64, usize, *const c_void) -> Status;
 type Location =
     unsafe extern "efiapi" fn(*mut PciIo, *mut usize, *mut usize, *mut usize, *mut usize) -> Status;
+/// `EFI_PCI_IO_PROTOCOL_ATTRIBUTES`: operation, attribute bits, result.
+type Attributes = unsafe extern "efiapi" fn(*mut PciIo, u32, u64, *mut u64) -> Status;
 type BarAttributes =
     unsafe extern "efiapi" fn(*mut PciIo, u8, *mut u64, *mut *mut c_void) -> Status;
 #[repr(C)]
@@ -38,7 +40,7 @@ pub struct PciIo {
     config_read: Read,
     config_write_copy_map_unmap_alloc_free_flush: [usize; 7],
     location: Location,
-    attributes: usize,
+    attributes: Attributes,
     bar_attributes: BarAttributes,
     set_bar_attributes: usize,
     rom_size: u64,
@@ -52,6 +54,7 @@ const _: () = {
     assert!(offset_of!(PciIo, mem_write) == 24);
     assert!(offset_of!(PciIo, config_read) == 48);
     assert!(offset_of!(PciIo, location) == 112);
+    assert!(offset_of!(PciIo, attributes) == 120);
     assert!(offset_of!(PciIo, bar_attributes) == 128);
     assert!(offset_of!(PciIo, rom_size) == 144);
 };
@@ -766,13 +769,22 @@ pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
 /// reads it at its probe ([`stela_boot_core::amd_discovery`]): through the
 /// `MM_INDEX` and `MM_DATA` registers, one dword at a time, whose index is
 /// put back after. Only the indirect window is written; the firmware's
-/// driver keeps the GPU and its picture.
+/// driver keeps the GPU and its picture. A GPU whose memory decoding the
+/// firmware left off (one no firmware driver started) has it turned on for
+/// the read, as Linux's `pci_enable_device` does, and off again after.
+/// An error names what was not read and why, in plain words.
 pub(crate) fn amd_graphics_version(
     address: Address,
     registers: u8,
 ) -> Result<(u8, u8, u8), alloc::string::String> {
     use alloc::{format, string::String};
-    use stela_boot_core::amd_discovery::{self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI};
+    use stela_boot_core::amd_discovery::{
+        self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI, RCC_CONFIG_MEMSIZE, REGISTER_BYTES,
+    };
+    /// `EFI_PCI_IO_ATTRIBUTE_MEMORY`: the function decodes its memory BARs.
+    const MEMORY: u64 = 0x0200;
+    const ENABLE: u32 = 2;
+    const DISABLE: u32 = 3;
     let handles = boot::find_handles::<PciIo>().map_err(|error| format!("{error:?}"))?;
     let mut found = None;
     for handle in handles {
@@ -786,13 +798,48 @@ pub(crate) fn amd_graphics_version(
     }
     let mut io = found.ok_or_else(|| String::from("the firmware lists no PCI protocol for it"))?;
     let io: &mut PciIo = &mut io;
+    let header = io
+        .read_header()
+        .map_err(|error| format!("its configuration header was not read: {error}"))?;
+    let window = io
+        .bar_regions(registers)
+        .map_err(|error| format!("the firmware does not describe its BAR {registers}: {error}"))?
+        .into_iter()
+        .find(|region| region.resource_type == 0)
+        .ok_or_else(|| format!("its BAR {registers} holds no memory range"))?
+        .host;
+    let length = window.end.saturating_sub(window.start);
+    if length < REGISTER_BYTES as u64 {
+        return Err(format!(
+            "its BAR {registers} at {:#x} holds {length:#x} bytes, under the {REGISTER_BYTES:#x} \
+             the table's registers need",
+            window.start
+        ));
+    }
+    // Command register bit 1: memory space decoding.
+    let decoding = header[4] & 1 << 1 != 0;
+    if !decoding {
+        // SAFETY: live boot protocol; Enable takes the attribute bits and
+        // no result pointer.
+        let status = unsafe { (io.attributes)(io, ENABLE, MEMORY, ptr::null_mut()) };
+        if !status.is_success() {
+            return Err(format!(
+                "its memory decoding is off and the firmware refused to turn it on ({status:?})"
+            ));
+        }
+    }
+    let refused = core::cell::Cell::new(None);
     let read = |io: &mut PciIo, offset: usize| -> u32 {
         let mut value = u32::MAX;
         // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
         // dword of the register BAR into the writable local. A refused read
-        // leaves all ones, which the table's reader takes as no answer.
-        let _ =
+        // leaves all ones, which the table's reader takes as no answer; the
+        // first refusal is kept for the error.
+        let status =
             unsafe { (io.mem_read)(io, 2, registers, offset as u64, 1, (&raw mut value).cast()) };
+        if !status.is_success() && refused.get().is_none() {
+            refused.set(Some((offset, status)));
+        }
         value
     };
     let write = |io: &mut PciIo, offset: usize, value: u32| -> bool {
@@ -828,7 +875,23 @@ pub(crate) fn amd_graphics_version(
             )
         };
         place
-            .map_err(|error| format!("{error:?}"))
+            .map_err(|error| match (error, refused.get()) {
+                (_, Some((offset, status))) => format!(
+                    "the firmware refused a read of its BAR {registers} at {offset:#x} \
+                     ({status:?})"
+                ),
+                (discovery::Error::NoAnswer, None) => format!(
+                    "its BAR {registers} at {:#x} reads all ones at {RCC_CONFIG_MEMSIZE:#x} with \
+                     memory decoding {}",
+                    window.start,
+                    if decoding {
+                        "on"
+                    } else {
+                        "turned on for the read"
+                    }
+                ),
+                (error, None) => format!("{error:?}"),
+            })
             .and_then(|place| {
                 let mut binary = Vec::new();
                 binary
@@ -846,6 +909,10 @@ pub(crate) fn amd_graphics_version(
     };
     write(io, MM_INDEX, index.0);
     write(io, MM_INDEX_HI, index.1);
+    if !decoding {
+        // SAFETY: as above; the firmware's own setting is put back.
+        let _ = unsafe { (io.attributes)(io, DISABLE, MEMORY, ptr::null_mut()) };
+    }
     result
 }
 
