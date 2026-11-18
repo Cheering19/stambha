@@ -1852,6 +1852,7 @@ pub(super) struct Refused {
     /// Its market name, or its maker and IDs.
     pub(super) name: String,
     /// Its stack draws, so it would have drawn macOS.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     pub(super) draws: bool,
     pub(super) address: String,
     pub(super) device: u16,
@@ -2134,6 +2135,7 @@ struct Unbound {
     /// The firmware's picture was on it.
     dark: bool,
     /// Its stack draws.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     draws: bool,
 }
 
@@ -2426,6 +2428,7 @@ pub(super) fn ident() -> String {
 pub(super) fn started(
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] refused: &[Refused],
 ) -> (String, Vec<String>) {
+    #[cfg(feature = "nvk")]
     use stela_boot_core::gpu_status;
     #[cfg(feature = "nvk")]
     if let Some(gpu) = installed() {
