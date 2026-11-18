@@ -308,6 +308,7 @@ static void release(struct device *dev)
 		return;
 	}
 	release_rom(host);
+	stela_linux_pci_free_saved_state(&host->dev);
 	if (host->function.release_context)
 		host->function.release_context(host->function.context);
 	kfree(host);

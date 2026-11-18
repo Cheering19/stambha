@@ -622,8 +622,115 @@ void pci_ignore_hotplug(struct pci_dev *dev)
 	dev->ignore_hotplug = 1;
 }
 
-/* The standard header, which is what a function loses in D3, following
- * drivers/pci/pci.c. */
+/* A capability's registers pci_save_state keeps, following drivers/pci/pci.h:
+ * the PCI Express capability's control registers, whose buffer the first
+ * save allocates (Linux's pci_allocate_cap_save_buffers allocates it when it
+ * adds the function) and the function's release frees. */
+struct pci_cap_saved_data {
+	u16 cap_nr;
+	bool cap_extended;
+	unsigned int size;
+	u32 data[];
+};
+
+struct pci_cap_saved_state {
+	struct hlist_node next;
+	struct pci_cap_saved_data cap;
+};
+
+/* The control registers a reset clears, in pci_save_pcie_state's order:
+ * device, link, slot and root control, and the device, link and slot
+ * controls of version 2. Absent registers save as zero and are not
+ * written back (pcie_capability_write_word). */
+static const int pcie_saved_registers[] = {
+	PCI_EXP_DEVCTL, PCI_EXP_LNKCTL, PCI_EXP_SLTCTL, PCI_EXP_RTCTL,
+	PCI_EXP_DEVCTL2, PCI_EXP_LNKCTL2, PCI_EXP_SLTCTL2,
+};
+/* Rounded up to whole words, so a stored copy's next capability stays
+ * aligned. */
+#define PCIE_SAVED_BYTES ALIGN(ARRAY_SIZE(pcie_saved_registers) * sizeof(u16), sizeof(u32))
+
+static struct pci_cap_saved_state *saved_cap(struct pci_dev *dev, u16 cap, bool extended)
+{
+	struct pci_cap_saved_state *state;
+
+	hlist_for_each_entry(state, &dev->saved_cap_space, next)
+		if (state->cap.cap_extended == extended && state->cap.cap_nr == cap)
+			return state;
+	return NULL;
+}
+
+static int save_pcie_state(struct pci_dev *dev)
+{
+	struct pci_cap_saved_state *state;
+	u16 *words;
+
+	if (!pci_is_pcie(dev))
+		return 0;
+	state = saved_cap(dev, PCI_CAP_ID_EXP, false);
+	if (!state) {
+		state = kzalloc(sizeof(*state) + PCIE_SAVED_BYTES, GFP_KERNEL);
+		if (!state) {
+			pci_err(dev, "buffer not found in %s\n", __func__);
+			return -ENOMEM;
+		}
+		state->cap.cap_nr = PCI_CAP_ID_EXP;
+		state->cap.size = PCIE_SAVED_BYTES;
+		hlist_add_head(&state->next, &dev->saved_cap_space);
+	}
+	words = (u16 *)state->cap.data;
+	for (size_t i = 0; i < ARRAY_SIZE(pcie_saved_registers); i++)
+		pcie_capability_read_word(dev, pcie_saved_registers[i], &words[i]);
+	return 0;
+}
+
+static void restore_pcie_state(struct pci_dev *dev)
+{
+	struct pci_cap_saved_state *state = saved_cap(dev, PCI_CAP_ID_EXP, false);
+	const u16 *words;
+
+	if (!state)
+		return;
+	words = (const u16 *)state->cap.data;
+	for (size_t i = 0; i < ARRAY_SIZE(pcie_saved_registers); i++)
+		pcie_capability_write_word(dev, pcie_saved_registers[i], words[i]);
+}
+
+/* Each resizable BAR set back to the size its resource has, following
+ * pci_restore_rebar_state: a reset of the whole function returns them to
+ * their defaults, while the resources (and the driver's mappings) keep the
+ * size the firmware chose. A BAR without a memory resource is left as it
+ * is: its size here would be no assignment's. */
+static void restore_rebar_state(struct pci_dev *dev)
+{
+	unsigned int pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_REBAR);
+	unsigned int count;
+	u32 ctrl;
+
+	if (!pos || pci_read_config_dword(dev, (int)pos + PCI_REBAR_CTRL, &ctrl) ||
+	    PCI_POSSIBLE_ERROR(ctrl))
+		return;
+	count = (ctrl & PCI_REBAR_CTRL_NBAR_MASK) >> PCI_REBAR_CTRL_NBAR_SHIFT;
+	for (unsigned int i = 0; i < count; i++, pos += 8) {
+		const struct resource *res;
+		unsigned int bar;
+
+		if (pci_read_config_dword(dev, (int)pos + PCI_REBAR_CTRL, &ctrl) ||
+		    PCI_POSSIBLE_ERROR(ctrl))
+			return;
+		bar = ctrl & PCI_REBAR_CTRL_BAR_IDX;
+		res = &dev->resource[bar];
+		if (bar >= PCI_STD_NUM_BARS || !(res->flags & IORESOURCE_MEM) || !resource_size(res))
+			continue;
+		ctrl &= ~(u32)PCI_REBAR_CTRL_BAR_SIZE;
+		ctrl |= (u32)pci_rebar_bytes_to_size(resource_size(res)) << PCI_REBAR_CTRL_BAR_SHIFT;
+		pci_write_config_dword(dev, (int)pos + PCI_REBAR_CTRL, ctrl);
+	}
+}
+
+/* What a function loses in D3 or a reset of its own, following
+ * drivers/pci/pci.c: its standard header and its PCI Express controls.
+ * Its message interrupt is its owner's (see stela/pci.h's enable_msi). */
 int pci_save_state(struct pci_dev *dev)
 {
     enum { SAVED_DWORDS = 16 };
@@ -636,29 +743,37 @@ int pci_save_state(struct pci_dev *dev)
     }
     memcpy(dev->saved_config_space, saved, sizeof(saved));
     dev->state_saved = true;
-    return 0;
+    return save_pcie_state(dev);
 }
 
+/* In pci_restore_state's order: the PCI Express controls and the resizable
+ * BARs' sizes before the header that turns decoding back on. */
 void pci_restore_state(struct pci_dev *dev)
 {
     if (!dev->state_saved)
         return;
+    restore_pcie_state(dev);
+    restore_rebar_state(dev);
     for (int i = 15; i >= 0; i--)
         if (pci_write_config_dword(dev, i * 4, dev->saved_config_space[i]))
             stela_linux_fatal("PCI state restore failed without completion");
     dev->state_saved = false;
 }
 
-/* A copy of the saved header a driver keeps across resets, following
- * drivers/pci/pci.c. pci_save_state saves no capability here, so the list
- * that follows the header is its terminator. */
-struct pci_cap_saved_data {
-	u16 cap_nr;
-	bool cap_extended;
-	unsigned int size;
-	u32 data[];
-};
+void stela_linux_pci_free_saved_state(struct pci_dev *dev)
+{
+	struct pci_cap_saved_state *state;
+	struct hlist_node *next;
 
+	hlist_for_each_entry_safe(state, next, &dev->saved_cap_space, next) {
+		hlist_del(&state->next);
+		kfree(state);
+	}
+}
+
+/* A copy of the saved state a driver keeps across resets, following
+ * drivers/pci/pci.c: the header, then each saved capability, then an empty
+ * one. */
 struct pci_saved_state {
 	u32 config_space[16];
 	struct pci_cap_saved_data cap[];
@@ -666,26 +781,46 @@ struct pci_saved_state {
 
 struct pci_saved_state *pci_store_saved_state(struct pci_dev *dev)
 {
+	struct pci_cap_saved_state *saved;
 	struct pci_saved_state *state;
+	struct pci_cap_saved_data *cap;
+	size_t size = sizeof(*state) + sizeof(struct pci_cap_saved_data);
 
 	if (!dev->state_saved)
 		return NULL;
-	state = kzalloc(sizeof(*state) + sizeof(struct pci_cap_saved_data), GFP_KERNEL);
+	hlist_for_each_entry(saved, &dev->saved_cap_space, next)
+		size += sizeof(struct pci_cap_saved_data) + saved->cap.size;
+	state = kzalloc(size, GFP_KERNEL);
 	if (!state)
 		return NULL;
 	memcpy(state->config_space, dev->saved_config_space, sizeof(state->config_space));
+	cap = state->cap;
+	hlist_for_each_entry(saved, &dev->saved_cap_space, next) {
+		size_t length = sizeof(struct pci_cap_saved_data) + saved->cap.size;
+
+		memcpy(cap, &saved->cap, length);
+		cap = (struct pci_cap_saved_data *)((u8 *)cap + length);
+	}
 	return state;
 }
 
 int pci_load_saved_state(struct pci_dev *dev, struct pci_saved_state *state)
 {
+	struct pci_cap_saved_data *cap;
+
 	dev->state_saved = false;
 	if (!state)
 		return 0;
-	/* A capability this function never saved cannot be loaded. */
-	if (state->cap[0].size)
-		return -EINVAL;
 	memcpy(dev->saved_config_space, state->config_space, sizeof(state->config_space));
+	/* A capability this function never saved cannot be loaded. */
+	for (cap = state->cap; cap->size;
+	     cap = (struct pci_cap_saved_data *)((u8 *)cap + sizeof(*cap) + cap->size)) {
+		struct pci_cap_saved_state *saved = saved_cap(dev, cap->cap_nr, cap->cap_extended);
+
+		if (!saved || saved->cap.size != cap->size)
+			return -EINVAL;
+		memcpy(saved->cap.data, cap->data, saved->cap.size);
+	}
 	dev->state_saved = true;
 	return 0;
 }
@@ -1391,6 +1526,48 @@ int main(void)
 	kfree(saved);
 	assert(!pci_load_saved_state(&dev, NULL) && !dev.state_saved);
 
+	/* A reset of the whole function (amdgpu's mode 1 reset, then its
+	 * pci_load_saved_state and pci_restore_state) clears the PCI Express
+	 * controls and returns a resizable BAR to its default size: both come
+	 * back, the BAR to its resource's 8 GiB, before the header. */
+	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] = 1 << 5 | PCI_EXP_DEVCTL_RELAX_EN;
+	*(u16 *)&config[0x70 + PCI_EXP_LNKCTL] = PCI_EXP_LNKCTL_CCC;
+	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL2] = PCI_EXP_DEVCTL2_ATOMIC_REQ;
+	*(u32 *)&config[0x100] = PCI_EXT_CAP_ID_REBAR | 1 << 16;
+	*(u32 *)&config[0x100 + PCI_REBAR_CAP] = 0x3f << 12;
+	*(u32 *)&config[0x100 + PCI_REBAR_CTRL] = 2 | 2 << PCI_REBAR_CTRL_NBAR_SHIFT |
+						  13 << PCI_REBAR_CTRL_BAR_SHIFT;
+	*(u32 *)&config[0x108 + PCI_REBAR_CTRL] = 4 | 8 << PCI_REBAR_CTRL_BAR_SHIFT;
+	dev.resource[2] = (struct resource){
+		.start = 0x400000000, .end = 0x5ffffffff, .flags = IORESOURCE_MEM};
+	memset(&dev.resource[4], 0, sizeof(dev.resource[4]));
+	assert(!pci_save_state(&dev));
+	saved = pci_store_saved_state(&dev);
+	assert(saved);
+	memcpy(before, config, sizeof(config));
+	memset(config + PCI_BASE_ADDRESS_0, 0, PCI_ROM_ADDRESS - PCI_BASE_ADDRESS_0);
+	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] = 2 << 12;
+	*(u16 *)&config[0x70 + PCI_EXP_LNKCTL] = 0;
+	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL2] = 0;
+	*(u32 *)&config[0x100 + PCI_REBAR_CTRL] &= ~(u32)PCI_REBAR_CTRL_BAR_SIZE;
+	*(u32 *)&config[0x100 + PCI_REBAR_CTRL] |= 8 << PCI_REBAR_CTRL_BAR_SHIFT;
+	assert(!pci_load_saved_state(&dev, saved) && dev.state_saved);
+	pci_restore_state(&dev);
+	assert(!dev.state_saved && !memcmp(before, config, sizeof(config)));
+	/* BAR 4 has no resource, so its size is not written. */
+	assert((*(u32 *)&config[0x108 + PCI_REBAR_CTRL] & PCI_REBAR_CTRL_BAR_SIZE) ==
+	       8 << PCI_REBAR_CTRL_BAR_SHIFT);
+	/* A copy holding a capability this function never saved does not
+	 * load. */
+	stela_linux_pci_free_saved_state(&dev);
+	assert(hlist_empty(&dev.saved_cap_space));
+	assert(pci_load_saved_state(&dev, saved) == -EINVAL && !dev.state_saved);
+	kfree(saved);
+	memset(&config[0x100], 0, sizeof(config) - 0x100);
+	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] = 1 << 5;
+	*(u16 *)&config[0x70 + PCI_EXP_LNKCTL] = 0;
+	memset(&dev.resource[2], 0, sizeof(dev.resource[2]));
+
 	/* A function with neither a function-level reset nor a D3hot that resets
 	 * it has no reset of its own, and keeps its header. (The resets
 	 * themselves sleep, which needs a Linux task: stela/pci_reset_test.c.) */
@@ -1448,6 +1625,7 @@ int main(void)
 	/* No ROM signature: nothing maps and decoding goes back off. */
 	rom_window[0] = 0;
 	assert(!pci_map_rom(&dev, &size) && *(u32 *)&config[PCI_ROM_ADDRESS] == 0xc0000000);
+	stela_linux_pci_free_saved_state(&dev);
 	stela_linux_exit();
 	printf("Linux PCI configuration, enabling, searches, PCI Express, resets, resizable BARs, BAR mappings and option ROMs passed\n");
 	return 0;

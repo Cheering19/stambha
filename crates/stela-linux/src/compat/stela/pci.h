@@ -107,4 +107,6 @@ bool stela_linux_pci_rom_mapped(const volatile void __iomem *address);
  * its flags, device capabilities and supported link speeds. A PCIBIOS error
  * when the function does not answer. */
 int stela_linux_pci_express_probe(struct pci_dev *dev);
+/* Free what pci_save_state allocated to keep the function's capabilities. */
+void stela_linux_pci_free_saved_state(struct pci_dev *dev);
 #endif
