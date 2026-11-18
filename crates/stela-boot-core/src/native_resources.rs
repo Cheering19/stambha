@@ -83,6 +83,9 @@ pub const ORDINARY_GENERAL_TASKS: usize = 4;
 /// ones. Each Linux kthread, ioctl worker and driver thread holds one.
 pub const KERNEL_GENERAL_TASKS: usize =
     TASK_STACKS - stela_driver_base::platform::work::ROLE_STACKS - ORDINARY_GENERAL_TASKS;
+/// A Linux task's stack: Linux's `THREAD_SIZE` as Stela's Linux build sets
+/// it, which also aligns it (`stela_linux::task::stack_requirement`).
+pub const LINUX_TASK_STACK_BYTES: u64 = 32 * 1024;
 /// An ordinary task's Rust stack. Native driver probes run on one, through
 /// controller attach paths whose frames alone pass 128 KiB.
 pub const ORDINARY_TASK_STACK_BYTES: u64 = 1024 * 1024;
@@ -95,7 +98,7 @@ pub fn task_stacks(
     base: u64,
 ) -> Result<crate::guarded_stacks::MixedLayout, crate::guarded_stacks::Error> {
     use crate::guarded_stacks::{Error, Geometry, MixedLayout};
-    let kernel = Geometry::new(16 * 1024, 16 * 1024)?;
+    let kernel = Geometry::new(LINUX_TASK_STACK_BYTES, LINUX_TASK_STACK_BYTES)?;
     let ordinary = Geometry::new(ORDINARY_TASK_STACK_BYTES, PAGE)?;
     let geometries = core::array::from_fn::<_, TASK_STACKS, _>(|index| {
         let roles = stela_driver_base::platform::work::ROLE_STACKS;
@@ -433,19 +436,20 @@ mod tests {
         assert_eq!(layout.count(), TASK_STACKS);
         assert_eq!(
             layout.physical_bytes(),
-            kernel as u64 * 16 * 1024 + ordinary as u64 * ORDINARY_TASK_STACK_BYTES
+            kernel as u64 * LINUX_TASK_STACK_BYTES + ordinary as u64 * ORDINARY_TASK_STACK_BYTES
         );
         assert_eq!(
             layout.raw_allocation_bytes(),
-            layout.physical_bytes() + 12_288
+            // The first Linux stack's alignment, less the page UEFI gives.
+            layout.physical_bytes() + LINUX_TASK_STACK_BYTES - 4096
         );
         let mut counts = (0, 0);
         for index in 0..TASK_STACKS {
             let slot = layout.slot(index).unwrap();
             let bytes = slot.usable.end - slot.usable.start;
-            if bytes == 16 * 1024 {
+            if bytes == LINUX_TASK_STACK_BYTES {
                 counts.0 += 1;
-                assert_eq!(slot.usable.start % (16 * 1024), 0);
+                assert_eq!(slot.usable.start % LINUX_TASK_STACK_BYTES, 0);
             } else {
                 assert_eq!(bytes, ORDINARY_TASK_STACK_BYTES);
                 counts.1 += 1;
