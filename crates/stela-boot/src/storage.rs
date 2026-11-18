@@ -300,28 +300,33 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
     // cannot serve the Metal device, is no such GPU.
     let driven = functions
         .iter()
-        .map(crate::pci_io::FunctionObservation::identity)
-        .filter(|identity| identity.vendor != NVIDIA && identity.class[0] == 0x03)
-        .find_map(|identity| {
-            stela_drivers::gpu::stack::GpuStack::select(&stela_drivers::gpu::Adapter {
+        // The revision names an AMD GPU's market name.
+        .map(|function| (function.identity(), function.header[8]))
+        .filter(|(identity, _)| identity.vendor != NVIDIA && identity.class[0] == 0x03)
+        .find_map(|(identity, revision)| {
+            let adapter = stela_drivers::gpu::Adapter {
                 address: identity.address,
                 vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
                 device: identity.device,
                 class: identity.class,
-                revision: 0,
-            })
-            .ok()
-            .filter(|stack| stack.draws())
+                revision,
+            };
+            stela_drivers::gpu::stack::GpuStack::select(&adapter)
+                .ok()
+                .filter(|stack| stack.draws())
+                .map(|stack| (adapter, stack))
         });
     let notice = if driven.is_some() {
         NvidiaNotice::Driven
     } else {
         nvidia_notice(&census)
     };
-    if let Some(stack) = driven {
+    if let Some((adapter, stack)) = driven {
         output::arguments(format_args!(
-            "HOST GPU: a {:?} display controller, which this image drives with {}\n",
-            stack.vendor, stack.kernel.driver
+            "HOST GPU: the {} at {}, which this image drives with {}\n",
+            adapter.name(),
+            adapter.address,
+            stack.kernel.driver
         ));
     } else {
         match notice {
