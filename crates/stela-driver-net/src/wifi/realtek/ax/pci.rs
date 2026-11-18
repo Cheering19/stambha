@@ -357,6 +357,13 @@ impl Rings {
         Ch12 { rings: self }
     }
 
+    /// CH12 refuses packets: `pre_init` has not succeeded yet, or a submit
+    /// failed after handing its packet over. Only another `pre_init` starts
+    /// it again.
+    pub fn ch12_stopped(&self) -> bool {
+        !self.ch12_ready.get()
+    }
+
     fn tx_ring(&self, channel: usize) -> Result<u32, AxError> {
         Ok(self.tx.address()? + (channel * TX_RING_BYTES) as u32)
     }

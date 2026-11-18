@@ -315,4 +315,4 @@ fn check_ready<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

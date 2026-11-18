@@ -400,6 +400,7 @@ fn submit_times_out_without_reclaim() {
     assert_eq!(io.trace[0], Op::W16(0x1080, 1));
     assert!(io.writes()[1..].iter().all(|op| *op == Op::Delay(1)));
     // The entry may still be in flight: nothing more is sent.
+    assert!(rings.ch12_stopped());
     io.trace.clear();
     assert_eq!(
         send(&mut rings, &mut io, &[4]),
@@ -451,16 +452,20 @@ fn submit_refuses_before_pre_init_and_bad_lengths() {
     let m = Arc::new(Mutex::new(Model::default()));
     let mut rings = install(&m);
     let mut io = settled();
+    assert!(rings.ch12_stopped());
     assert_eq!(
         send(&mut rings, &mut io, &[1]),
         Err(AxError::Dma("CH12 is stopped"))
     );
     start(&mut io, 2, &rings).unwrap();
+    assert!(!rings.ch12_stopped());
     io.trace.clear();
     let length = Err(AxError::Dma("CH12 packet length"));
     assert_eq!(send(&mut rings, &mut io, &[]), length);
     assert_eq!(send(&mut rings, &mut io, &[0; 4097]), length);
     assert!(io.trace.is_empty());
+    // A refused length never reached the queue, so CH12 is still running.
+    assert!(!rings.ch12_stopped());
     reclaim_at_once(&mut io);
     send(&mut rings, &mut io, &[7; 4096]).unwrap();
 }

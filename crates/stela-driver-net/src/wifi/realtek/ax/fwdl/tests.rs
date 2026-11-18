@@ -11,7 +11,7 @@ use std::sync::Mutex;
 /// A v0 image (no container) with a 4-byte dynamic header and two sections:
 /// type 2 at raw 0x8810_0000 with 4500 bytes, and type 1 at raw
 /// 0x2021_B000 with 3 bytes plus an 8-byte checksum.
-fn image_bytes() -> Vec<u8> {
+pub(crate) fn image_bytes() -> Vec<u8> {
     let mut b = vec![0u8; 32 + 2 * 16];
     b[4..8].copy_from_slice(&[0, 27, 66, 1]);
     // W3[23:16]: header length with the dynamic part, 32 + 32 + 4.

@@ -5,6 +5,7 @@
 //! `rtw89_write*_set`/`_clr`/`_mask` and `read_poll_timeout` uses from
 //! pinned rtw89/core.h. This module grants no power, firmware or DMA
 //! readiness; it only reads and writes a mapped window and waits on it.
+pub mod bringup;
 pub mod dmac;
 pub mod efuse;
 pub mod fwdl;
@@ -15,6 +16,7 @@ pub mod power;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub use bringup::{BringUpError, Running, bring_up};
 pub use fwdl::download;
 pub use io::{
     AxError, AxIo, NativeAxIo, Polled, clear8, clear16, clear32, field8, field16, field32,

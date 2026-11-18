@@ -29,7 +29,7 @@ const B_AX_EF_ADDR_MASK: u32 = 0x07FF_0000; // GENMASK(26, 16)
 
 // rtw8852c_chip_info (rtw8852c.c:3226-3228).
 const SEC_CTRL_EFUSE_SIZE: usize = 4;
-const PHYSICAL_EFUSE_SIZE: usize = 1216;
+pub const PHYSICAL_EFUSE_SIZE: usize = 1216;
 const LOGICAL_EFUSE_SIZE: usize = 2048;
 
 // efuse.c:15 and the 5-try (efuse.c:211-228) loop of rtw89_dump_physical_efuse_map.
