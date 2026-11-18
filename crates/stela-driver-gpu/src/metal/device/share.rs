@@ -74,6 +74,17 @@ pub fn probe() -> Option<Probe> {
     (!probe.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), Probe>(probe) })
 }
 
+/// The budget of a device whose GPU is `unified` (shares the processor's
+/// memory, as Vulkan's device type says of it), under `probe`: only such a
+/// GPU takes its memory from the share. A discrete GPU beside an integrated
+/// one (a laptop's NVIDIA or AMD GPU beside its AMD or Intel graphics) works
+/// in its VRAM and is never budgeted by the share, nor told it.
+pub fn budget(probe: Option<Probe>, unified: bool) -> Option<Budget> {
+    probe
+        .filter(|_| unified)
+        .map(|probe| Budget { probe, base: None })
+}
+
 /// The share kept free of allocations: a sixteenth, at least 64 MiB, for
 /// Linux's own pages and the work a refused allocation leaves in flight.
 pub fn margin(limit: u64) -> u64 {
@@ -109,6 +120,23 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    /// On a laptop with an integrated GPU and a discrete one, the share's
+    /// probe is set, but only the integrated GPU's device is budgeted by it.
+    #[test]
+    fn only_a_unified_gpus_device_is_budgeted_by_the_share() {
+        fn state() -> Option<ShareState> {
+            Some(ShareState {
+                held: 0,
+                limit: 2560 * MIB,
+            })
+        }
+        assert!(budget(Some(state), false).is_none());
+        let unified = budget(Some(state), true).unwrap();
+        assert_eq!((unified.probe)(), state());
+        assert!(unified.base.is_none());
+        assert!(budget(None, true).is_none());
+    }
 
     #[test]
     fn the_guest_is_told_what_the_share_backs() {

@@ -371,6 +371,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             compiler.features(),
             ApiFeatures::IMPLEMENTED,
         );
+        // Only a GPU that takes its memory from the share is budgeted by it.
+        let unified = capabilities.has_unified_memory;
         let layout = HeapLayout::new(&physical.limits);
         let timeline = backend.create_semaphore(0)?;
         let completion = backend.export_semaphore(timeline);
@@ -397,7 +399,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             shortage: reclaim::Shortage::default(),
             host_calls: None,
             memory_cap: crate::metal::vulkan::physical::VRAM_CAP,
-            share: share::probe().map(|probe| share::Budget { probe, base: None }),
+            share: share::budget(share::probe(), unified),
             resources: resources::Resources::default(),
             pipelines: pipelines::Pipelines::default(),
             execution_sets: execution_sets::ExecutionSets::default(),

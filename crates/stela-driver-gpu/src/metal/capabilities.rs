@@ -1016,11 +1016,11 @@ impl Derivation<'_> {
                     });
                 // A GPU with a share of RAM: what the share backs, as the
                 // device budgets its allocations.
-                match crate::metal::device::share::probe().and_then(|probe| probe()) {
-                    Some(state) if integrated => {
-                        heaps.min(crate::metal::device::share::working_set(state))
-                    }
-                    _ => heaps,
+                use crate::metal::device::share;
+                match share::budget(share::probe(), integrated).and_then(|budget| (budget.probe)())
+                {
+                    Some(state) => heaps.min(share::working_set(state)),
+                    None => heaps,
                 }
             },
             limits: limits_out,
