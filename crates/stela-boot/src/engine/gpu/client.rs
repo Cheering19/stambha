@@ -426,10 +426,60 @@ pub(super) fn shutdown(seconds: u64) -> bool {
     )
 }
 
+/// What the GPUs' unload before a fatal stop came to.
+pub(super) enum StopUnload {
+    /// Every driver stopped.
+    Stopped,
+    /// A driver was still stopping at the deadline.
+    Stopping,
+    /// Linux could not run for it on the boot CPU: refused for this
+    /// reason, or none when another processor kept the host drivers' lock.
+    NotRun(Option<WorkError>),
+}
+
 /// [`shutdown`] for a fatal stop, which allocates nothing: the stop never
-/// returns, so its stack keeps the request for a wait that gives up.
-pub(super) fn shutdown_for_fatal(seconds: u64) -> bool {
-    unload(&Request::new(Operation::Shutdown), seconds)
+/// returns, so its stack keeps the request for a wait that gives up. On
+/// the boot CPU, outside Linux (the caller's check), this processor runs
+/// Linux for the unload itself; a refusal there is returned, never a second
+/// stop that would replace the first one's reason.
+pub(super) fn shutdown_for_fatal(seconds: u64) -> StopUnload {
+    let request = Request::new(Operation::Shutdown);
+    if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+        return match unload(&request, seconds) {
+            true => StopUnload::Stopped,
+            false => StopUnload::Stopping,
+        };
+    }
+    let Some(gpu) = installed() else {
+        return StopUnload::Stopped;
+    };
+    super::close_moves();
+    let gpus = gpu.start._attached.len().max(1) as u64;
+    let ticks = seconds.saturating_mul(gpus).saturating_mul(gpu.tsc_hz);
+    let deadline = host::rdtsc().saturating_add(ticks);
+    post(&request);
+    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
+    // The lock is waited for within the deadline: a processor that keeps it
+    // past that is stuck itself, and the unload could not finish anyway.
+    let micros = seconds.saturating_mul(gpus).saturating_mul(1_000_000);
+    let ran = gpu.work.dispatch_linux_within(micros, |runtime| {
+        while waiting() {
+            gpu.advance_children();
+            start(gpu)?;
+            if waiting() {
+                runtime.step_or_idle()?;
+                CHILDREN_STALE.store(true, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    });
+    match ran {
+        Some(Ok(())) if request.done.load(Ordering::Acquire) != 0 => StopUnload::Stopped,
+        Some(Ok(())) => StopUnload::Stopping,
+        Some(Err(super::kernel_work::Error::Work(error))) => StopUnload::NotRun(Some(error)),
+        Some(Err(_)) => StopUnload::NotRun(Some(WorkError::Unavailable)),
+        None => StopUnload::NotRun(None),
+    }
 }
 
 fn unload(request: &Request, seconds: u64) -> bool {

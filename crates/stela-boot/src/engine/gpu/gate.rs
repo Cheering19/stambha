@@ -1631,25 +1631,38 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
 
 /// Unload the GPUs' firmware before a fatal stop ends the machine: the reset
 /// that follows takes down the link of a card whose GSP still runs, until a
-/// power cycle. The Linux environment that unloads it runs on the boot CPU,
-/// so a stop raised there leaves the firmware running and says so. Once.
+/// power cycle, and a card whose driver did not stop it (amdgpu's PSP ring,
+/// its video decoder) fails its next start. A stop raised inside Linux, on
+/// the processor that holds the host drivers' lock, cannot run Linux again
+/// and leaves the firmware running, and says so; any other stop, on the boot
+/// CPU too, unloads. Once.
 pub(in crate::engine) fn stop_for_fatal() {
+    use client::StopUnload;
     static STOPPING: AtomicBool = AtomicBool::new(false);
     if installed().is_none() || STOPPING.swap(true, Ordering::AcqRel) {
         return;
     }
-    // A stop on a processor running Linux in the boot CPU's place holds
-    // the host drivers' lock the unload would wait for.
-    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) || host::moved_here() {
+    use crate::engine::storage;
+    if storage::holds_host_drivers() || storage::host_drivers_held_here() || host::moved_here() {
         output::arguments(format_args!(
-            "GPU firmware left running: the stop is on the CPU that unloads it\n"
+            "GPU firmware left running: the stop is inside Linux, which unloads it\n"
         ));
-    } else if client::shutdown_for_fatal(STOP_UNLOAD_SECONDS) {
-        output::arguments(format_args!("GPU drivers stopped before the fatal stop\n"));
-    } else {
-        output::arguments(format_args!(
+        return;
+    }
+    match client::shutdown_for_fatal(STOP_UNLOAD_SECONDS) {
+        StopUnload::Stopped => {
+            output::arguments(format_args!("GPU drivers stopped before the fatal stop\n"));
+        }
+        StopUnload::Stopping => output::arguments(format_args!(
             "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s for each GPU; the firmware may still run\n"
-        ));
+        )),
+        StopUnload::NotRun(Some(error)) => output::arguments(format_args!(
+            "GPU firmware left running: Linux could not run for the unload ({error:?})\n"
+        )),
+        StopUnload::NotRun(None) => output::arguments(format_args!(
+            "GPU firmware left running: another processor kept the host drivers' lock past \
+             the unload's deadline\n"
+        )),
     }
 }
 
