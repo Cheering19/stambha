@@ -401,6 +401,55 @@ u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
 	return bandwidth;
 }
 
+/* A processor's identity from CPUID, as Linux's early identification
+ * (arch/x86/kernel/cpu/common.c, lib/cpu.c) decodes it: the maker from leaf
+ * 0's vendor string, and from leaf 1's signature the family, extended where
+ * the base family is 0xf, and the model, extended from family 6 up. PCIe
+ * host code reads it to know the root complex's maker, as Linux's does. */
+static struct cpuinfo_x86 decode_cpu(const char vendor[12], u32 signature)
+{
+	struct cpuinfo_x86 cpu = {.x86_vendor = X86_VENDOR_UNKNOWN};
+	u32 family = (signature >> 8) & 0xf;
+	u32 model = (signature >> 4) & 0xf;
+
+	if (!memcmp(vendor, "GenuineIntel", 12))
+		cpu.x86_vendor = X86_VENDOR_INTEL;
+	else if (!memcmp(vendor, "AuthenticAMD", 12))
+		cpu.x86_vendor = X86_VENDOR_AMD;
+	else if (!memcmp(vendor, "HygonGenuine", 12))
+		cpu.x86_vendor = X86_VENDOR_HYGON;
+	if (family == 0xf)
+		family += (signature >> 20) & 0xff;
+	if (family >= 6)
+		model |= ((signature >> 16) & 0xf) << 4;
+	cpu.x86 = (u8)family;
+	cpu.x86_model = (u8)model;
+	return cpu;
+}
+
+struct cpuinfo_x86 *stela_linux_cpu_data(unsigned int cpu)
+{
+	/* Linux code runs in one context at a time, so the first reader
+	 * fills it alone. */
+	static struct cpuinfo_x86 boot;
+	static bool known;
+	u32 leaf = 0, ebx, ecx, edx, signature;
+	char vendor[12];
+
+	(void)cpu;
+	if (known)
+		return &boot;
+	asm volatile("cpuid" : "+a"(leaf), "=b"(ebx), "=c"(ecx), "=d"(edx) : "c"(0));
+	memcpy(vendor, &ebx, 4);
+	memcpy(vendor + 4, &edx, 4);
+	memcpy(vendor + 8, &ecx, 4);
+	signature = 1;
+	asm volatile("cpuid" : "+a"(signature), "=b"(ebx), "=c"(ecx), "=d"(edx) : "c"(0));
+	boot = decode_cpu(vendor, signature);
+	known = true;
+	return &boot;
+}
+
 int pcie_get_mps(struct pci_dev *dev)
 {
 	u16 ctl;
@@ -1818,8 +1867,24 @@ int main(void)
 	rom_window[0] = 0;
 	assert(!pci_map_rom(&dev, &size) && *(u32 *)&config[PCI_ROM_ADDRESS] == 0xc0000000);
 	stela_linux_pci_free_saved_state(&dev);
+
+	/* The processor identities amdgpu's PCIe speed switching asks about:
+	 * Pinnacle Ridge (Zen+), a Raptor Lake, a Hygon and an unknown maker. */
+	struct cpuinfo_x86 cpu = decode_cpu("AuthenticAMD", 0x00800f82);
+
+	assert(cpu.x86_vendor == X86_VENDOR_AMD && cpu.x86 == 0x17 && cpu.x86_model == 0x08);
+	cpu = decode_cpu("AuthenticAMD", 0x00a60f12);
+	assert(cpu.x86 == 0x19 && cpu.x86_model == 0x61);
+	cpu = decode_cpu("GenuineIntel", 0x000b0671);
+	assert(cpu.x86_vendor == X86_VENDOR_INTEL && cpu.x86 == 6 && cpu.x86_model == 0xb7);
+	cpu = decode_cpu("HygonGenuine", 0x00900f02);
+	assert(cpu.x86_vendor == X86_VENDOR_HYGON && cpu.x86 == 0x18 && cpu.x86_model == 0);
+	cpu = decode_cpu("CentaurHauls", 0x000006f2);
+	assert(cpu.x86_vendor == X86_VENDOR_UNKNOWN && cpu.x86 == 6 && cpu.x86_model == 0xf);
+	/* This processor's, read once. */
+	assert(&cpu_data(0) == stela_linux_cpu_data(1) && cpu_data(0).x86 >= 6);
 	stela_linux_exit();
-	printf("Linux PCI configuration, enabling, searches, PCI Express, resets, resizable BARs, BAR mappings and option ROMs passed\n");
+	printf("Linux PCI configuration, enabling, searches, PCI Express, resets, resizable BARs, BAR mappings, option ROMs and processor identity passed\n");
 	return 0;
 }
 #endif

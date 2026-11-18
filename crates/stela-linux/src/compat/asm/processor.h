@@ -22,6 +22,22 @@ static const struct {
 	u8 x86;
 } boot_cpu_data __maybe_unused = {.x86 = 6};
 
+/* x86's struct cpuinfo_x86, with the fields Linux code here reads: the
+ * maker, family and model of the processor, decoded from CPUID as Linux's
+ * early CPU identification decodes them. Every processor is the boot
+ * processor's kind; the values are asm/processor.h's. */
+struct cpuinfo_x86 {
+	u8 x86_vendor;
+	u8 x86;
+	u8 x86_model;
+};
+#define X86_VENDOR_INTEL 0
+#define X86_VENDOR_AMD 2
+#define X86_VENDOR_HYGON 9
+#define X86_VENDOR_UNKNOWN 0xff
+struct cpuinfo_x86 *stela_linux_cpu_data(unsigned int cpu);
+#define cpu_data(cpu) (*stela_linux_cpu_data(cpu))
+
 struct pt_regs;
 struct task_struct;
 /* Nor does a thread keep user registers. */
