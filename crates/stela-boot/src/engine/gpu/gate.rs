@@ -1701,9 +1701,20 @@ pub(in crate::engine) fn stop_for_fatal() {
         return;
     }
     use crate::engine::storage;
-    if storage::holds_host_drivers() || storage::host_drivers_held_here() || host::moved_here() {
+    // Which of the three put the stop inside Linux, which cannot run again
+    // under it.
+    let inside = if storage::holds_host_drivers() {
+        Some("this processor holds the host drivers' lock")
+    } else if storage::host_drivers_held_here() {
+        Some("a fault stopped this processor inside the host drivers")
+    } else if host::moved_here() {
+        Some("this processor runs a process's Linux work in its place")
+    } else {
+        None
+    };
+    if let Some(why) = inside {
         output::arguments(format_args!(
-            "GPU firmware left running: the stop is inside Linux, which unloads it\n"
+            "GPU firmware left running: the stop is inside Linux, which unloads it ({why})\n"
         ));
         return;
     }
