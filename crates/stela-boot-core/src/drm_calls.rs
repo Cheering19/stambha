@@ -180,6 +180,14 @@ const XE_QUERY_PXP_STATUS: u32 = 9;
 /// drm_xe_vm_get_property)`, 56 bytes, its VM at byte 8.
 const XE_VM_GET_PROPERTY: u32 = 0xc038_644f;
 
+/// `DRM_IOCTL_I915_GETPARAM`: `DRM_IOWR(0x46, drm_i915_getparam_t)`, 16
+/// bytes, its parameter at byte 0.
+const I915_GETPARAM: u32 = 0xc010_6446;
+/// `I915_PARAM_IRQ_ACTIVE`, a parameter i915 answers `-ENODEV` for.
+const I915_PARAM_IRQ_ACTIVE: u32 = 1;
+/// `I915_PARAM_PXP_STATUS`.
+const I915_PARAM_PXP_STATUS: u32 = 58;
+
 /// Whether `driver`'s answer `result` to ioctl `request`, whose argument
 /// began with `input` as the caller passed it, is the driver's ordinary
 /// reply to a probe a Vulkan driver makes on every device and handles:
@@ -193,6 +201,15 @@ const XE_VM_GET_PROPERTY: u32 = 0xc038_644f;
 /// - xe, `VM_GET_PROPERTY` of VM `u32::MAX`, `-ENOENT`: on Xe2 and later
 ///   ANV detects VM fault reporting by asking for a VM no file has
 ///   (`xe_gem_supports_get_vm_faults`); `-ENOENT` is the answer it wants.
+/// - i915, `GETPARAM` of `PXP_STATUS`, `-ENODEV`: ANV asks on every GPU
+///   whether protected content can run (`i915_gem_supports_protected_context`)
+///   and takes `-ENODEV` as no; i915 has no PXP without
+///   `CONFIG_DRM_I915_PXP` and the MEI drivers (`intel_pxp_get_readiness_status`).
+/// - i915, `GETPARAM` of `IRQ_ACTIVE`, `-ENODEV`: Mesa's i915 device info
+///   asks for the parameter numbered by the boolean answer to
+///   `HAS_CONTEXT_ISOLATION` (`intel/dev/i915/intel_device_info.c`, a getparam
+///   inside a getparam's argument), which is 1 on every GPU i915 is handed; i915
+///   retired that parameter and answers `-ENODEV`, which Mesa ignores.
 pub fn probe_answer(driver: &str, request: u32, input: &[u8], result: i64) -> bool {
     let word = |at: usize| {
         input
@@ -202,6 +219,9 @@ pub fn probe_answer(driver: &str, request: u32, input: &[u8], result: i64) -> bo
     match (driver, request, result) {
         ("xe", XE_DEVICE_QUERY, ENODEV) => word(8) == Some(XE_QUERY_PXP_STATUS),
         ("xe", XE_VM_GET_PROPERTY, ENOENT) => word(8) == Some(u32::MAX),
+        ("i915", I915_GETPARAM, ENODEV) => {
+            matches!(word(0), Some(I915_PARAM_PXP_STATUS | I915_PARAM_IRQ_ACTIVE))
+        }
         _ => false,
     }
 }
@@ -256,6 +276,27 @@ mod tests {
         assert_eq!(VERSION, iowr(0x00, 64));
         assert_eq!(XE_DEVICE_QUERY, iowr(COMMAND_BASE, 40));
         assert_eq!(XE_VM_GET_PROPERTY, iowr(COMMAND_BASE + 0x0f, 56));
+        assert_eq!(I915_GETPARAM, iowr(COMMAND_BASE + 0x06, 16));
+    }
+
+    #[test]
+    fn i915s_answers_to_anvs_parameter_probes_are_not_refusals() {
+        let param = |number: u32| {
+            let mut argument = [0u8; 16];
+            argument[..4].copy_from_slice(&number.to_le_bytes());
+            argument
+        };
+        for number in [I915_PARAM_PXP_STATUS, I915_PARAM_IRQ_ACTIVE] {
+            assert!(probe_answer("i915", I915_GETPARAM, &param(number), ENODEV));
+            // Another errno or another driver is a refusal.
+            assert!(!probe_answer("i915", I915_GETPARAM, &param(number), -22));
+            assert!(!probe_answer("xe", I915_GETPARAM, &param(number), ENODEV));
+        }
+        // Any other parameter's -ENODEV is (the chipset ID, slice mask).
+        for number in [4, 46] {
+            assert!(!probe_answer("i915", I915_GETPARAM, &param(number), ENODEV));
+        }
+        assert!(!probe_answer("i915", I915_GETPARAM, &[], ENODEV));
     }
 
     #[test]
