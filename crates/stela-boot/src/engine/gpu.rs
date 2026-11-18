@@ -840,13 +840,18 @@ impl Host {
             Verdict::Write { repeated } => {
                 if let Some(count) = repeated {
                     output::arguments(format_args!(
-                        "LINUX the line before came {count} more times in all\n"
+                        "LINUX {}\n",
+                        stela_boot_core::repeated_lines::Counted { count, ended: true }
                     ));
                 }
                 output::arguments(format_args!("LINUX {line}\n"));
             }
             Verdict::Repeat { count: Some(count) } => output::arguments(format_args!(
-                "LINUX the line before came {count} more times so far\n"
+                "LINUX {}\n",
+                stela_boot_core::repeated_lines::Counted {
+                    count,
+                    ended: false
+                }
             )),
             Verdict::Repeat { count: None } => {}
         }

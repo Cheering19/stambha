@@ -55,6 +55,26 @@ impl Repeats {
     }
 }
 
+/// The line that counts repeats of the line Linux last wrote: `count` more
+/// so far, or in all once a different line follows (`ended`). It names that
+/// line as Linux's, as the boot's own lines may come between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Counted {
+    pub count: u64,
+    pub ended: bool,
+}
+
+impl fmt::Display for Counted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let when = if self.ended { "in all" } else { "so far" };
+        write!(
+            f,
+            "the line Linux last wrote came {} more times {when}",
+            self.count
+        )
+    }
+}
+
 /// FNV-1a over the formatted text.
 fn hash(text: fmt::Arguments<'_>) -> u64 {
     struct Fnv(u64);
@@ -105,6 +125,33 @@ mod tests {
         assert_eq!(
             repeats.line(format_args!("<6> third")),
             Verdict::Write { repeated: None }
+        );
+    }
+
+    /// A count names the line it counts as Linux's last, not the line above
+    /// it in the log, which may be the boot's own.
+    #[test]
+    fn a_count_names_the_line_linux_last_wrote() {
+        use alloc::format;
+        assert_eq!(
+            format!(
+                "{}",
+                Counted {
+                    count: 4,
+                    ended: false
+                }
+            ),
+            "the line Linux last wrote came 4 more times so far"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Counted {
+                    count: 4265,
+                    ended: true
+                }
+            ),
+            "the line Linux last wrote came 4265 more times in all"
         );
     }
 
