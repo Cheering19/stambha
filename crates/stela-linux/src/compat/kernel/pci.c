@@ -696,6 +696,94 @@ static void restore_pcie_state(struct pci_dev *dev)
 		pcie_capability_write_word(dev, pcie_saved_registers[i], words[i]);
 }
 
+/* A function's message, which a reset of the whole function clears.
+ * Linux's pci_restore_msi_state writes it back from the message it keeps
+ * (__pci_restore_msi_state); here the owner programmed it, so the words the
+ * owner wrote are kept: the control, the address, the data and the mask. */
+enum { MSI_CONTROL, MSI_ADDRESS_LO, MSI_ADDRESS_HI, MSI_DATA, MSI_MASK, MSI_SAVED_WORDS };
+
+static struct pci_cap_saved_state *msi_buffer(struct pci_dev *dev, u16 cap, size_t bytes)
+{
+	struct pci_cap_saved_state *state = saved_cap(dev, cap, false);
+
+	if (state)
+		return state;
+	state = kzalloc(sizeof(*state) + bytes, GFP_KERNEL);
+	if (!state) {
+		pci_err(dev, "buffer not found in %s\n", __func__);
+		return NULL;
+	}
+	state->cap.cap_nr = cap;
+	state->cap.size = (unsigned int)bytes;
+	hlist_add_head(&state->next, &dev->saved_cap_space);
+	return state;
+}
+
+static int save_msi_state(struct pci_dev *dev)
+{
+	u8 pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
+	struct pci_cap_saved_state *state;
+	u32 *words;
+	u16 control;
+
+	if (!pos)
+		return 0;
+	state = msi_buffer(dev, PCI_CAP_ID_MSI, MSI_SAVED_WORDS * sizeof(u32));
+	if (!state)
+		return -ENOMEM;
+	words = state->cap.data;
+	memset(words, 0, MSI_SAVED_WORDS * sizeof(u32));
+	if (pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &control))
+		return -EIO;
+	words[MSI_CONTROL] = control;
+	pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, &words[MSI_ADDRESS_LO]);
+	if (control & PCI_MSI_FLAGS_64BIT) {
+		u16 data;
+
+		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, &words[MSI_ADDRESS_HI]);
+		pci_read_config_word(dev, pos + PCI_MSI_DATA_64, &data);
+		words[MSI_DATA] = data;
+		if (control & PCI_MSI_FLAGS_MASKBIT)
+			pci_read_config_dword(dev, pos + PCI_MSI_MASK_64, &words[MSI_MASK]);
+	} else {
+		u16 data;
+
+		pci_read_config_word(dev, pos + PCI_MSI_DATA_32, &data);
+		words[MSI_DATA] = data;
+		if (control & PCI_MSI_FLAGS_MASKBIT)
+			pci_read_config_dword(dev, pos + PCI_MSI_MASK_32, &words[MSI_MASK]);
+	}
+	return 0;
+}
+
+/* In __pci_restore_msi_state's order: the message off, its address, data
+ * and mask, then the control word the owner left, with its enable. Only a
+ * function whose message is on, as Linux restores only then. */
+static void restore_msi_state(struct pci_dev *dev)
+{
+	struct pci_cap_saved_state *state = saved_cap(dev, PCI_CAP_ID_MSI, false);
+	u8 pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
+	const u32 *words;
+	u16 control;
+	bool wide;
+
+	if (!dev->msi_enabled || !state || !pos)
+		return;
+	words = state->cap.data;
+	control = (u16)words[MSI_CONTROL];
+	wide = control & PCI_MSI_FLAGS_64BIT;
+	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, control & (u16)~PCI_MSI_FLAGS_ENABLE);
+	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, words[MSI_ADDRESS_LO]);
+	if (wide)
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, words[MSI_ADDRESS_HI]);
+	pci_write_config_word(dev, pos + (wide ? PCI_MSI_DATA_64 : PCI_MSI_DATA_32),
+			      (u16)words[MSI_DATA]);
+	if (control & PCI_MSI_FLAGS_MASKBIT)
+		pci_write_config_dword(dev, pos + (wide ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32),
+				       words[MSI_MASK]);
+	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, control);
+}
+
 /* Each resizable BAR set back to the size its resource has, following
  * pci_restore_rebar_state: a reset of the whole function returns them to
  * their defaults, while the resources (and the driver's mappings) keep the
@@ -729,8 +817,8 @@ static void restore_rebar_state(struct pci_dev *dev)
 }
 
 /* What a function loses in D3 or a reset of its own, following
- * drivers/pci/pci.c: its standard header and its PCI Express controls.
- * Its message interrupt is its owner's (see stela/pci.h's enable_msi). */
+ * drivers/pci/pci.c: its standard header, its PCI Express controls and its
+ * message. */
 int pci_save_state(struct pci_dev *dev)
 {
     enum { SAVED_DWORDS = 16 };
@@ -743,11 +831,13 @@ int pci_save_state(struct pci_dev *dev)
     }
     memcpy(dev->saved_config_space, saved, sizeof(saved));
     dev->state_saved = true;
-    return save_pcie_state(dev);
+    error = save_pcie_state(dev);
+    return error ? error : save_msi_state(dev);
 }
 
 /* In pci_restore_state's order: the PCI Express controls and the resizable
- * BARs' sizes before the header that turns decoding back on. */
+ * BARs' sizes before the header that turns decoding back on, the message
+ * after it. */
 void pci_restore_state(struct pci_dev *dev)
 {
     if (!dev->state_saved)
@@ -757,6 +847,7 @@ void pci_restore_state(struct pci_dev *dev)
     for (int i = 15; i >= 0; i--)
         if (pci_write_config_dword(dev, i * 4, dev->saved_config_space[i]))
             stela_linux_fatal("PCI state restore failed without completion");
+    restore_msi_state(dev);
     dev->state_saved = false;
 }
 
@@ -1541,6 +1632,16 @@ int main(void)
 	dev.resource[2] = (struct resource){
 		.start = 0x400000000, .end = 0x5ffffffff, .flags = IORESOURCE_MEM};
 	memset(&dev.resource[4], 0, sizeof(dev.resource[4]));
+	/* The owner's 64-bit, maskable message, on. */
+	config[0x71] = 0x80;
+	config[0x80] = PCI_CAP_ID_MSI;
+	*(u16 *)&config[0x80 + PCI_MSI_FLAGS] =
+		PCI_MSI_FLAGS_64BIT | PCI_MSI_FLAGS_MASKBIT | PCI_MSI_FLAGS_ENABLE;
+	*(u32 *)&config[0x80 + PCI_MSI_ADDRESS_LO] = 0xfee01000;
+	*(u32 *)&config[0x80 + PCI_MSI_ADDRESS_HI] = 0;
+	*(u16 *)&config[0x80 + PCI_MSI_DATA_64] = 0x4041;
+	*(u32 *)&config[0x80 + PCI_MSI_MASK_64] = 0;
+	dev.msi_enabled = 1;
 	assert(!pci_save_state(&dev));
 	saved = pci_store_saved_state(&dev);
 	assert(saved);
@@ -1551,6 +1652,9 @@ int main(void)
 	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL2] = 0;
 	*(u32 *)&config[0x100 + PCI_REBAR_CTRL] &= ~(u32)PCI_REBAR_CTRL_BAR_SIZE;
 	*(u32 *)&config[0x100 + PCI_REBAR_CTRL] |= 8 << PCI_REBAR_CTRL_BAR_SHIFT;
+	memset(&config[0x80 + PCI_MSI_FLAGS], 0, 0x18 - PCI_MSI_FLAGS);
+	*(u16 *)&config[0x80 + PCI_MSI_FLAGS] = PCI_MSI_FLAGS_64BIT | PCI_MSI_FLAGS_MASKBIT;
+	*(u32 *)&config[0x80 + PCI_MSI_MASK_64] = 1;
 	assert(!pci_load_saved_state(&dev, saved) && dev.state_saved);
 	pci_restore_state(&dev);
 	assert(!dev.state_saved && !memcmp(before, config, sizeof(config)));
@@ -1567,6 +1671,14 @@ int main(void)
 	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] = 1 << 5;
 	*(u16 *)&config[0x70 + PCI_EXP_LNKCTL] = 0;
 	memset(&dev.resource[2], 0, sizeof(dev.resource[2]));
+	/* A function whose message is off gets none written back. */
+	dev.msi_enabled = 0;
+	assert(!pci_save_state(&dev));
+	*(u16 *)&config[0x80 + PCI_MSI_DATA_64] = 0;
+	pci_restore_state(&dev);
+	assert(!*(u16 *)&config[0x80 + PCI_MSI_DATA_64]);
+	memset(&config[0x80], 0, 0x18);
+	config[0x71] = 0;
 
 	/* A function with neither a function-level reset nor a D3hot that resets
 	 * it has no reset of its own, and keeps its header. (The resets
