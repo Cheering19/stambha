@@ -200,7 +200,9 @@ impl From<Error> for Failure {
 impl Failure {
     fn found(error: Error, place: Place, binary: &[u8]) -> Self {
         let first = |at: usize| -> Option<[u8; 4]> { binary.get(at..at + 4)?.try_into().ok() };
+        // Past a binary that is none, no table is placed.
         let entry = match u16_at(binary, 4) {
+            _ if error == Error::Signature => None,
             Ok(0 | 1) => Some(12),
             Ok(2) => Some(16),
             _ => None,
@@ -216,18 +218,54 @@ impl Failure {
     }
 }
 
+impl Error {
+    /// What the error means of the GPU, where its name does not say it.
+    fn meaning(self) -> Option<&'static str> {
+        Some(match self {
+            Self::NoAnswer => "RCC_CONFIG_MEMSIZE reads all ones: the GPU does not answer",
+            Self::NotReady => {
+                "MP0 C2PMSG_33 bit 31 is clear: the GPU's firmware has not placed the table"
+            }
+            Self::InSystemMemory => {
+                "RCC_CONFIG_MEMSIZE reads 0 and the scratch registers name no place: the table \
+                 is in system memory, where amdgpu finds it through ACPI"
+            }
+            Self::Memory => "no memory for the table's bytes",
+            _ => return None,
+        })
+    }
+}
+
 impl core::fmt::Display for Failure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:?}", self.error)?;
+        if let Some(meaning) = self.error.meaning() {
+            write!(f, " ({meaning})")?;
+        }
         if let Some((place, bytes)) = self.read {
             write!(
                 f,
-                "; read {:#x} bytes at VRAM offset {:#x}, which start {:02x?}",
-                place.bytes, place.offset, bytes
+                "; read {:#x} bytes at VRAM offset {:#x}, whose first word is {:#010x}",
+                place.bytes,
+                place.offset,
+                u32::from_le_bytes(bytes)
             )?;
+            if self.error == Error::Signature {
+                write!(f, " where a table binary's is {BINARY_SIGNATURE:#010x}")?;
+            }
         }
         if let Some((offset, bytes)) = self.table {
-            write!(f, "; its table at {offset:#x} starts {bytes:02x?}")?;
+            write!(
+                f,
+                "; its table at {offset:#x} starts {:#010x}",
+                u32::from_le_bytes(bytes)
+            )?;
+            if self.error == Error::TableSignature {
+                write!(
+                    f,
+                    " where an IP discovery table's is {DISCOVERY_TABLE_SIGNATURE:#010x} (IPDS)"
+                )?;
+            }
         }
         Ok(())
     }

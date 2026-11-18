@@ -229,11 +229,22 @@ fn a_table_not_taken_says_where_it_was_read_and_what_it_held() {
     let failure = Failure::found(Error::TableSignature, place, &table);
     assert_eq!(
         alloc::format!("{failure}"),
-        "TableSignature; read 0x2800 bytes at VRAM offset 0x1fff0000, which start \
-         [07, 14, 21, 28]; its table at 0x40 starts [58, 50, 44, 53]"
+        "TableSignature; read 0x2800 bytes at VRAM offset 0x1fff0000, whose first word is \
+         0x28211407; its table at 0x40 starts 0x53445058 where an IP discovery table's is \
+         0x53445049 (IPDS)"
+    );
+    // A binary whose signature is wrong names what was read and what was
+    // looked for.
+    let mut table = binary(RAPHAEL, 3);
+    table[0..4].copy_from_slice(&[0xff; 4]);
+    let failure = Failure::found(Error::Signature, place, &table);
+    assert_eq!(
+        alloc::format!("{failure}"),
+        "Signature; read 0x2800 bytes at VRAM offset 0x1fff0000, whose first word is \
+         0xffffffff where a table binary's is 0x28211407"
     );
     assert_eq!(
         alloc::format!("{}", Failure::from(Error::NotReady)),
-        "NotReady"
+        "NotReady (MP0 C2PMSG_33 bit 31 is clear: the GPU's firmware has not placed the table)"
     );
 }
