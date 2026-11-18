@@ -22,7 +22,7 @@
 //! `rtw89_fw_download` (`fw.c:2043`), the failure dump
 //! `rtw89_fw_dl_fail_dump`, any H2C after the download, or anything past
 //! the firmware's own ready status: no C2H, scan or radio state.
-use super::io::{AxError, AxIo, Polled, clear32, field16, poll_sample, set32};
+use super::io::{AxError, AxIo, Polled, clear32, field16, poll_sample_atomic, set32};
 use super::pci::{Ch12, FWCMD_SLOT_BYTES};
 use crate::wifi::realtek::firmware::{AxImage, AxSection};
 use alloc::vec::Vec;
@@ -281,9 +281,14 @@ fn fw_ctrl8<I: AxIo + ?Sized>(io: &mut I) -> Result<u8, AxError> {
 
 /// `rtw89_fwdl_check_path_ready_ax` (`mac.c:7419`) on PCIe.
 fn path_ready<I: AxIo + ?Sized>(io: &mut I, check: u8) -> Result<(), AxError> {
-    match poll_sample(io, FWDL_POLL_INTERVAL_US, FWDL_WAIT_US, fw_ctrl8, |value| {
-        value & check != 0
-    })? {
+    match poll_sample_atomic(
+        io,
+        FWDL_POLL_INTERVAL_US,
+        FWDL_WAIT_US,
+        false,
+        fw_ctrl8,
+        |value| value & check != 0,
+    )? {
         Polled::Met(_) => Ok(()),
         Polled::Expired(_) => Err(AxError::Timeout {
             register: R_AX_WCPU_FW_CTRL,
@@ -301,9 +306,14 @@ fn fwdl_status(value: u8) -> u8 {
 /// the whole 400 ms for `RTW89_FWDL_WCPU_FW_INIT_RDY`, then name the last
 /// status.
 fn check_ready<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    match poll_sample(io, FWDL_POLL_INTERVAL_US, FWDL_WAIT_US, fw_ctrl8, |value| {
-        fwdl_status(value) == RTW89_FWDL_WCPU_FW_INIT_RDY
-    })? {
+    match poll_sample_atomic(
+        io,
+        FWDL_POLL_INTERVAL_US,
+        FWDL_WAIT_US,
+        false,
+        fw_ctrl8,
+        |value| fwdl_status(value) == RTW89_FWDL_WCPU_FW_INIT_RDY,
+    )? {
         Polled::Met(_) => Ok(()),
         Polled::Expired(value) => Err(AxError::Firmware(match fwdl_status(value) {
             RTW89_FWDL_CHECKSUM_FAIL => "checksum",

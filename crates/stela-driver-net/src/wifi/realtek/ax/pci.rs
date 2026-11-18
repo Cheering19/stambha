@@ -20,7 +20,7 @@
 //! module does not grant interrupts, RX processing, TX on any channel but
 //! CH12, LTR/ASPM/L1SS setup (`mac_post_init`) or firmware readiness: a
 //! consumed TXBD proves only that the DMA engine read the packet.
-use super::io::{AxError, AxIo, clear16, clear32, field32, poll32, set32};
+use super::io::{AxError, AxIo, clear16, clear32, field32, poll32, poll32_atomic, set32};
 use crate::bus::dma::{
     mapping::{Direction, DmaDomain, DmaError},
     memory::{MemoryError, PageSource},
@@ -470,15 +470,7 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
     // rtw89_pci_ops_reset: ring registers and the software indices.
     reset_trx_rings(io, rings)?;
     // rtw89_pci_rst_bdram_ax (pci.c:47).
-    set32(io, R_AX_HAXI_INIT_CFG1, B_AX_RST_BDRAM)?;
-    poll32(
-        io,
-        R_AX_HAXI_INIT_CFG1,
-        B_AX_RST_BDRAM,
-        0,
-        1,
-        BDRAM_POLL_TIMEOUT_US,
-    )?;
+    rst_bdram(io)?;
     // rtw89_pci_ctrl_txdma_ch_ax(false), then _fw_ch_ax(true) (pci.c:249-275).
     set32(io, R_AX_HAXI_DMA_STOP1, B_AX_TX_STOP1_MASK)?;
     set32(io, R_AX_HAXI_DMA_STOP2, B_AX_TX_STOP2_ALL)?;
@@ -519,6 +511,20 @@ fn poll_dma_all_idle<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
         )?;
     }
     Ok(())
+}
+
+/// `rtw89_pci_rst_bdram_ax` (`pci.c:47-54`): set the reset bit, then
+/// `read_poll_timeout_atomic(.., 1, 100, false)` for it to clear.
+fn rst_bdram<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    set32(io, R_AX_HAXI_INIT_CFG1, B_AX_RST_BDRAM)?;
+    poll32_atomic(
+        io,
+        R_AX_HAXI_INIT_CFG1,
+        B_AX_RST_BDRAM,
+        0,
+        1,
+        BDRAM_POLL_TIMEOUT_US,
+    )
 }
 
 /// `rtw89_pci_clr_idx_all_ax` (`pci.c:2867`), RTL8852C channel set.

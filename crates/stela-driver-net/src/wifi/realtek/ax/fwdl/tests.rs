@@ -366,14 +366,16 @@ fn ready_error_codes() {
             Err(AxError::Firmware(error)),
             "status {status}"
         );
-        // rtw89_fw_check_rdy waits for ready until FWDL_WAIT_CNT (400 ms)
-        // and only then decodes the last status.
+        // rtw89_fw_check_rdy waits for ready for FWDL_WAIT_CNT (400 ms) of
+        // `read_poll_timeout_atomic` budget (iopoll.h: 399_602 samples, so
+        // 399_601 1 us waits, with free reads) and only then decodes the
+        // last status.
         let delay = io.trace.iter().position(|op| *op == Op::Delay(5000));
         let polls = io.trace[delay.unwrap()..]
             .iter()
             .filter(|op| **op == Op::Delay(1))
             .count();
-        assert!(polls >= 400_000, "status {status}: {polls} samples");
+        assert_eq!(polls, 399_601, "status {status}");
     }
 }
 
@@ -440,7 +442,8 @@ fn path_ready_timeout_sends_nothing() {
             mask: 1 << 1
         })
     );
-    assert!(io.now - began >= 400_000);
+    // read_poll_timeout_atomic: 399_601 waits of 1 us with free reads.
+    assert_eq!(io.now - began, 399_601);
     assert!(sent.lock().unwrap().is_empty());
     assert!(!io.trace.iter().any(|op| matches!(op, Op::W16(0x1080, _))));
 }
@@ -497,4 +500,29 @@ fn submit_failure_stops_the_download() {
         1
     );
     assert!(!io.trace.contains(&Op::Delay(5000)));
+}
+
+/// Reads of `R_AX_WCPU_FW_CTRL` (the 8-bit sample).
+fn ctrl_reads(m: &RegisterModel) -> usize {
+    m.trace
+        .iter()
+        .filter(|o| **o == Op::R8(R_AX_WCPU_FW_CTRL))
+        .count()
+}
+
+/// `read_poll_timeout_atomic(.., 1, FWDL_WAIT_CNT, false)` (`mac.c:7431`,
+/// `fw.c:112`): left_ns = 400_000_000, cost 1001 per failure, so the
+/// expired sample is k = 400_000_000 / 1001 + 1 = 399_601 and the poll
+/// makes 399_602 samples, where wall time with a 1 us read ends near 200_000.
+#[test]
+fn fwdl_ready_polls_spend_the_linux_iteration_budget() {
+    const SAMPLES: usize = 399_602;
+    let mut m = RegisterModel::new();
+    m.read_cost_us = 1;
+    assert!(path_ready(&mut m, 0x02).is_err());
+    assert_eq!(ctrl_reads(&m), SAMPLES);
+    let mut m = RegisterModel::new();
+    m.read_cost_us = 1;
+    assert!(check_ready(&mut m).is_err());
+    assert_eq!(ctrl_reads(&m), SAMPLES);
 }

@@ -120,6 +120,15 @@ pub fn poll32<I: AxIo + ?Sized>(
     poll32_value(io, reg, mask, want, interval_us, timeout_us).map(|_| ())
 }
 
+/// One `poll32` sample: the register, refused if it reads all ones.
+fn sample32<I: AxIo + ?Sized>(io: &mut I, reg: u32, wants_all_ones: bool) -> Result<u32, AxError> {
+    let value = io.read32(reg)?;
+    if value == u32::MAX && !wants_all_ones {
+        return Err(AxError::AllOnes { register: reg });
+    }
+    Ok(value)
+}
+
 /// `poll32`, returning the register value that satisfied the wait, as
 /// `read_poll_timeout` leaves it in its `val` argument.
 pub fn poll32_value<I: AxIo + ?Sized>(
@@ -131,22 +140,60 @@ pub fn poll32_value<I: AxIo + ?Sized>(
     timeout_us: u64,
 ) -> Result<u32, AxError> {
     let wants_all_ones = mask == u32::MAX && want == u32::MAX;
-    let sample = |io: &mut I| {
-        let value = io.read32(reg)?;
-        if value == u32::MAX && !wants_all_ones {
-            return Err(AxError::AllOnes { register: reg });
-        }
-        Ok(value)
-    };
-    match poll_sample(io, interval_us, timeout_us, sample, |value| {
-        value & mask == want
-    })? {
+    match poll_sample(
+        io,
+        interval_us,
+        timeout_us,
+        |io| sample32(io, reg, wants_all_ones),
+        |value| value & mask == want,
+    )? {
         Polled::Met(value) => Ok(value),
         Polled::Expired(_) => Err(AxError::Timeout {
             register: reg,
             mask,
         }),
     }
+}
+
+/// `poll32_value` for a poll Linux writes as `read_poll_timeout_atomic`:
+/// budgeted by iterations (`poll_sample_atomic`), not wall time.
+pub fn poll32_value_atomic<I: AxIo + ?Sized>(
+    io: &mut I,
+    reg: u32,
+    mask: u32,
+    want: u32,
+    delay_us: u64,
+    timeout_us: u64,
+    delay_before: bool,
+) -> Result<u32, AxError> {
+    let wants_all_ones = mask == u32::MAX && want == u32::MAX;
+    match poll_sample_atomic(
+        io,
+        delay_us,
+        timeout_us,
+        delay_before,
+        |io| sample32(io, reg, wants_all_ones),
+        |value| value & mask == want,
+    )? {
+        Polled::Met(value) => Ok(value),
+        Polled::Expired(_) => Err(AxError::Timeout {
+            register: reg,
+            mask,
+        }),
+    }
+}
+
+/// `poll32_value_atomic` with no delay before the first sample, keeping
+/// only the outcome.
+pub fn poll32_atomic<I: AxIo + ?Sized>(
+    io: &mut I,
+    reg: u32,
+    mask: u32,
+    want: u32,
+    delay_us: u64,
+    timeout_us: u64,
+) -> Result<(), AxError> {
+    poll32_value_atomic(io, reg, mask, want, delay_us, timeout_us, false).map(|_| ())
 }
 
 /// How a `poll_sample` wait ended.
@@ -194,6 +241,53 @@ pub fn poll_sample<I: AxIo + ?Sized, T: Copy>(
         if io.now_us()? <= now {
             return Err(AxError::Clock);
         }
+    }
+    Err(AxError::Clock)
+}
+
+/// `poll_timeout_us_atomic` (`iopoll.h:85-118`): the budget of every poll
+/// Linux writes as `read_poll_timeout_atomic`. It reads no clock. `left_ns`
+/// starts at `timeout_us * 1000`; the optional `delay_before` wait and each
+/// failed sample's `delay_us(delay_us)` subtract `delay_us * 1000`, and every
+/// failed sample also subtracts 1 ns (the `cpu_relax()` branch). The wait is
+/// over once `left_ns < 0`, after one last sample. A register read costs real
+/// time on PCIe, so this waits longer than `timeout_us` of wall time. Sample
+/// counts: `timeout_us * 1000 / (delay_us * 1000 + 1) + 2` (1001 for 1 us
+/// over 1000 us; `timeout_us * 1000 + 2` with no delay). The loop bound is
+/// exactly that count, so the guard never cuts a Linux-length wait short.
+/// `timeout_us == 0` expires after one sample here, where Linux never times
+/// out; no caller passes 0.
+pub fn poll_sample_atomic<I: AxIo + ?Sized, T: Copy>(
+    io: &mut I,
+    delay_us: u64,
+    timeout_us: u64,
+    delay_before: bool,
+    mut sample: impl FnMut(&mut I) -> Result<T, AxError>,
+    done: impl Fn(T) -> bool,
+) -> Result<Polled<T>, AxError> {
+    let delay_ns = i128::from(delay_us) * 1000;
+    let mut left_ns = i128::from(timeout_us) * 1000;
+    if delay_before && delay_us != 0 {
+        io.delay_us(delay_us);
+        left_ns -= delay_ns;
+    }
+    let bound = (left_ns.max(0) / (delay_ns + 1)).saturating_add(2);
+    let mut taken: i128 = 0;
+    while taken < bound {
+        taken += 1;
+        let expired = left_ns < 0;
+        let value = sample(io)?;
+        if done(value) {
+            return Ok(Polled::Met(value));
+        }
+        if expired {
+            return Ok(Polled::Expired(value));
+        }
+        if delay_us != 0 {
+            io.delay_us(delay_us);
+            left_ns -= delay_ns;
+        }
+        left_ns -= 1;
     }
     Err(AxError::Clock)
 }

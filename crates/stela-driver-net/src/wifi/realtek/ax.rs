@@ -20,7 +20,8 @@ pub use bringup::{BringUpError, Running, bring_up};
 pub use fwdl::download;
 pub use io::{
     AxError, AxIo, NativeAxIo, Polled, clear8, clear16, clear32, field8, field16, field32,
-    poll_sample, poll32, poll32_value, set8, set16, set32,
+    poll_sample, poll_sample_atomic, poll32, poll32_atomic, poll32_value, poll32_value_atomic,
+    set8, set16, set32,
 };
 pub use pci::{Ch12, Rings, encode_txbd, pre_init};
 pub use power::{power_off, power_on, xtal_si_read, xtal_si_write};

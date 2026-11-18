@@ -24,6 +24,8 @@ pub struct RegisterModel {
     pub now: u64,
     /// Keep `now_us` constant across delays, as a stalled clock would.
     pub freeze_clock: bool,
+    /// Microseconds each register read adds to the clock, as PCIe latency.
+    pub read_cost_us: u64,
 }
 
 impl RegisterModel {
@@ -34,6 +36,7 @@ impl RegisterModel {
             hooks: BTreeMap::new(),
             now: 1_000,
             freeze_clock: false,
+            read_cost_us: 0,
         }
     }
     fn get(&self, reg: u32, width: u32) -> u32 {
@@ -68,6 +71,9 @@ impl RegisterModel {
             .collect()
     }
     fn read(&mut self, reg: u32, width: u32) -> u32 {
+        if !self.freeze_clock {
+            self.now += self.read_cost_us;
+        }
         if let Some(mut hook) = self.hooks.remove(&reg) {
             let v = hook(self);
             self.put(reg, width, v);

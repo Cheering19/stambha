@@ -13,7 +13,7 @@
 //! DAV map, phycap, the efuse version byte and all other logical fields are
 //! not ported. This module does not grant firmware download, secure-boot
 //! support or any claim that the MAC address is valid.
-use super::io::{AxError, AxIo, clear8, clear16, poll32_value, set8, set16};
+use super::io::{AxError, AxIo, clear8, clear16, poll32_value_atomic, set8, set16};
 use alloc::{vec, vec::Vec};
 
 // reg.h (pinned rtw89).
@@ -75,16 +75,17 @@ fn dump_once<I: AxIo + ?Sized>(io: &mut I, start: u16, out: &mut [u8]) -> Result
         let addr = u32::from(start) + i as u32;
         let ctl = (addr << 16) & B_AX_EF_ADDR_MASK;
         io.write32(R_AX_EFUSE_CTRL, ctl & !B_AX_EF_RDY)?;
-        // `read_poll_timeout_atomic(..., delay_before_read = true)`: a 1 us
-        // wait after the write, before the first sample (efuse.c:126-128).
-        io.delay_us(READ_POLL_INTERVAL_US);
-        let value = poll32_value(
+        // `read_poll_timeout_atomic(..., delay_before_read = true)`
+        // (efuse.c:126-128): the 1 us wait before the first sample counts
+        // against the iteration budget.
+        let value = poll32_value_atomic(
             io,
             R_AX_EFUSE_CTRL,
             B_AX_EF_RDY,
             B_AX_EF_RDY,
             READ_POLL_INTERVAL_US,
             READ_POLL_TIMEOUT_US,
+            true,
         )?;
         *byte = value as u8;
     }
@@ -546,5 +547,50 @@ mod tests {
         phys[6..12].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0]);
         let log = logical_map(&phys).unwrap();
         assert_eq!(mac_address(&log), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0]);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
+
+    /// `read_poll_timeout_atomic(.., 1, 1000000, true)` (`efuse.c:126-128`):
+    /// the delay_before wait leaves left_ns = 999_999_000, cost 1001 per
+    /// failure, so the expired sample is k = 999_999_000 / 1001 + 1 = 999_001
+    /// and the poll makes 999_002 samples, where wall time with a 1 us read
+    /// ends near 500_000.
+    #[test]
+    fn efuse_ready_poll_spends_the_linux_iteration_budget() {
+        let mut m = RegisterModel::new();
+        m.read_cost_us = 1;
+        let err = poll32_value_atomic(
+            &mut m,
+            R_AX_EFUSE_CTRL,
+            B_AX_EF_RDY,
+            B_AX_EF_RDY,
+            READ_POLL_INTERVAL_US,
+            READ_POLL_TIMEOUT_US,
+            true,
+        );
+        assert!(err.is_err());
+        let reads = m
+            .trace
+            .iter()
+            .filter(|o| **o == Op::R32(R_AX_EFUSE_CTRL))
+            .count();
+        assert_eq!(reads, 999_002);
+        // dump_once itself must be the atomic caller: its first sample of a
+        // never-ready byte comes after exactly one 1 us wait.
+        let mut d = RegisterModel::new();
+        d.read_cost_us = 1;
+        let mut out = [0u8; 1];
+        assert!(dump_once(&mut d, 0, &mut out).is_err());
+        let polls = d
+            .trace
+            .iter()
+            .filter(|o| **o == Op::R32(R_AX_EFUSE_CTRL))
+            .count();
+        assert_eq!(polls, 999_002);
     }
 }

@@ -192,3 +192,93 @@ fn native_checks_bounds_alignment_and_quarantine() {
         "quarantined owner must be retained"
     );
 }
+
+/// Samples of `reg` in the model's trace.
+fn reads_of(m: &RegisterModel, reg: u32) -> usize {
+    m.trace.iter().filter(|o| **o == Op::R32(reg)).count()
+}
+
+#[test]
+fn atomic_poll_spends_linux_iteration_budget() {
+    // iopoll.h:85-118 with delay 1 us, timeout 1000 us: left_ns = 1_000_000
+    // and each failed sample costs 1000 + 1 ns, so left_ns first goes
+    // negative at iteration k = 1000 (1_000_000 - 1000 * 1001 = -1000, while
+    // k = 999 leaves 1_000_000 - 999 * 1001 = 1). Samples k = 0..=1000 are
+    // 1001, the last being the expired one.
+    let mut m = RegisterModel::new();
+    m.read_cost_us = 1;
+    let start = m.now_us().unwrap();
+    assert_eq!(
+        poll32_atomic(&mut m, 0x40, 1, 1, 1, 1000),
+        Err(AxError::Timeout {
+            register: 0x40,
+            mask: 1
+        })
+    );
+    assert_eq!(reads_of(&m, 0x40), 1001);
+    // Each iteration costs its 1 us delay plus the 1 us read.
+    assert!(m.now_us().unwrap() - start >= 2000);
+    // The wall-time poll over the same model expires after about 1000 us.
+    let mut w = RegisterModel::new();
+    w.read_cost_us = 1;
+    let wall_start = w.now_us().unwrap();
+    assert!(poll32(&mut w, 0x40, 1, 1, 1, 1000).is_err());
+    assert!(w.now_us().unwrap() - wall_start < 1100);
+    assert!(reads_of(&w, 0x40) < 600);
+}
+
+#[test]
+fn atomic_poll_zero_delay_counts_nanoseconds() {
+    // delay 0, timeout 5 us: left_ns = 5000 and each failed sample costs the
+    // 1 ns of `__left_ns--`, so left_ns is negative first at k = 5001 and
+    // samples k = 0..=5001 number 5002 (`timeout_us * 1000 + 2`).
+    let mut m = RegisterModel::new();
+    assert!(poll32_atomic(&mut m, 0x40, 1, 1, 0, 5).is_err());
+    assert_eq!(reads_of(&m, 0x40), 5002);
+    assert!(!m.trace.iter().any(|o| matches!(o, Op::Delay(_))));
+}
+
+#[test]
+fn atomic_poll_succeeds_on_final_sample_after_expiry() {
+    // Delay 1 us, timeout 3 us: left_ns = 3000, cost 1001 per failure, so
+    // the expired sample is k = 3 (3000 - 3 * 1001 = -3) and the poll makes
+    // 4 samples. The register turns ready on exactly that 4th sample.
+    let mut m = RegisterModel::new();
+    let mut reads = 0;
+    m.on_read(
+        0x30,
+        alloc::boxed::Box::new(move |_m: &mut RegisterModel| {
+            reads += 1;
+            if reads == 4 { 1 } else { 0 }
+        }),
+    );
+    assert_eq!(poll32_atomic(&mut m, 0x30, 1, 1, 1, 3), Ok(()));
+    assert_eq!(reads_of(&m, 0x30), 4);
+}
+
+#[test]
+fn atomic_poll_delay_before_counts_against_budget() {
+    // delay_before: one 1 us wait first, so left_ns = 3000 - 1000 = 2000 and
+    // the expired sample is k = 2 (2000 - 2 * 1001 = -2): 3 samples.
+    let mut m = RegisterModel::new();
+    assert!(poll32_value_atomic(&mut m, 0x40, 1, 1, 1, 3, true).is_err());
+    assert_eq!(m.trace[0], Op::Delay(1));
+    assert_eq!(reads_of(&m, 0x40), 3);
+}
+
+#[test]
+fn atomic_poll_keeps_all_ones_refusal_and_ignores_the_clock() {
+    let mut m = RegisterModel::new();
+    m.set32(0x50, 0xFFFF_FFFF);
+    assert_eq!(
+        poll32_atomic(&mut m, 0x50, 1, 0, 1, 500),
+        Err(AxError::AllOnes { register: 0x50 })
+    );
+    // No clock is read, so a stalled one cannot fail an atomic poll.
+    let mut s = RegisterModel::new();
+    s.freeze_clock = true;
+    assert!(matches!(
+        poll32_atomic(&mut s, 0x40, 1, 1, 1, 20),
+        Err(AxError::Timeout { .. })
+    ));
+}

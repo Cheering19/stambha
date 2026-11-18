@@ -503,3 +503,22 @@ fn programmed_rings_stay_mapped_after_drop() {
     // The device may still hold the ring addresses: quarantine, no unmap.
     assert_eq!(m.lock().unwrap().mappings.len(), MAPPINGS);
 }
+
+/// `read_poll_timeout_atomic(.., 1, RTW89_PCI_POLL_BDRAM_RST_CNT, false)`
+/// (`pci.c:54`): left_ns = 100_000, cost 1001 per failure, so the expired
+/// sample is k = 100_000 / 1001 + 1 = 100 and the poll makes 101 samples,
+/// where wall time with a 1 us read ends near 50.
+#[test]
+fn bdram_reset_poll_spends_the_linux_iteration_budget() {
+    let mut m = RegisterModel::new();
+    m.read_cost_us = 1;
+    m.set32(R_AX_HAXI_INIT_CFG1, B_AX_RST_BDRAM);
+    assert!(rst_bdram(&mut m).is_err());
+    let reads = m
+        .trace
+        .iter()
+        .filter(|o| **o == Op::R32(R_AX_HAXI_INIT_CFG1))
+        .count();
+    // One read for the set32, then the poll samples.
+    assert_eq!(reads, 1 + 101);
+}
