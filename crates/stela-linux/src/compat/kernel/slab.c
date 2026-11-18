@@ -82,6 +82,13 @@ static bool request_supported(gfp_t flags)
 	if (!IS_ENABLED(CONFIG_MEMCG))
 		allowed |= __GFP_ACCOUNT;
 	bool may_block = gfpflags_allow_blocking(flags);
+	/* A request that may not fail may wait: Linux's allocator retries it
+	 * until it is met. DRM's drm_modeset_lock_all asks so for its acquire
+	 * context on every amdgpu display hot-plug, and without it takes no lock
+	 * and restores the connector's state unlocked. One that may not wait
+	 * stays refused. */
+	if (may_block)
+		allowed |= __GFP_NOFAIL;
 	if ((flags & ~allowed) || (may_block && !stela_linux_blocking_allocation_allowed())) {
 		stela_linux_unsupported("kmalloc allocation policy or context");
 		return false;
@@ -108,6 +115,10 @@ static void *allocate(size_t size, gfp_t flags, size_t minimum_align)
 	u8 *base = gfpflags_allow_blocking(flags) ?
 		stela_linux_heap_alloc(align + size, align) :
 		stela_linux_heap_try_alloc(align + size, align);
+	/* The platform heap reclaims nothing, so retrying as Linux does would
+	 * never end: a request that may not fail and finds no memory stops. */
+	if (!base && (flags & __GFP_NOFAIL))
+		stela_linux_fatal("a kmalloc that may not fail found no memory");
 	if (!base)
 		return NULL;
 	struct header *header = (struct header *)(base + align) - 1;
@@ -306,7 +317,7 @@ static void policy_and_context(void)
 		GFP_KERNEL | __GFP_DMA, GFP_KERNEL | __GFP_DMA32,
 		GFP_KERNEL | __GFP_RECLAIMABLE, GFP_KERNEL | __GFP_MOVABLE,
 		GFP_KERNEL | __GFP_COMP, GFP_KERNEL | __GFP_MEMALLOC,
-		GFP_KERNEL | __GFP_NOFAIL,
+		GFP_ATOMIC | __GFP_NOFAIL, GFP_NOWAIT | __GFP_NOFAIL,
 		GFP_KERNEL | __GFP_THISNODE,
 		GFP_KERNEL | (__force gfp_t)(1U << 31),
 	};
@@ -349,7 +360,7 @@ static void policy_and_context(void)
 	const gfp_t admitted[] = {
 		GFP_KERNEL, GFP_KERNEL | __GFP_ZERO, GFP_KERNEL | __GFP_NOWARN,
 		GFP_KERNEL | __GFP_NOMEMALLOC, GFP_KERNEL | __GFP_NORETRY,
-		GFP_KERNEL_ACCOUNT,
+		GFP_KERNEL_ACCOUNT, GFP_KERNEL | __GFP_NOFAIL,
 	};
 	unsigned int before = refusals;
 	for (size_t i = 0; i < ARRAY_SIZE(admitted); i++) {
@@ -358,6 +369,13 @@ static void policy_and_context(void)
 		kfree(object);
 	}
 	assert(refusals == before && stela_linux_quiescent());
+}
+
+static void unmet_nofail(void)
+{
+	stela_linux_enter(&stela_linux_bare);
+	stela_test_allocations_begin(true);
+	(void)__kmalloc_noprof(96, GFP_KERNEL | __GFP_NOFAIL);
 }
 
 static void strict_refusal(void)
@@ -543,6 +561,8 @@ int main(void)
 	nonblocking_policy_and_context();
 	stela_linux_exit();
 	assert(stela_test_traps(strict_refusal));
+	/* A request that may not fail never returns NULL: unmet, it stops. */
+	assert(stela_test_traps(unmet_nofail));
 	assert(stela_test_traps(outside_owner));
 	printf("Linux kmalloc: actual alignment, zeroing, live isolation, bounds and explicit policy/context refusal\n");
 	return 0;
