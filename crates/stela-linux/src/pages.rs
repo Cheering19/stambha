@@ -888,12 +888,12 @@ impl<P: Provider> Drop for Catalog<P> {
 #[cfg(test)]
 mod tests;
 
-/// The ordinary pages Linux holds now and the limit on them, when its
-/// catalog has one (an integrated GPU's share): a snapshot from any
-/// processor, which may be a page or two behind.
-pub fn held_under_limit() -> Option<(usize, usize)> {
+/// The ordinary pages Linux holds now, and the limit on them when its
+/// catalog has one (an integrated GPU's share), else zero: a snapshot from
+/// any processor, which may be a page or two behind.
+pub fn held_and_limit() -> (usize, usize) {
     let (mut held, mut limit) = (0, 0);
     // SAFETY: two plain reads of the catalog's counts into locals.
     unsafe { stela_linux_page_catalog_use(&raw mut held, &raw mut limit) };
-    (limit != 0).then_some((held, limit))
+    (held, limit)
 }

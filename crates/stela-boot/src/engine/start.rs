@@ -284,7 +284,7 @@ fn start(handoff: u64) -> Started {
             layout::physical(0),
         )
     };
-    crate::native_memory::set_gpu_share(handoff.gpu_share);
+    crate::native_memory::set_gpu_share(handoff.gpu_share, handoff.heap.bytes);
     // SAFETY: original private reservation held in the shared physmap, before
     // any remapper or AP has started.
     if let Err(error) = unsafe { crate::native_memory::initialize_amd_tables(handoff.amd_tables) } {

@@ -54,26 +54,54 @@ pub unsafe fn initialize(cpu: usize, physical: u64, bytes: usize, table_offset: 
 /// with memory of its own (`Handoff::gpu_share`).
 static GPU_SHARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Records the integrated GPU's share of the heap the loader planned.
-/// With one, the Metal device budgets its allocations by what Linux holds
-/// of the share ([`share_state`]).
-pub(crate) fn set_gpu_share(bytes: u64) {
+/// The heap region's bytes, the share's among them.
+static HEAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records the integrated GPU's share of the heap the loader planned, and
+/// the heap region's bytes. The Metal device of an integrated GPU budgets
+/// its allocations by what Linux holds of the share ([`share_state`]); a
+/// discrete GPU's never is (`share::budget`).
+pub(crate) fn set_gpu_share(bytes: u64, heap: u64) {
     GPU_SHARE.store(bytes, core::sync::atomic::Ordering::Relaxed);
+    HEAP_BYTES.store(heap, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "nvk")]
-    if bytes != 0 {
-        stela_drivers::gpu::metal::device::share::set_probe(share_state);
-    }
+    stela_drivers::gpu::metal::device::share::set_probe(share_state);
 }
 
-/// What Linux holds of the integrated GPU's share now, and its size, from
-/// the page catalog's counts; none before the catalog has its limit.
+/// What Linux holds now of the memory an integrated GPU that draws works
+/// in, and that memory's size: the share, from the page catalog's limit. A
+/// plan without one gave the Metal device to a discrete GPU, which did not
+/// start, so the integrated GPU draws after all: it then works in what the
+/// heap holds past its own needs (`host_memory::HEAP_OWN`), said once.
 #[cfg(feature = "nvk")]
 fn share_state() -> Option<stela_drivers::gpu::metal::device::share::ShareState> {
-    let (held, limit) = stela_linux::pages::held_under_limit()?;
-    Some(stela_drivers::gpu::metal::device::share::ShareState {
-        held: held as u64 * PAGE as u64,
-        limit: limit as u64 * PAGE as u64,
-    })
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let (held, limit) = stela_linux::pages::held_and_limit();
+    let held = held as u64 * PAGE as u64;
+    if limit != 0 {
+        return Some(stela_drivers::gpu::metal::device::share::ShareState {
+            held,
+            limit: limit as u64 * PAGE as u64,
+        });
+    }
+    if GPU_SHARE.load(Ordering::Relaxed) != 0 {
+        // The catalog has not taken the share's limit yet.
+        return None;
+    }
+    let heap = HEAP_BYTES.load(Ordering::Relaxed);
+    let limit = heap.saturating_sub(stela_boot_core::host_memory::HEAP_OWN);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::output::arguments(format_args!(
+            "GPU MEMORY an integrated GPU draws without a share of its own, as the plan gave the \
+             Metal device to a discrete GPU that did not start: its allocations are held to the \
+             {}M the {}M heap holds past its own {}M\n",
+            limit >> 20,
+            heap >> 20,
+            stela_boot_core::host_memory::HEAP_OWN >> 20
+        ));
+    }
+    Some(stela_drivers::gpu::metal::device::share::ShareState { held, limit })
 }
 
 /// The ordinary pages Linux may hold at once: an integrated GPU's share of
