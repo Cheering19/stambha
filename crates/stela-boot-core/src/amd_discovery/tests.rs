@@ -1,5 +1,6 @@
 use super::*;
 use alloc::{vec, vec::Vec};
+use core::cell::RefCell;
 
 /// A version 1 binary whose one die lists `ips` (hw_id, major, minor,
 /// revision), each with one base address, in an IP discovery table of
@@ -127,4 +128,87 @@ fn the_table_is_found_where_amdgpu_looks() {
         place(registers(u32::MAX, [0; 3], true), |_| 0),
         Err(Error::NoAnswer)
     );
+}
+
+/// A GPU's register BAR as the read reaches it: its first page, the
+/// registers past it, and its VRAM behind the index window.
+struct Gpu {
+    page: RefCell<[u32; INDEX_PAGE_BYTES / 4]>,
+    far: [(usize, u32); 2],
+    vram: Vec<u8>,
+    vram_base: u64,
+}
+
+impl Registers for Gpu {
+    fn read(&self, offset: usize) -> u32 {
+        if offset < INDEX_PAGE_BYTES {
+            if offset == MM_DATA {
+                let page = self.page.borrow();
+                let position = u64::from(page[MM_INDEX_HI / 4]) << 31
+                    | u64::from(page[MM_INDEX / 4] & 0x7fff_ffff);
+                let at = position.wrapping_sub(self.vram_base) as usize;
+                return self.vram.get(at..at + 4).map_or(0, |word| {
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+                });
+            }
+            return self.page.borrow()[offset / 4];
+        }
+        self.far
+            .iter()
+            .find(|(at, _)| *at == offset)
+            .map_or(0, |&(_, value)| value)
+    }
+
+    fn write(&self, offset: usize, value: u32) -> bool {
+        assert!(offset < INDEX_PAGE_BYTES, "a write past the index page");
+        self.page.borrow_mut()[offset / 4] = value;
+        true
+    }
+}
+
+#[test]
+fn the_table_is_read_through_the_index_page_and_the_index_is_put_back() {
+    // Raphael (Ryzen 7000's graphics) with 512 MiB of VRAM and the table
+    // not at its usual place but where the scratch registers in the first
+    // page place it.
+    let table = binary(RAPHAEL, 3);
+    let mut page = [0u32; INDEX_PAGE_BYTES / 4];
+    page[MM_INDEX / 4] = 0x1234;
+    page[MM_INDEX_HI / 4] = 0x5;
+    page[DRIVER_SCRATCH_0 / 4] = 0x1000_0000;
+    page[DRIVER_SCRATCH_2 / 4] = table.len() as u32;
+    let gpu = Gpu {
+        page: RefCell::new(page),
+        far: [
+            (MP0_SMN_C2PMSG_33, FIRMWARE_READY),
+            (RCC_CONFIG_MEMSIZE, 512),
+        ],
+        vram: table.clone(),
+        vram_base: 0x1000_0000,
+    };
+    let ips = read(&gpu).unwrap();
+    assert_eq!(ips, parse(&table).unwrap());
+    assert_eq!(version(&ips, GC), Some((10, 3, 6)));
+    let page = gpu.page.borrow();
+    assert_eq!((page[MM_INDEX / 4], page[MM_INDEX_HI / 4]), (0x1234, 0x5));
+}
+
+#[test]
+fn a_refused_index_write_reads_no_table_and_says_why() {
+    struct Refusing;
+    impl Registers for Refusing {
+        fn read(&self, offset: usize) -> u32 {
+            match offset {
+                MP0_SMN_C2PMSG_33 => FIRMWARE_READY,
+                RCC_CONFIG_MEMSIZE => 512,
+                DRIVER_SCRATCH_2 => 0x100,
+                _ => 0,
+            }
+        }
+        fn write(&self, _: usize, _: u32) -> bool {
+            false
+        }
+    }
+    // Every dword reads all ones: no signature.
+    assert_eq!(read(&Refusing), Err(Error::Signature));
 }

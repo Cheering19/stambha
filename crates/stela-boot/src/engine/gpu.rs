@@ -69,7 +69,7 @@ use stela_drivers::gpu::metal::open::PcieLink;
 use stela_drivers::{
     bus::{
         irq::{Disposition, Handler, IrqError, IrqRegistration, Route, Source},
-        mmio::owned::{self, CacheAttribute, Mapping, Protection},
+        mmio::owned::{self, CacheAttribute, Mapping},
         pci::{
             Bar, ConfigError, ConfigFailure, ConfigSpace, Function,
             owned::{ConfigRetention, OwnedConfig},
@@ -1532,7 +1532,7 @@ fn claim(
             0,
             PAGE as usize,
             CacheAttribute::Uncached,
-            Protection::ReadOnly,
+            before.register_page,
         )
         .map_err(ServiceError::Mapping)?;
     let identified = (before.identify)(

@@ -77,6 +77,8 @@ pub enum Error {
     TableChecksum,
     Truncated,
     DieId,
+    /// No memory for the table's bytes.
+    Memory,
 }
 
 /// Where to read the table: the VRAM offset and length.
@@ -123,6 +125,52 @@ pub fn place(
         offset: (u64::from(vram_mib) << 20).saturating_sub(BELOW_TOP),
         bytes: TABLE_BYTES,
     })
+}
+
+/// The register BAR's first page: the index registers and the driver
+/// scratch registers lie in it.
+pub const INDEX_PAGE_BYTES: usize = 4096;
+
+/// The register BAR as the read before the reset reaches it. The read
+/// writes the index registers, so the page that holds them is the one
+/// mapping of it the read uses: a second mapping of a page already mapped
+/// is refused.
+pub trait Registers {
+    /// A dword of the register BAR; all ones when it does not answer.
+    fn read(&self, offset: usize) -> u32;
+    /// Writes a dword of the first page ([`INDEX_PAGE_BYTES`]); false when
+    /// the write was refused.
+    fn write(&self, offset: usize, value: u32) -> bool;
+}
+
+/// The IP blocks the table lists, read from VRAM through the `MM_INDEX`,
+/// `MM_INDEX_HI` and `MM_DATA` window one dword at a time, as
+/// `amdgpu_device_mm_access` reads it; the index registers hold their
+/// earlier values again after.
+pub fn read(registers: &impl Registers) -> Result<Vec<Ip>, Error> {
+    let index = (registers.read(MM_INDEX), registers.read(MM_INDEX_HI));
+    let vram = |position: u64| -> u32 {
+        let selected = registers.write(MM_INDEX, position as u32 | 0x8000_0000)
+            && registers.write(MM_INDEX_HI, (position >> 31) as u32);
+        if selected {
+            registers.read(MM_DATA)
+        } else {
+            u32::MAX
+        }
+    };
+    let result = place(|offset| registers.read(offset), vram).and_then(|place| {
+        let mut binary = Vec::new();
+        binary
+            .try_reserve_exact(place.bytes)
+            .map_err(|_| Error::Memory)?;
+        for at in (0..place.bytes as u64).step_by(4) {
+            binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
+        }
+        parse(&binary)
+    });
+    registers.write(MM_INDEX, index.0);
+    registers.write(MM_INDEX_HI, index.1);
+    result
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, Error> {

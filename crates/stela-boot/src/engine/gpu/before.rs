@@ -47,7 +47,8 @@ pub(super) struct Observed<'a> {
     pub(super) isa_bridges: &'a [stela_drivers::probe::IsaBridge],
     /// Its configuration, for reads only.
     pub(super) function: &'a mut Function<OwnedConfig>,
-    /// The first page of the stack's register BAR, mapped read-only.
+    /// The first page of the stack's register BAR, mapped as the stack's
+    /// part asks ([`Before::register_page`]).
     pub(super) registers: &'a Mapping,
     /// The stack's register BAR, for the reads a stack's part maps itself.
     pub(super) register_bar: &'a owned::Resource,
@@ -64,6 +65,10 @@ pub(super) struct Before {
     /// the stack's register BAR mapped read-only before the reset, and
     /// selects it.
     pub(super) identify: fn(Observed<'_>, Arc<Catalog>) -> Result<Identified, ServiceError>,
+    /// How the first page of the register BAR is mapped for `identify`:
+    /// read-write for a part that writes there (amdgpu's index registers),
+    /// as a page already mapped is not mapped a second time.
+    pub(super) register_page: Protection,
     /// Waits, after the reset, for what the driver's probe expects to find
     /// done. The register BAR is the resource.
     pub(super) settle:
@@ -109,6 +114,7 @@ static NOUVEAU: Before = Before {
             searched: Vec::new(),
         })
     },
+    register_page: Protection::ReadOnly,
     settle: |services, registers, identified| match identified
         .identity
         .and_then(gpu::nouveau_chip::Chip::from_boot0)
@@ -160,6 +166,8 @@ static AMDGPU: Before = Before {
             searched: Vec::new(),
         })
     },
+    // The IP discovery read writes the index registers in it.
+    register_page: Protection::ReadWrite,
     settle: |_, _, _| Ok(()),
 };
 
@@ -204,6 +212,7 @@ static XE: Before = Before {
             searched: chipset_bridges(&observed),
         })
     },
+    register_page: Protection::ReadOnly,
     settle: |_, _, _| Ok(()),
 };
 
@@ -332,7 +341,7 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
     use stela_loader::host_firmware::recipes::{self, DiscoveredIp};
     let address = observed.adapter.address;
     let device = observed.adapter.device;
-    let ips = match ip_discovery(observed.services, observed.register_bar) {
+    let ips = match ip_discovery(observed.services, observed.registers, observed.register_bar) {
         Ok(ips) => ips,
         Err(why) => {
             output::arguments(format_args!(
@@ -393,57 +402,42 @@ fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> 
 
 /// The IP blocks of the AMD GPU whose register BAR is `registers`, from
 /// its IP discovery table, read before the reset as amdgpu reads it at its
-/// probe ([`stela_boot_core::amd_discovery`]): through the `MM_INDEX` and
-/// `MM_DATA` registers, one dword at a time, whose index is put back after.
+/// probe ([`stela_boot_core::amd_discovery::read`]): through the `MM_INDEX`
+/// and `MM_DATA` registers of `page`, the BAR's first page mapped
+/// read-write, whose index is put back after.
 fn ip_discovery(
     services: &dyn NativeServices,
+    page: &Mapping,
     registers: &owned::Resource,
 ) -> Result<Vec<stela_boot_core::amd_discovery::Ip>, String> {
-    use stela_boot_core::amd_discovery::{self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI};
+    use stela_boot_core::amd_discovery::{self as discovery, INDEX_PAGE_BYTES};
     if (registers.physical_span().bytes() as usize) < discovery::REGISTER_BYTES {
         return Err(String::from(
             "its register BAR is smaller than amdgpu's discovery reads",
         ));
     }
-    let read = |offset| read_register(services, registers, offset).unwrap_or(u32::MAX);
-    let mut window = services
-        .authority()
-        .map_err(|error| format!("{error:?}"))?
-        .map(
-            registers.clone(),
-            0,
-            PAGE as usize,
-            CacheAttribute::Uncached,
-            Protection::ReadWrite,
-        )
-        .map_err(|error| format!("its index registers did not map ({error:?})"))?;
-    let index = (window.read32(MM_INDEX), window.read32(MM_INDEX_HI));
-    let vram = |position: u64| -> u32 {
-        let read = window
-            .write32(MM_INDEX, position as u32 | 0x8000_0000)
-            .and_then(|()| window.write32(MM_INDEX_HI, (position >> 31) as u32))
-            .and_then(|()| window.read32(MM_DATA));
-        read.unwrap_or(u32::MAX)
-    };
-    let result = discovery::place(read, &vram)
-        .map_err(|error| format!("{error:?}"))
-        .and_then(|place| {
-            let mut binary = Vec::new();
-            binary
-                .try_reserve_exact(place.bytes)
-                .map_err(|_| String::from("no memory for the table"))?;
-            for at in (0..place.bytes as u64).step_by(4) {
-                binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
-            }
-            discovery::parse(&binary).map_err(|error| format!("{error:?}"))
-        });
-    if let (Ok(low), Ok(high)) = index {
-        let _ = window.write32(MM_INDEX, low);
-        let _ = window.write32(MM_INDEX_HI, high);
+    struct Bar<'a> {
+        services: &'a dyn NativeServices,
+        page: &'a Mapping,
+        registers: &'a owned::Resource,
     }
-    // SAFETY: the accesses above were this scoped mapping's only use.
-    unsafe { window.retire() }.map_err(|error| format!("{error:?}"))?;
-    result
+    impl discovery::Registers for Bar<'_> {
+        fn read(&self, offset: usize) -> u32 {
+            if offset < INDEX_PAGE_BYTES {
+                return self.page.read32(offset).unwrap_or(u32::MAX);
+            }
+            read_register(self.services, self.registers, offset).unwrap_or(u32::MAX)
+        }
+        fn write(&self, offset: usize, value: u32) -> bool {
+            offset < INDEX_PAGE_BYTES && self.page.write32(offset, value).is_ok()
+        }
+    }
+    discovery::read(&Bar {
+        services,
+        page,
+        registers,
+    })
+    .map_err(|error| format!("{error:?}"))
 }
 
 /// The files xe and the display code ask for on the Intel GPU with PCI
