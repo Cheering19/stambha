@@ -1662,6 +1662,14 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         })
     }
 
+    /// What keeps the device from Metal3 or Apple7, for the boot log
+    /// ([`crate::metal::capabilities::Capabilities::family_shortfall`]);
+    /// `None` for a device in both, or while a call holds the service.
+    pub fn family_shortfall(&self) -> Option<alloc::string::String> {
+        self.try_turn()
+            .and_then(|mut turn| turn.device().capabilities().family_shortfall())
+    }
+
     /// Where retired command buffers' time went since the last call, unless
     /// a call holds the service now; it is then counted for the next.
     pub fn gpu_times(&self) -> Option<crate::metal::device::gpu_times::GpuTimes> {

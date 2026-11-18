@@ -1490,6 +1490,12 @@ fn open_gpu(
                 bound.name
             ));
             summarize(bound, &facts, shares_memory, Some(&*service));
+            if let Some(shortfall) = service.family_shortfall() {
+                output::arguments(format_args!(
+                    "GPU {}: {shortfall}; macOS runs on Apple GPUs of both families\n",
+                    bound.name
+                ));
+            }
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);
             service.set_look_budget(gpu.tsc_hz / 1_000_000 * LOOK_MICROS);
