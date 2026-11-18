@@ -733,5 +733,65 @@ mod tests {
             assert!(chosen.claimed.contains(&1));
             assert_eq!(unplanned(&planned, &addresses(&census), &chosen), [1]);
         }
+        // Intel's GPUs are told by their driver's table, i915's or xe's,
+        // whichever this image offers the GPU first: an Alder Lake iGPU is
+        // integrated and an Arc A770 (DG2) discrete, for the plan and the
+        // engine alike, whatever the loader passes on.
+        #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+        {
+            let intel = |bus: u8, device: u16| {
+                let adapter = at(bus, crate::Vendor::Intel, device);
+                let stack = GpuStack::select(&adapter).expect("an Intel stack takes it");
+                (adapter, stack)
+            };
+            let (alder_lake, igpu_stack) = intel(0, 0x46a6);
+            let (arc, arc_stack) = intel(3, 0x56a0);
+            assert_eq!(igpu_stack.kernel.table_integrated(&alder_lake), Some(true));
+            assert_eq!(arc_stack.kernel.table_integrated(&arc), Some(false));
+            for told in [None, Some(true), Some(false)] {
+                assert_eq!(driven(igpu_stack, &alder_lake, told).integrated, Some(true));
+                assert_eq!(driven(arc_stack, &arc, told).integrated, Some(false));
+            }
+            // A laptop whose panel is on the Intel iGPU and whose NVIDIA or
+            // AMD card draws: the iGPU shows the card's frames, and the plan
+            // reserves its display memory. The AMD card's kind is told by its
+            // IP discovery table.
+            for card in [(nvidia, &NVIDIA, None), (dgpu, &AMD, Some(false))] {
+                assert_eq!(
+                    alike(&[
+                        (alder_lake, igpu_stack, None, true),
+                        (card.0, card.1, card.2, false)
+                    ]),
+                    (
+                        Memory::Display,
+                        vec![Choice::Later { beside: 1 }, Choice::First]
+                    )
+                );
+            }
+            // The same with an Arc card beside the iGPU.
+            assert_eq!(
+                alike(&[
+                    (alder_lake, igpu_stack, None, true),
+                    (arc, arc_stack, None, false)
+                ]),
+                (
+                    Memory::Display,
+                    vec![Choice::Later { beside: 1 }, Choice::First]
+                )
+            );
+            // A monitor on the Arc card: the iGPU is left, nothing shared.
+            assert_eq!(
+                alike(&[
+                    (alder_lake, igpu_stack, None, false),
+                    (arc, arc_stack, None, true)
+                ]),
+                (Memory::Own, vec![Choice::Left { beside: 1 }, Choice::First])
+            );
+            // The iGPU alone draws in its share.
+            assert_eq!(
+                alike(&[(alder_lake, igpu_stack, None, true)]),
+                (Memory::Shared, vec![Choice::First])
+            );
+        }
     }
 }
