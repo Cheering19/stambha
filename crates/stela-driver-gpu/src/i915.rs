@@ -38,18 +38,18 @@ pub fn platform(device: u16) -> Option<Platform> {
         })
 }
 
-/// The first graphics version i915 leaves to xe: xe's table starts at Tiger
-/// Lake (Gen12), and the boot gives i915 none of what it needs there (GuC
-/// submission and its firmware).
-pub const XE_VERSION: u8 = 12;
-
 /// Whether i915 is handed the adapter: its table holds the device without a
-/// force-probe mark, below the versions that are xe's, and ANV opens the
-/// device ([`crate::anv::opens`]), which leaves Skylake to Ice Lake and
-/// their Atom lines (Gen9 to Gen11). Stela keeps Linux's default of no
-/// force probe (`CONFIG_DRM_I915_FORCE_PROBE`), so `i915_pci_probe` refuses
-/// a marked device. A GPU not handed over is not claimed, keeps the
-/// firmware's screen and is reported as any GPU without a driver is.
+/// force-probe mark and ANV opens the device ([`crate::anv::opens`]), which
+/// leaves Skylake to Meteor Lake, DG1 and DG2 (Gen9 to Gen12.71). These are
+/// the devices upstream Linux binds to i915 by default: xe's table marks
+/// Tiger Lake to Meteor Lake and DG2 for force probe, and holds none of the
+/// older ones. i915 registers before xe (`build/i915.rs`), so it binds them
+/// first and xe, which probes every device of its table here, binds one
+/// whose i915 probe fails. Stela keeps Linux's default of no force probe
+/// for i915 (`CONFIG_DRM_I915_FORCE_PROBE`), so `i915_pci_probe` refuses a
+/// marked device (the Data Center GPU Flex), which xe then binds. A GPU not
+/// handed over is not claimed, keeps the firmware's screen and is reported
+/// as any GPU without a driver is.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     handed(adapter.device)
         .map(|_| ())
@@ -58,9 +58,7 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
 
 /// What i915's table says of `device`, if i915 is handed it ([`admits`]).
 pub fn handed(device: u16) -> Option<Platform> {
-    platform(device).filter(|platform| {
-        !platform.forced && platform.version < XE_VERSION && crate::anv::opens(device)
-    })
+    platform(device).filter(|platform| !platform.forced && crate::anv::opens(device))
 }
 
 /// The DMA mask i915 sets on the adapter. One outside its table is never
@@ -240,53 +238,79 @@ mod tests {
         assert_eq!(platform(0xe20b), None);
     }
 
-    /// The devices i915 is handed are exactly those the loader pins a
-    /// display program for, each under its platform's name in i915's table,
-    /// and exactly the Gen9 to Gen11 devices of i915's table ANV opens.
+    /// The devices i915 is handed are exactly the devices of its table ANV
+    /// opens that upstream binds to i915 by default, each with its files
+    /// pinned: the older platforms' display program under i915's name, and
+    /// from Tiger Lake on the files of xe's platform, which serve both
+    /// drivers as xe is i915's fallback there.
     #[test]
     fn i915_is_handed_the_devices_anv_opens_and_each_has_its_firmware_recipe() {
-        use stela_loader::host_firmware::recipes::{i915_platform, require_i915};
+        use stela_loader::host_firmware::recipes::{i915_platform, require_i915, require_xe};
         let mut handed = 0;
+        let mut gen12 = 0;
         for &(device, _, forced, version, name, _) in DEVICES {
             let admitted = admits(&adapter(device));
             let mut inventory = stela_loader::host_firmware::requirements::Inventory::default();
-            let recipe = require_i915(&mut inventory, device);
-            assert_eq!(recipe.is_ok(), admitted.is_ok(), "{device:04x} {name}");
-            // xe's table holds every device from Gen12 on.
+            let older = require_i915(&mut inventory, device).is_ok();
+            let shared = require_xe(&mut inventory, device).is_ok();
+            // No device has both kinds of files; the older platforms' are
+            // exactly those i915 alone is handed.
+            assert!(!(older && shared), "{device:04x} {name}");
+            assert_eq!(
+                older,
+                admitted.is_ok() && version < 12,
+                "{device:04x} {name}"
+            );
+            if admitted.is_ok() {
+                assert!(older || shared, "{device:04x} {name}");
+            }
+            // xe's table holds exactly the devices from Gen12 on.
             #[cfg(feature = "xe-port")]
             assert_eq!(
                 crate::xe::DEVICES.iter().any(|entry| entry.0 == device),
-                version >= XE_VERSION,
+                version >= 12,
                 "{device:04x} {name}"
             );
             let Ok(()) = admitted else {
                 continue;
             };
             handed += 1;
-            assert!(!forced && (9..=11).contains(&version), "{device:04x}");
+            assert!(!forced && (9..=12).contains(&version), "{device:04x}");
             // Mesa's version of the device is i915's.
             assert_eq!(crate::anv::version(device), Some(version), "{device:04x}");
-            assert_eq!(i915_platform(device).unwrap().0, name, "{device:04x}");
+            if older {
+                assert!(version < 12, "{device:04x}");
+                assert_eq!(i915_platform(device).unwrap().0, name, "{device:04x}");
+            } else {
+                gen12 += 1;
+            }
         }
         // Skylake, Broxton, Gemini Lake, Kaby Lake, Coffee Lake, Comet Lake,
-        // Ice Lake, Elkhart Lake and Jasper Lake.
-        assert_eq!(handed, 118);
+        // Ice Lake, Elkhart Lake and Jasper Lake; then Tiger Lake, Rocket
+        // Lake, Alder Lake S, P and N, Raptor Lake S, P and U, DG1, DG2,
+        // Meteor Lake and Arrow Lake.
+        assert_eq!((handed - gen12, gen12), (118, 105));
         for device in [
-            0x1916, 0x5a85, 0x3185, 0x5916, 0x3e92, 0x9bc5, 0x8a52, 0x4571, 0x4e71,
+            0x1916, 0x5a85, 0x3185, 0x5916, 0x3e92, 0x9bc5, 0x8a52, 0x4571, 0x4e71, 0x9a49, 0x4c8a,
+            0x4680, 0x46a6, 0x46d1, 0xa7a0, 0x4905, 0x56a0, 0x7d55, 0x7d67,
         ] {
             assert_eq!(admits(&adapter(device)), Ok(()), "{device:04x}");
         }
         // Not handed over, as ANV opens none of them: Broadwell and Cherry Trail
         // (Gen8), Haswell, Bay Trail, Ivy Bridge, Sandy Bridge, Ironlake,
-        // GM45, i915G and i830, and the one Ice Lake ID Mesa leaves out.
+        // GM45, i915G and i830, and the IDs of Ice Lake and Rocket Lake Mesa
+        // leaves out.
         for device in [
             0x1616, 0x22b0, 0x0416, 0x0f31, 0x0166, 0x0126, 0x0046, 0x2a42, 0x2582, 0x3577, 0x8a70,
+            0x4c80,
         ] {
             assert!(admits(&adapter(device)).is_err(), "{device:04x}");
             assert!(!crate::anv::opens(device), "{device:04x}");
         }
-        // Gen12 on is xe's.
-        for device in [0x9a49, 0x56a0, 0x7d55] {
+        // Not i915's: the Data Center GPU Flex, which it binds only by force
+        // probe, and Lunar Lake, Battlemage and Panther Lake, which its table
+        // does not hold.
+        for device in [0x56c0, 0x64a0, 0xe20b, 0xb080] {
             assert!(admits(&adapter(device)).is_err(), "{device:04x}");
         }
     }

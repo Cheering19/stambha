@@ -106,14 +106,16 @@ const OPEN: super::image::Open = &[
     ),
 ];
 
-/// The unit of xe's own `module_init`.
+/// The unit of xe's own `module_init`. It registers after i915's (33), so
+/// xe binds a device both tables hold only when i915's probe fails.
+/// Ordinal 37 is xe's display parameters' ([`DISPLAY_PARAMETERS`]).
 const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "xe",
-        group_ordinal: 33,
+        group_ordinal: 36,
         unit_ordinal: 1,
-        global_ordinal: 33,
+        global_ordinal: 36,
     },
     source: "drivers/gpu/drm/xe/xe_module",
     module: MODULE.name,
@@ -130,9 +132,9 @@ const DISPLAY_PARAMETERS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "xe",
-        group_ordinal: 33,
+        group_ordinal: 36,
         unit_ordinal: 2,
-        global_ordinal: 34,
+        global_ordinal: 37,
     },
     source: "drivers/gpu/drm/i915/display/intel_display_params",
     module: MODULE.name,

@@ -123,18 +123,13 @@ mod tests {
     #[test]
     fn every_device_i915_is_handed_has_a_method_read_here() {
         for &(device, ..) in crate::i915::DEVICES {
-            let adapter = crate::Adapter {
-                address: crate::bus::pci::Address {
-                    segment: 0,
-                    bus: 0,
-                    device: 2,
-                    function: 0,
-                },
-                vendor: crate::Vendor::Intel,
-                device,
-                class: [3, 0, 0],
+            // A discrete GPU's stolen memory is in its own memory, and from
+            // Meteor Lake on an integrated one's is behind BAR 2: i915 finds
+            // both itself.
+            let own = |platform: &crate::i915::Platform| {
+                platform.discrete || platform.name == "METEORLAKE"
             };
-            if crate::i915::admits(&adapter).is_ok() {
+            if crate::i915::handed(device).is_some_and(|platform| !own(&platform)) {
                 assert!(
                     matches!(method(device), Some("gen9" | "gen11")),
                     "{device:04x}"

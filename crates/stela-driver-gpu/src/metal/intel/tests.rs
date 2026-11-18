@@ -136,9 +136,16 @@ fn the_gpus_i915_is_handed_are_admitted_with_i915s_platform_name() {
             .architecture,
         "SKYLAKE"
     );
-    // Broadwell, which no driver is handed, Tiger Lake, which is xe's, and
-    // an ID of no table are no devices of i915's here.
-    for device in [0x1616, 0x9a49, 0x0001] {
+    // Tiger Lake, which i915 is offered first.
+    assert_eq!(
+        admit_i915_device(&tiger_lake(), 0x9a49, attachment(false))
+            .unwrap()
+            .architecture,
+        "TIGERLAKE"
+    );
+    // Broadwell, which no driver is handed, and an ID of no table are no
+    // devices of i915's here.
+    for device in [0x1616, 0x0001] {
         let mut other = tiger_lake();
         other.device_id = device;
         assert_eq!(

@@ -214,8 +214,10 @@ fn main() {
             #[cfg(feature = "amdgpu-port")]
             amdgpu::port(&linux),
         ];
-        // i915 comes last: it keeps the display code it shares with xe apart
-        // from the archives built before it.
+        // i915 is built last: it keeps the display code it shares with xe
+        // apart from the archives built before it. It registers first of the
+        // Intel drivers all the same: the image orders drivers by their
+        // global ordinal (`build/image.rs`).
         #[cfg(feature = "i915-port")]
         {
             let others = drivers

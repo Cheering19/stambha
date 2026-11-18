@@ -1652,6 +1652,10 @@ pub(super) struct Claimed {
     later: bool,
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
     stack: &'static GpuStack,
+    /// The kernel drivers Linux offers it to, in registration order: its
+    /// stack's, then any later one of the vendor whose table holds it (xe
+    /// after i915), each of which binds it when those before it did not.
+    offered: Vec<&'static str>,
     /// Whether it is integrated as its kernel driver's table says before the
     /// probe ([`stela_drivers::gpu::stack::Kernel::table_integrated`]).
     #[cfg(feature = "nvk")]
@@ -2031,6 +2035,7 @@ fn claim(
         market: adapter.name(),
         later: false,
         stack,
+        offered: offered(stack, adapter),
         #[cfg(feature = "nvk")]
         integrated: stack.kernel.table_integrated(adapter),
         #[cfg(feature = "nvk")]
@@ -2531,9 +2536,13 @@ struct Setup {
 
 impl Setup {
     fn of(claimed: &[Claimed]) -> Self {
+        // A part may need several words (the Intel part one set for each
+        // driver that may bind the GPU); each is checked on its own.
         let mut words: Vec<String> = claimed
             .iter()
-            .filter_map(|claimed| claimed.parameters.clone())
+            .filter_map(|claimed| claimed.parameters.as_deref())
+            .flat_map(str::split_whitespace)
+            .map(String::from)
             .collect();
         words.extend(gpu_page_parameter(
             crate::native_memory::gpu_share() / 4096,
@@ -2729,10 +2738,21 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
             Ok(attached) => {
                 // SAFETY: entered.
                 if unsafe { attached.bound() } {
-                    output::arguments(format_args!(
-                        "GPU {}: {} bound it\n",
-                        claimed.name, claimed.stack.kernel.driver
-                    ));
+                    // SAFETY: entered.
+                    let driver = unsafe { attached.driver() }.and_then(|name| name.to_str().ok());
+                    let stack = bound_stack(claimed.stack, driver);
+                    if core::ptr::eq(stack, claimed.stack) {
+                        output::arguments(format_args!(
+                            "GPU {}: {} bound it\n",
+                            claimed.name, stack.kernel.driver
+                        ));
+                    } else {
+                        output::arguments(format_args!(
+                            "GPU {}: {} did not bind it, so {} did, the next registered \
+                             driver whose table holds it; Linux's lines above say why\n",
+                            claimed.name, claimed.stack.kernel.driver, stack.kernel.driver
+                        ));
+                    }
                     // Its driver drives what the screen on it shows.
                     claimed.screen.end(None);
                     #[cfg(feature = "nvk")]
@@ -2740,7 +2760,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                         name: claimed.name,
                         market: claimed.market,
                         shows_screen: claimed.shows_screen,
-                        stack: claimed.stack,
+                        stack,
                         integrated: claimed.integrated,
                         drm: claimed.drm,
                         link: claimed.link,
@@ -2750,9 +2770,9 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                     use stela_boot_core::gpu_status::Picture;
                     let picture = claimed.screen.after_failed_probe(claimed.shows_screen);
                     output::arguments(format_args!(
-                        "GPU {}: {} did not bind it; Linux's lines above say why.{}\n",
+                        "GPU {}: {}; Linux's lines above say why.{}\n",
                         claimed.name,
-                        claimed.stack.kernel.driver,
+                        not_bound(&claimed.offered),
                         match picture {
                             Picture::Elsewhere | Picture::Held => "",
                             Picture::Kept =>
@@ -2786,6 +2806,41 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
         }
     }
     job
+}
+
+/// The kernel drivers Linux offers `adapter` to, `stack`'s first, then the
+/// later stacks' of its vendor whose drivers hold it.
+fn offered(stack: &'static GpuStack, adapter: &gpu::Adapter) -> Vec<&'static str> {
+    let mut names = alloc::vec![stack.kernel.driver];
+    names.extend(
+        gpu::stack::STACKS
+            .iter()
+            .skip_while(|other| !core::ptr::eq(**other, stack))
+            .skip(1)
+            .filter(|other| other.vendor == stack.vendor && (other.kernel.admits)(adapter).is_ok())
+            .map(|other| other.kernel.driver),
+    );
+    names
+}
+
+/// That none of the drivers `offered` bound a GPU, as a line says it.
+fn not_bound(offered: &[&str]) -> String {
+    match offered {
+        [] => String::from("no driver bound it"),
+        [driver] => format!("{driver} did not bind it"),
+        [first, rest @ ..] => format!("neither {first} nor {} bound it", rest.join(" nor ")),
+    }
+}
+
+/// The stack of the driver Linux bound a claimed GPU to, named `driver`:
+/// the claimed stack's, or the one of the same vendor whose driver bound it
+/// after the claimed driver's probe failed (xe after i915). A name no stack
+/// of the vendor has keeps the claimed stack.
+fn bound_stack(claimed: &'static GpuStack, driver: Option<&str>) -> &'static GpuStack {
+    driver
+        .filter(|driver| *driver != claimed.kernel.driver)
+        .and_then(|driver| GpuStack::bound(claimed.vendor, driver))
+        .unwrap_or(claimed)
 }
 
 /// The running environment.

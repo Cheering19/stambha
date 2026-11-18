@@ -1,5 +1,5 @@
-//! The Intel stacks' parts of the claim: xe's, i915's and the display
-//! code's needs of the boot, in an image built with the Intel port.
+//! The Intel stacks' part of the claim: xe's, i915's and the display code's
+//! needs of the boot, in an image built with the Intel port.
 use super::{Before, Identified, Observed, Searched, on_usb, select_firmware};
 use crate::output;
 use alloc::{format, vec::Vec};
@@ -13,14 +13,20 @@ use stela_drivers::{
 };
 use stela_loader::host_firmware::requirements::Inventory;
 
-/// xe: the platform is the PCI device ID's, as in xe's own table, and its
-/// GuC, HuC, GSC and DMC files are that platform's. Nothing of the GPU's
-/// boots by itself after a reset: xe loads all of it. The display code's
-/// Video BIOS Table is the one file the PC itself holds.
-pub(super) static XE: Before = Before {
+/// The Intel GPUs' part, for both drivers: i915 is offered a device first
+/// where it is handed it (Skylake to Meteor Lake, DG1, DG2), as upstream
+/// Linux binds those to i915 by default, and xe binds the device when
+/// i915's probe fails; xe alone drives Lunar Lake, Battlemage and later. So
+/// the claim prepares the device for each driver that may bind it: the
+/// files of the platform, which serve both (`require_xe`), or i915's
+/// display program on the older platforms; the PC's Video BIOS Table under
+/// each driver's parameter; the stolen memory and the host bridge i915's
+/// probe reads; and the HuC and GSC turned off. Nothing of the GPU's boots
+/// by itself after a reset: the driver loads all of it.
+pub(super) static INTEL: Before = Before {
     admits: |adapter, catalog| {
         on_usb(
-            &xe_files(adapter.device)?,
+            &files(adapter.device)?,
             &format!("{:04x}", adapter.device),
             catalog,
         )
@@ -28,20 +34,33 @@ pub(super) static XE: Before = Before {
     identify: |mut observed, catalog| {
         use stela_loader::host_firmware::recipes;
         let adapter = observed.adapter;
+        let address = adapter.address;
         // Register 0 identifies nothing here; the read proves the window.
         observed
             .registers
             .read32(0)
             .map_err(ServiceError::Mapping)?;
-        if gpu::xe::force_probed(adapter.device) {
-            output::arguments(format_args!(
-                "GPU {}: xe binds {} only by Linux's force probe, which Stela sets for every \
-                 device of xe's table: upstream Linux calls xe experimental on it\n",
-                adapter.address,
-                recipes::intel_gpu_platform(adapter.device).unwrap_or("this platform"),
-            ));
+        let drivers = Drivers::of(adapter);
+        // The name people know the platform by, or i915's for the older
+        // platforms.
+        let chip = recipes::intel_gpu_platform(adapter.device)
+            .or(drivers.i915.map(|platform| platform.name));
+        let platform = chip.unwrap_or("this platform");
+        match (drivers.i915.is_some(), drivers.xe) {
+            (true, true) => output::arguments(format_args!(
+                "GPU {address}: i915 is offered {platform} first, as upstream Linux binds it to \
+                 i915; xe binds it if i915's probe fails\n"
+            )),
+            (false, true) if gpu::xe::force_probed(adapter.device) => {
+                output::arguments(format_args!(
+                    "GPU {address}: xe binds {platform} only by Linux's force probe, which \
+                     Stela sets for every device of xe's table: upstream Linux calls xe \
+                     experimental on it\n"
+                ))
+            }
+            _ => {}
         }
-        let inventory = xe_files(adapter.device)?;
+        let inventory = files(adapter.device)?;
         let target = inventory
             .requests()
             .first()
@@ -52,68 +71,24 @@ pub(super) static XE: Before = Before {
             .target;
         let table = video_bios_table(&mut observed, target);
         let name = format!("{:04x}", adapter.device);
-        // Tiger Lake to Raptor Lake take it as i915 does (patch 0222); the
-        // others find theirs through BAR 2.
-        let stolen = gpu::xe::stolen_from_early_quirks(adapter.device)
-            .then(|| graphics_stolen(&mut observed, "xe"))
-            .flatten();
+        let names = drivers.names();
+        // Both take it from Linux's early quirks where those name a method:
+        // integrated graphics before Meteor Lake (xe through patch 0230).
+        // Meteor Lake and later and the discrete GPUs find theirs through
+        // BAR 2 themselves.
+        let stolen = (gpu::intel_stolen::method(adapter.device).is_some()
+            && (drivers.i915.is_some() || gpu::xe::stolen_from_early_quirks(adapter.device)))
+        .then(|| graphics_stolen(&mut observed, names))
+        .flatten();
+        let mut searched = chipset_bridges(&observed, names);
+        if drivers.i915.is_some() {
+            searched.extend(host_bridge(&observed));
+        }
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
             identity: None,
-            chip: recipes::intel_gpu_platform(adapter.device),
-            // The display code asks the firmware service for the table this
-            // parameter names before it looks anywhere else (`intel_bios.c`).
-            parameters: table.map(|_| gpu::command_line::video_bios_table(VBT)),
-            searched: chipset_bridges(&observed, "xe"),
-            stolen,
-        })
-    },
-    register_page: Protection::ReadOnly,
-    settle: |_, _, _| Ok(()),
-};
-
-/// i915: the platform is the PCI device ID's, as in i915's own table, and
-/// its file is that platform's display microcontroller program, which i915
-/// starts without. Its probe reads the host bridge (`i915_gmch.c`) and the
-/// stolen memory Linux's x86 early quirks find; the display code takes the
-/// PC's Video BIOS Table as xe's does.
-pub(super) static I915: Before = Before {
-    admits: |adapter, catalog| {
-        on_usb(
-            &i915_files(adapter.device)?,
-            &format!("{:04x}", adapter.device),
-            catalog,
-        )
-    },
-    identify: |mut observed, catalog| {
-        let adapter = observed.adapter;
-        // Register 0 identifies nothing here; the read proves the window.
-        observed
-            .registers
-            .read32(0)
-            .map_err(ServiceError::Mapping)?;
-        let platform = gpu::i915::handed(adapter.device)
-            .ok_or(ServiceError::Refused("i915 is not handed the GPU"))?;
-        let inventory = i915_files(adapter.device)?;
-        let target = inventory
-            .requests()
-            .first()
-            .ok_or(ServiceError::Refused(
-                "the GPU has no pinned firmware recipe",
-            ))?
-            .view()
-            .target;
-        let table = video_bios_table(&mut observed, target);
-        let name = format!("{:04x}", adapter.device);
-        let mut searched = chipset_bridges(&observed, "i915");
-        searched.extend(host_bridge(&observed));
-        let stolen = graphics_stolen(&mut observed, "i915");
-        Ok(Identified {
-            firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
-            identity: None,
-            chip: Some(platform.name),
-            // As xe's (`intel_bios.c`).
-            parameters: table.map(|_| format!("i915.vbt_firmware={VBT}")),
+            chip,
+            parameters: Some(drivers.parameters(adapter.device, table.is_some(), address)),
             searched,
             stolen,
         })
@@ -121,6 +96,89 @@ pub(super) static I915: Before = Before {
     register_page: Protection::ReadOnly,
     settle: |_, _, _| Ok(()),
 };
+
+/// The Intel drivers that may bind a device, in the order Linux offers it
+/// to them.
+struct Drivers {
+    /// What i915's table says of it, when i915 is handed it.
+    i915: Option<gpu::i915::Platform>,
+    /// Whether xe is handed it.
+    xe: bool,
+}
+
+impl Drivers {
+    fn of(adapter: &gpu::Adapter) -> Self {
+        Self {
+            i915: gpu::i915::handed(adapter.device),
+            xe: gpu::xe::admits(adapter).is_ok(),
+        }
+    }
+
+    /// The drivers' names, as the log lines give them.
+    fn names(&self) -> &'static str {
+        match (self.i915.is_some(), self.xe) {
+            (true, true) => "i915 or xe",
+            (true, false) => "i915",
+            _ => "xe",
+        }
+    }
+
+    /// The words of Linux's command line each driver that may bind `device`
+    /// needs: the file it finds the PC's Video BIOS Table under, when the
+    /// OpRegion holds one (the display code asks the firmware service for it
+    /// before it looks anywhere else, `intel_bios.c`), and, on a platform of
+    /// xe's table, an empty path for the HuC and GSC images, which turns
+    /// those controllers off. Stela runs no media engine and no content
+    /// protection, so neither image is on the USB; an empty path makes xe
+    /// and i915 mark each disabled at a debug level and start without it:
+    /// no fetch, no HuC authentication and no GSC proxy to wait for. The GuC
+    /// loads without the GSC on every platform, Meteor Lake and later
+    /// included. The older platforms' i915 loads neither (its default
+    /// `enable_guc` is 0 there). One line for each controller a driver would
+    /// load there.
+    fn parameters(
+        &self,
+        device: u16,
+        table: bool,
+        address: impl core::fmt::Display,
+    ) -> alloc::string::String {
+        let controllers = gpu::xe::firmware(device);
+        let mut words = Vec::new();
+        let drivers = [
+            self.i915.is_some().then_some("i915"),
+            self.xe.then_some("xe"),
+        ];
+        for driver in drivers.into_iter().flatten() {
+            if table {
+                words.push(format!("{driver}.vbt_firmware={VBT}"));
+            }
+            if controllers.is_some() {
+                words.push(format!("{driver}.huc_firmware_path="));
+                words.push(format!("{driver}.gsc_firmware_path="));
+            }
+        }
+        // i915 loads a HuC on every platform of xe's table it is handed but
+        // Tiger and Rocket Lake, DG2's (through its GSC) among them, which
+        // xe's table names none for.
+        let i915 = self.i915.is_some();
+        let left_out = controllers.into_iter().flat_map(|files| {
+            [
+                (files.huc.is_some() || i915)
+                    .then_some("media controller (HuC): Stela runs no video engine"),
+                files
+                    .gsc
+                    .map(|_| "security controller (GSC): Stela runs no content protection"),
+            ]
+        });
+        for engine in left_out.flatten() {
+            output::arguments(format_args!(
+                "GPU {address}: {} leaves out its {engine}\n",
+                self.names()
+            ));
+        }
+        words.join(" ")
+    }
+}
 
 /// The functions of the host bridge's device, with the configuration the
 /// scan read, which i915 reads through `pci_get_domain_bus_and_slot(0, 0,
@@ -295,20 +353,15 @@ fn video_bios_table(
     image
 }
 
-/// The files xe and the display code ask for on the Intel GPU with PCI
-/// device ID `device`.
-fn xe_files(device: u16) -> Result<Inventory, ServiceError> {
+/// The files the driver that binds the Intel GPU with PCI device ID
+/// `device` and the display code ask for: the platform's files, which serve
+/// i915 and xe alike, on a device of xe's table, and i915's display program
+/// on the older platforms only i915 drives.
+fn files(device: u16) -> Result<Inventory, ServiceError> {
+    use stela_loader::host_firmware::recipes;
     let mut inventory = Inventory::default();
-    stela_loader::host_firmware::recipes::require_xe(&mut inventory, device)
-        .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
-    Ok(inventory)
-}
-
-/// The file i915's display code asks for on the Intel GPU with PCI device
-/// ID `device`.
-fn i915_files(device: u16) -> Result<Inventory, ServiceError> {
-    let mut inventory = Inventory::default();
-    stela_loader::host_firmware::recipes::require_i915(&mut inventory, device)
-        .map_err(|_| ServiceError::Refused("the GPU has no pinned i915 firmware recipe"))?;
+    recipes::require_xe(&mut inventory, device)
+        .or_else(|_| recipes::require_i915(&mut inventory, device))
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned Intel firmware recipe"))?;
     Ok(inventory)
 }

@@ -5,9 +5,10 @@ const BASE: (usize, usize) = (88, 185_584_904);
 /// What each port adds to the bundle, as files and bytes, and how many of
 /// its recipes hold another's bytes. amdgpu: 349 files, 60.6 MiB; `mec2`
 /// and `mec` of most families and a revision's files that did not change
-/// are one file. xe: 29 files, 10.0 MiB. i915: 5 files, 59.5 KiB.
+/// are one file. xe: 20 files, 3.2 MiB (GuC and display programs; no HuC
+/// or GSC). i915: 5 files, 59.5 KiB.
 const AMD: (usize, usize, usize) = (349, 63_515_756, 62);
-const INTEL: (usize, usize, usize) = (29, 10_480_332, 0);
+const INTEL: (usize, usize, usize) = (20, 3_381_836, 0);
 const I915: (usize, usize, usize) = (5, 60_900, 0);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
@@ -287,8 +288,8 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     }
     #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     {
-        // With the Intel ports. A Tiger Lake GPU (xe's table): its GuC, HuC and
-        // DMC. An Ice Lake GPU, which i915 drives: its display program. A
+        // With the Intel ports. A Tiger Lake GPU (xe's table): its GuC and DMC,
+        // and no HuC. An Ice Lake GPU, which i915 drives: its display program. A
         // Broadwell GPU, which no driver here drives, selects nothing and is not
         // named as lacking files: no driver here would read them.
         let intel = [
@@ -302,7 +303,6 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
             "i915/icl_dmc_ver1_09.bin",
             "i915/tgl_dmc_ver2_12.bin",
             "i915/tgl_guc_70.bin",
-            "i915/tgl_huc.bin",
         ]);
         expected.sort_unstable();
         assert_eq!(members(&both), expected);

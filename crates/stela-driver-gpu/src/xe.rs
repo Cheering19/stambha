@@ -364,15 +364,21 @@ mod tests {
     }
 
     #[test]
-    fn every_file_xe_and_its_display_name_has_a_pinned_recipe() {
+    fn every_guc_and_display_program_xe_names_has_a_pinned_recipe() {
         use stela_loader::host_firmware::recipes;
         let pinned: alloc::collections::BTreeSet<&str> = recipes::XE
             .iter()
             .map(|recipe| recipe.image.member)
             .collect();
         for (platform, files) in FIRMWARE {
-            for file in files.iter().flatten() {
+            // The GuC is pinned; the HuC and GSC images are left out, as
+            // the boot turns both controllers off (`xe.huc_firmware_path=`,
+            // `xe.gsc_firmware_path=`).
+            if let Some(file) = files[0] {
                 assert!(pinned.contains(file), "{platform}: {file} has no recipe");
+            }
+            for file in files[1..].iter().flatten() {
+                assert!(!pinned.contains(file), "{platform}: {file} is pinned");
             }
         }
         // Display version 35's program is asked for only by Nova Lake, which
@@ -440,11 +446,11 @@ mod tests {
             let (programs, images): (alloc::vec::Vec<&str>, alloc::vec::Vec<&str>) = names
                 .iter()
                 .partition(|name| DISPLAY_FIRMWARE.contains(name));
-            let expected: alloc::vec::Vec<&str> = [files.guc, files.huc, files.gsc]
-                .into_iter()
-                .flatten()
-                .collect();
-            assert_eq!(images, expected, "{device:04x} ({name})");
+            // xe's GuC first; Alder Lake N also holds the GuC i915 names
+            // for it, Alder Lake P's, as i915 binds it first.
+            assert_eq!(images.first(), files.guc.as_ref(), "{device:04x} ({name})");
+            let i915_guc = usize::from(*name == "ALDERLAKE_N");
+            assert_eq!(images.len(), 1 + i915_guc, "{device:04x} ({name})");
             // One display program where the platform has a display engine.
             assert_eq!(
                 programs.len(),

@@ -93,14 +93,18 @@ const OPEN: super::image::Open = &[
     ("platform devices", &["platform_device_register_full"]),
 ];
 
-/// The unit of i915's own `module_init`.
+/// The unit of i915's own `module_init`. It registers before xe's (36), so
+/// Linux offers i915 a device both tables hold first, as upstream binds
+/// Tiger Lake to Meteor Lake, DG1 and DG2 to i915 by default, and xe gets
+/// the device when i915's probe fails. Ordinals 34 and 35 are left for
+/// i915's parameter units.
 const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "i915",
-        group_ordinal: 36,
+        group_ordinal: 33,
         unit_ordinal: 1,
-        global_ordinal: 36,
+        global_ordinal: 33,
     },
     source: "drivers/gpu/drm/i915/i915_module",
     module: MODULE.name,

@@ -99,10 +99,9 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
         "nouveau" => Some(&NOUVEAU),
         #[cfg(feature = "amdgpu")]
         "amdgpu" => Some(&AMDGPU),
+        // One part for both: either driver may bind the device.
         #[cfg(feature = "intel")]
-        "xe" => Some(&intel::XE),
-        #[cfg(feature = "intel")]
-        "i915" => Some(&intel::I915),
+        "xe" | "i915" => Some(&intel::INTEL),
         _ => None,
     }
 }

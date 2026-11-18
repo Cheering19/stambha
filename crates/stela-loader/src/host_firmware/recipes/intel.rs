@@ -1,7 +1,10 @@
-//! xe's and i915's firmware: the GuC, HuC, GSC and display programs xe
+//! xe's and i915's firmware: the GuC images and display programs xe, i915
 //! and the display code name for each platform of xe's table, and the
-//! display programs i915 loads on the platforms it drives in Stela. Built
-//! only with the Intel port, so an image or stick without it holds none.
+//! display programs i915 loads on the older platforms only it drives. The
+//! media (HuC) and security (GSC) controllers' images are left out: Stela
+//! runs no media engine and no content protection, and the boot turns both
+//! controllers off on Linux's command line. Built only with the Intel port,
+//! so an image or stick without it holds none.
 use super::*;
 
 /// The Intel GPU files and their notices: linux-firmware 20261019, whose
@@ -53,10 +56,10 @@ const fn xe_xe(member: &'static str, length: usize, sha256: &'static str) -> Rec
     xe_file(member, length, sha256, &XE_LICENSE)
 }
 
-/// What xe and the display code it shares with i915 load on the platforms
-/// xe's PCI ID table admits, Tiger Lake through Panther Lake: the GuC, HuC
-/// and GSC images of `xe_uc_fw.c` and the display microcontroller programs of
-/// `intel_dmc.c`, named as the drivers name them.
+/// What xe, i915 and the display code they share load on the platforms xe's
+/// PCI ID table admits, Tiger Lake through Panther Lake: the GuC images of
+/// `xe_uc_fw.c` and `intel_uc_fw.c` and the display microcontroller programs
+/// of `intel_dmc.c`, named as the drivers name them.
 pub const XE: &[Recipe] = &[
     xe_i915(
         "i915/tgl_guc_70.bin",
@@ -97,51 +100,6 @@ pub const XE: &[Recipe] = &[
         "xe/ptl_guc_70.bin",
         365376,
         "ac42861c62b69f19923d9a69d971fb849921585a01924e14c0e8ac679d7cde81",
-    ),
-    xe_i915(
-        "i915/tgl_huc.bin",
-        589888,
-        "dbb1316bac13a76427ffa7827e52b5b9affe8a4cadd23dc22e2a54e35c53bdad",
-    ),
-    xe_i915(
-        "i915/dg1_huc.bin",
-        589888,
-        "ee9a00ca754931ab045e2e3e862e7b33c9ba87f6ae90aa18335b7a7a7ee87d16",
-    ),
-    xe_i915(
-        "i915/mtl_huc_gsc.bin",
-        561152,
-        "3ea23f39e946122d1446565d1a07c0866bf3e3c8819b43134925371d877ca4cd",
-    ),
-    xe_xe(
-        "xe/lnl_huc.bin",
-        643072,
-        "320e765cbe42b0f5f95333794a6a00a4e67246d6ad8393b59b64efdc3506cfe9",
-    ),
-    xe_xe(
-        "xe/bmg_huc.bin",
-        585728,
-        "747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15",
-    ),
-    xe_xe(
-        "xe/ptl_huc.bin",
-        651264,
-        "93e9aaf15362630441042a31fe864f9e4df76b401ada91de6df64e0f6b8adbca",
-    ),
-    xe_i915(
-        "i915/mtl_gsc_1.bin",
-        1142784,
-        "01e8e2bb0eae90e3b4471703bb04d1bd13adb43373480fb10be6f101b877e0f3",
-    ),
-    xe_xe(
-        "xe/lnl_gsc_1.bin",
-        1163264,
-        "b9a28846de2df43e8464cb783f965efe3a20df54da26392576583a4e0f4bbef1",
-    ),
-    xe_xe(
-        "xe/ptl_gsc_1.bin",
-        1171456,
-        "76e77660fa1a492aeef256eba65078a76f6801a8827cfd0758e8669d7462a465",
     ),
     xe_i915(
         "i915/tgl_dmc_ver2_12.bin",
@@ -211,17 +169,22 @@ pub const XE: &[Recipe] = &[
 #[cfg(test)]
 const XE_FALLBACK: &str = "i915/adlp_dmc_ver2_16.bin";
 
-/// A platform's name, PCI device IDs and files: GuC, HuC, GSC, DMC (none
-/// for a GPU without a display engine).
-type XePlatform = (&'static str, &'static [u16], [Option<&'static str>; 4]);
+/// A platform's name, PCI device IDs and files: xe's GuC, the display
+/// program (none for a GPU without a display engine), and the GuC i915
+/// loads where it names another.
+type XePlatform = (&'static str, &'static [u16], [Option<&'static str>; 3]);
 
 /// The platforms of xe's PCI ID table that have pinned files, each with the
-/// device IDs Linux's `include/drm/intel/pciids.h` gives it and the files xe
-/// and the display code name for it: GuC, HuC, GSC, DMC. A platform's later
-/// re-releases share its files: Raptor Lake S with Alder Lake S, Raptor Lake
-/// P and U and Alder Lake N with Alder Lake P (N loads Tiger Lake's GuC and
-/// no HuC), Arrow Lake with Meteor Lake, Wildcat Lake with Panther Lake
-/// except for its display.
+/// device IDs Linux's `include/drm/intel/pciids.h` gives it and the files
+/// the drivers name for it: xe's GuC, the display program, and i915's GuC
+/// where it differs. i915 binds Tiger Lake to Meteor Lake, DG1 and DG2 first
+/// and xe is its fallback, so a device holds both drivers' files. i915 runs
+/// Tiger Lake and Rocket Lake without a GuC (its default `enable_guc`), and
+/// loads the same GuC as xe elsewhere except on Alder Lake N, which its
+/// table describes as Alder Lake P. A platform's later re-releases share its
+/// files: Raptor Lake S with Alder Lake S, Raptor Lake P and U and Alder
+/// Lake N with Alder Lake P (xe loads Tiger Lake's GuC on N), Arrow Lake
+/// with Meteor Lake, Wildcat Lake with Panther Lake except for its display.
 const XE_PLATFORMS: &[XePlatform] = &[
     (
         "Tiger Lake",
@@ -230,9 +193,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         ],
         [
             Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
             Some("i915/tgl_dmc_ver2_12.bin"),
+            None,
         ],
     ),
     (
@@ -242,9 +204,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         &[0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a],
         [
             Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
             Some("i915/rkl_dmc_ver2_03.bin"),
+            None,
         ],
     ),
     (
@@ -255,9 +216,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         ],
         [
             Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
             Some("i915/adls_dmc_ver2_01.bin"),
+            None,
         ],
     ),
     (
@@ -269,9 +229,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         ],
         [
             Some("i915/adlp_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
             Some("i915/adlp_dmc.bin"),
+            None,
         ],
     ),
     (
@@ -279,9 +238,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         &[0x46d0, 0x46d1, 0x46d2, 0x46d3, 0x46d4],
         [
             Some("i915/tgl_guc_70.bin"),
-            None,
-            None,
             Some("i915/adlp_dmc.bin"),
+            Some("i915/adlp_guc_70.bin"),
         ],
     ),
     (
@@ -289,9 +247,8 @@ const XE_PLATFORMS: &[XePlatform] = &[
         &[0x4905, 0x4906, 0x4907, 0x4908, 0x4909],
         [
             Some("i915/dg1_guc_70.bin"),
-            Some("i915/dg1_huc.bin"),
-            None,
             Some("i915/dg1_dmc_ver2_02.bin"),
+            None,
         ],
     ),
     (
@@ -303,38 +260,27 @@ const XE_PLATFORMS: &[XePlatform] = &[
         ],
         [
             Some("i915/dg2_guc_70.bin"),
-            None,
-            None,
             Some("i915/dg2_dmc_ver2_08.bin"),
+            None,
         ],
     ),
     // DG2 without a display engine: no display program is asked for.
     (
         "Data Center GPU Flex (ATS-M)",
         &[0x56c0, 0x56c1, 0x56c2],
-        [Some("i915/dg2_guc_70.bin"), None, None, None],
+        [Some("i915/dg2_guc_70.bin"), None, None],
     ),
     (
         "Meteor Lake or Arrow Lake",
         &[
             0x7d40, 0x7d45, 0x7d55, 0x7d60, 0x7dd5, 0x7d51, 0x7dd1, 0x7d41, 0x7d67, 0xb640,
         ],
-        [
-            Some("i915/mtl_guc_70.bin"),
-            Some("i915/mtl_huc_gsc.bin"),
-            Some("i915/mtl_gsc_1.bin"),
-            Some("i915/mtl_dmc.bin"),
-        ],
+        [Some("i915/mtl_guc_70.bin"), Some("i915/mtl_dmc.bin"), None],
     ),
     (
         "Lunar Lake",
         &[0x6420, 0x64a0, 0x64b0],
-        [
-            Some("xe/lnl_guc_70.bin"),
-            Some("xe/lnl_huc.bin"),
-            Some("xe/lnl_gsc_1.bin"),
-            Some("i915/xe2lpd_dmc.bin"),
-        ],
+        [Some("xe/lnl_guc_70.bin"), Some("i915/xe2lpd_dmc.bin"), None],
     ),
     (
         "Arc B-series (Battlemage)",
@@ -342,12 +288,7 @@ const XE_PLATFORMS: &[XePlatform] = &[
             0xe202, 0xe209, 0xe20b, 0xe20c, 0xe20d, 0xe210, 0xe211, 0xe212, 0xe216, 0xe220, 0xe221,
             0xe222, 0xe223,
         ],
-        [
-            Some("xe/bmg_guc_70.bin"),
-            Some("xe/bmg_huc.bin"),
-            None,
-            Some("i915/bmg_dmc.bin"),
-        ],
+        [Some("xe/bmg_guc_70.bin"), Some("i915/bmg_dmc.bin"), None],
     ),
     (
         "Panther Lake",
@@ -355,21 +296,15 @@ const XE_PLATFORMS: &[XePlatform] = &[
             0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
             0xb0b0,
         ],
-        [
-            Some("xe/ptl_guc_70.bin"),
-            Some("xe/ptl_huc.bin"),
-            Some("xe/ptl_gsc_1.bin"),
-            Some("i915/xe3lpd_dmc.bin"),
-        ],
+        [Some("xe/ptl_guc_70.bin"), Some("i915/xe3lpd_dmc.bin"), None],
     ),
     (
         "Wildcat Lake",
         &[0xfd80, 0xfd81],
         [
             Some("xe/ptl_guc_70.bin"),
-            Some("xe/ptl_huc.bin"),
-            Some("xe/ptl_gsc_1.bin"),
             Some("i915/xe3lpd_3002_dmc.bin"),
+            None,
         ],
     ),
 ];
@@ -402,17 +337,13 @@ pub fn intel_gpu_platform(device: u16) -> Option<&'static str> {
         .map(|(name, ..)| *name)
 }
 
-/// The platforms whose xe loads without their GSC image, Battlemage and
-/// later: `xe_gsc_init` goes on when it is missing, as only content
-/// protection needs it there. Before them a missing GSC fails xe's probe.
-const XE_GSC_OPTIONAL: [&str; 2] = ["Panther Lake", "Wildcat Lake"];
-
-/// Whether xe and the display code start without the file `request` names
-/// when it is missing, on every platform that names it: a display
+/// Whether xe, i915 and the display code start without the file `request`
+/// names when it is missing, on every platform that names it: a display
 /// microcontroller program (`intel_dmc.c` runs the display without its
-/// power states) and the GSC image of Battlemage and later. A GuC or HuC
-/// image is always needed: `xe_uc_init` fails without either. i915's files,
-/// display microcontroller programs only, are all optional.
+/// power states). A GuC image is always needed: `xe_uc_init` fails without
+/// it, and i915 without one where it submits through the GuC runs no
+/// command (its GT is wedged). i915's own files, the display programs of
+/// the older platforms, are all optional.
 pub(super) fn optional(request: &Request) -> bool {
     // i915's only files are display microcontroller programs.
     if request.target.driver == I915_TARGET.driver {
@@ -422,14 +353,13 @@ pub(super) fn optional(request: &Request) -> bool {
         return false;
     }
     let mut named = false;
-    for (platform, _, files) in XE_PLATFORMS {
+    for (_, _, files) in XE_PLATFORMS {
         for (column, file) in files.iter().enumerate() {
             if *file != Some(request.name.as_str()) {
                 continue;
             }
             named = true;
-            let tolerated = column == 3 || (column == 2 && XE_GSC_OPTIONAL.contains(platform));
-            if !tolerated {
+            if column != 1 {
                 return false;
             }
         }
@@ -437,8 +367,9 @@ pub(super) fn optional(request: &Request) -> bool {
     named
 }
 
-/// Requires the files xe and the display code ask for on the Intel GPU with
-/// PCI device ID `device`.
+/// Requires the files xe, i915 and the display code ask for on the Intel GPU
+/// with PCI device ID `device`, a device of xe's table: whichever of the two
+/// drivers binds it finds its files.
 pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
     let (_, _, files) = XE_PLATFORMS
         .iter()
@@ -470,9 +401,9 @@ const fn i915_dmc(member: &'static str, length: usize, sha256: &'static str) -> 
     }
 }
 
-/// What i915's display code loads on the platforms i915 drives in Stela:
-/// the display microcontroller programs `intel_dmc.c` names for Skylake to
-/// Ice Lake. i915 loads no GuC or HuC there under its default `enable_guc`
+/// What i915's display code loads on the platforms only i915 drives: the
+/// display microcontroller programs `intel_dmc.c` names for Skylake to Ice
+/// Lake. i915 loads no GuC or HuC there under its default `enable_guc`
 /// (`intel_uc.c` uses them from Gen12 on).
 pub const I915: &[Recipe] = &[
     i915_dmc(
@@ -502,12 +433,13 @@ pub const I915: &[Recipe] = &[
     ),
 ];
 
-/// The platforms i915 drives in Stela, Skylake to Ice Lake and their Atom
+/// The platforms only i915 drives, Skylake to Ice Lake and their Atom
 /// lines, each by the name of its `enum intel_platform` entry without the
 /// `INTEL_` prefix, with the PCI device IDs i915's table gives it and the
 /// display microcontroller program `dmc_firmware_default` names for it. A
-/// device xe's table also holds is xe's and is not listed, and neither is
-/// one no Vulkan driver here opens: graphics before Skylake, and an ID
+/// device xe's table also holds has its files in [`XE_PLATFORMS`], which
+/// serve both drivers, and is not listed; neither is one no Vulkan driver
+/// here opens: graphics before Skylake, and an ID
 /// Mesa's table leaves out.
 type I915Platform = (&'static str, &'static [u16], &'static str);
 pub const I915_PLATFORMS: &[I915Platform] = &[
@@ -597,10 +529,10 @@ pub fn i915_platform(device: u16) -> Option<&'static I915Platform> {
 }
 
 /// Requires the file i915 asks for on `device`, its platform's display
-/// microcontroller program, when `device` is one i915 drives in Stela.
+/// microcontroller program, when `device` is one only i915 drives.
 pub fn require_i915(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
     let (_, _, dmc) = i915_platform(device)
-        .ok_or_else(|| Error(format!("{device:04x} is no Intel GPU i915 drives in Stela")))?;
+        .ok_or_else(|| Error(format!("{device:04x} is no Intel GPU only i915 drives")))?;
     inventory.observe(Requirement {
         name: dmc,
         target: I915_TARGET,
@@ -631,50 +563,49 @@ mod tests {
     }
 
     #[test]
-    fn an_intel_gpu_requires_the_files_xe_names_for_its_platform() {
+    fn an_intel_gpu_requires_the_guc_and_display_program_its_drivers_name() {
         // Tiger Lake, Alder Lake P and Raptor Lake P, U and S, as in laptops.
         assert_eq!(
             xe_files(0x9a49),
-            [
-                "i915/tgl_guc_70.bin",
-                "i915/tgl_huc.bin",
-                "i915/tgl_dmc_ver2_12.bin"
-            ]
+            ["i915/tgl_guc_70.bin", "i915/tgl_dmc_ver2_12.bin"]
         );
         for device in [0x46a3, 0xa7a0, 0xa7a1] {
             assert_eq!(
                 xe_files(device),
-                [
-                    "i915/adlp_guc_70.bin",
-                    "i915/tgl_huc.bin",
-                    "i915/adlp_dmc.bin"
-                ]
+                ["i915/adlp_guc_70.bin", "i915/adlp_dmc.bin"]
             );
         }
         for device in [0x468b, 0xa78b] {
             assert_eq!(
                 xe_files(device),
-                [
-                    "i915/tgl_guc_70.bin",
-                    "i915/tgl_huc.bin",
-                    "i915/adls_dmc_ver2_01.bin"
-                ]
+                ["i915/tgl_guc_70.bin", "i915/adls_dmc_ver2_01.bin"]
             );
         }
-        // A platform with a GSC loads its HuC through it.
+        // Alder Lake N: xe's GuC is Tiger Lake's, i915's Alder Lake P's.
         assert_eq!(
-            xe_files(0x7d55),
+            xe_files(0x46d1),
             [
-                "i915/mtl_guc_70.bin",
-                "i915/mtl_huc_gsc.bin",
-                "i915/mtl_gsc_1.bin",
-                "i915/mtl_dmc.bin"
+                "i915/tgl_guc_70.bin",
+                "i915/adlp_dmc.bin",
+                "i915/adlp_guc_70.bin"
             ]
         );
+        // No HuC or GSC image on any platform, Meteor Lake's GuC included:
+        // the GuC loads without the GSC there.
         assert_eq!(
-            xe_files(0xe20b),
-            ["xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin"]
+            xe_files(0x7d55),
+            ["i915/mtl_guc_70.bin", "i915/mtl_dmc.bin"]
         );
+        assert_eq!(xe_files(0xe20b), ["xe/bmg_guc_70.bin", "i915/bmg_dmc.bin"]);
+        assert_eq!(
+            xe_files(0xb080),
+            ["xe/ptl_guc_70.bin", "i915/xe3lpd_dmc.bin"]
+        );
+        for (_, _, files) in XE_PLATFORMS {
+            for file in files.iter().flatten() {
+                assert!(!file.contains("huc") && !file.contains("gsc"), "{file}");
+            }
+        }
         assert_eq!(intel_gpu_platform(0x9a49), Some("Tiger Lake"));
         // Ice Lake and Ivy Bridge are not xe's.
         for device in [0x8a56, 0x0166] {
@@ -735,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn xe_starts_without_its_display_programs_and_late_gsc_images_only() {
+    fn the_drivers_start_without_their_display_programs_only() {
         let request = |name: &str| {
             Request::from(Requirement {
                 name,
@@ -747,22 +678,19 @@ mod tests {
             "i915/tgl_dmc_ver2_12.bin",
             "i915/adlp_dmc.bin",
             "i915/bmg_dmc.bin",
-            "xe/ptl_gsc_1.bin",
         ] {
             assert!(optional(&request(name)), "{name}");
         }
-        // GuC and HuC images, and GSC images before Battlemage, are needed.
+        // GuC images, i915's on Alder Lake N among them, are needed; HuC and
+        // GSC images are no recipes at all.
         for name in [
             "i915/tgl_guc_70.bin",
+            "i915/adlp_guc_70.bin",
+            "xe/ptl_guc_70.bin",
             "i915/tgl_huc.bin",
-            "xe/bmg_huc.bin",
             "i915/mtl_gsc_1.bin",
-            "xe/lnl_gsc_1.bin",
         ] {
             assert!(!optional(&request(name)), "{name}");
-        }
-        for platform in XE_GSC_OPTIONAL {
-            assert!(XE_PLATFORMS.iter().any(|(name, ..)| *name == platform));
         }
     }
 

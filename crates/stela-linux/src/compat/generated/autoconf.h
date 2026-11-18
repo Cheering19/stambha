@@ -149,8 +149,10 @@
 #define CONFIG_DRM_XE 1
 #define CONFIG_DRM_XE_DISPLAY 1
 /* xe's ID table marks Tiger Lake through Meteor Lake and Arc A-series as
- * experimental and binds them only when this names them. Stela has no other
- * driver for them, so it names every device of the table. */
+ * experimental and binds them only when this names them. i915 registers first
+ * and binds those by default, as upstream does; xe is the fallback for one
+ * whose i915 probe fails, which only this lets it bind, so it names every
+ * device of the table. */
 #define CONFIG_DRM_XE_FORCE_PROBE "*"
 
 /* i915 with display, for the Intel GPUs before Xe2. Its entry depends on
