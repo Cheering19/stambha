@@ -2218,7 +2218,10 @@ impl Setup {
             .iter()
             .filter_map(|claimed| claimed.parameters.clone())
             .collect();
-        words.extend(gpu_share_parameter(crate::native_memory::gpu_page_limit()));
+        words.extend(gpu_page_parameter(
+            crate::native_memory::gpu_share() / 4096,
+            crate::native_memory::gpu_page_limit(),
+        ));
         let (command_line, left_out) = gpu::command_line::compose(words);
         let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
         for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
@@ -2237,13 +2240,19 @@ impl Setup {
     }
 }
 
-/// The word that lets an integrated GPU's driver place its whole share
-/// (`Handoff::gpu_share`, `pages` pages) in system memory, and keeps TTM
-/// from swapping to shmem ([`gpu::command_line::page_limit`]). Linux holds
-/// no more pages than the share at once (the page catalog's limit), so the
-/// share is its RAM. Nothing for a GPU with memory of its own.
-fn gpu_share_parameter(pages: Option<usize>) -> Option<String> {
-    pages.map(gpu::command_line::page_limit)
+/// TTM's limit for the pages Linux may hold (`Handoff::gpu_pages`, `pages`
+/// pages): for an integrated GPU's share (`share` pages, nonzero) twice it,
+/// which lets its driver place the whole share in system memory and keeps
+/// TTM from swapping to shmem ([`gpu::command_line::page_limit`]); else the
+/// bound itself, the page catalog's limit, so a discrete GPU's GTT and its
+/// evictions from VRAM are the pages the heap can give
+/// ([`gpu::command_line::bound`]). Nothing where the loader set no bound.
+fn gpu_page_parameter(share: u64, pages: Option<usize>) -> Option<String> {
+    let pages = pages?;
+    Some(match usize::try_from(share) {
+        Ok(share) if share != 0 => gpu::command_line::page_limit(share),
+        _ => gpu::command_line::bound(pages),
+    })
 }
 
 /// A claimed GPU no driver bound.

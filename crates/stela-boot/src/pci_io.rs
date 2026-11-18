@@ -867,6 +867,57 @@ pub(crate) fn amd_graphics_version(
     })
 }
 
+/// The bytes BAR `bar` of the function at `address` decodes, and how they
+/// were read: the firmware's description of the BAR, or, where it gives
+/// none, the function's Resizable BAR control, read without a write. An
+/// error says why neither answered.
+pub(crate) fn bar_bytes(
+    address: Address,
+    bar: u8,
+) -> Result<(u64, &'static str), alloc::string::String> {
+    use alloc::format;
+    let handles = boot::find_handles::<PciIo>().map_err(|error| format!("{error:?}"))?;
+    let mut io = handles
+        .iter()
+        .filter_map(|&handle| get_protocol::<PciIo>(handle).ok())
+        .find_map(|mut io| io.address().is_ok_and(|at| at == address).then_some(io))
+        .ok_or_else(|| alloc::string::String::from("the firmware lists no PCI protocol for it"))?;
+    let described = io.bar_regions(bar).map(|regions| {
+        regions
+            .into_iter()
+            .filter(|region| region.resource_type == 0)
+            .map(|region| region.host.end.saturating_sub(region.host.start))
+            .sum::<u64>()
+    });
+    match described {
+        Ok(bytes) if bytes != 0 => return Ok((bytes, "as the firmware describes it")),
+        _ => {}
+    }
+    let io: &mut PciIo = &mut io;
+    let read = |offset: u16| -> u32 {
+        let mut value = u32::MAX;
+        // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
+        // configuration dword into the writable local; a refused read leaves
+        // all ones, which ends the capability walk.
+        let _ = unsafe {
+            (io.config_read)(&mut *io, 2, u32::from(offset), 1, (&raw mut value).cast())
+        };
+        value
+    };
+    stela_boot_core::aperture::resizable_bar_bytes(read, bar)
+        .map(|bytes| (bytes, "by its Resizable BAR control"))
+        .ok_or_else(|| match described {
+            Err(error) => format!(
+                "the firmware does not describe its BAR {bar} ({error}) and it has no Resizable \
+                 BAR control for it"
+            ),
+            Ok(_) => format!(
+                "the firmware describes no memory in its BAR {bar} and it has no Resizable BAR \
+                 control for it"
+            ),
+        })
+}
+
 /// `EFI_PCI_IO_ATTRIBUTE_MEMORY`: the function decodes its memory BARs.
 const ATTRIBUTE_MEMORY: u64 = 0x0200;
 /// `EfiPciIoAttributeOperationEnable` and `...Disable`.

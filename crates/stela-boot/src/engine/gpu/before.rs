@@ -475,10 +475,13 @@ fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_d
     let share = crate::native_memory::gpu_share();
     if share == 0 {
         let heap = crate::ALLOCATOR.usage();
+        let bound = crate::native_memory::gpu_page_limit().unwrap_or(0) as u64 * 4096;
         output::arguments(format_args!(
             "GPU {address}: integrated, and the memory plan gave it no share of RAM: Linux's \
-             pages for it come from Stela's heap of {}M; its VRAM carve-out {carve_out}\n",
-            mib(heap.total as u64)
+             pages for it come from Stela's heap of {}M, at most {}M of them; its VRAM \
+             carve-out {carve_out}\n",
+            mib(heap.total as u64),
+            mib(bound)
         ));
         return;
     }

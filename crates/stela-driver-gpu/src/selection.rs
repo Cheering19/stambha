@@ -156,6 +156,12 @@ pub enum Memory {
     Display,
 }
 
+/// The GPUs of `found` that start, by index, as [`select`] starts them when
+/// every claim succeeds: the loader's question, asked before any claim.
+pub fn started(found: &[Found]) -> Vec<usize> {
+    select(found, |_| true).claimed
+}
+
 /// The memory the GPUs of `found` use, as [`select`] starts them when every
 /// claim succeeds: the loader's question, asked before any claim. A kind
 /// left to a GPU's probe counts as integrated, as the loader takes a GPU it
@@ -164,11 +170,9 @@ pub enum Memory {
 /// platform then budgets its Metal device by what the heap holds past its
 /// own needs.
 pub fn memory(found: &[Found]) -> Memory {
-    let chosen = select(found, |_| true);
-    let started: Vec<Driven> = chosen
-        .claimed
-        .iter()
-        .filter_map(|&index| found[index].stack.ok())
+    let started: Vec<Driven> = started(found)
+        .into_iter()
+        .filter_map(|index| found[index].stack.ok())
         .collect();
     let integrated = |driven: &Driven| driven.integrated.unwrap_or(true);
     let discrete_draws = started.iter().any(|gpu| gpu.draws && !integrated(gpu));
@@ -415,10 +419,15 @@ mod tests {
         for integrated in [INTEGRATED, SHOWS] {
             let laptop = [gpu(integrated, true), gpu(DISCRETE, false)];
             assert_eq!(memory(&laptop), Memory::Display);
+            // Both start: the memory plan counts each one's aperture.
+            let mut both = started(&laptop);
+            both.sort_unstable();
+            assert_eq!(both, [0, 1]);
         }
         // A mux set to the discrete GPU: the integrated one is left.
         let muxed = [gpu(INTEGRATED, false), gpu(DISCRETE, true)];
         assert_eq!(memory(&muxed), Memory::Own);
+        assert_eq!(started(&muxed), [1]);
         // An integrated GPU the loader could not tell starts beside a card.
         let desktop = [gpu(PROBED, false), gpu(DISCRETE, true)];
         assert_eq!(memory(&desktop), Memory::Display);

@@ -27,6 +27,17 @@ pub fn page_limit(share: usize) -> String {
     format!("ttm.pages_limit={}", share.saturating_mul(2))
 }
 
+/// TTM's limit where no share is planned: the bound on Linux's pages,
+/// `pages` (the page catalog's limit, what the heap holds past its own
+/// needs). A discrete GPU's GTT is TTM's limit (amdgpu caps only an APU's),
+/// so it holds the pages the heap can give. TTM's count passes it only
+/// where Linux's pages would pass the catalog's limit too; its swap to
+/// shmem is then refused, and the allocation fails as it would at the
+/// catalog.
+pub fn bound(pages: usize) -> String {
+    format!("ttm.pages_limit={pages}")
+}
+
 /// The firmware file xe's display code asks for the video BIOS table before
 /// it looks anywhere else (`intel_bios.c`).
 pub fn video_bios_table(file: &str) -> String {
@@ -60,7 +71,7 @@ mod tests {
     /// the built objects register, so none is refused or left out.
     #[test]
     fn every_word_the_boot_builds_is_registered() {
-        let mut words = vec![page_limit(655_360)];
+        let mut words = vec![page_limit(655_360), bound(224_256)];
         // Only an image with xe holds xe's parameters.
         if cfg!(feature = "xe-port") {
             words.push(video_bios_table("intel/vbt.bin"));
@@ -83,5 +94,12 @@ mod tests {
         assert_eq!(line, "ttm.pages_limit=16");
         assert_eq!(left_out, ["ttm.no_such_parameter=1", "bare"]);
         assert!(registered("ttm.pages-limit=1"));
+    }
+
+    /// A share's limit is twice it; a bound is itself.
+    #[test]
+    fn a_bound_is_ttms_limit_as_it_is() {
+        assert_eq!(page_limit(655_360), "ttm.pages_limit=1310720");
+        assert_eq!(bound(224_256), "ttm.pages_limit=224256");
     }
 }

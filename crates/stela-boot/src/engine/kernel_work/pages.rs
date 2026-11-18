@@ -149,7 +149,8 @@ impl KernelWork {
         let pages = self.task_pages()?;
         // SAFETY: exact retained heap and slot allocations on the loader root.
         let (provider, extents) = unsafe { pages.into_inventory() }?;
-        // An integrated GPU's pages are held to its share of the heap.
+        // Linux's pages are held to the bound the loader planned: an
+        // integrated GPU's share, or what the heap holds past its own needs.
         let limit = crate::native_memory::gpu_page_limit();
         // SAFETY: exact claimed owner on this taskless dispatcher before
         // Initial. Provider keeps the actual backing through publication.

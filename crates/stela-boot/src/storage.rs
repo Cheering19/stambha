@@ -370,6 +370,8 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
     }
     let screen = crate::console::Framebuffer::firmware_function();
     let mut found = Vec::new();
+    // The BAR each GPU's driver maps whole, where it does.
+    let mut apertures = Vec::new();
     for identity in functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)
@@ -395,6 +397,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
                     stack: Err("no stack of this image drives it"),
                     firmware_screen,
                 });
+                apertures.push(None);
                 continue;
             }
         };
@@ -419,7 +422,14 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
             }),
             firmware_screen,
         });
+        apertures.push(stack.kernel.aperture.map(|bar| (adapter.address, bar)));
     }
+    let aperture: u64 = stela_drivers::gpu::selection::started(&found)
+        .into_iter()
+        .filter_map(|index| apertures[index])
+        .map(|(address, bar)| aperture_tables(address, bar))
+        .sum();
+    GPU_APERTURE.store(aperture, core::sync::atomic::Ordering::Relaxed);
     let memory = match stela_drivers::gpu::selection::memory(&found) {
         Memory::Own => GpuMemory::Own,
         Memory::Shared => GpuMemory::Shared,
@@ -439,6 +449,27 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
         },
         core::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// The page tables of the BAR `bar` of the GPU at `address`, which its
+/// driver maps whole as it starts (`host_memory::aperture_tables`), said in
+/// a line. A BAR whose size is not read is taken at 256 MiB, the size of a
+/// BAR no Resizable BAR control widened.
+fn aperture_tables(address: stela_drivers::bus::pci::Address, bar: u8) -> u64 {
+    use stela_boot_core::host_memory;
+    const UNRESIZED: u64 = 256 << 20;
+    let (bytes, how) = match crate::pci_io::bar_bytes(address, bar) {
+        Ok((bytes, how)) => (bytes, alloc::string::String::from(how)),
+        Err(why) => (UNRESIZED, alloc::format!("taken as 256M: {why}")),
+    };
+    let tables = host_memory::aperture_tables(bytes);
+    output::arguments(format_args!(
+        "HOST GPU {address} has its driver map its BAR {bar} of {}M whole ({how}): {}M of page \
+         tables for it\n",
+        bytes >> 20,
+        tables >> 20
+    ));
+    tables
 }
 
 /// Whether the GPU at `adapter` is integrated, by `stack`'s table or its IP
@@ -496,6 +527,17 @@ pub fn gpu_memory() -> stela_boot_core::host_memory::GpuMemory {
 /// [`plan_gpu_memory`]'s answer: 0 before it ran, 1 own memory, 2 shared,
 /// 3 display beside a discrete GPU.
 static GPU_MEMORY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The page tables of the apertures the started GPUs' drivers map whole.
+static GPU_APERTURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// [`plan_gpu_memory`]'s answer with the apertures' tables.
+pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {
+    stela_boot_core::host_memory::GpuPlan {
+        memory: gpu_memory(),
+        aperture: GPU_APERTURE.load(core::sync::atomic::Ordering::Relaxed),
+    }
+}
 
 const NVIDIA: u16 = 0x10de;
 /// The [`NvidiaNotice`] the census chose, as its discriminant.

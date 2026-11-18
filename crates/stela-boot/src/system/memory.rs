@@ -33,6 +33,9 @@ pub(super) struct EngineMemory {
     /// as for a display's pages beside a discrete GPU, which only grow the
     /// heap.
     pub gpu: u64,
+    /// The most bytes of pages Linux holds at once (`host_memory::page_bound`):
+    /// the share, or what the heap holds past its own needs.
+    pub pages: u64,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -137,21 +140,23 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         },
     };
     let free = free_ram()?;
-    let gpu = crate::storage::gpu_memory();
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores, gpu)?;
+    let plan = crate::storage::gpu_plan();
+    let gpu = plan.memory;
+    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores, plan)?;
+    let pages = stela_boot_core::host_memory::page_bound(&sizes, gpu);
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M\n",
+        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M aperture={}M \
+         pages={}M\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
         sizes.gpu >> 20,
+        sizes.aperture >> 20,
+        pages >> 20,
     ));
-    output::arguments(format_args!(
-        "HOST MEMORY gpu: {}\n",
-        gpu.describe(sizes.gpu, sizes.heap)
-    ));
+    output::arguments(format_args!("HOST MEMORY gpu: {}\n", gpu.describe(&sizes)));
     if gpu.limits_pages() && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
         output::arguments(format_args!(
             "HOST MEMORY the integrated GPU gets {}M of this PC's RAM, under the {}M a macOS \
@@ -180,8 +185,9 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         crate::native_smp::resources::code_part_bytes(part.code_bytes, sizes.code.parts)?;
     }
     // The GPU's pages come from the heap's allocator, held to their share
-    // by Linux's page limit, so the share lies in the same region.
-    let heap = allocate(sizes.heap + sizes.gpu)?;
+    // by Linux's page limit, so the share lies in the same region, as do
+    // the page tables of the apertures drivers map whole.
+    let heap = allocate(sizes.heap + sizes.gpu + sizes.aperture)?;
     // The engine allocator uses this existing physmap directly. Prove the
     // complete firmware reservation is covered before publishing the handoff.
     if !ram.iter().any(|&(start, end)| {
@@ -233,6 +239,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     Ok(EngineMemory {
         heap,
         gpu: if gpu.limits_pages() { sizes.gpu } else { 0 },
+        pages,
         native_resources,
         native_task_allocations,
         stack,

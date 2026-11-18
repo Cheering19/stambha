@@ -733,25 +733,145 @@ fn a_display_only_integrated_gpu_adds_its_pages_to_the_heap() {
     assert!(GpuMemory::Shared.limits_pages());
 }
 
-/// The plan's line states the rule it chose.
+/// The plan's line states the rule it chose, with the page bound and the
+/// aperture's tables.
 #[test]
 fn the_plans_line_states_its_rule() {
+    let display = Sizes {
+        heap: 3060 * MIB,
+        gpu: DISPLAY_SHARE,
+        ..sizes(10842 * MIB, 8, 8, GpuMemory::Own).unwrap()
+    };
     assert_eq!(
-        GpuMemory::Display.describe(DISPLAY_SHARE, 3300 * MIB),
+        GpuMemory::Display.describe(&display),
         "a discrete GPU draws and the integrated GPU shows the display: the heap takes 256M \
-         more for the integrated GPU's driver and scanout, and Linux's pages are not bounded, \
-         as the discrete GPU's system-memory buffers come from the heap; should the discrete \
-         GPU not start and the integrated one draw, its Metal device works in what the heap \
-         holds past its own 2424M, about 1132M"
+         more for the integrated GPU's driver and scanout; Linux's pages, the discrete GPU's \
+         system-memory buffers among them, are at most 892M, what the 3316M heap holds past \
+         its own 2424M (at least 384M), TTM's limit the same; should the discrete GPU not \
+         start and the integrated one draw, its Metal device works in those 892M"
     );
+    let shared = Sizes {
+        gpu: 2560 * MIB,
+        ..display
+    };
     assert!(
         GpuMemory::Shared
-            .describe(2560 * MIB, 2816 * MIB)
+            .describe(&shared)
             .contains("share of 2560M")
     );
-    assert!(
-        GpuMemory::Own
-            .describe(0, 0)
-            .starts_with("no integrated GPU starts")
+    let own = Sizes {
+        heap: 3300 * MIB,
+        gpu: 0,
+        aperture: 34 * MIB,
+        ..display
+    };
+    assert_eq!(
+        GpuMemory::Own.describe(&own),
+        "no integrated GPU starts: Linux's pages, a discrete GPU's system-memory buffers and \
+         its evictions from VRAM among them, come from the heap, at most 876M of them, what \
+         the 3300M heap holds past its own 2424M (at least 384M); TTM's limit is the same, \
+         and an allocation past it fails as the GPU's memory being full; the heap takes 34M \
+         more for the page tables of the device-memory apertures drivers map whole"
+    );
+}
+
+/// Where no share is planned, Linux's pages are held to the heap's spare
+/// past its own needs, at least [`PAGES_LEAST`], which is far above what
+/// nouveau and NVK hold: the bound only makes explicit what the heap could
+/// give them.
+#[test]
+fn a_discrete_gpus_pages_are_held_to_the_heaps_spare() {
+    // The NVIDIA floor heap, at its window: the least.
+    let floor = Sizes {
+        heap: HEAP_FLOOR,
+        gpu: 0,
+        ..sizes(free(32), 8, 8, GpuMemory::Own).unwrap()
+    };
+    assert_eq!(page_bound(&floor, GpuMemory::Own), 392 * MIB);
+    let small = Sizes {
+        heap: 2720 * MIB,
+        ..floor
+    };
+    assert_eq!(page_bound(&small, GpuMemory::Own), PAGES_LEAST);
+    // NVK's host heap held 16 MiB, nouveau's GSP image is about 61 MiB.
+    const { assert!(PAGES_LEAST >= 4 * (16 + 61) * MIB) };
+    // Every host's plan: the bound leaves the heap at least its floor less
+    // the least, and an integrated GPU's share is its own bound.
+    for installed in [8, 12, 16, 32, 64, 128] {
+        for memory in [GpuMemory::Own, GpuMemory::Display, GpuMemory::Shared] {
+            let sizes = sizes(free(installed), 8, 8, memory).unwrap();
+            let bound = page_bound(&sizes, memory);
+            match memory {
+                GpuMemory::Shared => assert_eq!(bound, sizes.gpu),
+                _ => {
+                    assert!(bound >= PAGES_LEAST, "{installed} {memory:?}");
+                    assert!(
+                        sizes.heap + sizes.gpu - bound >= HEAP_OWN.min(sizes.heap - PAGES_LEAST),
+                        "{installed} {memory:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A driver that maps a whole device-memory aperture (amdgpu's visible VRAM,
+/// xe's LMEMBAR) makes the heap that much bigger for its 4 KiB page tables,
+/// and the guest that much smaller; nothing else moves.
+#[test]
+fn an_apertures_page_tables_grow_the_heap() {
+    assert_eq!(aperture_tables(256 * MIB), 2 * MIB);
+    assert_eq!(aperture_tables(16 * GIB), 34 * MIB);
+    assert_eq!(aperture_tables(24 * GIB), 50 * MIB);
+    for installed in [8, 16, 32] {
+        for memory in [GpuMemory::Own, GpuMemory::Display, GpuMemory::Shared] {
+            let plain = sizes(free(installed), 8, 8, memory).unwrap();
+            let plan = GpuPlan {
+                memory,
+                aperture: aperture_tables(16 * GIB),
+            };
+            let grown = sizes(free(installed) + plan.aperture, 8, 8, plan).unwrap();
+            assert_eq!(
+                Sizes {
+                    aperture: 0,
+                    ..grown
+                },
+                plain,
+                "{installed} {memory:?}"
+            );
+            assert_eq!(page_bound(&grown, memory), page_bound(&plain, memory));
+        }
+    }
+}
+
+/// What an integrated GPU that draws leaves the guest, by host.
+#[test]
+fn an_integrated_gpus_share_leaves_the_guest() {
+    let split = |free: u64| {
+        let sizes = sizes(free, 8, 8, GpuMemory::Shared).unwrap();
+        [sizes.heap, sizes.gpu, sizes.guest].map(|bytes| bytes / MIB)
+    };
+    let rows = [
+        7354 * MIB,
+        free(8),
+        10854 * MIB,
+        free(12),
+        free(16),
+        free(32),
+    ]
+    .map(split);
+    // heap, share, guest (MiB): the 8 GiB VM and host keep the guest's
+    // floor and give the share what is above it; the 12 GiB VM's measured
+    // free RAM, a 12 GiB host, 16 and 32 GiB hosts.
+    assert_eq!(
+        rows,
+        [
+            [2704, 780, 3072],
+            [2704, 1362, 3072],
+            [2816, 2560, 4400],
+            [2880, 2560, 5220],
+            [4400, 2644, 7272],
+            [5232, 5290, 18700],
+        ]
     );
 }

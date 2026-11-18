@@ -25,6 +25,11 @@ pub struct Kernel {
     /// The BAR of the device's register window, whose first page the boot
     /// reads before the function's reset.
     pub registers: fn(&Adapter) -> usize,
+    /// The BAR of device memory the driver maps whole as it starts (amdgpu's
+    /// `ioremap_wc` of all visible VRAM, xe's of its LMEM BAR), which Stela's
+    /// page window maps in 4 KiB pages whose tables the memory plan counts;
+    /// `None` for a driver that maps device memory a buffer at a time.
+    pub aperture: Option<u8>,
     /// Whether the driver's probe takes the GPU from the firmware itself,
     /// resetting it with the family's own reset where a previous driver left
     /// it running (amdgpu's `amdgpu_device_need_reset_on_init`), so that a
@@ -233,6 +238,8 @@ pub static NVIDIA: GpuStack = GpuStack {
         // with a chip it does not know is its probe's answer.
         admits: |_| Ok(()),
         registers: |_| 0,
+        // nouveau maps BAR1 a buffer at a time (`nouveau_ttm_io_mem_reserve`).
+        aperture: None,
         resets_itself: false,
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
@@ -267,6 +274,8 @@ pub static AMD: GpuStack = GpuStack {
         // `rmmio_base` (`amdgpu_device.c`): BAR 5 for every family Stela
         // drives; BAR 0 is the memory aperture.
         registers: crate::amdgpu::registers,
+        // `amdgpu_ttm_init`: `ioremap_wc(aper_base, visible_vram_size)`, BAR 0.
+        aperture: Some(0),
         resets_itself: true,
         // The mask the device's memory controller block sets
         // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
@@ -325,6 +334,8 @@ pub static INTEL: GpuStack = GpuStack {
         admits: crate::xe::admits,
         // GTTMMADR (`regs/xe_bars.h`): the registers, then the GTT.
         registers: |_| 0,
+        // `xe_vram.c`: `devm_ioremap_wc(io_start, io_size)` of LMEMBAR, BAR 2.
+        aperture: Some(2),
         resets_itself: false,
         // The platform's `dma_mask_size` (`xe_pci.c`), which
         // `xe_set_dma_info` sets as the mask.

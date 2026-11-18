@@ -885,9 +885,59 @@ pub fn memory_bar(header: &[u8; 64], index: u8) -> Result<(u64, bool), BarError>
     Ok((address, low & 1 << 3 != 0))
 }
 
+/// The Resizable BAR extended capability's ID (PCIe Base 7.8.6).
+const RESIZABLE_BAR: u32 = 0x15;
+
+/// The size BAR `bar` decodes now, by its function's Resizable BAR
+/// capability, read without a write: `read` gives the configuration dword
+/// at an offset in extended space. `None` where the function has no such
+/// capability or it does not list `bar`.
+pub fn resizable_bar_bytes(mut read: impl FnMut(u16) -> u32, bar: u8) -> Option<u64> {
+    let mut offset: u16 = 0x100;
+    // Each capability is at least a dword; a loop in the list ends here.
+    for _ in 0..(4096 - 0x100) / 4 {
+        let header = read(offset);
+        if header == 0 || header == u32::MAX {
+            return None;
+        }
+        if header & 0xffff == RESIZABLE_BAR {
+            // Bits 7:5 of the first control register: how many BARs it lists.
+            let count = (read(offset + 8) >> 5 & 7).max(1) as u16;
+            return (0..count).find_map(|index| {
+                let control = read(offset + 8 + index * 8);
+                (control & 7 == u32::from(bar)).then(|| 1u64 << (20 + (control >> 8 & 0x3f)))
+            });
+        }
+        offset = (header >> 20) as u16 & !3;
+        if offset < 0x100 {
+            return None;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resizable_bars_size_is_read_from_its_control() {
+        // AER at 0x100, then Resizable BAR at 0x200 listing BAR 0 at 16 GiB
+        // (encoding 14) and BAR 2 at 256 MiB (encoding 8).
+        let space = |offset: u16| match offset {
+            0x100 => 0x2000_0001,
+            0x200 => 0x0001_0015,
+            0x208 => 0x0000_0e40,
+            0x210 => 0x0000_0802,
+            _ => 0,
+        };
+        assert_eq!(resizable_bar_bytes(space, 0), Some(16 << 30));
+        assert_eq!(resizable_bar_bytes(space, 2), Some(256 << 20));
+        assert_eq!(resizable_bar_bytes(space, 5), None);
+        // No extended capabilities, or a list that loops on itself.
+        assert_eq!(resizable_bar_bytes(|_| 0, 0), None);
+        assert_eq!(resizable_bar_bytes(|_| 0x1000_0001, 0), None);
+    }
 
     #[test]
     fn a_memory_bar_is_read_from_the_header_as_linux_decodes_it() {
