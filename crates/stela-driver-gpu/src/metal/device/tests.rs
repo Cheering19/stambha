@@ -6038,3 +6038,19 @@ fn held_work_of_another_connection_keeps_no_memory() {
     device.backend().finish();
     device.poll().unwrap();
 }
+
+/// An integrated GPU's note says its memory is system memory from Stela's
+/// heap, which a log of a heap that ran out is read against.
+#[test]
+fn an_integrated_gpus_memory_note_says_it_shares_the_heap() {
+    let mut backend = MockBackend::new();
+    backend.physical.as_mut().unwrap().identity.device_type =
+        crate::metal::vulkan::PhysicalDeviceType::IntegratedGpu;
+    let mut device = device_on(backend);
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    assert!(
+        first.starts_with("SHARED MEMORY (system memory from Stela's heap) holds 0M of the "),
+        "{first}"
+    );
+}

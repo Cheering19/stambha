@@ -340,8 +340,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let cap = self.memory_cap.map_or_else(String::new, |cap| {
             format!("; a test build caps the device at {}M", mib(cap))
         });
+        // An integrated GPU's memory is system memory: its driver takes it
+        // from Stela's heap, which the note's reader weighs it against.
+        let kind = if self.capabilities.has_unified_memory {
+            "SHARED MEMORY (system memory from Stela's heap)"
+        } else {
+            "VRAM"
+        };
         self.shortage.notes.push_back(format!(
-            "VRAM holds {}M of the {}M the guest works in: allocated={}M recycled={}M \
+            "{kind} holds {}M of the {}M the guest works in: allocated={}M recycled={}M \
              chunks={}M blocks={}/{}M out_of_memory={}; {driver}{}{cap}",
             mib(held + memory.chunks.bytes),
             mib(budget),

@@ -487,15 +487,18 @@ fn driver_message(text: &str) {
 }
 
 /// Logs what a guest call made or met, such as a render pipeline, once for
-/// each distinct note, with the heap's live bytes and high-water mark after
-/// it: a compile that raised the mark shows it against the note before.
+/// each distinct note, with the heap's live bytes, its size and its
+/// high-water mark after it: a compile that raised the mark shows it against
+/// the note before, and an integrated GPU's memory note against the heap
+/// that memory comes from.
 fn note(text: &str) {
     static SEEN: Seen<512> = Seen::new();
     if let Some(unheld) = SEEN.first_time(text) {
         let heap = crate::ALLOCATOR.usage();
         output::arguments(format_args!(
-            "GPU {text} heap={}M peak={}M{unheld}\n",
+            "GPU {text} heap={}M/{}M peak={}M{unheld}\n",
             heap.live >> 20,
+            heap.total >> 20,
             heap.peak >> 20
         ));
         report_peaks();
