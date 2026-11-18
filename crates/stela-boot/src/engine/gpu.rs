@@ -942,6 +942,15 @@ impl function::Host for Device {
             Some((first, _)) if reusable >= wanted => (first, wanted),
             _ => {
                 let count = wanted.min(free);
+                if count < wanted {
+                    // A driver that needs every vector (xe asks for exactly
+                    // the table's entries) then fails with -ENOSPC.
+                    output::arguments(format_args!(
+                        "GPU MSI-X: {wanted} vectors asked, {free} of Stela's {} interrupt lines \
+                         for Linux left, so {count} given\n",
+                        stela_linux::service::LINES
+                    ));
+                }
                 if count == 0 {
                     return Err(function::MsiError::Native(ENOSPC));
                 }
