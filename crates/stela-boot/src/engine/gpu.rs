@@ -267,13 +267,20 @@ fn firmware_map() -> Option<&'static FirmwareMap> {
 /// `ATRM` for a discrete GPU (`amdgpu_atrm_get_bios`), then the `VFCT`
 /// image (`amdgpu_acpi_vfct_bios`), then the option ROM copy the firmware
 /// kept (x86 Linux's `pci_dev::rom` from its EFI stub). One line says which.
-fn platform_rom(adapter: &gpu::Adapter, integrated: bool) -> &'static [u8] {
+/// A driver that does not read its video BIOS from those places
+/// (`Kernel::reads_rom`) gets the `VFCT` image alone, as every claim did.
+fn platform_rom(adapter: &gpu::Adapter, kernel: &gpu::stack::Kernel) -> &'static [u8] {
     let address = adapter.address;
-    if let Some(image) = atrm_image(adapter, integrated) {
+    if kernel.reads_rom
+        && let Some(image) = atrm_image(adapter, (kernel.integrated)(adapter))
+    {
         return image;
     }
     if let Some(image) = vfct_image(adapter) {
         return image;
+    }
+    if !kernel.reads_rom {
+        return &[];
     }
     let Some(map) = firmware_map() else {
         return &[];
@@ -1503,7 +1510,7 @@ fn claim(
         // A mapping past the driver's mask is refused
         // (`function::Mappings`), not truncated.
         dma_limit: stack.kernel.dma_limit(adapter),
-        rom: platform_rom(adapter, (stack.kernel.integrated)(adapter)),
+        rom: platform_rom(adapter, &stack.kernel),
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
@@ -1692,8 +1699,11 @@ fn claim(
     if reset {
         resized_bars(address, &function, &mut placement, &mut bars);
     }
-    // After the reset, which clears what a ROM BAR held.
-    if let Some((region, resource)) = expansion_rom(services, &mut function) {
+    // After the reset, which clears what a ROM BAR held; only for a driver
+    // that reads its video BIOS through it.
+    if stack.kernel.reads_rom
+        && let Some((region, resource)) = expansion_rom(services, &mut function)
+    {
         placement.rom_bar = region;
         bars.push(region.start..region.start + region.size.max(PAGE));
         resources.push(resource);

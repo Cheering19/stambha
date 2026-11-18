@@ -70,6 +70,16 @@ pub struct Kernel {
     /// ([`crate::drm_version`]), so the boot names it without opening a file
     /// of the GPU; `None` where the build had no source to read.
     pub version: Option<(u32, u32, u32)>,
+    /// Whether the driver reads its video BIOS from the platform ROM and the
+    /// expansion ROM BAR where the GPU's own copy is not found, so its claim
+    /// gives it the option ROM the firmware read (and ATRM's image) and
+    /// places a ROM BAR the firmware left unassigned: amdgpu
+    /// (`amdgpu_get_bios`) and xe's display (`intel_bios_init`, its VBT
+    /// through `pci_map_rom`). nouveau shadows its image from PRAMIN or
+    /// PROM, and reaches the PCI ROM and the platform ROM only when those
+    /// and ACPI give none (`nvbios_shadow`'s `skip`), so its claim does
+    /// neither and gives it the VFCT image alone, as before.
+    pub reads_rom: bool,
 }
 
 /// The drivers' DRM versions as the build read them; an image without a
@@ -223,6 +233,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         reset: None,
         describe: None,
         version: versions::NOUVEAU,
+        reads_rom: false,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
@@ -269,6 +280,7 @@ pub static AMD: GpuStack = GpuStack {
         }),
         describe: Some(crate::amdgpu::query::describe),
         version: versions::AMDGPU,
+        reads_rom: true,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
@@ -320,6 +332,7 @@ pub static INTEL: GpuStack = GpuStack {
         reset: None,
         describe: None,
         version: versions::XE,
+        reads_rom: true,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
@@ -898,6 +911,18 @@ mod tests {
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!((reset.watch)(&mut refuse), None);
         assert_eq!((reset.state)(&mut refuse, 7), None);
+    }
+
+    /// A claim touches the expansion ROM and hands over the firmware's
+    /// option ROM only for a driver that reads its video BIOS there; the
+    /// released NVIDIA stack's claim does neither, as before.
+    #[test]
+    fn only_a_driver_that_reads_its_rom_gets_the_rom_bar_and_the_option_rom() {
+        assert!(!NVIDIA.kernel.reads_rom);
+        #[cfg(feature = "amdgpu-port")]
+        assert!(AMD.kernel.reads_rom);
+        #[cfg(feature = "xe-port")]
+        assert!(INTEL.kernel.reads_rom);
     }
 
     /// Every stack names its driver's DRM version without a client: the
