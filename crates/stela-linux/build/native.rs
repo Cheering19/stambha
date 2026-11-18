@@ -563,14 +563,25 @@ impl Linux {
         // task lease. Only their ELF links wrap current.
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
             for (name, source, define) in [
-                ("linux_file", "file.c", "STELA_LINUX_FILE_TEST"),
-                ("linux_mapping", "mapping.c", "STELA_LINUX_MAPPING_TEST"),
+                ("linux_file", "kernel/file.c", "STELA_LINUX_FILE_TEST"),
+                (
+                    "linux_mapping",
+                    "kernel/mapping.c",
+                    "STELA_LINUX_MAPPING_TEST",
+                ),
+                // dma-buf.c's sync file ioctls, as ANV asks for them on
+                // i915, through the descriptor table.
+                (
+                    "linux_dma_buf",
+                    "stela/dma_buf_test.c",
+                    "STELA_LINUX_DMA_BUF_TEST",
+                ),
             ] {
                 let mut fixture = build.clone();
                 fixture
                     .define(define, None)
                     .flag("-Wl,--wrap=stela_linux_current");
-                if name == "linux_file" {
+                if name != "linux_mapping" {
                     for symbol in [
                         "__cond_resched",
                         "call_rcu",
@@ -580,12 +591,7 @@ impl Linux {
                         fixture.flag(format!("-Wl,--wrap={symbol}"));
                     }
                 }
-                tests.add(
-                    &fixture,
-                    name,
-                    &format!("{COMPAT}/kernel/{source}"),
-                    &archives,
-                );
+                tests.add(&fixture, name, &format!("{COMPAT}/{source}"), &archives);
             }
         }
         for (name, source, define) in [
