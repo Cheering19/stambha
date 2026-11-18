@@ -1524,7 +1524,7 @@ fn open_gpus(
     let tsc_hz = handoff.tsc_hz;
     #[cfg(feature = "nvk")]
     let heap_bytes = heap.end - heap.start;
-    crate::status::begin("Starting the GPU");
+    crate::status::begin(stela_boot_core::gpu_step::TITLE);
     let gop = if handoff.screen.is_some() {
         mmio.verified_framebuffer()
     } else {
@@ -1571,40 +1571,13 @@ fn open_gpus(
         Ok((claimed, refused, Some(random))) if !claimed.is_empty() => (claimed, refused, random),
         Ok((_, refused, _)) => {
             // Each GPU that did not start, and why, or that there is none.
-            use stela_boot_core::gpu_status;
-            match refused.split_first() {
-                None => crate::status::warn(&gpu_status::none(&found)),
-                Some((first, rest)) => {
-                    crate::status::warn(&gpu_status::refused(
-                        first.vendor,
-                        &first.name,
-                        &first.address,
-                        first.device,
-                        first.reason,
-                        &first.why,
-                    ));
-                    for gpu in rest {
-                        crate::status::info(&gpu_status::refused(
-                            gpu.vendor,
-                            &gpu.name,
-                            &gpu.address,
-                            gpu.device,
-                            gpu.reason,
-                            &gpu.why,
-                        ));
-                    }
-                }
-            }
-            // The display adapters no driver here runs, and why: the
-            // refused ones were named above.
-            for adapter in found.iter().filter(|adapter| {
-                stela_drivers::gpu::stack::GpuStack::select(adapter).is_err()
-                    && !refused
-                        .iter()
-                        .any(|gpu| gpu.address == format!("{}", adapter.address))
-            }) {
-                crate::status::info(&gpu_status::unused(adapter));
-            }
+            let ports: Vec<_> = stela_drivers::gpu::stack::STACKS
+                .iter()
+                .map(|stack| stack.vendor)
+                .collect();
+            show_gpu_step(stela_boot_core::gpu_step::not_started(
+                &found, &refused, &ports,
+            ));
             return false;
         }
         Err(error) => {
@@ -1625,6 +1598,7 @@ fn open_gpus(
         heap_bytes,
     };
     gpu::amd_acpi_methods(acpi, &claimed, found.clone(), companions);
+    let starting = gpu::claimed_adapters(&claimed, &found);
     // Store the claim's lines before Linux starts, so the USB keeps them
     // even when the start never returns.
     output::flush_log();
@@ -1646,26 +1620,18 @@ fn open_gpus(
     let ok = match opened {
         Ok(()) => {
             // The GPU that draws, then why each other GPU found does not.
-            let (result, others) = gpu::started(&refused);
-            crate::status::done(&result);
-            for gpu in &refused {
-                crate::status::warning(&stela_boot_core::gpu_status::refused(
-                    gpu.vendor,
-                    &gpu.name,
-                    &gpu.address,
-                    gpu.device,
-                    gpu.reason,
-                    &gpu.why,
-                ));
-            }
-            for line in &others {
-                crate::status::info(line);
-            }
+            show_gpu_step(gpu::started(&refused));
             true
+        }
+        // Each GPU no driver bound said so as its probe ended.
+        #[cfg(feature = "nvk")]
+        Err(gpu::Error::NoDevices) => {
+            crate::status::warn(stela_boot_core::gpu_status::NONE_BOUND);
+            false
         }
         Err(error) => {
             crate::status::warn(&stela_boot_core::gpu_status::failed(
-                &found,
+                &starting,
                 &format!("{error}"),
             ));
             false
@@ -1676,6 +1642,24 @@ fn open_gpus(
     // keeps them.
     output::flush_log();
     ok
+}
+
+/// Shows the GPU step's lines ([`stela_boot_core::gpu_step`]): the first
+/// ends the step, the others are lines of their own.
+fn show_gpu_step(lines: Vec<(stela_boot_core::gpu_step::Mark, String)>) {
+    use stela_boot_core::gpu_step::Mark;
+    let mut lines = lines.into_iter();
+    match lines.next() {
+        Some((Mark::Ok, text)) => crate::status::done(&text),
+        Some((_, text)) => crate::status::warn(&text),
+        None => crate::status::done(""),
+    }
+    for (mark, text) in lines {
+        match mark {
+            Mark::Info => crate::status::info(&text),
+            Mark::Ok | Mark::Warn => crate::status::warning(&text),
+        }
+    }
 }
 
 /// What the board's devices are placed from besides the board itself.

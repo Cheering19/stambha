@@ -8,6 +8,14 @@ use stela_loader::host_firmware::recipes::nvidia_chip;
 /// Blackwell: every chip `recipes::nvidia_chip` names), as people know them.
 pub const SUPPORTED: &str = "an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU";
 
+/// The AMD GPUs a build with amdgpu's port drives (graphics generation 9 on,
+/// `stela_driver_core::amd_metal`), as people know them.
+const SUPPORTED_AMD: &str = "an AMD Radeon RX Vega or later GPU";
+
+/// The Intel GPUs a build with xe's and i915's ports drives (graphics
+/// version 9 on, as ANV opens them), as people know them.
+const SUPPORTED_INTEL: &str = "an Intel GPU from 6th generation Core processors on";
+
 /// The boot screen's line when the GPU that draws, `gpu` by its name,
 /// started with no screen connected and macOS is shown on the screen the PC
 /// started on, which another display adapter drives (a laptop with no
@@ -39,7 +47,7 @@ pub fn started(drawer: Option<&str>, failed: &[String], shows: Option<&str>) -> 
 /// `drawer` draws, or its image has no Vulkan driver for it.
 pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     match drawer {
-        Some(drawer) => format!("the {gpu} only shows screens wired to it: the {drawer} draws"),
+        Some(_) => format!("the {gpu} shows the picture on the screens wired to it"),
         None => format!(
             "the {gpu} only shows screens wired to it: this Stela has no Vulkan driver for it"
         ),
@@ -131,29 +139,22 @@ pub fn refused(
     }
 }
 
-/// The screen line for the NVIDIA GPUs among `adapters` that were claimed
-/// but did not start, `error` naming the step that ended the start.
+/// The GPU step's end when every claimed GPU's driver failed on it: the
+/// lines above it, one for each such GPU ([`unbound`]), say why.
+pub const NONE_BOUND: &str = "no GPU started; the lines above say why";
+
+/// The screen line for the GPUs that were claimed, `adapters`, when none of
+/// them started, `error` naming the step that ended the start.
 pub fn failed(adapters: &[Adapter], error: &str) -> String {
     let named: Vec<String> = adapters
         .iter()
-        .filter(|found| found.vendor == Vendor::Nvidia)
-        .map(|found| format!("{} at {}", found.name(), found.address))
+        .map(|found| format!("the {} at {}", found.name(), found.address))
         .collect();
-    // Without an NVIDIA GPU, the other adapters a driver was started for.
-    let others: Vec<String> = adapters
-        .iter()
-        .filter(|found| found.vendor != Vendor::Nvidia)
-        .map(|found| format!("{} at {}", found.name(), found.address))
-        .collect();
-    let gpu = match (named.is_empty(), others.is_empty()) {
-        (false, _) => named.join(" and "),
-        (true, false) => others.join(" and "),
-        (true, true) => String::from("NVIDIA GPU"),
+    let gpu = match named.is_empty() {
+        true => String::from("the GPU"),
+        false => named.join(" and "),
     };
-    format!(
-        "the {gpu} could not start: {error}. macOS starts without it; the boot log on this USB \
-         says why"
-    )
+    format!("{gpu} could not start: {error}. The boot log on this USB says why")
 }
 
 /// What became of the firmware's picture on a claimed GPU no driver bound.
@@ -200,7 +201,7 @@ pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> 
         ),
     };
     format!(
-        "the {gpu} at {address} did not start: its Linux driver {driver} did not bind it.{screen} \
+        "the {gpu} at {address} did not start: its driver {driver} stopped with an error.{screen} \
          The boot log on this USB says why"
     )
 }
@@ -377,12 +378,6 @@ pub fn bar_sizes(bars: &[(usize, u64)]) -> String {
     named.join(", ")
 }
 
-/// How the screen names a display adapter: its market name, else its
-/// maker and IDs, and its PCI address.
-pub fn adapter(adapter: &Adapter) -> String {
-    format!("the {} at {}", adapter.name(), adapter.address)
-}
-
 fn maker(vendor: Vendor) -> String {
     match vendor {
         Vendor::Nvidia => String::from("NVIDIA"),
@@ -392,30 +387,34 @@ fn maker(vendor: Vendor) -> String {
     }
 }
 
-/// The line for a display adapter Stela's GPU driver does not run, and why.
-pub fn unused(found: &Adapter) -> String {
-    format!(
-        "{} is not used: {}",
-        adapter(found),
-        found.unavailable_reason()
-    )
-}
-
-/// The screen line for a PC without an NVIDIA GPU, naming the display
-/// adapters it has instead.
-pub fn none(adapters: &[Adapter]) -> String {
+/// The screen line for a PC with no GPU this build drives, `ports` being the
+/// makers whose GPUs it drives: the GPUs it has instead, by their market
+/// names, and what Stela needs. A build that drives NVIDIA GPUs alone says
+/// so and names no other maker's port. Display adapters of no GPU maker,
+/// as a server's BMC display, tell a user nothing: the log names them.
+pub fn none(adapters: &[Adapter], ports: &[Vendor]) -> String {
     let found: Vec<String> = adapters
         .iter()
-        .filter(|found| found.vendor != Vendor::Nvidia)
-        .map(adapter)
+        .filter(|found| !matches!(found.vendor, Vendor::Other(_)))
+        .map(|found| format!("the {}", found.name()))
         .collect();
-    match found.is_empty() {
-        true => format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}"),
-        false => format!(
-            "this PC has no NVIDIA GPU, only {}: Stela needs {SUPPORTED}",
-            found.join(" and ")
-        ),
+    let only = match found.is_empty() {
+        true => String::new(),
+        false => format!(", only {}", found.join(" and ")),
+    };
+    let amd = ports.contains(&Vendor::Amd);
+    let intel = ports.contains(&Vendor::Intel);
+    if !amd && !intel {
+        return format!("this PC has no NVIDIA GPU{only}: Stela needs {SUPPORTED}");
     }
+    let mut needed = alloc::vec![SUPPORTED];
+    needed.extend(amd.then_some(SUPPORTED_AMD));
+    needed.extend(intel.then_some(SUPPORTED_INTEL));
+    let (last, rest) = needed.split_last().unwrap_or((&SUPPORTED, &[]));
+    format!(
+        "this PC has no GPU Stela drives{only}: Stela needs {}, or {last}",
+        rest.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -467,8 +466,8 @@ mod tests {
                 "xe",
                 Picture::Elsewhere
             ),
-            "the Intel Iris Xe Graphics at 00:02.0 did not start: its Linux driver xe did not \
-             bind it. The boot log on this USB says why"
+            "the Intel Iris Xe Graphics at 00:02.0 did not start: its driver xe stopped with an \
+             error. The boot log on this USB says why"
         );
         let reset = unbound(
             "Intel Iris Xe Graphics",
@@ -478,8 +477,8 @@ mod tests {
         );
         assert!(
             reset.contains(
-                "xe did not bind it. The screen the PC started on is wired to it and stays \
-                 dark: the GPU was reset for its driver. The boot log"
+                "xe stopped with an error. The screen the PC started on is wired to it and \
+                 stays dark: the GPU was reset for its driver. The boot log"
             ),
             "{reset}"
         );
@@ -605,7 +604,7 @@ mod tests {
             "the NVIDIA GeForce GTX 1080 at 01:00.0 is not supported: Stela needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(none(&[], &[Vendor::Nvidia]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
     }
 
     #[test]
@@ -625,21 +624,31 @@ mod tests {
         };
         let amd = at(3, Vendor::Amd, 0x744c, 0xc8);
         let intel = at(0, Vendor::Intel, 0xa780, 4);
+        // QEMU's virtio GPU or a server's BMC display: no maker's name.
+        let other = at(1, Vendor::Other(0x1af4), 0x1050, 1);
+        // A build that drives NVIDIA GPUs alone names no other port.
         assert_eq!(
-            none(&[amd, intel]),
-            "this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX at 0000:03:00.0 and the \
-             Intel UHD Graphics 770 at 0000:00:00.0: Stela needs an NVIDIA GeForce GTX 16 or RTX \
-             20, 30, 40 or 50 series GPU"
+            none(&[amd, intel, other], &[Vendor::Nvidia]),
+            "this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX and the Intel UHD \
+             Graphics 770: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series \
+             GPU"
         );
         assert_eq!(
-            unused(&amd),
-            "the AMD Radeon RX 7900 XTX at 0000:03:00.0 is not used: AMDGPU is not ported to \
-             Stela"
+            none(&[other], &[Vendor::Nvidia]),
+            "this PC has no NVIDIA GPU: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 \
+             or 50 series GPU"
         );
-        // QEMU's virtio GPU: no maker's name.
+        // One with the AMD and Intel ports says what else it drives.
         assert_eq!(
-            adapter(&at(1, Vendor::Other(0x1af4), 0x1050, 1)),
-            "the display adapter at 0000:01:00.0"
+            none(&[other], &[Vendor::Nvidia, Vendor::Amd, Vendor::Intel]),
+            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+             30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from \
+             6th generation Core processors on"
+        );
+        assert_eq!(
+            none(&[], &[Vendor::Nvidia, Vendor::Amd]),
+            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+             30, 40 or 50 series GPU, or an AMD Radeon RX Vega or later GPU"
         );
     }
 
@@ -660,8 +669,7 @@ mod tests {
         assert_eq!(started(None, &[], None), "started");
         assert_eq!(
             shows_only(amd, Some(nvidia)),
-            "the AMD Radeon Graphics only shows screens wired to it: the NVIDIA GeForce RTX 5080 \
-             draws"
+            "the AMD Radeon Graphics shows the picture on the screens wired to it"
         );
         assert!(shows_only("Intel Arc A770", None).ends_with("no Vulkan driver for it"));
         assert_eq!(
@@ -814,18 +822,19 @@ mod tests {
             class: [3, 0, 0],
             revision: 0,
         };
-        // An RTX 4060 beside an Intel iGPU.
-        let found = [at(0, Vendor::Intel, 0xa780), at(1, Vendor::Nvidia, 0x2882)];
+        // An RTX 4060 claimed beside an Intel iGPU left with the firmware.
+        let claimed = [at(1, Vendor::Nvidia, 0x2882)];
         assert_eq!(
-            failed(&found, "GPU startup exceeded its deadline"),
+            failed(&claimed, "GPU startup exceeded its deadline"),
             "the NVIDIA GeForce RTX 4060 at 0000:01:00.0 could not start: GPU startup exceeded \
-             its deadline. macOS starts without it; the boot log on this USB says why"
+             its deadline. The boot log on this USB says why"
         );
-        assert!(failed(&[], "x").starts_with("the NVIDIA GPU could not start: x."));
-        // Without an NVIDIA GPU, the adapters a driver was started for.
-        assert!(
-            failed(&found[..1], "x")
-                .starts_with("the Intel UHD Graphics 770 at 0000:00:00.0 could not start: x."),
-        );
+        assert!(failed(&[], "x").starts_with("the GPU could not start: x."));
+        // Both, where both were claimed.
+        let both = [at(0, Vendor::Intel, 0xa780), claimed[0]];
+        assert!(failed(&both, "x").starts_with(
+            "the Intel UHD Graphics 770 at 0000:00:00.0 and the NVIDIA GeForce RTX 4060 at \
+                 0000:01:00.0 could not start: x."
+        ),);
     }
 }

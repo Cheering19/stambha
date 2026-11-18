@@ -53,6 +53,7 @@ pub mod first_stop;
 pub mod gpu_loss;
 pub mod gpu_requests;
 pub mod gpu_status;
+pub mod gpu_step;
 pub mod gpu_triage;
 pub mod guarded_stacks;
 pub mod guest_bluetooth;

@@ -1360,7 +1360,7 @@ pub(super) fn metal_choice(
 /// driver that decides during its probe and does not answer leaves the
 /// kind unknown, and the GPU counts as integrated, so a discrete GPU takes
 /// the Metal device first; that is reported once per GPU.
-fn integrated(index: usize, bound: &Bound) -> bool {
+pub(super) fn integrated(index: usize, bound: &Bound) -> bool {
     /// The bound GPUs, by index, whose unanswered query was reported.
     static REPORTED: AtomicU64 = AtomicU64::new(0);
     let Some(query) = bound.stack.kernel.probed_integrated else {
