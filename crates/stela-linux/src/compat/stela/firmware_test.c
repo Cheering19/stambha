@@ -95,6 +95,8 @@ static void fixture_unbind(struct fixture *fixture)
 }
 static void fixture_enter(struct fixture *fixture)
 {
+	/* Each case counts its own log lines, under the boot's bound. */
+	reported_requests = 0;
 	current_fixture = fixture;
 	stela_linux_enter(&canonical_owner);
 	fixture_bind(fixture);
@@ -150,7 +152,11 @@ static void independent_lifetime(void)
 				       wrappers[i]->data != wrappers[j]->data);
 		}
 	}
-	assert(fixture->requests == ARRAY_SIZE(requests) && !fixture->messages);
+	/* Each delivered file is named with its bytes. */
+	assert(fixture->requests == ARRAY_SIZE(requests) &&
+	       fixture->messages == ARRAY_SIZE(requests));
+	assert(fixture->level == LOGLEVEL_INFO &&
+	       strstr(fixture->message, "firmware vendor/exact-image.bin: 257 bytes\n"));
 	assert(backing[0] == 0x7c && backing[size + 1] == 0xc7);
 	fixture_exit(fixture);
 	/* Destroy the actual context and bytes, not just a logical owner flag. */
@@ -201,16 +207,20 @@ static void errors_and_shapes(void)
 			const struct firmware *firmware = (const struct firmware *)1;
 			assert(requests[j](&firmware, request_name, &fixture.device) == errors[i]);
 			assert(!firmware && allocation_calls == calls && !live_snapshots);
-			assert(fixture.messages == before + (j == 0 ? 1U : 0U));
-			if (!j) {
-				char expected[160];
+			/* Every refusal is named once, a warning only where asked. */
+			assert(fixture.messages == before + 1);
+			char expected[160];
+			if (!j)
 				snprintf(expected, sizeof(expected),
-					 "Direct firmware load for %s failed with error %d\n",
-					 request_name, errors[i]);
-				assert(fixture.level == LOGLEVEL_WARNING);
-				/* Device diagnostics may add the original device prefix. */
-				assert(strstr(fixture.message, expected));
-			}
+					 "Direct firmware load for %s failed with error %d: %s\n",
+					 request_name, errors[i], refusal(errors[i]));
+			else
+				snprintf(expected, sizeof(expected),
+					 "firmware %s not given (error %d: %s); asked for as optional\n",
+					 request_name, errors[i], refusal(errors[i]));
+			assert(fixture.level == (j ? LOGLEVEL_INFO : LOGLEVEL_WARNING));
+			/* Device diagnostics may add the original device prefix. */
+			assert(strstr(fixture.message, expected));
 		}
 	}
 	fixture.status = 0;
@@ -233,7 +243,7 @@ static void errors_and_shapes(void)
 			const struct firmware *firmware = (const struct firmware *)1;
 			assert(requests[j](&firmware, request_name, &fixture.device) == shapes[i].status);
 			assert(!firmware && !live_snapshots && allocation_calls == calls);
-			assert(fixture.messages == before);
+			assert(fixture.messages == before + 1);
 		}
 	}
 	/* Invalid public inputs never reach the unsafe provider. */
@@ -247,6 +257,32 @@ static void errors_and_shapes(void)
 	}
 	assert(fixture.requests == before);
 	fixture_exit(&fixture);
+}
+
+/* A boot log names a bounded number of requests, then says it stops. */
+static void bounded_reports(void)
+{
+	u8 backing[5];
+	fill(backing, sizeof(backing), 7);
+	struct fixture fixture = {.data = backing, .size = sizeof(backing)};
+	fixture_enter(&fixture);
+	for (unsigned int i = 0; i < REPORTED_REQUESTS + 3; i++) {
+		const struct firmware *firmware;
+		assert(!request_firmware(&firmware, request_name, &fixture.device));
+		release_firmware(firmware);
+		if (i < REPORTED_REQUESTS)
+			assert(strstr(fixture.message, "firmware vendor/exact-image.bin: 5 bytes\n"));
+	}
+	assert(fixture.messages == REPORTED_REQUESTS + 1);
+	assert(strstr(fixture.message, "firmware: later requests are not listed\n"));
+	fixture.status = -ENOENT;
+	const struct firmware *missing = NULL;
+	assert(request_firmware(&missing, request_name, &fixture.device) == -ENOENT);
+	assert(fixture.messages == REPORTED_REQUESTS + 1);
+	fixture_exit(&fixture);
+	/* The two refusals a GPU's selection answers read as what they mean. */
+	assert(!strcmp(refusal(-ENOENT), "it is not on the USB"));
+	assert(!strcmp(refusal(-EACCES), "it is not among the files Stela chose for this device"));
 }
 
 static void allocation_failure(void)
@@ -265,7 +301,8 @@ static void allocation_failure(void)
 		unsigned int before = fixture.messages;
 		assert(requests[i](&firmware, request_name, &fixture.device) == -ENOMEM);
 		assert(!firmware && live_snapshots == 1 && allocation_calls == calls);
-		assert(allocated_bytes == bytes && fixture.messages == before);
+		assert(allocated_bytes == bytes && fixture.messages == before + 1);
+		assert(strstr(fixture.message, "error -12: no memory for its copy"));
 		check(retained, sizeof(backing), 43);
 	}
 	fail_snapshot_allocation = false;
@@ -427,6 +464,7 @@ int main(void)
 	large_snapshot();
 	errors_and_shapes();
 	allocation_failure();
+	bounded_reports();
 	nonquiescent_refusal();
 	assert(!live_snapshots && allocated_bytes == released_bytes);
 	printf("Linux firmware: owned snapshots, exact authority, owner-independent lifetime, large payloads, errors, failure and context passed\n");
