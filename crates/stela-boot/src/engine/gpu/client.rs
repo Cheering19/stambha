@@ -269,7 +269,11 @@ enum Operation {
         offset: u64,
         size: usize,
     },
-    Unmap(u64),
+    /// Linux's munmap: any page-aligned run of a mapping.
+    Unmap {
+        address: u64,
+        bytes: u64,
+    },
     Fault {
         address: u64,
         write: bool,
@@ -584,13 +588,15 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 refused::map(fd, offset, size, result);
                 result
             }
-            Operation::Unmap(address) => {
-                let unmapped = gpu.mappings.borrow_mut().unmap(address);
+            Operation::Unmap { address, bytes } => {
+                let unmapped = gpu.mappings.borrow_mut().unmap(address, bytes);
                 match unmapped {
                     Ok(Some((mapping, span))) => release_mapping(gpu, mapping, span),
-                    // The last fault running in it releases it.
+                    // Pages of it remain, or the last fault running in it
+                    // releases it.
                     Ok(None) => {}
-                    Err(client_fault::NotMapped) => return EFAULT,
+                    Err(client_fault::Refused::NotMapped) => return EFAULT,
+                    Err(client_fault::Refused::Invalid) => return EINVAL,
                 }
                 0
             }
@@ -612,7 +618,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                         EFAULT
                     }
                     (Place::Inside { .. }, None) => EFAULT,
-                    (Place::Outside { .. }, _) => ENXIO,
+                    (Place::Released { .. } | Place::Outside { .. }, _) => ENXIO,
                 };
                 // No allocation: the faulting code may hold the heap's lock.
                 output::arguments(format_args!(
@@ -1028,7 +1034,7 @@ fn request_code(operation: &Operation) -> u32 {
         Operation::Duplicate(_) => HostCall::Duplicate,
         Operation::Device(_) => HostCall::Device,
         Operation::Map { .. } => HostCall::Map,
-        Operation::Unmap(_) => HostCall::Unmap,
+        Operation::Unmap { .. } => HostCall::Unmap,
         Operation::Fault { .. } => HostCall::Fault,
         Operation::Thread(_) => HostCall::Thread,
         Operation::Wake => HostCall::Wake,
@@ -1766,7 +1772,10 @@ pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
 
 /// Removes the mapping [`map`] gave at `address`.
 pub(super) fn unmap(address: NonNull<u8>) {
-    let result = submit(Operation::Unmap(address.as_ptr() as u64));
+    let result = submit(Operation::Unmap {
+        address: address.as_ptr() as u64,
+        bytes: u64::MAX,
+    });
     if result != 0 {
         output::arguments(format_args!("GPU unmap of {address:p} refused: {result}\n"));
     }
@@ -2187,12 +2196,15 @@ extern "C" fn stela_libc_drm_mmap(fd: c_int, offset: u64, size: usize) -> *mut c
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn stela_libc_drm_munmap(address: *mut c_void, _size: usize) -> c_int {
+extern "C" fn stela_libc_drm_munmap(address: *mut c_void, size: usize) -> c_int {
     let mapped = installed().is_some_and(|gpu| gpu.window.contains(address as u64));
     if !mapped {
         return 0;
     }
-    let result = submit(Operation::Unmap(address as u64));
+    let result = submit(Operation::Unmap {
+        address: address as u64,
+        bytes: size as u64,
+    });
     if result < 0 { result as c_int } else { 1 }
 }
 

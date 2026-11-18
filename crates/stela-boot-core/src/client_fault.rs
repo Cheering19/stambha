@@ -7,6 +7,7 @@
 //! only an address inside a VMA. Any other page is no client's: an access
 //! there is the host code's own error, which no refault can answer.
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::fmt;
 
 const PAGE: u64 = 4096;
@@ -32,6 +33,9 @@ impl Span {
 pub enum Place {
     /// In a client's mapping, at byte `at` of it: Linux's to refault.
     Inside { span: Span, at: u64 },
+    /// In a page of a client's mapping that the client already unmapped,
+    /// at byte `at` of the mapping: as Linux's split mapping, no longer it.
+    Released { span: Span, at: u64 },
     /// In no client's mapping, between the nearest ones.
     Outside {
         below: Option<Span>,
@@ -70,6 +74,16 @@ impl fmt::Display for Unserved {
                 span.fd,
                 (span.pages * PAGE) >> 10,
                 span.offset,
+                span.start,
+            ),
+            Place::Released { span, at } => write!(
+                f,
+                "FAULT IN UNMAPPED CLIENT PAGES a {access} at {:#x} is byte {at:#x} of fd {}'s \
+                 mapping of {} KiB at {:#x}, in pages the client unmapped, so it is no longer \
+                 the client's",
+                self.address,
+                span.fd,
+                (span.pages * PAGE) >> 10,
                 span.start,
             ),
             Place::Outside { below, above } => {
@@ -114,6 +128,11 @@ impl fmt::Display for Unserved {
 /// released by the last of them ([`Self::end_fault`]), so Linux never frees
 /// a mapping a fault still uses, and its addresses are not given out again
 /// before then.
+///
+/// As Linux's `munmap`, a client may unmap any page-aligned run of a mapping:
+/// ANV maps a buffer from the kernel's start of it and unmaps the pages
+/// before its slab entry. Those pages are no longer the mapping's, and the
+/// mapping ends when every page of it is.
 #[derive(Debug)]
 pub struct Mappings<M> {
     entries: BTreeMap<u64, Entry<M>>,
@@ -125,6 +144,36 @@ struct Entry<M> {
     span: Span,
     faults: u32,
     unmapped: bool,
+    /// The page runs the client unmapped, sorted and merged.
+    released: Vec<(u64, u64)>,
+}
+
+impl<M> Entry<M> {
+    fn released(&self, page: u64) -> bool {
+        self.released
+            .iter()
+            .any(|&(first, end)| page >= first && page < end)
+    }
+
+    /// Releases the pages of `address..address + bytes` in the mapping:
+    /// whether every page of it now is.
+    fn release(&mut self, address: u64, bytes: u64) -> bool {
+        let first = (address - self.span.start) / PAGE;
+        let end = first
+            .saturating_add(bytes.div_ceil(PAGE))
+            .min(self.span.pages);
+        self.released.push((first, end));
+        self.released.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.released.len());
+        for &(first, end) in &self.released {
+            match merged.last_mut() {
+                Some(previous) if first <= previous.1 => previous.1 = previous.1.max(end),
+                _ => merged.push((first, end)),
+            }
+        }
+        self.released = merged;
+        self.released == [(0, self.span.pages)]
+    }
 }
 
 /// A fault's lookup: where it lies, and the mapping Linux refaults it in,
@@ -135,9 +184,14 @@ pub struct Lookup<M> {
     pub held: Option<M>,
 }
 
-/// An unmapping of no mapping at that address.
+/// An unmapping refused, as Linux's `munmap` refuses it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NotMapped;
+pub enum Refused {
+    /// No mapping holds the address.
+    NotMapped,
+    /// No bytes, or an address not on a page.
+    Invalid,
+}
 
 impl<M> Default for Mappings<M> {
     fn default() -> Self {
@@ -157,6 +211,7 @@ impl<M: Copy> Mappings<M> {
                 span,
                 faults: 0,
                 unmapped: false,
+                released: Vec::new(),
             },
         );
     }
@@ -177,13 +232,18 @@ impl<M: Copy> Mappings<M> {
             .range(address.saturating_add(1)..)
             .map(|(_, e)| e)
             .find(live);
-        let place = place(below.map(|e| e.span), above.map(|e| e.span), address);
+        let place = match place(below.map(|e| e.span), above.map(|e| e.span), address) {
+            Place::Inside { span, at } if below.is_some_and(|e| e.released(at / PAGE)) => {
+                Place::Released { span, at }
+            }
+            place => place,
+        };
         let held = match place {
             Place::Inside { span, .. } => self.entries.get_mut(&span.start).map(|entry| {
                 entry.faults += 1;
                 entry.map
             }),
-            Place::Outside { .. } => None,
+            Place::Released { .. } | Place::Outside { .. } => None,
         };
         Lookup { place, held }
     }
@@ -203,14 +263,23 @@ impl<M: Copy> Mappings<M> {
         None
     }
 
-    /// Unmaps the mapping at `start`: it and its span to release now, or
-    /// none when faults still run in it, the last of which releases it.
-    pub fn unmap(&mut self, start: u64) -> Result<Option<(M, Span)>, NotMapped> {
-        let entry = self
+    /// Unmaps the `bytes` at `address` of the mapping that holds it: the
+    /// mapping and its span to release now when that was its last page, or
+    /// none when pages of it remain or faults still run in it, the last of
+    /// which releases it.
+    pub fn unmap(&mut self, address: u64, bytes: u64) -> Result<Option<(M, Span)>, Refused> {
+        if bytes == 0 || !address.is_multiple_of(PAGE) {
+            return Err(Refused::Invalid);
+        }
+        let (&start, entry) = self
             .entries
-            .get_mut(&start)
-            .filter(|entry| !entry.unmapped)
-            .ok_or(NotMapped)?;
+            .range_mut(..=address)
+            .next_back()
+            .filter(|(_, entry)| !entry.unmapped && address < entry.span.end())
+            .ok_or(Refused::NotMapped)?;
+        if !entry.release(address, bytes) {
+            return Ok(None);
+        }
         if entry.faults != 0 {
             entry.unmapped = true;
             return Ok(None);
@@ -340,8 +409,11 @@ mod tests {
             ..ABOVE
         };
         maps.insert(other, 3);
-        assert_eq!(maps.unmap(BELOW.start), Ok(None));
-        assert_eq!(maps.unmap(BELOW.start), Err(NotMapped));
+        assert_eq!(maps.unmap(BELOW.start, BELOW.pages * PAGE), Ok(None));
+        assert_eq!(
+            maps.unmap(BELOW.start, BELOW.pages * PAGE),
+            Err(Refused::NotMapped)
+        );
         // Its addresses stay taken, but no new fault finds it.
         assert_eq!(maps.len(), 3);
         let late = maps.begin_fault(address);
@@ -358,7 +430,7 @@ mod tests {
         maps.insert(BELOW, 1u32);
         assert_eq!(maps.begin_fault(BELOW.start).held, Some(1));
         assert_eq!(maps.begin_fault(BELOW.start + 2 * PAGE).held, Some(1));
-        assert_eq!(maps.unmap(BELOW.start), Ok(None));
+        assert_eq!(maps.unmap(BELOW.start, u64::MAX), Ok(None));
         assert_eq!(maps.end_fault(BELOW.start), None);
         assert_eq!(maps.end_fault(BELOW.start), Some((1, BELOW)));
         assert!(maps.is_empty());
@@ -366,7 +438,93 @@ mod tests {
         maps.insert(ABOVE, 2);
         assert_eq!(maps.begin_fault(ABOVE.start).held, Some(2));
         assert_eq!(maps.end_fault(ABOVE.start), None);
-        assert_eq!(maps.unmap(ABOVE.start), Ok(Some((2, ABOVE))));
+        assert_eq!(maps.unmap(ABOVE.start, PAGE), Ok(Some((2, ABOVE))));
         assert_eq!(maps.begin_fault(ABOVE.start).held, None);
+    }
+
+    #[test]
+    fn a_mapping_goes_once_every_page_of_it_is_released() {
+        // ANV's slab entry: the kernel maps a buffer from its start, so the
+        // entry at 12 KiB of a 16-page slab is mapped with the three pages
+        // before it, which are unmapped at once; the rest goes later.
+        let mut maps = Mappings::default();
+        maps.insert(BELOW, 1u32);
+        assert_eq!(maps.unmap(BELOW.start, 3 * PAGE), Ok(None));
+        assert_eq!(maps.begin_fault(BELOW.start + 3 * PAGE).held, Some(1));
+        assert_eq!(maps.end_fault(BELOW.start), None);
+        // A run inside, then the rest in two parts, out of order.
+        assert_eq!(maps.unmap(BELOW.start + 8 * PAGE, 2 * PAGE), Ok(None));
+        assert_eq!(maps.unmap(BELOW.start + 10 * PAGE, 100 * PAGE), Ok(None));
+        // A page released twice counts once.
+        assert_eq!(maps.unmap(BELOW.start + 9 * PAGE, PAGE), Ok(None));
+        assert_eq!(
+            maps.unmap(BELOW.start + 3 * PAGE, 5 * PAGE),
+            Ok(Some((1, BELOW)))
+        );
+        assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn an_empty_unaligned_or_unmapped_unmap_is_refused_and_releases_nothing() {
+        let mut maps = Mappings::default();
+        maps.insert(BELOW, 1u32);
+        assert_eq!(maps.unmap(BELOW.start, 0), Err(Refused::Invalid));
+        assert_eq!(maps.unmap(BELOW.start + 1, PAGE), Err(Refused::Invalid));
+        assert_eq!(maps.unmap(BELOW.end(), PAGE), Err(Refused::NotMapped));
+        assert_eq!(
+            maps.unmap(BELOW.start - PAGE, PAGE),
+            Err(Refused::NotMapped)
+        );
+        assert_eq!(
+            maps.unmap(BELOW.start, BELOW.pages * PAGE),
+            Ok(Some((1, BELOW)))
+        );
+    }
+
+    #[test]
+    fn a_page_unmapped_during_a_fault_leaves_the_mapping_held_by_it() {
+        let mut maps = Mappings::default();
+        maps.insert(BELOW, 1u32);
+        let lookup = maps.begin_fault(BELOW.start + 5 * PAGE);
+        assert_eq!(lookup.held, Some(1));
+        // While the fault sleeps the client unmaps the first pages, then all
+        // but the faulting one's: the fault's page stays the mapping's.
+        assert_eq!(maps.unmap(BELOW.start, 5 * PAGE), Ok(None));
+        assert_eq!(maps.unmap(BELOW.start + 6 * PAGE, 10 * PAGE), Ok(None));
+        // A fault in a released page is not the mapping's.
+        let late = maps.begin_fault(BELOW.start + PAGE);
+        assert_eq!(late.held, None);
+        assert_eq!(
+            late.place,
+            Place::Released {
+                span: BELOW,
+                at: PAGE
+            }
+        );
+        // The last page goes while the fault runs: the fault releases it.
+        assert_eq!(maps.unmap(BELOW.start + 5 * PAGE, PAGE), Ok(None));
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps.begin_fault(BELOW.start + 5 * PAGE).held, None);
+        assert_eq!(maps.end_fault(BELOW.start), Some((1, BELOW)));
+        assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn a_fault_in_an_unmapped_page_is_named_so() {
+        let line = Unserved {
+            address: BELOW.start + PAGE,
+            write: false,
+            place: Place::Released {
+                span: BELOW,
+                at: PAGE,
+            },
+        }
+        .to_string();
+        assert_eq!(
+            line,
+            "FAULT IN UNMAPPED CLIENT PAGES a read at 0xffff80100c001000 is byte 0x1000 of fd \
+             7's mapping of 64 KiB at 0xffff80100c000000, in pages the client unmapped, so it \
+             is no longer the client's"
+        );
     }
 }
