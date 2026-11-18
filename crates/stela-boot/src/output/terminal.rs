@@ -192,9 +192,21 @@ struct Failed(Option<stela_boot_core::heap::Failure>);
 
 impl core::fmt::Display for Failed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.0 {
-            Some(failure) => write!(f, "{failure}"),
-            None => Ok(()),
+        let Some(failure) = self.0 else {
+            return Ok(());
+        };
+        write!(f, "{failure}")?;
+        // An integrated GPU's pages, its GTT among them, come from its
+        // share of RAM, not the heap: what Linux held of it says whether
+        // the GPU's work was near its own limit too. Two plain reads.
+        match stela_linux::pages::held_and_limit() {
+            (held, limit) if limit != 0 => write!(
+                f,
+                "; the GPU's share of RAM: Linux holds {}M of {}M, its GTT's pages among them",
+                (held * stela_boot_core::native_memory::PAGE) >> 20,
+                (limit * stela_boot_core::native_memory::PAGE) >> 20
+            ),
+            _ => Ok(()),
         }
     }
 }
