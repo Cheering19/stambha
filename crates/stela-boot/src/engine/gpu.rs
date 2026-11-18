@@ -2002,7 +2002,7 @@ pub(super) fn claim_all(
     catalog: Option<&Arc<Catalog>>,
     port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
-    use stela_boot_core::gpu_status::{self, Reason};
+    use stela_boot_core::gpu_status::Reason;
     use stela_drivers::gpu::selection::{self, Choice, Driven, Found};
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
         vendor: adapter.vendor,
