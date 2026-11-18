@@ -88,6 +88,33 @@ impl BridgeWindows {
         self.buses.clone()
     }
 
+    /// Whether the bridge forwards every byte of `span` (one window holds
+    /// it all, or the bridge decodes subtractively).
+    pub fn forwards_all(&self, span: &Range<u64>) -> bool {
+        let holds = |window: &Range<u64>| window.start <= span.start && span.end <= window.end;
+        self.subtractive
+            || self.memory.as_ref().is_some_and(holds)
+            || self.prefetchable.as_ref().is_some_and(holds)
+    }
+
+    /// Its windows in words, for a log line.
+    pub fn describe(&self) -> alloc::string::String {
+        let window = |range: &Option<Range<u64>>| match range {
+            Some(range) => alloc::format!("{:#x}..{:#x}", range.start, range.end),
+            None => alloc::string::String::from("closed"),
+        };
+        alloc::format!(
+            "memory {}, prefetchable {}{}",
+            window(&self.memory),
+            window(&self.prefetchable),
+            if self.subtractive {
+                ", subtractive"
+            } else {
+                ""
+            }
+        )
+    }
+
     /// Whether the bridge forwards any byte of `span`.
     pub fn forwards(&self, span: &Range<u64>) -> bool {
         let overlaps = |window: &Range<u64>| window.start < span.end && span.start < window.end;
@@ -208,6 +235,24 @@ mod tests {
         assert!(bridge.forwards(&(0x6_0000 * MIB - 1..0x6_0000 * MIB + 1)));
         assert!(!bridge.forwards(&(0x4_0000 * MIB..0x4_0000 * MIB + 8 * MIB)));
         assert!(!bridge.forwards(&(0xa10 * MIB..0xa20 * MIB)));
+    }
+
+    #[test]
+    fn a_span_is_forwarded_whole_only_inside_one_window() {
+        let bridge =
+            BridgeWindows::from_words(port(1, 3, Some((0xa00, 0xa0f)), Some((0x6_0000, 0x6_0fff))))
+                .unwrap();
+        assert!(bridge.forwards_all(&(0xa08 * MIB..0xa10 * MIB)));
+        assert!(!bridge.forwards_all(&(0xa08 * MIB..0xa10 * MIB + 1)));
+        assert!(bridge.forwards_all(&(0x6_0000 * MIB..0x6_0001 * MIB)));
+        assert!(!bridge.forwards_all(&(0x9ff * MIB..0xa01 * MIB)));
+        assert_eq!(
+            bridge.describe(),
+            "memory 0xa0000000..0xa1000000, prefetchable 0x6000000000..0x6100000000"
+        );
+        let closed = BridgeWindows::from_words(port(2, 2, None, None)).unwrap();
+        assert!(!closed.forwards_all(&(0..1)));
+        assert_eq!(closed.describe(), "memory closed, prefetchable closed");
     }
 
     #[test]

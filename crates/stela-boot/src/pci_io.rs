@@ -764,30 +764,33 @@ pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
 }
 
 /// The version (major, minor, revision) of the graphics block that the AMD
-/// GPU at `address` lists in its IP discovery table, read through the
-/// firmware's protocol from the GPU's register BAR `registers` as amdgpu
-/// reads it at its probe ([`stela_boot_core::amd_discovery`]): through the
-/// `MM_INDEX` and `MM_DATA` registers, one dword at a time, whose index is
-/// put back after. Only the indirect window is written; the firmware's
-/// driver keeps the GPU and its picture. A GPU whose memory decoding the
-/// firmware left off (one no firmware driver started) has it turned on for
-/// the read, as Linux's `pci_enable_device` does, and off again after.
-/// An error names what was not read and why, in plain words.
+/// GPU at `address` lists in its IP discovery table, read from the GPU's
+/// register BAR `registers` as amdgpu reads it at its probe
+/// ([`stela_boot_core::amd_discovery`]): through the `MM_INDEX` and
+/// `MM_DATA` registers, one dword at a time, whose index is put back after.
+/// Only the indirect window is written; the firmware's driver keeps the GPU
+/// and its picture. A GPU whose memory decoding the firmware left off (one
+/// no firmware driver started) has it turned on for the read, as Linux's
+/// `pci_enable_device` does, and off again after.
+///
+/// The firmware's PCI protocol reads the BAR where it describes it. Where
+/// it does not (a GPU no firmware driver started may get no description),
+/// the BAR's address is read from the function's configuration space, each
+/// bridge above it must forward the register window and decode memory (one
+/// that does not is turned on for the read, as `pci_enable_bridge` does,
+/// and off after), and the registers are read at that physical range
+/// through its root bridge's protocol, as the engine reads them later
+/// through its own uncached mapping. An error names what was not read and
+/// why, in plain words.
 pub(crate) fn amd_graphics_version(
     address: Address,
     registers: u8,
 ) -> Result<(u8, u8, u8), alloc::string::String> {
     use alloc::{format, string::String};
-    use stela_boot_core::amd_discovery::{
-        self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI, RCC_CONFIG_MEMSIZE, REGISTER_BYTES,
-    };
-    /// `EFI_PCI_IO_ATTRIBUTE_MEMORY`: the function decodes its memory BARs.
-    const MEMORY: u64 = 0x0200;
-    const ENABLE: u32 = 2;
-    const DISABLE: u32 = 3;
+    use stela_boot_core::amd_discovery::REGISTER_BYTES;
     let handles = boot::find_handles::<PciIo>().map_err(|error| format!("{error:?}"))?;
     let mut found = None;
-    for handle in handles {
+    for &handle in &handles {
         let Ok(mut io) = get_protocol::<PciIo>(handle) else {
             continue;
         };
@@ -801,118 +804,370 @@ pub(crate) fn amd_graphics_version(
     let header = io
         .read_header()
         .map_err(|error| format!("its configuration header was not read: {error}"))?;
-    let window = io
-        .bar_regions(registers)
-        .map_err(|error| format!("the firmware does not describe its BAR {registers}: {error}"))?
-        .into_iter()
-        .find(|region| region.resource_type == 0)
-        .ok_or_else(|| format!("its BAR {registers} holds no memory range"))?
-        .host;
-    let length = window.end.saturating_sub(window.start);
-    if length < REGISTER_BYTES as u64 {
-        return Err(format!(
-            "its BAR {registers} at {:#x} holds {length:#x} bytes, under the {REGISTER_BYTES:#x} \
-             the table's registers need",
-            window.start
-        ));
-    }
-    // Command register bit 1: memory space decoding.
-    let decoding = header[4] & 1 << 1 != 0;
-    if !decoding {
-        // SAFETY: live boot protocol; Enable takes the attribute bits and
-        // no result pointer.
-        let status = unsafe { (io.attributes)(io, ENABLE, MEMORY, ptr::null_mut()) };
-        if !status.is_success() {
+    let described = match io.bar_regions(registers) {
+        Ok(regions) => {
+            let window = regions
+                .into_iter()
+                .find(|region| region.resource_type == 0)
+                .ok_or_else(|| format!("its BAR {registers} holds no memory range"))?
+                .host;
+            let length = window.end.saturating_sub(window.start);
+            if length < REGISTER_BYTES as u64 {
+                return Err(format!(
+                    "its BAR {registers} at {:#x} holds {length:#x} bytes, under the \
+                     {REGISTER_BYTES:#x} the table's registers need",
+                    window.start
+                ));
+            }
+            Ok(window.start)
+        }
+        Err(error) => Err(format!(
+            "the firmware does not describe its BAR {registers}: {error}"
+        )),
+    };
+    let decoding = match enable_memory(io, &header) {
+        Ok(decoding) => decoding,
+        Err(status) => {
             return Err(format!(
                 "its memory decoding is off and the firmware refused to turn it on ({status:?})"
             ));
         }
+    };
+    let result = match described {
+        Ok(start) => {
+            let mut bar = DescribedBar {
+                io: &mut *io,
+                registers,
+                refused: None,
+            };
+            graphics_version(&mut bar, || {
+                format!("its BAR {registers} at {start:#x}")
+            })
+        }
+        Err(undescribed) => {
+            by_address(&handles, address, &header, registers).and_then(|(start, mut bar)| {
+                let result = graphics_version(&mut bar, || {
+                    format!("its BAR {registers} read by address at {start:#x}")
+                });
+                bar.restore();
+                result
+            })
+            .map_err(|why| format!("{undescribed}; by its address: {why}"))
+        }
+    };
+    if !decoding {
+        restore_memory(io);
     }
-    let refused = core::cell::Cell::new(None);
-    let read = |io: &mut PciIo, offset: usize| -> u32 {
+    result.map_err(|why| {
+        if decoding {
+            why
+        } else {
+            format!("{why} (memory decoding turned on for the read)")
+        }
+    })
+}
+
+/// `EFI_PCI_IO_ATTRIBUTE_MEMORY`: the function decodes its memory BARs.
+const ATTRIBUTE_MEMORY: u64 = 0x0200;
+/// `EfiPciIoAttributeOperationEnable` and `...Disable`.
+const ATTRIBUTE_ENABLE: u32 = 2;
+const ATTRIBUTE_DISABLE: u32 = 3;
+
+/// Whether the function of `io`, with configuration `header`, decoded
+/// memory already; if not, its decoding is turned on (the refusal's status
+/// on failure).
+fn enable_memory(io: &mut PciIo, header: &[u8; 64]) -> Result<bool, Status> {
+    // Command register bit 1: memory space decoding.
+    if header[4] & 1 << 1 != 0 {
+        return Ok(true);
+    }
+    // SAFETY: live boot protocol; Enable takes the attribute bits and no
+    // result pointer.
+    let status = unsafe { (io.attributes)(io, ATTRIBUTE_ENABLE, ATTRIBUTE_MEMORY, ptr::null_mut()) };
+    if status.is_success() {
+        Ok(false)
+    } else {
+        Err(status)
+    }
+}
+
+/// Turns the memory decoding [`enable_memory`] turned on off again.
+fn restore_memory(io: &mut PciIo) {
+    // SAFETY: as in `enable_memory`; the firmware's own setting is put back.
+    let _ = unsafe { (io.attributes)(io, ATTRIBUTE_DISABLE, ATTRIBUTE_MEMORY, ptr::null_mut()) };
+}
+
+/// A GPU's register window, one dword at a time.
+trait RegisterWindow {
+    /// The dword at `offset`; all ones where the read is refused.
+    fn read(&mut self, offset: usize) -> u32;
+    /// Writes the dword at `offset`; whether the write was taken.
+    fn write(&mut self, offset: usize, value: u32) -> bool;
+    /// The first refused read: its offset and the firmware's status.
+    fn refused(&self) -> Option<(usize, Status)>;
+}
+
+/// A register BAR the firmware's PCI protocol describes.
+struct DescribedBar<'a> {
+    io: &'a mut PciIo,
+    registers: u8,
+    refused: Option<(usize, Status)>,
+}
+
+impl RegisterWindow for DescribedBar<'_> {
+    fn read(&mut self, offset: usize) -> u32 {
         let mut value = u32::MAX;
         // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
         // dword of the register BAR into the writable local. A refused read
-        // leaves all ones, which the table's reader takes as no answer; the
-        // first refusal is kept for the error.
-        let status =
-            unsafe { (io.mem_read)(io, 2, registers, offset as u64, 1, (&raw mut value).cast()) };
-        if !status.is_success() && refused.get().is_none() {
-            refused.set(Some((offset, status)));
+        // leaves all ones, which the table's reader takes as no answer.
+        let status = unsafe {
+            (self.io.mem_read)(
+                self.io,
+                2,
+                self.registers,
+                offset as u64,
+                1,
+                (&raw mut value).cast(),
+            )
+        };
+        if !status.is_success() && self.refused.is_none() {
+            self.refused = Some((offset, status));
         }
         value
-    };
-    let write = |io: &mut PciIo, offset: usize, value: u32| -> bool {
+    }
+    fn write(&mut self, offset: usize, value: u32) -> bool {
         // SAFETY: live boot protocol; one dword written from a local.
         unsafe {
-            (io.mem_write)(
-                io,
+            (self.io.mem_write)(
+                self.io,
                 2,
-                registers,
+                self.registers,
                 offset as u64,
                 1,
                 (&raw const value).cast(),
             )
         }
         .is_success()
-    };
-    let index = (read(io, MM_INDEX), read(io, MM_INDEX_HI));
-    let result = {
-        let vram = |io: &mut PciIo, position: u64| -> u32 {
-            if write(io, MM_INDEX, position as u32 | 0x8000_0000)
-                && write(io, MM_INDEX_HI, (position >> 31) as u32)
-            {
-                read(io, MM_DATA)
-            } else {
+    }
+    fn refused(&self) -> Option<(usize, Status)> {
+        self.refused
+    }
+}
+
+/// A register BAR read at its bus address through its root bridge's
+/// protocol, with the bridges above it whose memory decoding was turned on
+/// for the read.
+struct AddressedBar {
+    root: ScopedProtocol<uefi::proto::pci::root_bridge::PciRootBridgeIo>,
+    start: u64,
+    bridges: Vec<ScopedProtocol<PciIo>>,
+    refused: Option<(usize, Status)>,
+}
+
+impl AddressedBar {
+    /// Turns the bridges' memory decoding off again.
+    fn restore(&mut self) {
+        for bridge in self.bridges.iter_mut().rev() {
+            restore_memory(bridge);
+        }
+        self.bridges.clear();
+    }
+}
+
+impl RegisterWindow for AddressedBar {
+    fn read(&mut self, offset: usize) -> u32 {
+        match self.root.memory().read_one::<u32>(self.start + offset as u64) {
+            Ok(value) => value,
+            Err(error) => {
+                if self.refused.is_none() {
+                    self.refused = Some((offset, error.status()));
+                }
                 u32::MAX
             }
-        };
-        let place = {
-            let io = core::cell::RefCell::new(&mut *io);
-            discovery::place(
-                |offset| read(&mut io.borrow_mut(), offset),
-                |position| vram(&mut io.borrow_mut(), position),
-            )
-        };
-        place
-            .map_err(|error| match (error, refused.get()) {
-                (_, Some((offset, status))) => format!(
-                    "the firmware refused a read of its BAR {registers} at {offset:#x} \
-                     ({status:?})"
-                ),
-                (discovery::Error::NoAnswer, None) => format!(
-                    "its BAR {registers} at {:#x} reads all ones at {RCC_CONFIG_MEMSIZE:#x} with \
-                     memory decoding {}",
-                    window.start,
-                    if decoding {
-                        "on"
-                    } else {
-                        "turned on for the read"
-                    }
-                ),
-                (error, None) => format!("{error:?}"),
-            })
-            .and_then(|place| {
-                let mut binary = Vec::new();
-                binary
-                    .try_reserve_exact(place.bytes)
-                    .map_err(|_| String::from("no memory for the table"))?;
-                for at in (0..place.bytes as u64).step_by(4) {
-                    binary.extend_from_slice(&vram(io, place.offset + at).to_le_bytes());
-                }
-                discovery::parse(&binary).map_err(|error| format!("{error:?}"))
-            })
-            .and_then(|ips| {
-                discovery::version(&ips, discovery::GC)
-                    .ok_or_else(|| String::from("its table lists no graphics block"))
-            })
-    };
-    write(io, MM_INDEX, index.0);
-    write(io, MM_INDEX_HI, index.1);
-    if !decoding {
-        // SAFETY: as above; the firmware's own setting is put back.
-        let _ = unsafe { (io.attributes)(io, DISABLE, MEMORY, ptr::null_mut()) };
+        }
     }
+    fn write(&mut self, offset: usize, value: u32) -> bool {
+        self.root
+            .memory()
+            .write_one::<u32>(self.start + offset as u64, value)
+            .is_ok()
+    }
+    fn refused(&self) -> Option<(usize, Status)> {
+        self.refused
+    }
+}
+
+/// The register BAR `registers` of the function at `address`, with
+/// configuration `header`, read at the bus address its configuration space
+/// holds: each bridge above it (among `handles`) must forward the whole
+/// register window, and decodes memory for the read; its root bridge's
+/// protocol must list its bus. Each refusal is named.
+fn by_address(
+    handles: &[Handle],
+    address: Address,
+    header: &[u8; 64],
+    registers: u8,
+) -> Result<(u64, AddressedBar), alloc::string::String> {
+    use alloc::format;
+    use stela_boot_core::{
+        amd_discovery::REGISTER_BYTES,
+        firmware_screen::{BridgeWindows, BridgeWords},
+    };
+    use uefi::proto::pci::{configuration::ResourceRangeType, root_bridge::PciRootBridgeIo};
+    let (start, _) = stela_boot_core::aperture::memory_bar(header, registers)
+        .map_err(|error| format!("its configuration space's BAR {registers} {error}"))?;
+    let span = start..start.saturating_add(REGISTER_BYTES as u64);
+    let mut bridges = Vec::new();
+    let fail = |bridges: &mut Vec<ScopedProtocol<PciIo>>, why: alloc::string::String| {
+        for bridge in bridges.iter_mut().rev() {
+            restore_memory(bridge);
+        }
+        Err(why)
+    };
+    for &handle in handles {
+        let Ok(mut bridge) = get_protocol::<PciIo>(handle) else {
+            continue;
+        };
+        let (Ok(at), Ok(words)) = (bridge.address(), bridge.read_header()) else {
+            continue;
+        };
+        if at.segment != address.segment || words[0x0e] & 0x7f != 1 {
+            continue;
+        }
+        let dword = |offset: usize| {
+            u32::from_le_bytes([
+                words[offset],
+                words[offset + 1],
+                words[offset + 2],
+                words[offset + 3],
+            ])
+        };
+        let Some(windows) = BridgeWindows::from_words(BridgeWords {
+            class_revision: dword(0x08),
+            buses: dword(0x18),
+            memory: dword(0x20),
+            prefetchable: dword(0x24),
+            prefetchable_upper: (dword(0x28), dword(0x2c)),
+            control: dword(0x3c),
+        }) else {
+            continue;
+        };
+        if !windows.buses().contains(&address.bus) {
+            continue;
+        }
+        if !windows.forwards_all(&span) {
+            return fail(
+                &mut bridges,
+                format!(
+                    "its BAR {registers} at {start:#x} is outside the windows of the bridge at \
+                     {at} above it ({})",
+                    windows.describe()
+                ),
+            );
+        }
+        match enable_memory(&mut bridge, &words) {
+            Ok(true) => {}
+            Ok(false) => bridges.push(bridge),
+            Err(status) => {
+                return fail(
+                    &mut bridges,
+                    format!(
+                        "the bridge at {at} above it decodes no memory and the firmware refused \
+                         to turn it on ({status:?})"
+                    ),
+                );
+            }
+        }
+    }
+    let roots = boot::find_handles::<PciRootBridgeIo>().unwrap_or_default();
+    let root = roots.into_iter().find_map(|handle| {
+        let root = get_protocol::<PciRootBridgeIo>(handle).ok()?;
+        let buses = root
+            .configuration()
+            .ok()?
+            .into_iter()
+            .find(|descriptor| descriptor.resource_range_type == ResourceRangeType::Bus)?;
+        (root.segment_nr() == u32::from(address.segment)
+            && (buses.address_min..=buses.address_max).contains(&u64::from(address.bus)))
+        .then_some(root)
+    });
+    let Some(root) = root else {
+        return fail(
+            &mut bridges,
+            format!(
+                "no root bridge protocol lists bus {:#04x} of segment {}",
+                address.bus, address.segment
+            ),
+        );
+    };
+    Ok((
+        start,
+        AddressedBar {
+            root,
+            start,
+            bridges,
+            refused: None,
+        },
+    ))
+}
+
+/// The graphics version the IP discovery table behind `bar` lists, read
+/// through its indirect window, whose index is put back after; `at` names
+/// the BAR for an error.
+fn graphics_version(
+    bar: &mut impl RegisterWindow,
+    at: impl Fn() -> alloc::string::String,
+) -> Result<(u8, u8, u8), alloc::string::String> {
+    use alloc::{format, string::String};
+    use stela_boot_core::amd_discovery::{
+        self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI, RCC_CONFIG_MEMSIZE,
+    };
+    let index = (bar.read(MM_INDEX), bar.read(MM_INDEX_HI));
+    let vram = |bar: &mut dyn RegisterWindow, position: u64| -> u32 {
+        if bar.write(MM_INDEX, position as u32 | 0x8000_0000)
+            && bar.write(MM_INDEX_HI, (position >> 31) as u32)
+        {
+            bar.read(MM_DATA)
+        } else {
+            u32::MAX
+        }
+    };
+    let place = {
+        let cell = core::cell::RefCell::new(&mut *bar);
+        discovery::place(
+            |offset| cell.borrow_mut().read(offset),
+            |position| vram(&mut **cell.borrow_mut(), position),
+        )
+    };
+    let result = place
+        .map_err(|error| match (error, bar.refused()) {
+            (_, Some((offset, status))) => {
+                format!(
+                    "the firmware refused a read of {} at offset {offset:#x} ({status:?})",
+                    at()
+                )
+            }
+            (discovery::Error::NoAnswer, None) => {
+                format!("{} reads all ones at {RCC_CONFIG_MEMSIZE:#x}", at())
+            }
+            (error, None) => format!("{error:?}"),
+        })
+        .and_then(|place| {
+            let mut binary = Vec::new();
+            binary
+                .try_reserve_exact(place.bytes)
+                .map_err(|_| String::from("no memory for the table"))?;
+            for offset in (0..place.bytes as u64).step_by(4) {
+                binary.extend_from_slice(&vram(&mut *bar, place.offset + offset).to_le_bytes());
+            }
+            discovery::parse(&binary).map_err(|error| format!("{error:?}"))
+        })
+        .and_then(|ips| {
+            discovery::version(&ips, discovery::GC)
+                .ok_or_else(|| String::from("its table lists no graphics block"))
+        });
+    bar.write(MM_INDEX, index.0);
+    bar.write(MM_INDEX_HI, index.1);
     result
 }
 
