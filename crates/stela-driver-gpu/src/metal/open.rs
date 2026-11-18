@@ -21,6 +21,7 @@ use crate::{
         vulkan::{
             MemoryHeapFlags, MemoryProperties,
             backend::{Backend, Object},
+            object::Semaphore,
             physical::{Identity, PciBusInfo, PhysicalDevice},
         },
     },
@@ -204,12 +205,19 @@ pub fn describe(physical: &PhysicalDevice) -> String {
 
 /// How long a first submission may take to signal: a GPU whose rings do
 /// not run never does, and the boot goes on without its Metal device.
-const FIRST_SUBMISSION_NS: u64 = 2_000_000_000;
+pub const FIRST_SUBMISSION_NS: u64 = 2_000_000_000;
 
 /// Submits one empty command buffer that signals a timeline semaphore and
 /// waits for it: the first time the kernel driver's command submission, its
 /// fence and its interrupt run for the device. Whether it signaled in time.
 pub fn first_submission<B: Backend>(backend: &mut B) -> Result<bool, Error> {
+    let semaphore = submit_first(backend)?;
+    first_signaled(backend, semaphore, FIRST_SUBMISSION_NS)
+}
+
+/// The first submission of [`first_submission`], without its wait: the
+/// semaphore it signals at 1.
+pub fn submit_first<B: Backend>(backend: &mut B) -> Result<Semaphore, Error> {
     let semaphore = backend.create_semaphore(0)?;
     let segment = Segment {
         waits: alloc::vec::Vec::new(),
@@ -217,9 +225,20 @@ pub fn first_submission<B: Backend>(backend: &mut B) -> Result<bool, Error> {
         commands: alloc::vec::Vec::new(),
         signals: alloc::vec![(semaphore, 1)],
     };
+    backend.submit(core::slice::from_ref(&segment))?;
+    Ok(semaphore)
+}
+
+/// Whether [`submit_first`]'s `semaphore` signaled within `timeout`
+/// nanoseconds, zero to look without waiting, or the error the kernel
+/// driver refused it with.
+pub fn first_signaled<B: Backend>(
+    backend: &mut B,
+    semaphore: Semaphore,
+    timeout: u64,
+) -> Result<bool, Error> {
     let signaled = backend
-        .submit(core::slice::from_ref(&segment))
-        .and_then(|()| backend.wait_semaphore(semaphore, 1, FIRST_SUBMISSION_NS))
+        .wait_semaphore(semaphore, 1, timeout)
         // A submission the kernel driver refused still signals, on the
         // driver's submit thread after the call returned: its failure is
         // taken by the signal.

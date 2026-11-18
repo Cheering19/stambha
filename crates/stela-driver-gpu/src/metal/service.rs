@@ -437,6 +437,21 @@ pub struct Service<B: Backend, C: Compiler> {
     /// Whether a lost device the reopened one replaces is kept unreleased
     /// ([`Self::keep_lost_devices`]).
     keep_lost: bool,
+    /// The platform's ticks a reopened device's first submission has to
+    /// signal in before it serves ([`Self::check_reopened`]).
+    first_work_ticks: Option<u64>,
+    /// A reopened device whose first submission has not signaled yet.
+    probing: Option<Probing<B, C>>,
+}
+
+/// A reopened device that serves once its first submission signals
+/// ([`Service::check_reopened`]).
+struct Probing<B: Backend, C: Compiler> {
+    device: Device<B, C>,
+    epoch: DeviceEpoch,
+    semaphore: super::vulkan::object::Semaphore,
+    /// The platform's ticks at the submission.
+    since: u64,
 }
 
 impl<B: Backend, C: Compiler> Service<B, C> {
@@ -471,6 +486,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             prepare: None,
             replaced: Vec::new(),
             keep_lost: false,
+            first_work_ticks: None,
+            probing: None,
         }
     }
 
@@ -494,6 +511,19 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// work an amdgpu reset holds back, in the turn every client waits on.
     pub fn keep_lost_devices(mut self) -> Self {
         self.keep_lost = true;
+        self
+    }
+
+    /// Serves a reopened device only once an empty submission on it has
+    /// signaled within `ticks` of the platform's clock, as the first open
+    /// checks its device ([`super::open::first_submission`]), without waiting
+    /// in a call: until it signals, each connection or close that asks says
+    /// the reopen waits, which is no failed reopen. A submission that did not
+    /// signal in time, or that the kernel driver refused, fails the reopen,
+    /// and the device stays unreleased, as one whose GPU hung is reset by its
+    /// kernel driver.
+    pub fn check_reopened(mut self, ticks: u64) -> Self {
+        self.first_work_ticks = Some(ticks);
         self
     }
 
@@ -594,6 +624,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         if self.reopen.is_none() {
             return;
         }
+        if self.probing.is_some() {
+            self.probe_reopened();
+            return;
+        }
         if let Some(reason) = self.reopen_wait.as_mut().and_then(|wait| wait()) {
             let now = (self.device.clock())();
             self.waiting_from.get_or_insert(now);
@@ -605,38 +639,97 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             return;
         };
         match reopen() {
-            Ok(mut device) => {
-                if let Some(prepare) = self.prepare.as_mut() {
-                    prepare(&mut device);
+            Ok(mut device) if self.first_work_ticks.is_some() => {
+                match super::open::submit_first(device.backend()) {
+                    Ok(semaphore) => {
+                        self.probing = Some(Probing {
+                            device,
+                            epoch,
+                            semaphore,
+                            since: (self.device.clock())(),
+                        });
+                        self.probe_reopened();
+                    }
+                    Err(error) => {
+                        // Its first work may have reached the GPU.
+                        core::mem::forget(device);
+                        self.reopen_failed(error);
+                    }
                 }
-                let clock = self.device.clock();
-                let lost = core::mem::replace(&mut self.device, device);
-                if self.keep_lost {
-                    core::mem::forget(lost);
-                } else {
-                    self.replaced.push(lost);
-                }
-                self.device.set_clock(clock);
-                self.epoch = epoch;
-                self.shares = sharing::Shares::default();
-                self.signaled = 0;
-                self.loss_described = false;
-                self.pins_reported = false;
-                self.failed_reopens = 0;
-                self.reopen_error = None;
-                self.waiting_from = None;
             }
-            Err(error) => {
-                let now = (self.device.clock())();
-                if self.failed_reopens == 0 {
-                    self.failed_from = self.waiting_from.take().unwrap_or(now);
-                }
-                self.failed_at = now;
-                self.failed_reopens = self.failed_reopens.saturating_add(1);
-                self.reopen_error = Some(format!("{error:?}"));
-                self.refused.push(format!("{REOPEN_FAILED}{error:?}"));
+            Ok(device) => self.serve_reopened(device, epoch),
+            Err(error) => self.reopen_failed(error),
+        }
+    }
+
+    /// Looks, without waiting, whether the reopened device's first
+    /// submission signaled ([`Self::check_reopened`]): it then serves; while
+    /// within its bound the reopen waits; past it, or refused, the reopen
+    /// failed and the device is kept unreleased.
+    fn probe_reopened(&mut self) {
+        let Some(probing) = self.probing.as_mut() else {
+            return;
+        };
+        let now = (self.device.clock())();
+        let signaled = super::open::first_signaled(probing.device.backend(), probing.semaphore, 0);
+        let within = now.wrapping_sub(probing.since) < self.first_work_ticks.unwrap_or(0);
+        match signaled {
+            Ok(true) => {
+                let Probing { device, epoch, .. } = self.probing.take().expect("probed above");
+                self.serve_reopened(device, epoch);
+            }
+            Ok(false) if within => {
+                self.waiting_from.get_or_insert(probing.since);
+                self.refused.push(String::from(
+                    "the lost device waits to reopen: the reopened device's first submission \
+                     has not signaled yet",
+                ));
+            }
+            result => {
+                let probing = self.probing.take().expect("probed above");
+                // The GPU may yet run its work: releasing the device would
+                // wait for the kernel driver's reset of it.
+                core::mem::forget(probing.device);
+                self.reopen_failed(result.err().unwrap_or(Error::Unsupported(
+                    "the reopened device's first submission did not signal in time",
+                )));
             }
         }
+    }
+
+    /// Serves the reopened `device` in `epoch` in place of the lost one.
+    fn serve_reopened(&mut self, mut device: Device<B, C>, epoch: DeviceEpoch) {
+        if let Some(prepare) = self.prepare.as_mut() {
+            prepare(&mut device);
+        }
+        let clock = self.device.clock();
+        let lost = core::mem::replace(&mut self.device, device);
+        if self.keep_lost {
+            core::mem::forget(lost);
+        } else {
+            self.replaced.push(lost);
+        }
+        self.device.set_clock(clock);
+        self.epoch = epoch;
+        self.shares = sharing::Shares::default();
+        self.signaled = 0;
+        self.loss_described = false;
+        self.pins_reported = false;
+        self.failed_reopens = 0;
+        self.reopen_error = None;
+        self.waiting_from = None;
+    }
+
+    /// Counts a reopen that failed with `error`.
+    fn reopen_failed(&mut self, error: Error) {
+        let now = (self.device.clock())();
+        if self.failed_reopens == 0 {
+            self.failed_from = self.waiting_from.take().unwrap_or(now);
+        }
+        self.failed_at = now;
+        self.failed_reopens = self.failed_reopens.saturating_add(1);
+        self.reopen_error = Some(format!("{error:?}"));
+        self.refused.push(format!("{REOPEN_FAILED}{error:?}"));
     }
 
     /// How the device stands after a loss: whether it is lost, and the

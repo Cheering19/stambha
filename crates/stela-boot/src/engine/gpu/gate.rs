@@ -30,7 +30,7 @@ use stela_drivers::gpu::metal::{
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
     native::{self, ExportedMemory, Loader, MemoryExporter, NativeBackend, pipeline_store},
-    open::{Attachment, Gpu, OpenError, PcieLink, open, reopen},
+    open::{Attachment, FIRST_SUBMISSION_NS, Gpu, OpenError, PcieLink, open, reopen},
     service::{
         JobSlice, REOPEN_FAILED, Served, ServiceHost, SharedService, identity::DeviceEpoch,
         wire::Status,
@@ -1242,8 +1242,17 @@ fn service(
     // A driver that loses its device only with a GPU its kernel driver
     // reset, whose release would wait for that reset's end, keeps the lost
     // device unreleased, as an open whose first submission hung leaves it.
+    // Its reopened device serves once an empty submission on it signals
+    // within the bound the first open's check has, looked at without
+    // waiting in a call: one whose GPU hangs again fails the reopen.
     let service = if driver.keep_lost {
-        service.keep_lost_devices()
+        let service = service.keep_lost_devices();
+        match installed().map(|gpu| gpu.tsc_hz).filter(|&hz| hz != 0) {
+            Some(hz) => service.check_reopened(
+                (u128::from(hz) * u128::from(FIRST_SUBMISSION_NS) / 1_000_000_000) as u64,
+            ),
+            None => service,
+        }
     } else {
         service
     };

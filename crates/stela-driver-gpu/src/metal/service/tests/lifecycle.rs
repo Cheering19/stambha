@@ -382,6 +382,120 @@ fn a_reopened_device_keeps_the_lost_one_when_asked() {
     assert_eq!(lost_backend_after_reopen(true), (0, 2));
 }
 
+/// A reopened device of a driver that keeps its lost devices serves only
+/// once an empty submission on it signaled ([`Service::check_reopened`]):
+/// until then each client that asks waits, and none counts as a failure.
+#[test]
+fn a_reopened_device_serves_once_its_first_submission_signals() {
+    fn clock() -> u64 {
+        static NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        NOW.fetch_add(1000, Ordering::Relaxed)
+    }
+    let mut service = service()
+        .with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))))
+        .keep_lost_devices()
+        .check_reopened(1_000_000);
+    service.device().set_clock(clock);
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(held).unwrap();
+    assert!(
+        service.device().is_lost(),
+        "its first submission has not signaled"
+    );
+    assert_eq!(service.connect().unwrap_err().status, Status::DeviceLost);
+    assert_eq!(service.loss().failed_reopens, 0);
+    let refused = core::mem::take(&mut service.refused);
+    assert_eq!(refused.len(), 2);
+    assert!(refused.iter().all(|reason| reason
+        == "the lost device waits to reopen: the reopened device's first submission has not \
+            signaled yet"));
+    let probing = service.probing.as_mut().unwrap();
+    let semaphore = probing.semaphore;
+    assert_eq!(probing.device.backend().submissions.len(), 1);
+    crate::metal::vulkan::backend::Backend::signal_semaphore(
+        probing.device.backend(),
+        semaphore,
+        1,
+    )
+    .unwrap();
+    let next = connect(&mut service);
+    assert!(!service.device().is_lost());
+    assert!(service.probing.is_none());
+    cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
+}
+
+/// A reopened device whose first submission does not signal in its bound,
+/// as one whose GPU hangs again, fails the reopen; the next client tries a
+/// new one.
+#[test]
+fn a_reopened_device_whose_first_submission_hangs_fails_the_reopen() {
+    fn clock() -> u64 {
+        static NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        NOW.fetch_add(1000, Ordering::Relaxed)
+    }
+    static REOPENED: AtomicUsize = AtomicUsize::new(0);
+    let mut service = service()
+        .with_reopen(Box::new(|| {
+            REOPENED.fetch_add(1, Ordering::Relaxed);
+            Ok(device_on(MockBackend::new()))
+        }))
+        .keep_lost_devices()
+        .check_reopened(1500);
+    service.device().set_clock(clock);
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    // Submitted and looked at within the bound: it waits.
+    service.disconnect(held).unwrap();
+    assert_eq!(service.loss().failed_reopens, 0);
+    // Past it: the reopen failed.
+    assert!(service.connect().is_err());
+    let loss = service.loss();
+    assert_eq!(loss.failed_reopens, 1);
+    assert!(service.device().is_lost());
+    assert!(service.probing.is_none());
+    assert!(service.refused.last().unwrap().starts_with(REOPEN_FAILED));
+    assert!(
+        loss.error.unwrap().contains("did not signal in time"),
+        "the failure names the hang"
+    );
+    assert_eq!(REOPENED.load(Ordering::Relaxed), 1);
+    // The next client reopens again.
+    assert!(service.connect().is_err());
+    assert_eq!(REOPENED.load(Ordering::Relaxed), 2);
+}
+
+/// A reopened device whose first submission the kernel driver refused
+/// fails the reopen with that error.
+#[test]
+fn a_reopened_device_whose_first_submission_is_refused_fails_the_reopen() {
+    let mut service = service()
+        .with_reopen(Box::new(|| {
+            let mut backend = MockBackend::new();
+            backend.refuse_next = Some(Error::DeviceLost);
+            Ok(device_on(backend))
+        }))
+        .keep_lost_devices()
+        .check_reopened(u64::MAX);
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(held).unwrap();
+    assert_eq!(service.loss().failed_reopens, 0);
+    let probing = service.probing.as_mut().unwrap();
+    let semaphore = probing.semaphore;
+    crate::metal::vulkan::backend::Backend::signal_semaphore(
+        probing.device.backend(),
+        semaphore,
+        1,
+    )
+    .unwrap();
+    assert!(service.connect().is_err());
+    let loss = service.loss();
+    assert_eq!(loss.failed_reopens, 1);
+    assert_eq!(loss.error.as_deref(), Some("DeviceLost"));
+    assert!(service.probing.is_none());
+}
+
 #[test]
 fn a_device_that_does_not_reopen_stays_lost() {
     let mut service = service().with_reopen(Box::new(|| Err(Error::OutOfMemory)));
