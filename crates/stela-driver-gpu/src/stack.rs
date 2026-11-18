@@ -80,6 +80,27 @@ pub struct Kernel {
     /// and ACPI give none (`nvbios_shadow`'s `skip`), so its claim does
     /// neither and gives it the VFCT image alone, as before.
     pub reads_rom: bool,
+    /// Whether a fatal stop raised on the boot CPU, outside Linux, runs this
+    /// driver's unload there before the machine resets: amdgpu, whose PSP
+    /// ring and video decoder a reset leaves running, so the GPU's next
+    /// start fails at its PSP ring. nouveau's unload waits on GSP-RM's
+    /// replies and was never run beside the stopped work's own state on
+    /// that processor, so a stop there leaves its firmware running, as
+    /// every such stop did; a stop on another processor unloads it.
+    pub unloads_on_boot_cpu: bool,
+}
+
+/// The driver among `kernels`, those of the bound GPUs, whose unload a
+/// fatal stop on the boot CPU does not run there
+/// ([`Kernel::unloads_on_boot_cpu`]): one is enough to leave every GPU's
+/// firmware running, as the unload stops them all together.
+pub fn kept_from_boot_cpu_unload<'a>(
+    kernels: impl IntoIterator<Item = &'a Kernel>,
+) -> Option<&'static str> {
+    kernels
+        .into_iter()
+        .find(|kernel| !kernel.unloads_on_boot_cpu)
+        .map(|kernel| kernel.driver)
 }
 
 /// The drivers' DRM versions as the build read them; an image without a
@@ -234,6 +255,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         describe: None,
         version: versions::NOUVEAU,
         reads_rom: false,
+        unloads_on_boot_cpu: false,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
@@ -281,6 +303,7 @@ pub static AMD: GpuStack = GpuStack {
         describe: Some(crate::amdgpu::query::describe),
         version: versions::AMDGPU,
         reads_rom: true,
+        unloads_on_boot_cpu: true,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
@@ -333,6 +356,7 @@ pub static INTEL: GpuStack = GpuStack {
         describe: None,
         version: versions::XE,
         reads_rom: true,
+        unloads_on_boot_cpu: false,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
@@ -923,6 +947,26 @@ mod tests {
         assert!(AMD.kernel.reads_rom);
         #[cfg(feature = "xe-port")]
         assert!(INTEL.kernel.reads_rom);
+    }
+
+    /// A stop on the boot CPU unloads the GPUs there only when every bound
+    /// GPU's driver unloads from such a stop: the released NVIDIA stack
+    /// keeps its firmware running there, as before, an AMD GPU alone is
+    /// unloaded, and an AMD GPU beside an NVIDIA one is not.
+    #[test]
+    fn a_stop_on_the_boot_cpu_unloads_only_drivers_shown_to_unload_there() {
+        assert_eq!(kept_from_boot_cpu_unload(core::iter::empty()), None);
+        assert_eq!(kept_from_boot_cpu_unload([&NVIDIA.kernel]), Some("nouveau"));
+        #[cfg(feature = "amdgpu-port")]
+        {
+            assert_eq!(kept_from_boot_cpu_unload([&AMD.kernel]), None);
+            assert_eq!(
+                kept_from_boot_cpu_unload([&AMD.kernel, &NVIDIA.kernel]),
+                Some("nouveau")
+            );
+        }
+        #[cfg(feature = "xe-port")]
+        assert_eq!(kept_from_boot_cpu_unload([&INTEL.kernel]), Some("xe"));
     }
 
     /// Every stack names its driver's DRM version without a client: the

@@ -1709,12 +1709,30 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
 /// power cycle, and a card whose driver did not stop it (amdgpu's PSP ring,
 /// its video decoder) fails its next start. A stop raised inside Linux, on
 /// the processor that holds the host drivers' lock, cannot run Linux again
-/// and leaves the firmware running, and says so; any other stop, on the boot
-/// CPU too, unloads. Once.
+/// and leaves the firmware running, and says so; any other stop unloads, on
+/// the boot CPU only where every bound GPU's driver unloads from a stop
+/// there (`Kernel::unloads_on_boot_cpu`). Once.
 pub(in crate::engine) fn stop_for_fatal() {
     use client::StopUnload;
     static STOPPING: AtomicBool = AtomicBool::new(false);
-    if installed().is_none() || STOPPING.swap(true, Ordering::AcqRel) {
+    let Some(gpu) = installed() else {
+        return;
+    };
+    if STOPPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // On the boot CPU, the stopped work's own state is all around the
+    // unload: a driver not shown to unload there keeps the firmware
+    // running, as every stop there left it.
+    if host::processor() == BOOT_CPU.load(Ordering::Relaxed)
+        && let Some(driver) = stela_drivers::gpu::stack::kept_from_boot_cpu_unload(
+            gpu.start.bound.iter().map(|bound| &bound.stack.kernel),
+        )
+    {
+        output::arguments(format_args!(
+            "GPU firmware left running: the stop is on the CPU that unloads it, and {driver}'s \
+             unload is not run from a stop there\n"
+        ));
         return;
     }
     use crate::engine::storage;
