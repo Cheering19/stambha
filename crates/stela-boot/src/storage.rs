@@ -367,11 +367,13 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
         .map(crate::pci_io::FunctionObservation::identity)
         .filter(|identity| identity.class[0] == 0x03)
     {
+        // The stack and the kind do not depend on the revision.
         let adapter = Adapter {
             address: identity.address,
             vendor: Vendor::from_pci(identity.vendor),
             device: identity.device,
             class: identity.class,
+            revision: 0,
         };
         let Some(stack) = GpuStack::select(&adapter)
             .ok()
