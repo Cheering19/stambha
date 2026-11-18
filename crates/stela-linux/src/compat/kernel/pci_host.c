@@ -22,7 +22,129 @@ struct host_function {
 	 * function's with one. */
 	struct page *rom;
 	struct host_function *rom_next;
+	/* The ports above it, and the next attached function's with any. */
+	struct upstream_port *ports;
+	unsigned int port_count;
+	struct host_function *ports_next;
 };
+
+/* A port above an attached function, kept as its owner read it. */
+struct upstream_port {
+	struct pci_bus bus;
+	struct pci_dev dev;
+	char name[16];
+	u32 config[64];
+};
+
+/* The functions with ports above them. Only the serialized owner attaches
+ * and releases. */
+static struct host_function *port_hosts;
+
+/* A port answers reads from the copy of its configuration; past its first
+ * 256 bytes it answers as a function without extended space. */
+static int read_port(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 *value)
+{
+	const struct upstream_port *port = bus->sysdata;
+
+	if (devfn != port->dev.devfn || where < 0 ||
+	    (size_t)where + (size_t)size > sizeof(port->config))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	*value = 0;
+	memcpy(value, (const u8 *)port->config + where, (size_t)size);
+	return 0;
+}
+
+static int write_port(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 value)
+{
+	(void)bus;
+	(void)devfn;
+	(void)where;
+	(void)size;
+	(void)value;
+	stela_linux_unsupported("a PCI write to a port above a function: the ports stay as the firmware set them");
+	return PCIBIOS_SET_FAILED;
+}
+
+static struct pci_ops port_ops = {.read = read_port, .write = write_port};
+
+/* At most the depth of a PCI Express hierarchy that any GPU sits in: a root
+ * port, a platform switch and a GPU's own switch, with room to spare. */
+#define MAX_UPSTREAM_PORTS 8
+
+static int attach_ports(struct host_function *host, const struct stela_linux_pci_port *ports,
+			size_t count)
+{
+	if (!count)
+		return 0;
+	if (count > MAX_UPSTREAM_PORTS)
+		count = MAX_UPSTREAM_PORTS;
+	host->ports = kcalloc(count, sizeof(*host->ports), GFP_KERNEL);
+	if (!host->ports)
+		return -ENOMEM;
+	for (size_t i = 0; i < count; i++) {
+		struct upstream_port *port = &host->ports[i];
+		struct pci_dev *dev = &port->dev;
+		u32 class_revision;
+
+		memcpy(port->config, ports[i].config, sizeof(port->config));
+		port->bus.sysdata = port;
+		port->bus.ops = &port_ops;
+		port->bus.number = (unsigned char)ports[i].bus;
+		dev->bus = &port->bus;
+		dev->devfn = ports[i].devfn;
+		dev->current_state = PCI_D0;
+		pci_read_config_word(dev, PCI_VENDOR_ID, &dev->vendor);
+		pci_read_config_word(dev, PCI_DEVICE_ID, &dev->device);
+		pci_read_config_byte(dev, PCI_HEADER_TYPE, &dev->hdr_type);
+		pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_revision);
+		dev->revision = (u8)class_revision;
+		dev->class = class_revision >> 8;
+		if (stela_linux_pci_find_capability(dev, PCI_CAP_ID_EXP, &dev->pcie_cap) ||
+		    stela_linux_pci_express_probe(dev))
+			dev->pcie_cap = 0;
+		snprintf(port->name, sizeof(port->name), "%04x:%02x:%02x.%d", 0, ports[i].bus,
+			 PCI_SLOT(ports[i].devfn), PCI_FUNC(ports[i].devfn));
+		dev->dev.init_name = port->name;
+	}
+	host->port_count = (unsigned int)count;
+	host->ports_next = port_hosts;
+	port_hosts = host;
+	return 0;
+}
+
+static void release_ports(struct host_function *host)
+{
+	if (!host->ports)
+		return;
+	for (struct host_function **link = &port_hosts; *link; link = &(*link)->ports_next) {
+		if (*link == host) {
+			*link = host->ports_next;
+			break;
+		}
+	}
+	kfree(host->ports);
+	host->ports = NULL;
+	host->port_count = 0;
+}
+
+struct pci_dev *stela_linux_pci_upstream(struct pci_dev *dev)
+{
+	struct pci_dev *bridge;
+
+	if (!dev)
+		return NULL;
+	bridge = pci_upstream_bridge(dev);
+	if (bridge)
+		return bridge;
+	for (struct host_function *host = port_hosts; host; host = host->ports_next) {
+		if (dev == &host->dev)
+			return &host->ports[0].dev;
+		for (unsigned int i = 0; i < host->port_count; i++)
+			if (dev == &host->ports[i].dev)
+				return i + 1 < host->port_count ? &host->ports[i + 1].dev : NULL;
+	}
+	return NULL;
+}
 
 /* The functions with a platform ROM copy. Only the serialized owner attaches
  * and releases. */
@@ -308,6 +430,7 @@ static void release(struct device *dev)
 		return;
 	}
 	release_rom(host);
+	release_ports(host);
 	stela_linux_pci_free_saved_state(&host->dev);
 	if (host->function.release_context)
 		host->function.release_context(host->function.context);
@@ -396,6 +519,16 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 		dev->romlen = function->rom_length;
 		host->rom_next = rom_hosts;
 		rom_hosts = host;
+	}
+	/* The caller's ports, like its image, last only for the attach. */
+	host->function.upstream = NULL;
+	host->function.upstream_count = 0;
+	if (attach_ports(host, function->upstream, function->upstream_count)) {
+		if (status)
+			*status = -ENOMEM;
+		release_rom(host);
+		kfree(host);
+		return NULL;
 	}
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
@@ -643,6 +776,115 @@ static void test_identity(void)
 	pci_unregister_driver(&late);
 }
 
+/* A PCI Express capability at 0x60 of the given type, link capabilities
+ * and trained link: speeds as LNKCAP/LNKSTA encode them (1 = 2.5 GT/s). */
+static void express(u32 *dwords, u16 type, u8 max_speed, u8 max_width, u8 speed, u8 width)
+{
+	u8 *bytes = (u8 *)dwords;
+
+	bytes[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	bytes[PCI_CAPABILITY_LIST] = 0x60;
+	bytes[0x60] = PCI_CAP_ID_EXP;
+	bytes[0x61] = 0;
+	*(u16 *)&bytes[0x60 + PCI_EXP_FLAGS] = (u16)(2 | type << 4);
+	*(u32 *)&bytes[0x60 + PCI_EXP_LNKCAP] = (u32)max_speed | (u32)max_width << 4;
+	*(u16 *)&bytes[0x60 + PCI_EXP_LNKSTA] = (u16)(speed | width << 4);
+	*(u32 *)&bytes[0x60 + PCI_EXP_LNKCAP2] = (u32)GENMASK(max_speed, 1);
+}
+
+static void identify(u32 *dwords, u16 vendor, u16 device, u32 class)
+{
+	dwords[0] = (u32)device << 16 | vendor;
+	dwords[PCI_CLASS_REVISION / 4] = class << 8 | 0xc1;
+	((u8 *)dwords)[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_BRIDGE;
+}
+
+/* A discrete Navi card in a slot: a root port that runs at 32 GT/s, the
+ * card's own switch (its upstream and downstream ports, ATI's 1478 and
+ * 1479) and the GPU, all at 16 GT/s x16, with the slot's link trained at
+ * 8 GT/s x8. amdgpu skips the card's switch and finds the root port, with
+ * its speeds and width, as on Linux; the slowest trained link is the
+ * slot's, which the root port reports first from the top. */
+static void test_upstream(struct stela_linux_pci_function function)
+{
+	static struct stela_linux_pci_port ports[3];
+	struct stela_linux_pci_port *downstream = &ports[0], *upstream = &ports[1],
+				    *root = &ports[2];
+	u8 saved[256];
+
+	memcpy(saved, config, sizeof(saved));
+	express((u32 *)config, PCI_EXP_TYPE_ENDPOINT, 4, 16, 4, 16);
+	memset(ports, 0, sizeof(ports));
+	identify(downstream->config, PCI_VENDOR_ID_ATI, 0x1479, PCI_CLASS_BRIDGE_PCI << 8);
+	express(downstream->config, PCI_EXP_TYPE_DOWNSTREAM, 4, 16, 4, 16);
+	downstream->bus = 2;
+	identify(upstream->config, PCI_VENDOR_ID_ATI, 0x1478, PCI_CLASS_BRIDGE_PCI << 8);
+	express(upstream->config, PCI_EXP_TYPE_UPSTREAM, 4, 16, 3, 8);
+	upstream->bus = 1;
+	identify(root->config, PCI_VENDOR_ID_AMD, 0x14ab, PCI_CLASS_BRIDGE_PCI << 8);
+	express(root->config, PCI_EXP_TYPE_ROOT_PORT, 5, 16, 3, 8);
+	root->devfn = PCI_DEVFN(1, 1);
+	function.upstream = ports;
+	function.upstream_count = 3;
+	/* The cases after this one count releases of the context from none. */
+	function.release_context = NULL;
+	struct pci_dev *gpu = stela_linux_pci_attach(&function, NULL);
+
+	assert(gpu);
+	/* The attach keeps its own copy. */
+	memset(ports, 0xff, sizeof(ports));
+	assert(!pci_upstream_bridge(gpu));
+	struct pci_dev *partner = stela_linux_pci_upstream(gpu), *link = gpu;
+
+	assert(partner && partner->vendor == PCI_VENDOR_ID_ATI && partner->device == 0x1479);
+	assert(pci_pcie_type(partner) == PCI_EXP_TYPE_DOWNSTREAM);
+	assert(!strcmp(dev_name(&partner->dev), "0000:02:00.0"));
+	while (partner && partner->vendor == PCI_VENDOR_ID_ATI) {
+		link = partner;
+		partner = stela_linux_pci_upstream(link);
+	}
+	assert(link->device == 0x1478 && pci_pcie_type(link) == PCI_EXP_TYPE_UPSTREAM);
+	assert(partner && partner->vendor == PCI_VENDOR_ID_AMD && partner->device == 0x14ab);
+	assert(!strcmp(dev_name(&partner->dev), "0000:00:01.1"));
+	assert(pci_pcie_type(partner) == PCI_EXP_TYPE_ROOT_PORT);
+	assert(pcie_get_speed_cap(partner) == PCIE_SPEED_32_0GT);
+	assert(pcie_get_width_cap(partner) == PCIE_LNK_X16);
+	assert(pcie_get_speed_cap(link) == PCIE_SPEED_16_0GT);
+	assert(pcie_get_speed_cap(gpu) == PCIE_SPEED_16_0GT);
+	assert(!stela_linux_pci_upstream(partner));
+
+	struct pci_dev *limiting = NULL;
+	enum pci_bus_speed speed;
+	enum pcie_link_width width;
+
+	assert(pcie_bandwidth_available(gpu, &limiting, &speed, &width) == 8 * (8000 * 128 / 130));
+	assert(limiting == partner && speed == PCIE_SPEED_8_0GT && width == PCIE_LNK_X8);
+
+	/* The ports are read-only: a write is refused and reported. */
+	u32 value;
+	unsigned int before = refusals;
+
+	assert(pci_write_config_word(partner, PCI_COMMAND, 0) == PCIBIOS_SET_FAILED);
+	assert(refusals == before + 1);
+	refusals = before;
+	assert(!pci_read_config_dword(partner, PCI_VENDOR_ID, &value) && value == 0x14ab1022);
+	assert(pci_read_config_dword(partner, 0x100, &value) == PCIBIOS_DEVICE_NOT_FOUND);
+
+	/* A function attached without ports is on a root bus. */
+	function.upstream = NULL;
+	function.upstream_count = 0;
+	struct pci_dev *alone = stela_linux_pci_attach(&function, NULL);
+
+	assert(alone && !stela_linux_pci_upstream(alone));
+	assert(pcie_bandwidth_available(alone, &limiting, &speed, &width) == 16 * (16000 * 128 / 130));
+	assert(limiting == alone && speed == PCIE_SPEED_16_0GT && width == PCIE_LNK_X16);
+	stela_linux_pci_remove_device(alone);
+	stela_linux_pci_remove_device(gpu);
+	/* The ports went with the function. */
+	assert(!port_hosts);
+	memcpy(config, saved, sizeof(saved));
+}
+
 static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
 static const struct stela_linux_owner test_owner = {.services = &test_services};
 
@@ -670,6 +912,7 @@ int main(void)
 
 	assert(dev && !stela_linux_pci_bound(dev));
 	test_identity();
+	test_upstream(function);
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);

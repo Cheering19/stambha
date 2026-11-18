@@ -23,6 +23,18 @@ struct stela_linux_pci_region {
 	unsigned long flags;
 };
 
+/* A port above a function, as its owner read it when it enumerated the
+ * buses: its address and the first 256 bytes of its configuration, which
+ * hold its PCI Express capability and so its link's speeds and width. Linux
+ * code is shown it read-only (stela_linux_pci_upstream); the firmware
+ * configured it and nothing here changes it. */
+struct stela_linux_pci_port {
+	unsigned int bus, devfn;
+	u32 config[64];
+};
+
+_Static_assert(sizeof(struct stela_linux_pci_port) == 264, "Linux PCI port ABI");
+
 /* A physical function its owner enumerated. Configuration accesses return a
  * PCIBIOS result; dma_map returns DMA_MAPPING_ERROR when it cannot map, and
  * dma_limit is the highest address it hands out. Rust retains exact typed
@@ -60,9 +72,15 @@ struct stela_linux_pci_function {
 	/* The expansion ROM BAR where the owner placed it, decoding off, which
 	 * the attach keeps as PCI_ROM_RESOURCE: size 0 for none. */
 	struct stela_linux_pci_region rom_bar;
+	/* The ports between the function and its root complex, nearest first,
+	 * which the attach copies: none for a function on a root bus. */
+	const struct stela_linux_pci_port *upstream;
+	size_t upstream_count;
 };
 
-_Static_assert(sizeof(struct stela_linux_pci_function) == 280, "Linux PCI function ABI");
+_Static_assert(sizeof(struct stela_linux_pci_function) == 296, "Linux PCI function ABI");
+_Static_assert(__builtin_offsetof(struct stela_linux_pci_function, upstream) == 280,
+	       "Linux PCI upstream port ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, rom_bar) == 256,
 	       "Linux PCI ROM BAR ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, release_context) == 224,
@@ -107,6 +125,12 @@ bool stela_linux_pci_rom_mapped(const volatile void __iomem *address);
  * its flags, device capabilities and supported link speeds. A PCIBIOS error
  * when the function does not answer. */
 int stela_linux_pci_express_probe(struct pci_dev *dev);
+/* The port above dev, an attached function or a port this returned: Linux's
+ * pci_upstream_bridge where a bus has a bridge, else the ports the owner
+ * gave the function. NULL above the last one. Linux's own PCI tree here has
+ * no bridges, so drivers that walk it see none; a driver asks this where it
+ * needs the link the platform gives a function (amdgpu's PCIe speeds). */
+struct pci_dev *stela_linux_pci_upstream(struct pci_dev *dev);
 /* Free what pci_save_state allocated to keep the function's capabilities. */
 void stela_linux_pci_free_saved_state(struct pci_dev *dev);
 #endif

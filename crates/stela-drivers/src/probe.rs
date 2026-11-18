@@ -738,6 +738,35 @@ fn unsupported(class: [u8; 3]) -> Option<&'static str> {
     }
 }
 
+/// A port above a function, as the scan read it without a write: its
+/// address and its first 256 bytes of configuration, which hold its PCI
+/// Express link's speeds and width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpstreamPort {
+    pub address: Address,
+    pub config: [u32; 64],
+}
+
+impl UpstreamPort {
+    /// `function`'s first 256 bytes, when each reads.
+    fn read<C: crate::bus::pci::ConfigSpace>(
+        function: &mut crate::bus::pci::Function<C>,
+    ) -> Option<Self> {
+        let config = function.config();
+        let mut words = [0; 64];
+        for (offset, word) in (0..).step_by(4).zip(&mut words) {
+            *word = config.read32(offset).ok()?;
+        }
+        Some(Self {
+            address: function.address,
+            config: words,
+        })
+    }
+}
+
+/// The ports above each display controller ([`Devices::gpu_ports`]).
+pub type GpuPorts = Vec<(Address, Vec<UpstreamPort>)>;
+
 /// A PCI-to-ISA bridge as the scan read it, without a write. Intel's display
 /// code finds the PCH by the bridge's IDs (`intel_pch.c`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -788,6 +817,10 @@ pub struct Devices {
     /// PCI-to-ISA bridges as their configuration reads, which no driver
     /// here takes: a GPU's kernel driver names the chipset by them.
     pub isa_bridges: Vec<IsaBridge>,
+    /// The ports between each display controller and its root complex,
+    /// nearest first ([`native::ports_above`]): a GPU's kernel driver reads
+    /// the link its slot gives it from them, as amdgpu does on Linux.
+    pub gpu_ports: GpuPorts,
     /// A hybrid laptop's discrete GPU video BIOS, read through `ATRM` from
     /// the first display function's ACPI companion that has it, as amdgpu
     /// reads it (`gpu_methods::atrm`).
@@ -1721,6 +1754,8 @@ pub unsafe fn probe_observed(
     let mut usb4_hosts = Vec::new();
     // Each PCI bridge and its secondary bus, for ACPI companion lookups.
     let mut bridges = Vec::new();
+    // And each one's configuration, for the GPUs below it.
+    let mut ports = Vec::new();
     // i801 SMBus hosts, attached under ACPI arbitration once the embedded
     // controller is.
     #[cfg(feature = "native-acpi")]
@@ -1839,6 +1874,7 @@ pub unsafe fn probe_observed(
                         aspm: crate::bus::pci::aspm_control(&function)?,
                     })
                 })();
+                ports.extend(UpstreamPort::read(&mut function));
                 match checked {
                     Ok(bridge) => bridges.push(bridge),
                     Err(error) => {
@@ -2355,6 +2391,16 @@ pub unsafe fn probe_observed(
         }
     }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
+    devices.gpu_ports = devices
+        .gpus
+        .iter()
+        .map(|gpu| {
+            (
+                gpu.address,
+                native::ports_above(&bridges, &ports, gpu.address),
+            )
+        })
+        .collect();
     // Each display controller's companion, once every bridge above it is
     // known, found once: GSP-RM's ACPI data and AMD's graphics methods are
     // read on it, ATRM here.

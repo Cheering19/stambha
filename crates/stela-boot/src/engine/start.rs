@@ -1477,6 +1477,16 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
     })
 }
 
+/// What probe found of the GPUs and the platform around them: the display
+/// controllers, the PCI-to-ISA bridges, each GPU's ACPI companion and the
+/// ports above each GPU.
+type FoundGpus = (
+    Vec<stela_drivers::gpu::Adapter>,
+    Vec<stela_drivers::probe::IsaBridge>,
+    Vec<(stela_drivers::bus::pci::Address, String)>,
+    stela_drivers::probe::GpuPorts,
+);
+
 /// Claim the GPUs from probe and start them in the host's Linux environment.
 /// A GPU that cannot start is reported, and the Mac boots without it; whether
 /// any started is the answer.
@@ -1487,11 +1497,7 @@ fn open_gpus(
     acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    (adapters, isa_bridges, companions): (
-        Vec<stela_drivers::gpu::Adapter>,
-        Vec<stela_drivers::probe::IsaBridge>,
-        Vec<(stela_drivers::bus::pci::Address, String)>,
-    ),
+    (adapters, isa_bridges, companions, ports): FoundGpus,
 ) -> bool {
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
     let guest_ram = handoff.guest[..handoff.guest_count]
@@ -1548,6 +1554,7 @@ fn open_gpus(
                 &services,
                 &adapters,
                 &isa_bridges,
+                &ports,
                 gop,
                 firmware.as_ref(),
                 &|address| gpu::link::port_above(mmio, address),
@@ -3289,6 +3296,7 @@ fn start_devices(
                 gpus,
                 gpu_companions,
                 isa_bridges,
+                gpu_ports,
                 usb,
                 bluetooth: host_controller,
                 usb_disks,
@@ -3346,7 +3354,7 @@ fn start_devices(
                     host_acpi,
                     handoff,
                     host_firmware,
-                    (gpus, isa_bridges, gpu_companions),
+                    (gpus, isa_bridges, gpu_companions, gpu_ports),
                 )
             {
                 let firmware = handoff

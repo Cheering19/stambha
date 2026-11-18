@@ -1788,6 +1788,26 @@ impl Drop for RetiredScreen {
     }
 }
 
+/// The ports probe found above the GPU at `address`, nearest first, as
+/// Linux's PCI code keeps them: its driver reads the link its slot gives it
+/// from them, as amdgpu does to set its PCIe speeds.
+fn upstream_ports(
+    ports: &stela_drivers::probe::GpuPorts,
+    address: stela_drivers::bus::pci::Address,
+) -> Vec<function::Port> {
+    ports
+        .iter()
+        .find(|(found, _)| *found == address)
+        .map_or(&[][..], |(_, ports)| ports)
+        .iter()
+        .map(|port| function::Port {
+            bus: port.address.bus.into(),
+            devfn: (port.address.device << 3 | port.address.function).into(),
+            config: port.config,
+        })
+        .collect()
+}
+
 /// After a reset, which puts each Resizable BAR back at the size firmware
 /// set without checking it, as Linux `pci_restore_rebar_state` does: a BAR
 /// that kept a smaller size decodes only that, so the GPU's placement and
@@ -1879,6 +1899,7 @@ pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
     isa_bridges: &[stela_drivers::probe::IsaBridge],
+    ports: &stela_drivers::probe::GpuPorts,
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
     port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
@@ -1957,6 +1978,7 @@ pub(super) fn claim_all(
         match result {
             Ok(mut function) => {
                 function.market = adapter.name();
+                function.placement.upstream = upstream_ports(ports, adapter.address);
                 claimed.push(function);
                 true
             }

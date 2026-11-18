@@ -2392,6 +2392,7 @@ pub unsafe fn open(
         },
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
         isa_bridges: core::mem::take(&mut devices.isa_bridges),
+        gpu_ports: core::mem::take(&mut devices.gpu_ports),
         usb,
         usb_disks,
         disks: host_disks,
@@ -2743,6 +2744,9 @@ pub struct Opened {
     /// The PCI-to-ISA bridges probe read, which a GPU's kernel driver may
     /// name the chipset by.
     pub isa_bridges: alloc::vec::Vec<stela_drivers::probe::IsaBridge>,
+    /// The ports above each display controller, which its kernel driver
+    /// reads its slot's link from.
+    pub gpu_ports: stela_drivers::probe::GpuPorts,
     /// The xHCI controllers' topology owners, polled for hotplug.
     pub usb: super::usb::HostUsb,
     /// Whole disks for the guest's USB mass storage, in option order.

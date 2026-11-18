@@ -321,6 +321,86 @@ enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev)
 	return PCIE_LNK_WIDTH_UNKNOWN;
 }
 
+/* The speed a link status's Current Link Speed field names, as Linux's
+ * pcie_link_speed[] table gives it. */
+static enum pci_bus_speed link_speed(u16 status)
+{
+	switch (status & PCI_EXP_LNKSTA_CLS) {
+	case PCI_EXP_LNKSTA_CLS_2_5GB:
+		return PCIE_SPEED_2_5GT;
+	case PCI_EXP_LNKSTA_CLS_5_0GB:
+		return PCIE_SPEED_5_0GT;
+	case PCI_EXP_LNKSTA_CLS_8_0GB:
+		return PCIE_SPEED_8_0GT;
+	case PCI_EXP_LNKSTA_CLS_16_0GB:
+		return PCIE_SPEED_16_0GT;
+	case PCI_EXP_LNKSTA_CLS_32_0GB:
+		return PCIE_SPEED_32_0GT;
+	case PCI_EXP_LNKSTA_CLS_64_0GB:
+		return PCIE_SPEED_64_0GT;
+	default:
+		return PCI_SPEED_UNKNOWN;
+	}
+}
+
+/* A lane's data rate in Mb/s after its encoding, drivers/pci/pci.h's
+ * PCIE_SPEED2MBS_ENC. */
+static u32 lane_mbps(enum pci_bus_speed speed)
+{
+	switch (speed) {
+	case PCIE_SPEED_64_0GT:
+		return 64000 * 1 / 1;
+	case PCIE_SPEED_32_0GT:
+		return 32000 * 128 / 130;
+	case PCIE_SPEED_16_0GT:
+		return 16000 * 128 / 130;
+	case PCIE_SPEED_8_0GT:
+		return 8000 * 128 / 130;
+	case PCIE_SPEED_5_0GT:
+		return 5000 * 8 / 10;
+	case PCIE_SPEED_2_5GT:
+		return 2500 * 8 / 10;
+	default:
+		return 0;
+	}
+}
+
+/* The bandwidth the function's path to the root complex gives it, following
+ * drivers/pci/pci.c: the slowest trained link from the function up, with
+ * its device, speed and width. The path is Linux's bridges, else the ports
+ * the function's owner gave it (stela_linux_pci_upstream). */
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
+			     enum pci_bus_speed *speed, enum pcie_link_width *width)
+{
+	u32 bandwidth = 0;
+
+	if (speed)
+		*speed = PCI_SPEED_UNKNOWN;
+	if (width)
+		*width = PCIE_LNK_WIDTH_UNKNOWN;
+	for (; dev; dev = stela_linux_pci_upstream(dev)) {
+		u16 status = 0;
+		enum pci_bus_speed next_speed;
+		enum pcie_link_width next_width;
+		u32 next;
+
+		pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &status);
+		next_speed = link_speed(status);
+		next_width = (enum pcie_link_width)FIELD_GET(PCI_EXP_LNKSTA_NLW, status);
+		next = (u32)next_width * lane_mbps(next_speed);
+		if (!bandwidth || next <= bandwidth) {
+			bandwidth = next;
+			if (limiting_dev)
+				*limiting_dev = dev;
+			if (speed)
+				*speed = next_speed;
+			if (width)
+				*width = next_width;
+		}
+	}
+	return bandwidth;
+}
+
 int pcie_get_mps(struct pci_dev *dev)
 {
 	u16 ctl;

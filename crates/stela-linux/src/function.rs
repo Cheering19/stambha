@@ -88,8 +88,21 @@ pub struct Region {
     pub flags: u64,
 }
 
+/// A port above a function (`struct stela_linux_pci_port`), as its owner
+/// read it: its address and its first 256 bytes of configuration, which
+/// hold its PCI Express link's speeds and width.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Port {
+    pub bus: c_uint,
+    pub devfn: c_uint,
+    pub config: [u32; 64],
+}
+
+const _: () = assert!(size_of::<Port>() == 264);
+
 /// Where a function sits.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Placement {
     pub bus: u8,
     pub devfn: u8,
@@ -105,6 +118,11 @@ pub struct Placement {
     /// off, which Linux keeps as `PCI_ROM_RESOURCE` for `pci_map_rom`. Size
     /// 0 for none.
     pub rom_bar: Region,
+    /// The ports between the function and its root complex, nearest first:
+    /// Linux code reads its link from them (`stela_linux_pci_upstream`),
+    /// never writes them. Empty for a function on a root bus. The attach
+    /// copies them.
+    pub upstream: Vec<Port>,
 }
 
 /// A function's MSI capability (PCI Local Bus 3.0 6.8.1), one message at most.
@@ -196,9 +214,12 @@ struct RawFunction {
     rom: *const u8,
     rom_length: usize,
     rom_bar: Region,
+    upstream: *const Port,
+    upstream_count: usize,
 }
 
-const _: () = assert!(size_of::<RawFunction>() == 280);
+const _: () = assert!(size_of::<RawFunction>() == 296);
+const _: () = assert!(core::mem::offset_of!(RawFunction, upstream) == 280);
 const _: () = assert!(core::mem::offset_of!(RawFunction, rom_bar) == 256);
 const _: () = assert!(core::mem::offset_of!(RawFunction, rom_length) == 248);
 const _: () = assert!(core::mem::offset_of!(RawFunction, enroll) == 232);
@@ -877,6 +898,8 @@ impl<H: Host> Attached<H> {
             rom: placement.rom.as_ptr(),
             rom_length: placement.rom.len(),
             rom_bar: placement.rom_bar,
+            upstream: placement.upstream.as_ptr(),
+            upstream_count: placement.upstream.len(),
         };
         let mut error = 0;
         // SAFETY: caller's attach contract; C copies the table and returns a
