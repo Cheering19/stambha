@@ -396,6 +396,11 @@ pub struct Service<B: Backend, C: Compiler> {
     /// The platform's ticks at the first and the last of those reopens.
     failed_from: u64,
     failed_at: u64,
+    /// The platform's ticks at the first reopen since the loss that waited
+    /// ([`Self::with_reopen_wait`]): the failures that follow count their
+    /// span from it, so a wait does not lengthen the time before the
+    /// platform ends a session no GPU serves.
+    waiting_from: Option<u64>,
     /// What the last call made, for the platform's log: a render pipeline's
     /// stages and vertex fetch.
     noted: Option<String>,
@@ -450,6 +455,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             reopen_error: None,
             failed_from: 0,
             failed_at: 0,
+            waiting_from: None,
             noted: None,
             dropped: Dropped::default(),
             served: (0, Status::Ok),
@@ -589,6 +595,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             return;
         }
         if let Some(reason) = self.reopen_wait.as_mut().and_then(|wait| wait()) {
+            let now = (self.device.clock())();
+            self.waiting_from.get_or_insert(now);
             self.refused
                 .push(format!("the lost device waits to reopen: {reason}"));
             return;
@@ -616,11 +624,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 self.pins_reported = false;
                 self.failed_reopens = 0;
                 self.reopen_error = None;
+                self.waiting_from = None;
             }
             Err(error) => {
                 let now = (self.device.clock())();
                 if self.failed_reopens == 0 {
-                    self.failed_from = now;
+                    self.failed_from = self.waiting_from.take().unwrap_or(now);
                 }
                 self.failed_at = now;
                 self.failed_reopens = self.failed_reopens.saturating_add(1);

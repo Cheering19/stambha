@@ -247,6 +247,43 @@ fn a_lost_device_waits_to_reopen_while_the_platform_holds_it() {
     cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
 }
 
+/// A reopen that waited and then failed spans from the first wait: the
+/// platform ends a session no GPU serves no later for the wait, and a wait
+/// alone is no failure.
+#[test]
+fn failures_after_a_wait_span_from_the_wait() {
+    fn clock() -> u64 {
+        static NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        NOW.fetch_add(1000, Ordering::Relaxed)
+    }
+    static WAITS: AtomicUsize = AtomicUsize::new(2);
+    let mut service = service()
+        .with_reopen(Box::new(|| Err(Error::Unsupported("still resetting"))))
+        .with_reopen_wait(Box::new(|| {
+            (WAITS.load(Ordering::Relaxed) > 0).then(|| {
+                WAITS.fetch_sub(1, Ordering::Relaxed);
+                "its kernel driver is still resetting the GPU"
+            })
+        }));
+    service.device().set_clock(clock);
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    // Two waits: no failure yet.
+    service.disconnect(held).unwrap();
+    assert!(service.connect().is_err());
+    assert_eq!(service.loss().failed_reopens, 0);
+    // The first failure already spans the wait: the clock was read at
+    // each wait and at the failure.
+    assert!(service.connect().is_err());
+    let first = service.loss();
+    assert_eq!(first.failed_reopens, 1);
+    assert!(first.failing_ticks >= 2000, "{first:?}");
+    assert!(service.connect().is_err());
+    let second = service.loss();
+    assert_eq!(second.failed_reopens, 2);
+    assert!(second.failing_ticks > first.failing_ticks, "{second:?}");
+}
+
 /// Why a lost device did not come back is reported by the connections
 /// that tried to reopen it: a refused connection serves no call, so the
 /// reason waited, unreported, for a call that never came.
