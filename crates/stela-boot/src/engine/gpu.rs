@@ -1368,6 +1368,9 @@ pub(super) struct Claimed {
     /// Whether this GPU may be the one showing the firmware's screen.
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     shows_screen: bool,
+    /// The firmware's picture this claim holds until its driver's probe
+    /// tells whether it ended ([`RetiredScreen`]).
+    screen: RetiredScreen,
     device: Device,
     firmware: PciFirmware,
     /// The words of Linux's command line its driver needs for it.
@@ -1478,12 +1481,9 @@ fn claim(
             "a firmware framebuffer writer is still active",
         ));
     }
-    // A refusal from here until the GPU is sealed for its reset leaves what
-    // it scans out as it was, so the firmware's screen is given back.
-    let screen = RetiredScreen {
-        address,
-        retired: owns_screen,
-    };
+    // A refusal from here until the GPU is reset leaves what it scans out
+    // as it was, so the firmware's screen is given back.
+    let mut screen = RetiredScreen::hold(address, owns_screen);
     let mut placement = Placement {
         bus: address.bus,
         devfn: address.device << 3 | address.function,
@@ -1623,9 +1623,12 @@ fn claim(
         // SAFETY: this stack's driver takes the GPU from the firmware at its
         // probe, resetting it where a previous driver left it running.
         cold = unsafe { cold.driver_resets() };
+    } else {
+        // The reset below ends the firmware's picture on this GPU. A driver
+        // that resets the GPU itself keeps it until a step of its probe ends
+        // it, which the probe's result tells.
+        screen.end(None);
     }
-    // The seal and the reset below end the firmware's picture on this GPU.
-    screen.spend();
     let ready = cold
         .quiesce_and_bind()
         .map_err(|failure| cold_refusal(address, failure.error))?;
@@ -1734,6 +1737,7 @@ fn claim(
         .map_err(ServiceError::Config)?;
     Ok(Claimed {
         shows_screen: owns_screen,
+        screen,
         device: Device {
             config: SharedConfig(Rc::new(RefCell::new(ManuallyDrop::into_inner(function)))),
             msi,
@@ -1760,31 +1764,117 @@ fn claim(
     })
 }
 
-/// The firmware's screen a claim retired before it sized the GPU's BARs. A
-/// claim that stops before the GPU's views are sealed for its reset changed
-/// nothing the GPU scans out, so the screen is given back: the boot's text
-/// and, when another GPU draws, the guest's copied frames show there again.
+/// The firmware's picture while GPU claims hold it
+/// ([`stela_boot_core::firmware_picture`]).
+static FIRMWARE_PICTURE: stela_boot_core::screen::Exclusive<
+    stela_boot_core::firmware_picture::Held,
+> = stela_boot_core::screen::Exclusive::new(stela_boot_core::firmware_picture::Held::new());
+
+/// The firmware's screen a claim retired before it sized the GPU's BARs.
+/// The picture lasts until a step ends it: the claim's reset, or a step of
+/// the driver's probe that resets the GPU or starts its display engine
+/// (`stela_linux::function::screen_ended`); a driver bound to the GPU drives
+/// that screen from then on. A claim that lets go with none of those
+/// changed nothing the GPU scans out, so the screen is given back: the
+/// boot's text and, when another GPU draws, the guest's copied frames show
+/// there again.
 struct RetiredScreen {
     address: stela_drivers::bus::pci::Address,
     retired: bool,
 }
 
 impl RetiredScreen {
-    /// The claim goes on to seal and reset the GPU, which ends its picture.
-    fn spend(mut self) {
-        self.retired = false;
+    /// The claim of the GPU at `address`, which retired the firmware's
+    /// screen when `retired`.
+    fn hold(address: stela_drivers::bus::pci::Address, retired: bool) -> Self {
+        if retired {
+            let devfn = address.device << 3 | address.function;
+            FIRMWARE_PICTURE.with_until(|| false, |held| held.hold(address.bus, devfn));
+        }
+        Self { address, retired }
+    }
+
+    /// The picture ended: the claim resets the GPU (`None`), or the
+    /// driver's probe ended it with this step or bound the GPU.
+    fn end(&mut self, step: Option<&str>) {
+        if !core::mem::take(&mut self.retired) {
+            return;
+        }
+        let devfn = self.address.device << 3 | self.address.function;
+        FIRMWARE_PICTURE.with_until(|| false, |held| held.end(self.address.bus, devfn));
+        if let Some(step) = step {
+            output::arguments(format_args!(
+                "GPU {}: the firmware's picture on it ended with its driver's {step}\n",
+                self.address
+            ));
+        }
+    }
+
+    /// The claim lets go without ending the picture.
+    fn let_go(&mut self) {
+        if !core::mem::take(&mut self.retired) {
+            return;
+        }
+        let devfn = self.address.device << 3 | self.address.function;
+        let back = FIRMWARE_PICTURE
+            .with_until(|| false, |held| held.release(self.address.bus, devfn))
+            .unwrap_or(false);
+        if back && crate::console::restore_firmware() {
+            output::arguments(format_args!(
+                "GPU {}: the firmware's picture stays on its screen, as nothing reset the GPU \
+                 or started its display before its claim ended\n",
+                self.address
+            ));
+        }
+    }
+
+    /// What became of the picture once the driver's probe returned without
+    /// binding the GPU: the step that ended it is named, and a picture no
+    /// step ended is the boot's again.
+    fn after_failed_probe(
+        &mut self,
+        shows_screen: bool,
+    ) -> stela_boot_core::gpu_status::Picture<'static> {
+        use stela_boot_core::gpu_status::Picture;
+        if !shows_screen {
+            return Picture::Elsewhere;
+        }
+        if !self.retired {
+            return Picture::ResetForClaim;
+        }
+        let devfn = self.address.device << 3 | self.address.function;
+        match stela_linux::function::screen_ended(self.address.bus, devfn)
+            .and_then(|step| step.to_str().ok())
+        {
+            Some(step) => {
+                self.end(Some(step));
+                Picture::EndedBy(step)
+            }
+            None => {
+                self.let_go();
+                Picture::Kept
+            }
+        }
     }
 }
 
 impl Drop for RetiredScreen {
     fn drop(&mut self) {
-        if self.retired && crate::console::restore_firmware() {
-            output::arguments(format_args!(
-                "GPU {}: the firmware's picture stays on its screen, as the claim stopped \
-                 before the GPU was reset\n",
-                self.address
-            ));
-        }
+        self.let_go();
+    }
+}
+
+/// At a stop: give the firmware's screen back to the stop's reason when GPU
+/// claims hold it and no step ended its picture, as a driver's probe that
+/// stops the boot before it reset the GPU or started its display.
+pub(crate) fn picture_at_stop() {
+    let shows = FIRMWARE_PICTURE.try_with(|held| {
+        held.shows_at_stop(|bus, devfn| stela_linux::function::screen_ended(bus, devfn).is_some())
+    });
+    if shows == Some(true) && crate::console::restore_firmware() {
+        output::arguments(format_args!(
+            "GPU: the firmware's picture still shows, so the stop's reason is drawn on it\n"
+        ));
     }
 }
 
@@ -2162,20 +2252,26 @@ struct Unbound {
     /// Its market name, or its maker and IDs.
     market: String,
     driver: &'static str,
-    /// The firmware's picture was on it.
-    dark: bool,
+    /// What became of the firmware's picture on it.
+    picture: stela_boot_core::gpu_status::Picture<'static>,
     /// Its stack draws.
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     draws: bool,
 }
 
 impl Unbound {
+    /// A GPU whose probe never returned: a picture on it stays held.
     fn of(claimed: &Claimed) -> Self {
+        use stela_boot_core::gpu_status::Picture;
         Self {
             name: claimed.name.clone(),
             market: claimed.market.clone(),
             driver: claimed.stack.kernel.driver,
-            dark: claimed.shows_screen,
+            picture: match (claimed.shows_screen, claimed.screen.retired) {
+                (false, _) => Picture::Elsewhere,
+                (true, false) => Picture::ResetForClaim,
+                (true, true) => Picture::Held,
+            },
             draws: claimed.stack.draws(),
         }
     }
@@ -2230,6 +2326,11 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
         // SAFETY: entered, on a task.
         job.result = unsafe { gpu::stack::start_kernel(&setup.command_line) };
         if job.result.is_err() {
+            // No driver probed them, so a picture they hold stays.
+            let mut claimed = claimed;
+            for claimed in &mut claimed {
+                claimed.screen.let_go();
+            }
             // No source-specific device return was acknowledged.
             core::mem::forget(claimed);
             return job;
@@ -2251,7 +2352,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
             }
         }
     }
-    for claimed in claimed {
+    for mut claimed in claimed {
         let authority = {
             let mut function = claimed.device.config.0.borrow_mut();
             // SAFETY: the firmware keys came from the real chipset read on the
@@ -2290,6 +2391,8 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                         "GPU {}: {} bound it\n",
                         claimed.name, claimed.stack.kernel.driver
                     ));
+                    // Its driver drives what the screen on it shows.
+                    claimed.screen.end(None);
                     #[cfg(feature = "nvk")]
                     job.bound.push(Bound {
                         name: claimed.name,
@@ -2302,33 +2405,42 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                         port: claimed.port,
                     });
                 } else {
-                    // The claim reset the function, so the firmware's
-                    // picture on its outputs is gone and nothing draws there.
+                    use stela_boot_core::gpu_status::Picture;
+                    let picture = claimed.screen.after_failed_probe(claimed.shows_screen);
                     output::arguments(format_args!(
                         "GPU {}: {} did not bind it; Linux's lines above say why.{}\n",
                         claimed.name,
                         claimed.stack.kernel.driver,
-                        if claimed.shows_screen {
-                            " The firmware's picture was on this GPU and ended when it was \
-                             reset for the claim, so a display wired to it stays dark"
-                        } else {
-                            ""
+                        match picture {
+                            Picture::Elsewhere | Picture::Held => "",
+                            Picture::Kept =>
+                                " The firmware's picture was on this GPU and stays, as the \
+                                 driver stopped before it reset the GPU or started its display",
+                            Picture::ResetForClaim =>
+                                " The firmware's picture was on this GPU and ended when it was \
+                                 reset for the claim, so a display wired to it stays dark",
+                            Picture::EndedBy(_) =>
+                                " The firmware's picture was on this GPU and its driver ended \
+                                 it, so a display wired to it stays dark",
                         }
                     ));
                     job.unbound.push(Unbound {
                         name: claimed.name,
                         market: claimed.market,
                         driver: claimed.stack.kernel.driver,
-                        dark: claimed.shows_screen,
+                        picture,
                         draws: claimed.stack.draws(),
                     });
                 }
                 job._attached.push(attached);
             }
-            Err(error) => output::arguments(format_args!(
-                "GPU {} presentation refused: {:?}\n",
-                claimed.name, error.error
-            )),
+            Err(error) => {
+                output::arguments(format_args!(
+                    "GPU {} presentation refused: {:?}\n",
+                    claimed.name, error.error
+                ));
+                claimed.screen.after_failed_probe(claimed.shows_screen);
+            }
         }
     }
     job
@@ -2853,7 +2965,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
             &unbound.market,
             &unbound.name,
             unbound.driver,
-            unbound.dark,
+            unbound.picture,
         ));
     }
     let result = job.result.clone().map_err(Error::Init);

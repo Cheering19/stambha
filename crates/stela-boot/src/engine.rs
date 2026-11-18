@@ -1587,3 +1587,9 @@ pub(crate) fn stop_gpus_for_fatal() {
     #[cfg(feature = "nvk")]
     gpu::gate::stop_for_fatal();
 }
+
+/// Before a stop draws its reason: the firmware's screen back when a GPU
+/// claim holds it and nothing ended its picture ([`gpu::picture_at_stop`]).
+pub(crate) fn firmware_picture_at_stop() {
+    gpu::picture_at_stop();
+}

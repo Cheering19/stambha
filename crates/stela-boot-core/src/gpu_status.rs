@@ -175,20 +175,52 @@ pub fn failed(adapters: &[Adapter], error: &str) -> String {
     )
 }
 
+/// What became of the firmware's picture on a claimed GPU no driver bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Picture<'a> {
+    /// It was not on this GPU.
+    Elsewhere,
+    /// It was, and still is: the driver stopped before any step that ends
+    /// it, and the boot draws on it again.
+    Kept,
+    /// The claim's reset ended it.
+    ResetForClaim,
+    /// The driver ended it with this step of its probe, as `MODE2 reset` or
+    /// `start of the display engine`.
+    EndedBy(&'a str),
+    /// It was, and a probe that never returned still holds the GPU, so
+    /// nothing draws on it.
+    Held,
+}
+
 /// The screen line for the claimed GPU `gpu`, by its name, at PCI
-/// `address` that its Linux driver `driver` did not bind. `dark` when the
-/// firmware's picture was on it: the claim's reset ended that picture, so
-/// its display shows nothing and only another adapter's screen, or the log,
-/// carries this line.
-pub fn unbound(gpu: &str, address: &str, driver: &str, dark: bool) -> String {
+/// `address` that its Linux driver `driver` did not bind, with what became
+/// of the firmware's picture on it. A picture that ended leaves its display
+/// with nothing, so only another adapter's screen, or the log, carries this
+/// line.
+pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> String {
+    let screen = match picture {
+        Picture::Elsewhere => String::new(),
+        Picture::Kept => String::from(
+            " The screen the PC started on is wired to it and keeps its picture, as the driver \
+             stopped before it changed what that screen shows.",
+        ),
+        Picture::ResetForClaim => String::from(
+            " The screen the PC started on is wired to it and stays dark: the GPU was reset for \
+             its driver.",
+        ),
+        Picture::EndedBy(step) => format!(
+            " The screen the PC started on is wired to it and stays dark: the driver's {step} \
+             ended its picture."
+        ),
+        Picture::Held => String::from(
+            " The screen the PC started on is wired to it and stays dark while the driver's \
+             probe holds the GPU.",
+        ),
+    };
     format!(
-        "the {gpu} at {address} did not start: its Linux driver {driver} did not bind it.{} The \
-         boot log on this USB says why",
-        if dark {
-            " The screen the PC started on is wired to it and stays dark."
-        } else {
-            ""
-        }
+        "the {gpu} at {address} did not start: its Linux driver {driver} did not bind it.{screen} \
+         The boot log on this USB says why"
     )
 }
 
@@ -446,16 +478,44 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_gpu_says_when_its_screen_stays_dark() {
+    fn an_unbound_gpu_says_what_became_of_the_screen_on_it() {
         assert_eq!(
-            unbound("Intel Iris Xe Graphics", "00:02.0", "xe", false),
+            unbound(
+                "Intel Iris Xe Graphics",
+                "00:02.0",
+                "xe",
+                Picture::Elsewhere
+            ),
             "the Intel Iris Xe Graphics at 00:02.0 did not start: its Linux driver xe did not \
              bind it. The boot log on this USB says why"
         );
-        let dark = unbound("Intel Iris Xe Graphics", "00:02.0", "xe", true);
+        let reset = unbound(
+            "Intel Iris Xe Graphics",
+            "00:02.0",
+            "xe",
+            Picture::ResetForClaim,
+        );
         assert!(
-            dark.contains("xe did not bind it. The screen the PC started on is wired to it"),
-            "{dark}"
+            reset.contains(
+                "xe did not bind it. The screen the PC started on is wired to it and stays \
+                 dark: the GPU was reset for its driver. The boot log"
+            ),
+            "{reset}"
+        );
+        let kept = unbound("AMD Radeon Graphics", "01:00.0", "amdgpu", Picture::Kept);
+        assert!(
+            kept.contains("is wired to it and keeps its picture"),
+            "{kept}"
+        );
+        let ended = unbound(
+            "AMD Radeon Graphics",
+            "01:00.0",
+            "amdgpu",
+            Picture::EndedBy("MODE2 reset"),
+        );
+        assert!(
+            ended.contains("stays dark: the driver's MODE2 reset ended its picture."),
+            "{ended}"
         );
     }
 

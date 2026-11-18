@@ -622,6 +622,45 @@ struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_id
 	return dev;
 }
 
+/* The functions whose driver ended the picture the firmware left on their
+ * outputs, with the step that did. Few GPUs can show that picture. Only the
+ * serialized owner writes; a stop on any processor may read, so each entry's
+ * step is stored last and, once set, never changes. */
+static struct {
+	unsigned int bus, devfn;
+	const char *why;
+} screens_ended[8];
+
+void stela_linux_pci_screen_ended(struct pci_dev *dev, const char *why)
+{
+	unsigned int bus = dev->bus->number, devfn = dev->devfn;
+
+	for (size_t i = 0; i < ARRAY_SIZE(screens_ended); i++) {
+		if (!__atomic_load_n(&screens_ended[i].why, __ATOMIC_ACQUIRE)) {
+			screens_ended[i].bus = bus;
+			screens_ended[i].devfn = devfn;
+			__atomic_store_n(&screens_ended[i].why, why, __ATOMIC_RELEASE);
+			return;
+		}
+		if (screens_ended[i].bus == bus && screens_ended[i].devfn == devfn)
+			return;
+	}
+	stela_linux_unsupported("recording the end of the firmware's picture on a ninth PCI function");
+}
+
+const char *stela_linux_pci_screen_ended_at(unsigned int bus, unsigned int devfn)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(screens_ended); i++) {
+		const char *why = __atomic_load_n(&screens_ended[i].why, __ATOMIC_ACQUIRE);
+
+		if (!why)
+			return NULL;
+		if (screens_ended[i].bus == bus && screens_ended[i].devfn == devfn)
+			return why;
+	}
+	return NULL;
+}
+
 #ifdef STELA_LINUX_PCI_HOST_TEST
 #include <linux/bottom_half.h>
 #include <stela/page_test.h>
@@ -913,6 +952,14 @@ int main(void)
 	assert(dev && !stela_linux_pci_bound(dev));
 	test_identity();
 	test_upstream(function);
+
+	/* The first step that ended the firmware's picture is kept, by function. */
+	assert(!stela_linux_pci_screen_ended_at(3, PCI_DEVFN(1, 0)));
+	stela_linux_pci_screen_ended(dev, "MODE2 reset");
+	stela_linux_pci_screen_ended(dev, "start of the display engine");
+	assert(!strcmp(stela_linux_pci_screen_ended_at(3, PCI_DEVFN(1, 0)), "MODE2 reset"));
+	assert(!stela_linux_pci_screen_ended_at(3, PCI_DEVFN(2, 0)));
+	assert(!stela_linux_pci_screen_ended_at(4, PCI_DEVFN(1, 0)));
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);

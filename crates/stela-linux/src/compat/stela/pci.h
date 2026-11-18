@@ -16,6 +16,15 @@ int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
+/* The function's driver ends the picture the firmware left on its outputs:
+ * it resets the function, or starts its display engine, which blanks what
+ * the firmware lit. `why` names that step and outlives the boot (a string
+ * literal); the first is kept. The host gives the firmware's framebuffer
+ * back after a failed probe only when no step ended its picture. */
+void stela_linux_pci_screen_ended(struct pci_dev *dev, const char *why);
+/* The step that ended the firmware's picture on the function at bus and
+ * devfn, or NULL. Read on any processor, at a stop too. */
+const char *stela_linux_pci_screen_ended_at(unsigned int bus, unsigned int devfn);
 
 /* A placed memory region of a function. */
 struct stela_linux_pci_region {

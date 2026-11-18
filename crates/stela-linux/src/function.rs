@@ -281,9 +281,23 @@ unsafe extern "C" {
     fn stela_linux_pci_shutdown(device: *mut c_void);
     fn stela_linux_pci_remove_device(device: *mut c_void);
     fn stela_linux_pci_quarantined_functions() -> u64;
+    fn stela_linux_pci_screen_ended_at(bus: c_uint, devfn: c_uint) -> *const c_char;
     fn stela_linux_fatal(message: *const c_char) -> !;
     fn stela_linux_page_dma_pin(physical: u64) -> *mut c_void;
     fn stela_linux_page_dma_unpin(pin: *mut c_void);
+}
+
+/// The step of its driver that ended the picture the firmware left on the
+/// outputs of the function at `bus` and `devfn`: a reset of it, or the start
+/// of its display engine (`stela_linux_pci_screen_ended`). None while no
+/// step did. Any processor may ask, at a stop too: a step, once named, never
+/// changes.
+pub fn screen_ended(bus: u8, devfn: u8) -> Option<&'static core::ffi::CStr> {
+    // SAFETY: the C side only reads its table, whose steps are string
+    // literals that live for the boot.
+    let why = unsafe { stela_linux_pci_screen_ended_at(c_uint::from(bus), c_uint::from(devfn)) };
+    // SAFETY: a non-null step is a NUL-terminated literal of the image.
+    (!why.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(why) })
 }
 
 /// Functions whose final device reference ended outside their original

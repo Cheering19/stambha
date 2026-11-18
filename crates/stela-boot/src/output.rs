@@ -1379,6 +1379,7 @@ fn halt(code: u32) -> ! {
 /// exists.
 fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
     crate::native_mmio::shootdown::before_stop_screen();
+    crate::engine::firmware_picture_at_stop();
     console::reclaim();
     if console::active() && !RAW_SCREEN.load(Ordering::Relaxed) {
         crate::status::fail(message);
