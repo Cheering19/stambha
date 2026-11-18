@@ -1399,7 +1399,11 @@ fn open_gpu(
     }
     // Read before the GPU's first work, for the guest's `StelaHost`.
     client::remember_memory(index as u32, bound.stack);
-    let link = match PcieLink::admitted(bound.link, integrated(index, bound)) {
+    // So is what the driver says of the chip, for the summary below: once
+    // the GPU hung, a file's close may wait for the driver's reset.
+    let facts = client::describe(index as u32, bound.stack);
+    let shares_memory = integrated(index, bound);
+    let link = match PcieLink::admitted(bound.link, shares_memory) {
         Ok(link) => link,
         Err(reason) => return refuse(reason),
     };
@@ -1469,12 +1473,14 @@ fn open_gpu(
                 core::mem::forget(service);
                 // The reset unmapped the display's buffers too.
                 super::display::abandon();
+                summarize(bound, &facts, shares_memory, None);
                 return None;
             }
             output::arguments(format_args!(
                 "GPU {}: Metal service open at DRM minor {index}\n",
                 bound.name
             ));
+            summarize(bound, &facts, shares_memory, Some(&*service));
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);
             service.set_look_budget(gpu.tsc_hz / 1_000_000 * LOOK_MICROS);
@@ -1511,8 +1517,46 @@ fn open_gpu(
             }
             Some(service)
         }
-        Err(error) => refuse(&format!("Metal could not open: {error:?}")),
+        Err(error) => {
+            let refused = refuse(&format!("Metal could not open: {error:?}"));
+            summarize(bound, &facts, shares_memory, None);
+            refused
+        }
     }
+}
+
+/// The one `GPU SUMMARY` line of `bound` as its Metal service opened, or
+/// did not: what a triager reads first of a GPU that fails on a PC nobody
+/// here can test. `facts` is what its kernel driver said of the chip
+/// ([`client::describe`]); the heaps are the Vulkan driver's, where its
+/// device opened.
+fn summarize(bound: &Bound, facts: &str, integrated: bool, service: Option<&Shared>) {
+    let (working_set, heaps) = match service.and_then(|service| service.memory_plan()) {
+        Some((working_set, heaps)) => {
+            let mut text = String::new();
+            for heap in heaps {
+                let kind = if heap.device_local { "local" } else { "host" };
+                text.push_str(&format!(" {}M/{kind}", heap.size >> 20));
+            }
+            (Some(working_set), text)
+        }
+        None => (None, String::new()),
+    };
+    let heap = crate::ALLOCATOR.usage();
+    let summary = stela_boot_core::gpu_triage::Summary {
+        address: &bound.name,
+        vendor: bound.drm.vendor,
+        device: bound.drm.device,
+        revision: bound.drm.revision,
+        driver: bound.stack.kernel.driver,
+        facts,
+        integrated,
+        working_set,
+        heaps: &heaps,
+        heap_live: heap.live,
+        heap_total: heap.total,
+    };
+    output::arguments(format_args!("{summary}\n"));
 }
 
 /// `--profile`: every device times its command buffers' passes apart and

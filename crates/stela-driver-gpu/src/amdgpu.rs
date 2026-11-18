@@ -154,14 +154,95 @@ pub mod query {
     /// The first `N` words of the answer to `query`. The driver copies no
     /// more than the size asked.
     fn get<const N: usize>(control: Control, query: u32) -> Option<[u64; N]> {
+        get_with(control, query, [0; 4])
+    }
+
+    /// [`get`] with the query's own `arguments`.
+    fn get_with<const N: usize>(
+        control: Control,
+        query: u32,
+        arguments: [u32; 4],
+    ) -> Option<[u64; N]> {
         let mut answer = [0_u64; N];
         let mut record = Info {
             return_pointer: answer.as_mut_ptr() as u64,
             return_size: size_of::<[u64; N]>() as u32,
             query,
-            arguments: [0; 4],
+            arguments,
         };
         (control(INFO, (&raw mut record).cast()) == 0).then_some(answer)
+    }
+
+    /// `AMDGPU_INFO_HW_IP_INFO`, answering `struct drm_amdgpu_info_hw_ip`.
+    const HW_IP_INFO: u32 = 0x02;
+    /// `AMDGPU_HW_IP_GFX`.
+    const HW_IP_GFX: u32 = 0;
+    /// `AMDGPU_INFO_FW_VERSION`, answering `struct drm_amdgpu_info_firmware`
+    /// (version, feature) for the `struct drm_amdgpu_query_fw` asked.
+    const FW_VERSION: u32 = 0x0e;
+    /// The firmware the GPU's start and the Metal device's engines run, by
+    /// `AMDGPU_INFO_FW_*`, each answered for any GPU amdgpu drives (zero for
+    /// one the chip does not run), in amdgpu's own short names.
+    const FIRMWARE: [(u32, &str); 12] = [
+        (0x0c, "sos"),
+        (0x15, "toc"),
+        (0x0a, "smc"),
+        (0x1b, "imu"),
+        (0x04, "me"),
+        (0x05, "pfp"),
+        (0x06, "ce"),
+        (0x08, "mec"),
+        (0x07, "rlc"),
+        (0x1a, "mes"),
+        (0x0b, "sdma"),
+        (0x14, "dmcub"),
+    ];
+
+    /// What amdgpu says of the bound chip, for the boot log's summary: its
+    /// family and graphics block version, revisions and compute units, the
+    /// version of each firmware it runs, and its memory (VRAM, the part the
+    /// CPU reaches, and GTT, the system memory it maps).
+    pub fn describe(control: Control) -> Option<alloc::string::String> {
+        use alloc::format;
+        let device = get::<7>(control, DEV_INFO)?;
+        let family = device[2] as u32;
+        let mut text = format!(
+            "family {} ({family}) chip_rev={:#x} external_rev={:#x} cus={}",
+            super::family_name(family).unwrap_or("unnamed"),
+            device[0] >> 32,
+            device[1] as u32,
+            device[6] as u32,
+        );
+        if let Some(gfx) = get_with::<4>(control, HW_IP_INFO, [HW_IP_GFX, 0, 0, 0]) {
+            let discovered = (gfx[3] >> 32) as u32;
+            text.push_str(&match discovered {
+                0 => format!(" gfx={}.{}", gfx[0] as u32, gfx[0] >> 32),
+                _ => format!(
+                    " gfx={}.{}.{}",
+                    discovered >> 16 & 0xff,
+                    discovered >> 8 & 0xff,
+                    discovered & 0xff
+                ),
+            });
+        }
+        text.push_str("; firmware");
+        for (kind, name) in FIRMWARE {
+            match get_with::<1>(control, FW_VERSION, [kind, 0, 0, 0]) {
+                Some([answer]) if answer as u32 != 0 => {
+                    text.push_str(&format!(" {name}={:#x}", answer as u32))
+                }
+                _ => {}
+            }
+        }
+        if let Some(heaps) = get::<12>(control, MEMORY) {
+            text.push_str(&format!(
+                "; vram={}M visible={}M gtt={}M",
+                heaps[0] >> 20,
+                heaps[4] >> 20,
+                heaps[8] >> 20
+            ));
+        }
+        Some(text)
     }
 
     /// The device's family (`AMDGPU_FAMILY_*`), the fifth 32-bit field of
@@ -513,5 +594,60 @@ mod tests {
             query::memory_bytes(&mut info(&mut alloc::vec::Vec::new(), true)),
             Some((8 << 30) - (512 << 20) + (15 << 30))
         );
+    }
+
+    /// The summary names the family, graphics version, each firmware the
+    /// driver reports running (none it answers zero for) and the memory,
+    /// as a Granite Ridge iGPU answers them.
+    #[test]
+    fn the_summary_names_family_firmware_and_memory() {
+        let mut answer = |request: u32, argument: *mut c_void| {
+            assert_eq!(request, 0x4020_6445);
+            // SAFETY: the query passes its own record and answer buffer.
+            let record = unsafe { &*argument.cast::<[u64; 4]>() };
+            let (size, query, kind) =
+                (record[1] as u32, (record[1] >> 32) as u32, record[2] as u32);
+            // SAFETY: as above; the buffer holds `size` bytes.
+            let words = unsafe {
+                core::slice::from_raw_parts_mut(record[0] as *mut u64, size as usize / 8)
+            };
+            match query {
+                0x16 => {
+                    words[0] = 0x1 << 32 | 0x13c0;
+                    words[1] = 0xcb << 32 | 0x2;
+                    words[2] = 149;
+                    words[6] = 2;
+                }
+                0x02 => {
+                    assert_eq!(kind, 0, "the graphics block");
+                    words[0] = 3 << 32 | 10;
+                    words[3] = 0x000a_0306 << 32;
+                }
+                0x0e => {
+                    words[0] = match kind {
+                        0x0c => 0x0047_0028,
+                        0x0a => 0x0062_5400,
+                        0x04 => 0x1d,
+                        _ => 0,
+                    }
+                }
+                0x19 => {
+                    words[0] = 512 << 20;
+                    words[4] = 256 << 20;
+                    words[8] = 1650 << 20;
+                }
+                _ => return -22,
+            }
+            0
+        };
+        assert_eq!(
+            query::describe(&mut answer).as_deref(),
+            Some(
+                "family GC_10_3_6 (149) chip_rev=0x1 external_rev=0x2 cus=2 gfx=10.3.6; firmware \
+                 sos=0x470028 smc=0x625400 me=0x1d; vram=512M visible=256M gtt=1650M"
+            )
+        );
+        let mut refuse = |_: u32, _: *mut c_void| -22;
+        assert_eq!(query::describe(&mut refuse), None);
     }
 }

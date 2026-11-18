@@ -510,6 +510,7 @@ mod tests {
                 chip: crate::xe::query::chip,
                 memory_bytes: crate::xe::query::memory_bytes,
                 reset: None,
+                describe: None,
             },
             metal: Some(intel::ADMISSION),
         };

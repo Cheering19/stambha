@@ -8,6 +8,7 @@
 //! vendor is driven is then the kernel driver's own ID table's answer, when
 //! Linux matches the function against the registered driver.
 use crate::{Adapter, Vendor};
+use alloc::{format, string::String};
 use core::ffi::c_void;
 
 /// A device-control call on the bound GPU's open DRM file: the request code
@@ -55,6 +56,53 @@ pub struct Kernel {
     /// close of its files, how it tells whether it reset the GPU, so a GPU
     /// it reset during its first work is left unreleased.
     pub reset: Option<Reset>,
+    /// What the driver says of the bound chip, by its query ioctls, for the
+    /// boot log's one summary of the GPU: its family, the firmware versions
+    /// it runs and the memory it found.
+    pub describe: Option<fn(Control) -> Option<String>>,
+}
+
+/// `DRM_IOCTL_VERSION`: `DRM_IOWR(0x00, struct drm_version)`.
+const DRM_IOCTL_VERSION: u32 = 0xc040_6400;
+
+/// `struct drm_version`, asking for the name only.
+#[repr(C)]
+struct DrmVersion {
+    major: i32,
+    minor: i32,
+    patch: i32,
+    name_length: usize,
+    name: *mut u8,
+    date_length: usize,
+    date: *mut u8,
+    description_length: usize,
+    description: *mut u8,
+}
+
+/// The kernel driver's name and version as DRM reports them to any client,
+/// such as `amdgpu 3.64.0`.
+pub fn drm_version(control: Control) -> Option<String> {
+    let mut name = [0_u8; 32];
+    let mut version = DrmVersion {
+        major: 0,
+        minor: 0,
+        patch: 0,
+        name_length: name.len(),
+        name: name.as_mut_ptr(),
+        date_length: 0,
+        date: core::ptr::null_mut(),
+        description_length: 0,
+        description: core::ptr::null_mut(),
+    };
+    if control(DRM_IOCTL_VERSION, (&raw mut version).cast()) != 0 {
+        return None;
+    }
+    // The driver answers its name's whole length, which may exceed the room.
+    let name = core::str::from_utf8(&name[..version.name_length.min(name.len())]).ok()?;
+    Some(format!(
+        "{name} {}.{}.{}",
+        version.major, version.minor, version.patch
+    ))
 }
 
 /// How a driver that decides whether a GPU is integrated during its probe
@@ -197,6 +245,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
         reset: None,
+        describe: None,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
@@ -239,6 +288,7 @@ pub static AMD: GpuStack = GpuStack {
             watch: crate::amdgpu::query::reset_watch,
             state: crate::amdgpu::query::reset_state,
         }),
+        describe: Some(crate::amdgpu::query::describe),
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
@@ -286,6 +336,7 @@ pub static INTEL: GpuStack = GpuStack {
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
         reset: None,
+        describe: None,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
@@ -897,5 +948,36 @@ mod tests {
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!((reset.watch)(&mut refuse), None);
         assert_eq!((reset.state)(&mut refuse, 7), None);
+    }
+
+    /// DRM's version query names the driver and its version; a name longer
+    /// than the room is cut to it, and a refusal answers nothing.
+    #[test]
+    fn the_drm_version_names_the_driver() {
+        let mut answer = |request: u32, argument: *mut core::ffi::c_void| {
+            assert_eq!(request, 0xc040_6400);
+            // SAFETY: the query passes its own `struct drm_version`.
+            let version = unsafe { &mut *argument.cast::<DrmVersion>() };
+            assert_eq!(core::mem::size_of::<DrmVersion>(), 64);
+            assert!(version.date.is_null() && version.description.is_null());
+            let name = b"amdgpu";
+            // SAFETY: the name buffer holds `name_length` bytes.
+            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), version.name, name.len()) };
+            (version.major, version.minor, version.patch) = (3, 64, 0);
+            version.name_length = name.len();
+            0
+        };
+        assert_eq!(drm_version(&mut answer).as_deref(), Some("amdgpu 3.64.0"));
+        let mut long = |_: u32, argument: *mut core::ffi::c_void| {
+            // SAFETY: as above.
+            let version = unsafe { &mut *argument.cast::<DrmVersion>() };
+            // SAFETY: as above.
+            unsafe { core::ptr::write_bytes(version.name, b'x', version.name_length) };
+            version.name_length = 40;
+            0
+        };
+        assert_eq!(drm_version(&mut long).map(|text| text.len()), Some(32 + 6));
+        let mut refuse = |_: u32, _: *mut core::ffi::c_void| -22;
+        assert_eq!(drm_version(&mut refuse), None);
     }
 }
