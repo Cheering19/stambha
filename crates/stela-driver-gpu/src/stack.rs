@@ -293,18 +293,39 @@ pub static INTEL: GpuStack = GpuStack {
     vulkan: None,
 };
 
+/// Why Linux did not start: its error, and the command-line word it
+/// refused or the parameter that refused its value, when one did.
+#[cfg(feature = "linux-drm")]
+#[derive(Clone, Debug)]
+pub struct StartError {
+    pub errno: stela_linux::owner::Errno,
+    pub rejected: Option<alloc::string::String>,
+}
+
+#[cfg(feature = "linux-drm")]
+impl core::fmt::Display for StartError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "errno {}", -self.errno)?;
+        match &self.rejected {
+            Some(word) => write!(f, ", refusing \"{word}\" on its command line"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Brings Linux up and registers every kernel driver built into the image,
 /// stopping at the first stage that fails. Linux then matches each presented
 /// function against the registered drivers' own ID tables, so one image
 /// serves every vendor's devices and registration is not per stack.
 /// `command_line` is Linux's: space-separated `module.parameter=value` words
-/// that set the built-in drivers' parameters before any of them registers.
+/// that set the built-in drivers' parameters before any of them registers
+/// ([`crate::command_line`]).
 ///
 /// # Safety
 /// On the canonical Linux owner's original managed task after Initial and
 /// SRCU startup have completed, once per environment. Initcalls may sleep.
 #[cfg(feature = "linux-drm")]
-pub unsafe fn start_kernel(command_line: &str) -> Result<(), stela_linux::owner::Errno> {
+pub unsafe fn start_kernel(command_line: &str) -> Result<(), StartError> {
     unsafe extern "C" {
         /// The build's one registration image (`build/image.rs`).
         static stela_linux_gpu_image: c_void;
@@ -313,21 +334,33 @@ pub unsafe fn start_kernel(command_line: &str) -> Result<(), stela_linux::owner:
             command_line: *const u8,
             length: usize,
             registry: *mut *mut c_void,
+            rejected: *mut u8,
+            rejected_size: usize,
         ) -> core::ffi::c_int;
     }
     let mut registry = core::ptr::null_mut();
+    let mut rejected = [0u8; 128];
     // SAFETY: the caller's contract; the image is the build's, the registry
     // copies the command line, and its state lasts as long as what it started.
+    // The start writes at most `rejected.len()` bytes, NUL-terminated.
     match unsafe {
         stela_linux_start(
             &raw const stela_linux_gpu_image,
             command_line.as_ptr(),
             command_line.len(),
             &raw mut registry,
+            rejected.as_mut_ptr(),
+            rejected.len(),
         )
     } {
         0 => Ok(()),
-        error => Err(error),
+        errno => Err(StartError {
+            errno,
+            rejected: core::ffi::CStr::from_bytes_until_nul(&rejected)
+                .ok()
+                .map(|word| word.to_string_lossy().into_owned())
+                .filter(|word| !word.is_empty()),
+        }),
     }
 }
 

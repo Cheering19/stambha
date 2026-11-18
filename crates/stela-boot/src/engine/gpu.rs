@@ -2055,6 +2055,9 @@ struct Start {
 /// the functions a probe searches for, each once.
 struct Setup {
     command_line: String,
+    /// Words no parameter of the image takes, which Linux would refuse and
+    /// fail its whole start on: each is named once and left out.
+    left_out: Vec<String>,
     searched: Vec<stela_linux::function::Identity>,
 }
 
@@ -2065,7 +2068,7 @@ impl Setup {
             .filter_map(|claimed| claimed.parameters.clone())
             .collect();
         words.extend(gpu_share_parameter(crate::native_memory::gpu_page_limit()));
-        let command_line = words.join(" ");
+        let (command_line, left_out) = gpu::command_line::compose(words);
         let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
         for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
             if !searched
@@ -2077,19 +2080,19 @@ impl Setup {
         }
         Self {
             command_line,
+            left_out,
             searched,
         }
     }
 }
 
 /// The word that lets an integrated GPU's driver place its whole share
-/// (`Handoff::gpu_share`, `pages` pages) in system memory: TTM's own limit,
-/// whose default of half the RAM Linux sees amdgpu takes as its GTT's size.
-/// Linux holds no more pages than the share at once (the page catalog's
-/// limit), so the share is its RAM, and the GPU may take all of it, as the
-/// guest is told it works in. Nothing for a GPU with memory of its own.
+/// (`Handoff::gpu_share`, `pages` pages) in system memory, and keeps TTM
+/// from swapping to shmem ([`gpu::command_line::page_limit`]). Linux holds
+/// no more pages than the share at once (the page catalog's limit), so the
+/// share is its RAM. Nothing for a GPU with memory of its own.
 fn gpu_share_parameter(pages: Option<usize>) -> Option<String> {
-    pages.map(|pages| format!("ttm.pages_limit={pages}"))
+    pages.map(gpu::command_line::page_limit)
 }
 
 /// A claimed GPU no driver bound.
@@ -2123,7 +2126,7 @@ struct Started {
     unbound: Vec<Unbound>,
     #[cfg(feature = "nvk")]
     bound: Vec<Bound>,
-    result: Result<(), Errno>,
+    result: Result<(), gpu::stack::StartError>,
 }
 
 // SAFETY: the original managed runtime enters the canonical owner on the
@@ -2150,6 +2153,12 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
         result: Ok(()),
     };
     if let Some(setup) = setup {
+        for word in &setup.left_out {
+            output::arguments(format_args!(
+                "GPU: no driver in this image declares the parameter \"{word}\" sets; it is \
+                 left off Linux's command line\n"
+            ));
+        }
         if !setup.command_line.is_empty() {
             output::arguments(format_args!(
                 "GPU: Linux starts with \"{}\"\n",
@@ -2781,7 +2790,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
             unbound.dark,
         ));
     }
-    let result = job.result.map_err(Error::Init);
+    let result = job.result.clone().map_err(Error::Init);
     #[cfg(feature = "nvk")]
     let result = result.and_then(|()| {
         if claiming && job.bound.is_empty() {
@@ -3116,7 +3125,7 @@ pub(super) enum Error {
     Srcu(stela_linux::srcu::Error),
     Submit(stela_linux::task::runtime::SubmitError),
     Child(Outcome),
-    Init(Errno),
+    Init(gpu::stack::StartError),
     Timeout,
     #[cfg(feature = "nvk")]
     NoDevices,
@@ -3139,7 +3148,7 @@ impl core::fmt::Display for Error {
             Self::Srcu(error) => write!(f, "{error}"),
             Self::Submit(error) => write!(f, "GPU startup job refused: {error:?}"),
             Self::Child(outcome) => write!(f, "GPU startup child ended: {outcome:?}"),
-            Self::Init(error) => write!(f, "Linux initialization failed: errno {}", -error),
+            Self::Init(error) => write!(f, "Linux initialization failed: {error}"),
             Self::Timeout => {
                 f.write_str("GPU startup exceeded its deadline; native owners remain held")
             }

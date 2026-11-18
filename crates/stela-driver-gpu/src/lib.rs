@@ -13,6 +13,8 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(feature = "linux-drm")]
+pub mod command_line;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 

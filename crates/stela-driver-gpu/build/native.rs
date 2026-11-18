@@ -236,11 +236,42 @@ const DRM_UNITS: &[UnitSpec] = &[
         module: "backlight",
         file: "drivers/video/backlight/backlight",
     },
+    // TTM's units that declare its module's parameters (`ttm.pages_limit`,
+    // `ttm.dma32_pages_limit`, `ttm.page_pool_size`), so the command line
+    // sets them as it does in Linux, where TTM is the module `ttm`.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "ttm",
+            group_ordinal: 12,
+            unit_ordinal: 1,
+            global_ordinal: 12,
+        },
+        source: "drivers/gpu/drm/ttm/ttm_tt",
+        module: "ttm",
+        file: "drivers/gpu/drm/ttm/ttm",
+    },
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "ttm",
+            group_ordinal: 12,
+            unit_ordinal: 2,
+            global_ordinal: 13,
+        },
+        source: "drivers/gpu/drm/ttm/ttm_pool",
+        module: "ttm",
+        file: "drivers/gpu/drm/ttm/ttm",
+    },
 ];
 
 /// The captured units that define `pr_fmt` themselves.
 #[cfg(feature = "linux-drm")]
-const PREFIXED: [&str; 2] = ["drivers/hwmon/hwmon", "drivers/video/backlight/backlight"];
+const PREFIXED: [&str; 3] = [
+    "drivers/hwmon/hwmon",
+    "drivers/video/backlight/backlight",
+    "drivers/gpu/drm/ttm/ttm_tt",
+];
 
 /// Reviewed common-first/DRM-next prefix, used again by the final class image.
 #[cfg(feature = "linux-drm")]

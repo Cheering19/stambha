@@ -208,7 +208,7 @@ static XE: Before = Before {
             chip: recipes::intel_gpu_platform(adapter.device),
             // The display code asks the firmware service for the table this
             // parameter names before it looks anywhere else (`intel_bios.c`).
-            parameters: table.map(|_| format!("xe.vbt_firmware={VBT}")),
+            parameters: table.map(|_| stela_drivers::gpu::command_line::video_bios_table(VBT)),
             searched: chipset_bridges(&observed),
         })
     },

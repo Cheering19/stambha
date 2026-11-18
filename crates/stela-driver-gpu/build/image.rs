@@ -8,8 +8,8 @@ use std::{collections::BTreeSet, env, path::PathBuf};
 use stela_c_build::linux_capture::{self as initcalls, Captured, Projection, UnitSpec};
 
 /// Ordinals of the image's units after the common cohort: DRM's own level
-/// (its core, helpers and buses) holds 5 to 31, and each driver one from 32
-/// on: nouveau 32, xe 33, amdgpu 34.
+/// (its core, helpers and buses) holds 5 to 31, and the drivers' units 32
+/// on: nouveau 32, xe 33 and its display parameters 34, amdgpu 35.
 pub const FIRST_DRIVER_ORDINAL: u32 = 32;
 
 /// The kernel services a driver's objects import that the environment lacks
@@ -24,6 +24,9 @@ pub struct Driver {
     /// captured.
     pub spec: UnitSpec,
     pub captured: Captured,
+    /// Its other captured units, which declare parameters of its module,
+    /// each with the ordinal after the one before.
+    pub more: Vec<(UnitSpec, Captured)>,
     /// Its objects, with the captured unit's.
     pub archive: PathBuf,
     pub open: Open,
@@ -41,9 +44,15 @@ pub fn link(linux: &Linux, mut drivers: Vec<Driver>) {
     );
     let mut captured = linux.captured.clone();
     let environment_count = captured.len();
-    captured.extend(drivers.iter().map(|driver| driver.captured.clone()));
+    for driver in &drivers {
+        captured.push(driver.captured.clone());
+        captured.extend(driver.more.iter().map(|(_, unit)| unit.clone()));
+    }
     let mut expected = native::environment_units();
-    expected.extend(drivers.iter().map(|driver| driver.spec));
+    for driver in &drivers {
+        expected.push(driver.spec);
+        expected.extend(driver.more.iter().map(|(spec, _)| *spec));
+    }
     let image = initcalls::source(
         &captured,
         Projection {
@@ -87,6 +96,15 @@ pub fn link(linux: &Linux, mut drivers: Vec<Driver>) {
         open.is_empty() && stale.is_empty(),
         "the imports of {names} changed: newly open {open:?}; now supplied {stale:?}"
     );
+    let names = captured
+        .iter()
+        .flat_map(|unit| parameters(unit.object()))
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| name == "ttm.pages_limit"),
+        "the image registers no ttm.pages_limit, which the boot sets: {names:?}"
+    );
+    write_parameters(&names);
     let digest = initcalls::write(
         &output.join("captured-units.bin"),
         &captured[initcalls::COMMON.len()..],
@@ -97,4 +115,51 @@ pub fn link(linux: &Linux, mut drivers: Vec<Driver>) {
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
         println!("cargo:rustc-link-lib=static=stela-linux-gpu-image");
     }
+}
+
+/// The module parameters `object` registers: each `module.parameter` name
+/// its `__param_str_` strings hold, which `registration.h` declares beside
+/// each parameter's record, as `moduleparam.h` does.
+fn parameters(object: &std::path::Path) -> Vec<String> {
+    use object::{Object, ObjectSection, ObjectSymbol};
+    let bytes =
+        std::fs::read(object).unwrap_or_else(|error| panic!("{}: {error}", object.display()));
+    let file = object::File::parse(&*bytes)
+        .unwrap_or_else(|error| panic!("{}: {error}", object.display()));
+    file.symbols()
+        .filter(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.starts_with("__param_str_"))
+        })
+        .map(|symbol| {
+            let data = symbol
+                .section_index()
+                .and_then(|index| file.section_by_index(index).ok())
+                .and_then(|section| section.data().ok())
+                .unwrap_or_else(|| panic!("{}: a parameter name without data", object.display()));
+            let start = usize::try_from(symbol.address()).expect("a section offset");
+            let text = &data[start..];
+            let end = text
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(text.len());
+            String::from_utf8(text[..end].to_vec()).expect("a parameter name is text")
+        })
+        .collect()
+}
+
+/// `parameters.rs` in the build's output: `names` as the Rust array
+/// `crate::command_line::REGISTERED` includes.
+pub fn write_parameters(names: &[String]) {
+    let mut names = names.to_vec();
+    names.sort();
+    names.dedup();
+    let list = names
+        .iter()
+        .map(|name| format!("{name:?},"))
+        .collect::<String>();
+    let path = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo's output directory"))
+        .join("parameters.rs");
+    std::fs::write(path, format!("&[{list}]\n")).expect("write the image's parameters");
 }

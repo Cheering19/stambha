@@ -64,6 +64,8 @@ fn main() {
     if std::env::var_os("CLIPPY_ARGS").is_some() {
         let tests = stela_c_build::linux_build::Tests::default();
         tests.write();
+        #[cfg(feature = "linux-drm")]
+        image::write_parameters(&[]);
         return;
     }
     #[cfg(feature = "linux-kernel")]
