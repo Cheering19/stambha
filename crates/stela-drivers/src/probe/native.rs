@@ -1024,19 +1024,25 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     image: &realtek_wifi::firmware::AxImage<'_>,
     pages: &dyn PageSource,
 ) -> Result<(Running, Rings), Error> {
-    // SAFETY: `acknowledge_quiescence`'s contract, point by point:
+    // SAFETY: `device.finalize()` acknowledges the quiescence
+    // (`PreparingRequester::acknowledge_quiescence`, inside
+    // `Rtw89Native::finalize`), then finalizes the receipt; its contract is
+    // the acknowledgement's, point by point:
     // - Engine stop and submission exclusion, with no restart: Bus Master
     //   has been clear since the mount parked the function, so no engine of
     //   the chip reached memory. `quiesce` just read the MAC power state
     //   (R_AX_IC_PWR_STATE[9:8]) and returned only for two states:
-    //   `MAC_AX_MAC_OFF`, in which the WCPU and every DMA engine are
-    //   unpowered; or `MAC_AX_MAC_ON`, after it stopped the PCIe WPDMA
-    //   (B_AX_STOP_WPDMA), stopped the AXI master and disabled the TX/RX HCI
-    //   DMA (`rtw89_pci_ctrl_dma_all(false)`), then powered the MAC down
-    //   (`rtw8852c_pwr_off_func`: the WCPU and the MAC-domain DMAC and CMAC
-    //   functions off). LPS, where the firmware is alive, and the undefined
-    //   state were refused before this. No Stela queue or ring exists yet,
-    //   and only `bring_up` below powers the MAC on again, after the binding.
+    //   `MAC_AX_MAC_OFF`, in which the MAC domain (WCPU, DMAC and CMAC) is
+    //   unpowered; or `MAC_AX_MAC_ON`, after it set B_AX_STOP_WPDMA, set
+    //   the AXI master stop and cleared the TX/RX HCI DMA enables
+    //   (`rtw89_pci_ctrl_dma_all(false)`), then ran `rtw8852c_pwr_off_func`
+    //   (its XTAL SI power-down commands, the BB reset and pad clears,
+    //   B_AX_APFM_OFFMAC set and polled until it cleared, then the PCIe
+    //   low-power option and B_AX_APFM_SWLPS) and wrote the coex
+    //   scoreboard. Either way the PCIe side has issued nothing since the
+    //   park. LPS, where the firmware is alive, and the undefined state were
+    //   refused before this. No Stela queue or ring exists yet, and only
+    //   `bring_up` below powers the MAC on again, after the binding.
     // - Firmware, IRQ delivery and worker users retired: the mount's cold
     //   grant excludes earlier firmware, IRQ and work users; MSI, MSI-X and
     //   INTx were turned off before BAR2 was read, no handler exists, and

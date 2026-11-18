@@ -163,7 +163,7 @@ fn native_refuses_small_window() {
 }
 
 #[test]
-fn native_checks_bounds_alignment_and_quarantine() {
+fn native_checks_bounds_and_alignment_and_keeps_its_owner() {
     let words = window();
     let weak = Arc::downgrade(&words);
     let _time = crate::test_clock::virtualize();
@@ -183,14 +183,12 @@ fn native_checks_bounds_alignment_and_quarantine() {
     assert_eq!(io.write32(2, 0), Err(oob(2)));
     let t = io.now_us().unwrap();
     assert!(io.now_us().unwrap() >= t);
-    io.quarantine();
-    assert_eq!(io.read32(0), Err(oob(0)));
-    assert_eq!(io.now_us(), Err(AxError::Clock));
-    drop(io);
     assert!(
         weak.upgrade().is_some(),
-        "quarantined owner must be retained"
+        "the window keeps its owner while it lives"
     );
+    drop(io);
+    assert!(weak.upgrade().is_none());
 }
 
 /// Samples of `reg` in the model's trace.

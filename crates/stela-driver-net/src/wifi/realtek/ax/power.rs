@@ -3,10 +3,14 @@
 // Copyright(c) 2019-2020  Realtek Corporation
 //! RTL8852CE (PCIe) XTAL SI access and MAC power on/off, from
 //! `rtw89_mac_write_xtal_si_ax` / `rtw89_mac_read_xtal_si_ax` (`mac.c:7195`),
-//! `rtw8852c_pwr_on_func` / `rtw8852c_pwr_off_func` (`rtw8852c.c:327-530`),
+//! `rtw8852c_pwr_on_func` / `rtw8852c_pwr_off_func` (`rtw8852c.c:327-529`),
 //! `rtw89_mac_power_switch` / `rtw89_mac_pwr_on` (`mac.c:1521-1600`) and
 //! `rtw89_mac_reset_pwr_state_ax` (`mac.c:4104`). Only the PCIe branches are
-//! ported. This module does not write the coex scoreboard, read the efuse,
+//! ported. The only coex scoreboard write here is the power-off's
+//! `MAC_AX_NOTIFY_PWR_MAJOR` (`power_switch_off`); the power-on's
+//! `MAC_AX_NOTIFY_TP_MAJOR` and its efuse read belong to the caller. This
+//! module does not handle USB or SDIO, an unplugged device, or the vcore
+//! reset of thermal protection.
 use super::io::{AxError, AxIo, clear8, clear32, field32, poll32, set8, set32};
 
 // reg.h / mac.h (pinned rtw89), PCIe AX.
@@ -227,7 +231,7 @@ pub fn power_on<I: AxIo + ?Sized>(io: &mut I) -> Result<(), PowerOnError> {
     power_on_once(io).map_err(|retry| PowerOnError { first, retry })
 }
 
-/// `rtw8852c_pwr_on_func` (`rtw8852c.c:327-437`), PCIe.
+/// `rtw8852c_pwr_on_func` (`rtw8852c.c:327-451`), PCIe.
 fn pwr_on_func<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let hci_sel = (io.read32(R_AX_SYS_STATUS1)? & B_AX_PAD_HCI_SEL_V2_MASK) >> 3;
     if hci_sel == MAC_AX_HCI_SEL_PCIE_USB {
@@ -327,11 +331,11 @@ fn pwr_on_func<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 }
 
 /// `rtw89_mac_power_switch(false)` without its tail: `rtw8852c_pwr_off_func`
-/// (`rtw8852c.c:439-530`) only. Linux then notifies BT coex through the
-/// scoreboard (`power_switch_off` does that for `power_on`'s retry); a caller
-/// powering off on its own must append `write8(0x00AF, 0x80)`. An unplugged
-/// device would use another function in Linux; that path does not exist here.
-pub fn power_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+/// (`rtw8852c.c:453-529`) only. Linux then notifies BT coex through the
+/// scoreboard (`power_switch_off` does that); a caller powering off on its
+/// own must append `write8(0x00AF, 0x80)`. An unplugged device would use
+/// another function in Linux; that path does not exist here.
+pub(crate) fn power_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     xtal_si_write(io, XTAL_SI_ANAPAR_WL, XTAL_SI_RFC2RF, XTAL_SI_RFC2RF)?;
     xtal_si_write(io, XTAL_SI_ANAPAR_WL, 0, XTAL_SI_OFF_EI)?;
     xtal_si_write(io, XTAL_SI_ANAPAR_WL, 0, XTAL_SI_OFF_WEI)?;
@@ -403,11 +407,11 @@ mod tests {
         Op::W32(0x0270, 1 << 31 | mask << 16 | value << 8 | offset)
     }
 
-    /// `rtw8852c_pwr_off_func`, `rtw8852c.c:439-530`, against `settled()`
+    /// `rtw8852c_pwr_off_func`, `rtw8852c.c:453-529`, against `settled()`
     /// (0x0004 reads back with bit17 set).
     fn off_trace() -> Vec<Op> {
         vec![
-            // 441-464: XTAL SI ANAPAR_WL/WL_RFC_S0/S1 power-down words.
+            // 458-482: XTAL SI ANAPAR_WL/WL_RFC_S0/S1 power-down words.
             xtal(0x90, 0x10, 0x10),
             xtal(0x90, 0, 0x08),
             xtal(0x90, 0, 0x04),
@@ -416,33 +420,33 @@ mod tests {
             xtal(0x90, 0x80, 0x80),
             xtal(0x90, 0, 0x02),
             xtal(0x90, 0, 0x01),
-            // 466: write32_set SYS_PW_CTRL EN_WLON.
+            // 485: write32_set SYS_PW_CTRL EN_WLON.
             Op::W32(0x0004, 0x0003_0000),
-            // 467: write32_clr WLRF_CTRL AFC_AFEDIG.
+            // 486: write32_clr WLRF_CTRL AFC_AFEDIG.
             Op::W32(0x02F0, 0),
-            // 468: write8_clr SYS_FUNC_EN FEN_BB_GLB_RSTN | FEN_BBRSTB.
+            // 487: write8_clr SYS_FUNC_EN FEN_BB_GLB_RSTN | FEN_BBRSTB.
             Op::W8(0x0002, 0),
-            // 469-470: write32_clr SYS_ISO_CTRL_EXTEND WLBBGLB_1 | WLBBFUN_1.
+            // 488-489: write32_clr SYS_ISO_CTRL_EXTEND WLBBGLB_1 | WLBBFUN_1.
             Op::W32(0x0080, 0),
-            // 471: write32_clr ADIE_PAD_PWR_CTRL PADPDN_WL_RFC_1P3.
+            // 490: write32_clr ADIE_PAD_PWR_CTRL PADPDN_WL_RFC_1P3.
             Op::W32(0x0018, 0),
-            // 473: XTAL SI SHDN_WL cleared.
+            // 492: XTAL SI SHDN_WL cleared.
             xtal(0x90, 0, 0x20),
-            // 477: write32_clr ADIE_PAD_PWR_CTRL PADPDN_WL_PTA_1P3.
+            // 496: write32_clr ADIE_PAD_PWR_CTRL PADPDN_WL_PTA_1P3.
             Op::W32(0x0018, 0),
-            // 479: XTAL SI GND_SHDN_WL cleared.
+            // 498: XTAL SI GND_SHDN_WL cleared.
             xtal(0x90, 0, 0x40),
-            // 483: write32_set SYS_PW_CTRL APFM_OFFMAC (poll 484-488).
+            // 502: write32_set SYS_PW_CTRL APFM_OFFMAC (poll 504-505).
             Op::W32(0x0004, 0x0003_0200),
-            // 491: write32 WLLPS_CTRL = SW_LPS_OPTION (PCIe).
+            // 509-510: write32 WLLPS_CTRL = SW_LPS_OPTION (PCIe).
             Op::W32(0x0090, 0x0001_A0B2),
-            // 496: write32_clr SYS_PW_CTRL XTAL_OFF_A_DIE.
+            // 514: write32_clr SYS_PW_CTRL XTAL_OFF_A_DIE.
             Op::W32(0x0004, 0x0003_0000),
-            // 497: write32_set SYS_SWR_CTRL1 SYM_CTRL_SPS_PWMFREQ.
+            // 515: write32_set SYS_SWR_CTRL1 SYM_CTRL_SPS_PWMFREQ.
             Op::W32(0x0010, 0x0400),
-            // 498-499: write32_mask SPS_DIG_ON_CTRL0 REG_ZCDC_H = 3.
+            // 516-517: write32_mask SPS_DIG_ON_CTRL0 REG_ZCDC_H = 3.
             Op::W32(0x0200, 0x0006_0000),
-            // 502: write32_set SYS_PW_CTRL APFM_SWLPS (PCIe).
+            // 519-520: write32_set SYS_PW_CTRL APFM_SWLPS (PCIe).
             Op::W32(0x0004, 0x0003_0400),
         ]
     }
@@ -495,45 +499,45 @@ mod tests {
         m.set32(0x00F4, 3 << 3); // PAD_HCI_SEL_V2 == PCIE_USB
         power_on(&mut m).unwrap();
         let expected = vec![
-            // rtw8852c.c:333-336: HCI sel 3 -> write32_set LDO_AON_CTRL0 PD_REGU_L.
+            // rtw8852c.c:332-335: HCI sel 3 -> write32_set LDO_AON_CTRL0 PD_REGU_L.
             Op::W32(0x0218, 0x0001_0000),
-            // 338-339: write32_clr SYS_PW_CTRL AFSM_WLSUS_EN | AFSM_PCIE_SUS_EN.
+            // 337-338: write32_clr SYS_PW_CTRL AFSM_WLSUS_EN | AFSM_PCIE_SUS_EN.
             Op::W32(0x0004, 0x0002_0000),
-            // 340: write32_set SYS_PW_CTRL DIS_WLBT_PDNSUSEN_SOPC.
+            // 339: write32_set SYS_PW_CTRL DIS_WLBT_PDNSUSEN_SOPC.
             Op::W32(0x0004, 0x0006_0000),
-            // 341: write32_set WLLPS_CTRL DIS_WLBT_LPSEN_LOPC.
+            // 340: write32_set WLLPS_CTRL DIS_WLBT_LPSEN_LOPC.
             Op::W32(0x0090, 0x0002),
-            // 342: write32_clr SYS_PW_CTRL APDM_HPDN.
+            // 341: write32_clr SYS_PW_CTRL APDM_HPDN.
             Op::W32(0x0004, 0x0006_0000),
-            // 343: write32_clr SYS_PW_CTRL APFM_SWLPS.
+            // 342: write32_clr SYS_PW_CTRL APFM_SWLPS.
             Op::W32(0x0004, 0x0006_0000),
-            // 345-346: write32_mask SPS_DIG_ON_CTRL0 OCP_L1 = 7 (poll RDY_SYSPWR 348).
+            // 344-345: write32_mask SPS_DIG_ON_CTRL0 OCP_L1 = 7 (poll RDY_SYSPWR 347-348).
             Op::W32(0x0200, 0xE000),
             // 352: write32_set SYS_PW_CTRL EN_WLON.
             Op::W32(0x0004, 0x0007_0000),
-            // 353: write32_set SYS_PW_CTRL APFN_ONMAC (poll 355-358).
+            // 353: write32_set SYS_PW_CTRL APFN_ONMAC (poll 355-356).
             Op::W32(0x0004, 0x0007_0100),
-            // 361-367: write8 set/clr/set/clr/set PLATFORM_EN.
+            // 360-365: write8 set/clr/set/clr/set PLATFORM_EN.
             Op::W8(0x0088, 1),
             Op::W8(0x0088, 0),
             Op::W8(0x0088, 1),
             Op::W8(0x0088, 0),
             Op::W8(0x0088, 1),
-            // 370: PCIe: write32_clr SYS_SDIO_CTRL PCIE_CALIB_EN_V1.
+            // 367-368: PCIe: write32_clr SYS_SDIO_CTRL PCIE_CALIB_EN_V1.
             Op::W32(0x0070, 0),
-            // 372: write32_clr SYS_ISO_CTRL_EXTEND CMAC1_FEN.
+            // 370: write32_clr SYS_ISO_CTRL_EXTEND CMAC1_FEN.
             Op::W32(0x0080, 0),
-            // 373: write32_set SYS_ISO_CTRL_EXTEND R_SYM_ISO_CMAC12PP.
+            // 371: write32_set SYS_ISO_CTRL_EXTEND R_SYM_ISO_CMAC12PP.
             Op::W32(0x0080, 0x20),
-            // 374-378: write32_clr AFE_CTRL1 WLCMAC1_P4..PC_EN.
+            // 372-376: write32_clr AFE_CTRL1 WLCMAC1_P4..PC_EN.
             Op::W32(0x0024, 0),
-            // 379: write32_set ADIE_PAD_PWR_CTRL PADPDN_WL_PTA_1P3.
+            // 377: write32_set ADIE_PAD_PWR_CTRL PADPDN_WL_PTA_1P3.
             Op::W32(0x0018, 0x40),
-            // 381: XTAL SI ANAPAR_WL GND_SHDN_WL.
+            // 379-380: XTAL SI ANAPAR_WL GND_SHDN_WL.
             xtal(0x90, 0x40, 0x40),
-            // 386: write32_set ADIE_PAD_PWR_CTRL PADPDN_WL_RFC_1P3.
+            // 384: write32_set ADIE_PAD_PWR_CTRL PADPDN_WL_RFC_1P3.
             Op::W32(0x0018, 0x60),
-            // 388-413: XTAL SI ANAPAR_WL SHDN_WL, OFF_WEI, OFF_EI, RFC2RF=0,
+            // 386-410: XTAL SI ANAPAR_WL SHDN_WL, OFF_WEI, OFF_EI, RFC2RF=0,
             // PON_WEI, PON_EI, SRAM2RFC=0.
             xtal(0x90, 0x20, 0x20),
             xtal(0x90, 0x04, 0x04),
@@ -542,28 +546,28 @@ mod tests {
             xtal(0x90, 0x01, 0x01),
             xtal(0x90, 0x02, 0x02),
             xtal(0x90, 0, 0x80),
-            // 414-419: XTAL SI XMD_2 = 0x10 under LDO_LPS (0x70), XMD_4 = 0 under LPS_CAP (0x0F).
+            // 412-416: XTAL SI XMD_2 = 0x10 under LDO_LPS (0x70), XMD_4 = 0 under LPS_CAP (0x0F).
             xtal(0x24, 0x10, 0x70),
             xtal(0x26, 0, 0x0F),
-            // 422: write32_set PMC_DBG_CTRL2 SYSON_DIS_PMCR_AX_WRMSK.
+            // 419: write32_set PMC_DBG_CTRL2 SYSON_DIS_PMCR_AX_WRMSK.
             Op::W32(0x00CC, 0x04),
-            // 423: write32_set SYS_ISO_CTRL ISO_EB2CORE.
+            // 420: write32_set SYS_ISO_CTRL ISO_EB2CORE.
             Op::W32(0x0000, 0x0100),
-            // 424: write32_clr SYS_ISO_CTRL PWC_EV2EF_B15.
+            // 421: write32_clr SYS_ISO_CTRL PWC_EV2EF_B15.
             Op::W32(0x0000, 0x0100),
-            // 426: fsleep(1000).
+            // 423: fsleep(1000).
             Op::Delay(1000),
-            // 428: write32_clr SYS_ISO_CTRL PWC_EV2EF_B14.
+            // 425: write32_clr SYS_ISO_CTRL PWC_EV2EF_B14.
             Op::W32(0x0000, 0x0100),
-            // 429: write32_clr PMC_DBG_CTRL2 SYSON_DIS_PMCR_AX_WRMSK.
+            // 426: write32_clr PMC_DBG_CTRL2 SYSON_DIS_PMCR_AX_WRMSK.
             Op::W32(0x00CC, 0),
-            // 431-433: PCIe: write32_set GPIO0_15_EECS_EESK_LED1_PULL_LOW_EN bits 16-18.
+            // 428-431: PCIe: write32_set GPIO0_15_EECS_EESK_LED1_PULL_LOW_EN bits 16-18.
             Op::W32(0x02E4, 0x0007_0000),
-            // 435-441: write32_set DMAC_FUNC_EN (bits 30..14).
+            // 433-439: write32_set DMAC_FUNC_EN (bits 30..14).
             Op::W32(0x8400, 0x7FFF_C000),
-            // 443-447: write32_set CMAC_FUNC_EN.
+            // 441-445: write32_set CMAC_FUNC_EN.
             Op::W32(0xC000, 0x7000_803F),
-            // 449-450: write32_mask LED1_FUNC_SEL PINMUX_EESK_FUNC_SEL_V1 = BT_LOG (1).
+            // 447-448: write32_mask LED1_FUNC_SEL PINMUX_EESK_FUNC_SEL_V1 = BT_LOG (1).
             Op::W32(0x02DC, 0x0100_0000),
         ];
         assert_eq!(m.writes(), expected);

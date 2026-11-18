@@ -620,8 +620,10 @@ impl Ch12<'_> {
     /// and `__rtw89_pci_tx_kick_off` do, then wait until the hardware read
     /// index (`IDX` [27:16]) has passed the entry (1 us samples, 400 ms).
     ///
-    /// A failure after the packet was handed over leaves the queue refusing
-    /// further packets until the next successful `pre_init`.
+    /// Any failure after the length check (the slot or TXBD write, a sync,
+    /// the kick or the reclaim wait) leaves the queue refusing further
+    /// packets until the next successful `pre_init`: it is marked stopped
+    /// before the slot is written.
     ///
     /// # Safety
     /// `io` is the exclusive register window of the same RTL8852C requester

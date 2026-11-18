@@ -288,7 +288,7 @@ pub fn poll_sample<I: AxIo + ?Sized, T: Copy>(
 /// counts: `timeout_us * 1000 / (delay_us * 1000 + 1) + 2` (1001 for 1 us
 /// over 1000 us; `timeout_us * 1000 + 2` with no delay). The loop bound is
 /// exactly that count, so the guard never cuts a Linux-length wait short.
-/// `timeout_us == 0` expires after one sample here, where Linux never times
+/// `timeout_us == 0` expires after two samples here, where Linux never times
 /// out; no caller passes 0.
 pub fn poll_sample_atomic<I: AxIo + ?Sized, T: Copy>(
     io: &mut I,
@@ -325,21 +325,26 @@ pub fn poll_sample_atomic<I: AxIo + ?Sized, T: Copy>(
     Err(AxError::Clock)
 }
 
-/// Real volatile MMIO over the device's BAR. The owner is kept for good on
-/// quarantine: the device may still reach the mapping.
+/// Real volatile MMIO over the device's BAR. The owner (BAR claim and
+/// mapping) lives as long as the window: whoever keeps the device after a
+/// failure keeps the window, and so the owner, with it.
 pub struct NativeAxIo {
     registers: Mmio,
     clock: Clock,
     bytes: usize,
-    owned: Option<Arc<dyn Any>>,
+    _owner: Arc<dyn Any>,
 }
 
 impl NativeAxIo {
     /// # Safety
     /// `window` is the exclusive uncached BAR of the owned rtw89 requester,
     /// mapped for at least `bytes`, and `owner` keeps that claim and mapping
-    /// alive. No other worker touches the device through another path, and
-    /// `clock` is calibrated for the CPU that drives it.
+    /// alive. Safe `write32` can program ring addresses, so DMA domains used
+    /// with these registers bind the same requester, as the `pci::pre_init`
+    /// contract requires, and the caller writes no DMA address through them
+    /// outside that contract. No other worker touches or resets the device
+    /// through another path while the window is in use, and `clock` is
+    /// calibrated for the CPU that drives it.
     pub unsafe fn new(
         window: NonNull<u8>,
         bytes: usize,
@@ -357,24 +362,13 @@ impl NativeAxIo {
             registers: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
             clock,
             bytes,
-            owned: Some(owner),
+            _owner: owner,
         })
-    }
-
-    /// Refuse every further access and keep the owner (BAR claim and
-    /// mapping) alive indefinitely.
-    pub fn quarantine(&mut self) {
-        if let Some(owner) = self.owned.take() {
-            core::mem::forget(owner);
-        }
     }
 
     fn check(&self, reg: u32, width: usize) -> Result<usize, AxError> {
         let at = reg as usize;
-        if self.owned.is_none()
-            || !at.is_multiple_of(width)
-            || at.checked_add(width).is_none_or(|end| end > self.bytes)
-        {
+        if !at.is_multiple_of(width) || at.checked_add(width).is_none_or(|end| end > self.bytes) {
             return Err(AxError::OutOfWindow { register: reg });
         }
         Ok(at)
@@ -407,7 +401,6 @@ impl AxIo for NativeAxIo {
         self.clock.delay(us);
     }
     fn now_us(&mut self) -> Result<u64, AxError> {
-        self.owned.as_ref().ok_or(AxError::Clock)?;
         Ok(self.clock.now_us())
     }
 }

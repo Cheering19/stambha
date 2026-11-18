@@ -131,7 +131,7 @@ fn xtal(offset: u32, value: u32, mask: u32) -> Op {
 }
 
 /// The writes the trace must end with: `rtw8852c_pwr_off_func`
-/// (`rtw8852c.c:439-530`), then `rtw89_mac_update_scoreboard(
+/// (`rtw8852c.c:453-529`), then `rtw89_mac_update_scoreboard(
 /// MAC_AX_NOTIFY_PWR_MAJOR)` (`mac.c:1580`). `None` values are
 /// read-modify-writes whose value depends on earlier state.
 fn power_off_tail() -> Vec<(Op, bool)> {
@@ -178,7 +178,7 @@ fn assert_ends_with_power_off(io: &RegisterModel) {
         };
         assert!(same, "power-off write {i}: got {got:?}, want {want:?}");
     }
-    // The last APFM_SWLPS write sets bit 10 (rtw8852c.c:502).
+    // The last APFM_SWLPS write sets bit 10 (rtw8852c.c:520).
     assert!(matches!(got[tail.len() - 2], Op::W32(0x0004, v) if v & 1 << 10 != 0));
 }
 

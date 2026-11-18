@@ -247,8 +247,9 @@ fn power_down<I: AxIo + ?Sized>(io: &mut I) {
 /// - 1, `MAC_AX_MAC_ON`: the PCIe WPDMA is stopped and the AXI master and
 ///   TX/RX HCI DMA disabled ([`pci::stop_dma`], the start of
 ///   `rtw89_pci_ops_mac_pre_init_ax`), then `rtw89_mac_power_switch(false)`
-///   powers the MAC down (`rtw8852c_pwr_off_func`: WCPU, DMAC and CMAC
-///   functions off), then the `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard.
+///   runs `rtw8852c_pwr_off_func` (XTAL SI power-down commands, then
+///   `B_AX_APFM_OFFMAC` set and polled clear, then the PCIe low-power
+///   option), then writes the `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard.
 /// - 2, `MAC_AX_MAC_LPS`, firmware-managed power save with the WCPU alive
 ///   and its HCI DMA path live, and 3, undefined: refused with
 ///   `MacPowerState`, nothing written. Leaving LPS is the firmware's
