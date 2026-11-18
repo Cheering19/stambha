@@ -213,6 +213,183 @@ pub fn read<E>(
         .ok_or(unread.map_or(Absent::NoTable, Absent::Read))
 }
 
+/// What the display code reads from a Video BIOS Table for the built-in
+/// panel (`intel_bios.c`): which panel entry is its, how its backlight is
+/// driven, and the eDP power sequence delays it waits through.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Panel {
+    /// The table's BDB version.
+    pub version: u16,
+    /// The panel's entry, or `None` when the table names none
+    /// (`bdb_lfp_options` absent) or leaves it to the panel's EDID (255).
+    pub panel_type: Option<u8>,
+    /// The panel entry's backlight, when the table has the block.
+    pub backlight: Option<Backlight>,
+    /// The panel entry's eDP power sequence, in 100 µs units: T1+T3, T8,
+    /// T9, T10, T11+T12 (`struct edp_power_seq`), when the table has the
+    /// eDP block.
+    pub power_sequence: Option<[u16; 5]>,
+}
+
+/// A panel entry's backlight in the table (`bdb_lfp_backlight`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Backlight {
+    /// A PWM signal, of `hertz`, from `method` (`lfp_backlight_control_method`
+    /// from BDB 191 on: 0 PMIC, 1 LPSS, 2 the display's own PWM, 3 DSI DCS,
+    /// 4 the panel driver, 5 the eDP AUX interface; before 191 the
+    /// display's own PWM) and its controller.
+    Pwm {
+        method: u8,
+        controller: u8,
+        hertz: u16,
+    },
+    /// No PWM backlight (another entry type): the display code then drives
+    /// it through the eDP AUX channel when the panel offers that, else not.
+    NoPwm(u8),
+}
+
+/// BDB block IDs (`enum bdb_block_id`).
+const BDB_EDP: u8 = 27;
+const BDB_LFP_OPTIONS: u8 = 40;
+const BDB_LFP_BACKLIGHT: u8 = 43;
+const BDB_MIPI_SEQUENCE: u8 = 53;
+
+/// The data of the BDB block `id` of `bdb`, as `find_raw_section` walks the
+/// blocks: an ID, a 16-bit size (32-bit for a MIPI sequence block of
+/// version 3 and later), then the data.
+fn block(bdb: &[u8], id: u8) -> Option<&[u8]> {
+    let header = usize::from(u16::from_le_bytes([*bdb.get(18)?, *bdb.get(19)?]));
+    let total = usize::from(u16::from_le_bytes([*bdb.get(20)?, *bdb.get(21)?])).min(bdb.len());
+    let mut index = header;
+    while index + 3 < total {
+        let current = bdb[index];
+        let size = if current == BDB_MIPI_SEQUENCE && *bdb.get(index + 3)? >= 3 {
+            u32::from_le_bytes(bdb.get(index + 4..index + 8)?.try_into().ok()?) as usize
+        } else {
+            usize::from(u16::from_le_bytes([bdb[index + 1], bdb[index + 2]]))
+        };
+        index += 3;
+        let end = index.checked_add(size)?;
+        if end > total {
+            return None;
+        }
+        if current == id {
+            return Some(&bdb[index..end]);
+        }
+        index = end;
+    }
+    None
+}
+
+/// What the display code reads for the built-in panel from the Video BIOS
+/// Table `vbt` (as [`table`] cut it), or `None` when its data block cannot
+/// be found. Every field is read only where the block holds it.
+pub fn panel(vbt: &[u8]) -> Option<Panel> {
+    /// `struct vbt_header`'s `bdb_offset`.
+    const BDB_OFFSET: usize = 0x1c;
+    let offset = u32::from_le_bytes(vbt.get(BDB_OFFSET..BDB_OFFSET + 4)?.try_into().ok()?);
+    let bdb = vbt.get(offset as usize..)?;
+    if bdb.get(..16)? != b"BIOS_DATA_BLOCK " {
+        return None;
+    }
+    let version = u16::from_le_bytes([*bdb.get(16)?, *bdb.get(17)?]);
+    let panel_type = block(bdb, BDB_LFP_OPTIONS)
+        .and_then(|options| options.first().copied())
+        .filter(|&panel| panel < 16);
+    let backlight = panel_type.and_then(|panel| {
+        let panel = usize::from(panel);
+        let data = block(bdb, BDB_LFP_BACKLIGHT)?;
+        // `entry_size`, then 16 entries of `lfp_backlight_data_entry`.
+        const ENTRY: usize = 6;
+        if usize::from(*data.first()?) != ENTRY {
+            return None;
+        }
+        let entry = data.get(1 + panel * ENTRY..1 + (panel + 1) * ENTRY)?;
+        let kind = entry[0] & 3;
+        if kind != 2 {
+            return Some(Backlight::NoPwm(kind));
+        }
+        let hertz = u16::from_le_bytes([entry[1], entry[2]]);
+        // `level[16]`, then `backlight_control[16]` from 191 on.
+        let (method, controller) = match data.get(1 + 16 * ENTRY + 16 + panel) {
+            Some(&control) if version >= 191 => (control & 0xf, control >> 4),
+            _ => (2, 0),
+        };
+        Some(Backlight::Pwm {
+            method,
+            controller,
+            hertz,
+        })
+    });
+    let power_sequence = panel_type.and_then(|panel| {
+        let data = block(bdb, BDB_EDP)?;
+        let entry = data.get(usize::from(panel) * 10..usize::from(panel) * 10 + 10)?;
+        let mut delays = [0; 5];
+        for (delay, bytes) in delays.iter_mut().zip(entry.as_chunks::<2>().0) {
+            *delay = u16::from_le_bytes(*bytes);
+        }
+        Some(delays)
+    });
+    Some(Panel {
+        version,
+        panel_type,
+        backlight,
+        power_sequence,
+    })
+}
+
+impl core::fmt::Display for Panel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "BDB {}: ", self.version)?;
+        match self.panel_type {
+            Some(panel) => write!(f, "panel entry {panel}")?,
+            None => f.write_str("panel entry chosen by the panel's EDID")?,
+        }
+        match self.backlight {
+            Some(Backlight::Pwm {
+                method,
+                controller,
+                hertz,
+            }) => {
+                let by = match method {
+                    0 => "the PMIC",
+                    1 => "the LPSS PWM",
+                    2 => "the display's own PWM",
+                    3 => "DSI DCS commands",
+                    4 => "the panel driver",
+                    5 => "the eDP AUX channel",
+                    _ => "an unknown method",
+                };
+                write!(
+                    f,
+                    "; backlight by {by} (method {method}, controller {controller}) at {hertz} Hz"
+                )?;
+            }
+            Some(Backlight::NoPwm(kind)) => write!(
+                f,
+                "; no PWM backlight (type {kind}): the eDP AUX channel's, where the panel has one"
+            )?,
+            None if self.panel_type.is_some() => f.write_str("; no backlight block")?,
+            None => {}
+        }
+        match self.power_sequence {
+            Some([t1_t3, t8, t9, t10, t11_t12]) => write!(
+                f,
+                "; eDP power delays T1+T3 {}, T8 {}, T9 {}, T10 {}, T11+T12 {} ms",
+                t1_t3 / 10,
+                t8 / 10,
+                t9 / 10,
+                t10 / 10,
+                t11_t12 / 10
+            ),
+            None if self.panel_type.is_some() => {
+                f.write_str("; no eDP block: the delays the firmware left in the registers")
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +555,114 @@ mod tests {
         bytes[0x18..0x1a].copy_from_slice(&20u16.to_le_bytes());
         assert_eq!(table(&bytes), None);
         assert_eq!(table(&bytes[..40]), None);
+    }
+
+    /// A table of BDB `version` with `blocks`, each an ID and its data.
+    fn with_blocks(version: u16, blocks: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut bdb = b"BIOS_DATA_BLOCK ".to_vec();
+        bdb.extend(version.to_le_bytes());
+        bdb.extend(22u16.to_le_bytes());
+        bdb.extend(0u16.to_le_bytes());
+        for (id, data) in blocks {
+            bdb.push(*id);
+            bdb.extend((data.len() as u16).to_le_bytes());
+            bdb.extend(data);
+        }
+        let size = bdb.len() as u16;
+        bdb[20..22].copy_from_slice(&size.to_le_bytes());
+        let mut table = vec![0; 48];
+        table[..4].copy_from_slice(b"$VBT");
+        table[0x1c..0x20].copy_from_slice(&48u32.to_le_bytes());
+        table.extend(bdb);
+        let total = table.len() as u16;
+        table[0x18..0x1a].copy_from_slice(&total.to_le_bytes());
+        table
+    }
+
+    #[test]
+    fn the_panels_backlight_and_power_delays_are_its_entrys() {
+        let mut backlight = vec![6];
+        for panel in 0..16u8 {
+            // Panel 3: a PWM of 200 Hz; the others none.
+            let kind = if panel == 3 { 2 } else { 0 };
+            backlight.extend([kind, 200, 0, 0, 0, 0]);
+        }
+        backlight.extend([0; 16]);
+        let mut methods = [0u8; 16];
+        methods[3] = 5 | 1 << 4;
+        backlight.extend(methods);
+        let mut edp = vec![0; 160];
+        edp[30..40].copy_from_slice(&[0xd2, 0, 0x64, 0, 0xc8, 0, 0xf4, 1, 0x88, 0x13]);
+        // A MIPI block of version 3 comes first, its size in 32 bits after
+        // its version (the 16-bit size is not read).
+        let mut mipi = vec![3];
+        mipi.extend(6u32.to_le_bytes());
+        mipi.push(0);
+        let vbt = with_blocks(
+            236,
+            &[
+                (BDB_MIPI_SEQUENCE, mipi),
+                (BDB_LFP_OPTIONS, vec![3, 0, 0, 0]),
+                (BDB_LFP_BACKLIGHT, backlight),
+                (BDB_EDP, edp),
+            ],
+        );
+        let panel = panel(table(&vbt).unwrap()).unwrap();
+        assert_eq!(
+            panel,
+            Panel {
+                version: 236,
+                panel_type: Some(3),
+                backlight: Some(Backlight::Pwm {
+                    method: 5,
+                    controller: 1,
+                    hertz: 200
+                }),
+                power_sequence: Some([210, 100, 200, 500, 5000]),
+            }
+        );
+        assert_eq!(
+            alloc::format!("{panel}"),
+            "BDB 236: panel entry 3; backlight by the eDP AUX channel (method 5, controller 1) \
+             at 200 Hz; eDP power delays T1+T3 21, T8 10, T9 20, T10 50, T11+T12 500 ms"
+        );
+        // Before 191 the PWM is the display's own; a panel the EDID picks
+        // has no entry; no data block, no answer.
+        let old = with_blocks(
+            190,
+            &[
+                (BDB_LFP_OPTIONS, vec![3]),
+                (BDB_LFP_BACKLIGHT, {
+                    let mut data = vec![6];
+                    data.extend([2, 0x10, 0x27, 0, 0, 0].repeat(16));
+                    data
+                }),
+            ],
+        );
+        let panel = super::panel(&old).unwrap();
+        assert_eq!(
+            panel.backlight,
+            Some(Backlight::Pwm {
+                method: 2,
+                controller: 0,
+                hertz: 10000
+            })
+        );
+        assert_eq!(panel.power_sequence, None);
+        let by_edid = with_blocks(240, &[(BDB_LFP_OPTIONS, vec![255])]);
+        let panel = super::panel(&by_edid).unwrap();
+        assert_eq!((panel.panel_type, panel.backlight), (None, None));
+        assert_eq!(
+            alloc::format!("{panel}"),
+            "BDB 240: panel entry chosen by the panel's EDID"
+        );
+        let mut broken = by_edid.clone();
+        broken[48] = b'X';
+        assert_eq!(super::panel(&broken), None);
+        // A block that claims more than the table holds ends the walk.
+        let mut short = with_blocks(240, &[(BDB_LFP_OPTIONS, vec![1])]);
+        let last = short.len() - 2;
+        short[last] = 0xff;
+        assert_eq!(super::panel(&short).unwrap().panel_type, None);
     }
 }

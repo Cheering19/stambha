@@ -319,6 +319,9 @@ fn video_bios_table(
         }
     };
     let (bytes, place, (major, minor)) = (table.bytes.len(), table.place, table.version);
+    // What the display code will take from it for a built-in panel: one
+    // line, so a dark or dim laptop panel's log names what the table said.
+    let panel = opregion::panel(&table.bytes);
     let revision = format!("{major}.{minor}");
     let catalog = Catalog::from_handoff(alloc::vec![Resource {
         name: VBT,
@@ -344,10 +347,21 @@ fn video_bios_table(
         .ok()
     });
     match image {
-        Some(_) => output::arguments(format_args!(
-            "GPU {address}: Video BIOS Table of {bytes} bytes from the OpRegion's {place} \
-             (OpRegion {major}.{minor})\n"
-        )),
+        Some(_) => {
+            output::arguments(format_args!(
+                "GPU {address}: Video BIOS Table of {bytes} bytes from the OpRegion's {place} \
+                 (OpRegion {major}.{minor})\n"
+            ));
+            match panel {
+                Some(panel) => output::arguments(format_args!(
+                    "GPU {address}: Video BIOS Table for a built-in panel: {panel}\n"
+                )),
+                None => output::arguments(format_args!(
+                    "GPU {address}: Video BIOS Table holds no data block the display code \
+                     can read\n"
+                )),
+            }
+        }
         None => absent(&"it cannot be held as a firmware image"),
     }
     image
