@@ -3452,11 +3452,15 @@ pub(super) fn serve(
         let wanted = screen.unwrap_or((0, 0));
         display::take(wanted, shown, size);
         let failed = gate::open_service();
-        let errors = fall_back_after_metal(failed, fallback, |from| {
-            display::take_from(from, wanted, shown, size);
+        // A stop in a fallback's start stores the USB's log, as one in the
+        // start does.
+        let errors = super::storage::in_gpu_start(|| {
+            fall_back_after_metal(failed, fallback, |from| {
+                display::take_from(from, wanted, shown, size);
+            })
         });
         report_drawer(&errors);
-        release_unshown(&errors);
+        super::storage::in_gpu_start(|| release_unshown(&errors));
     }
 }
 
