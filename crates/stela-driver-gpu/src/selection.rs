@@ -224,6 +224,22 @@ pub fn memory(found: &[Found]) -> Memory {
     }
 }
 
+/// Whether an integrated GPU this image draws with may draw in place of the
+/// discrete GPU the plan of `found` ([`memory`]) gives the Metal device,
+/// should that one not start: the plan shares no RAM with a GPU, and a GPU
+/// of `found` whose stack draws is integrated, or of a kind only its probe
+/// tells. The memory plan then keeps room for its pages. A GPU no stack of
+/// this image drives never counts, so an image without an integrated GPU's
+/// driver plans as before.
+pub fn integrated_may_draw_instead(found: &[Found]) -> bool {
+    memory(found) != Memory::Shared
+        && found.iter().any(|found| {
+            found
+                .stack
+                .is_ok_and(|driven| driven.draws && driven.integrated.unwrap_or(true))
+        })
+}
+
 /// What `stack` says of the display controller `adapter` before its start,
 /// the same for the loader's memory plan and the engine's census: whether
 /// it draws, and its kind as its driver's table gives it, else `told`, the
@@ -679,6 +695,43 @@ mod tests {
             let serves = crate::stack::metal_devices(&candidates).serve[0];
             assert_eq!(memory(&found) == Memory::Shared, kinds[serves], "{kinds:?}");
         }
+    }
+
+    /// The plan keeps room for an integrated GPU's pages exactly where one
+    /// this image draws with may draw in a discrete GPU's place: an NVIDIA
+    /// or AMD card beside an AMD or Intel integrated GPU, whether the
+    /// monitor is on the card (the integrated GPU left) or the panel on the
+    /// integrated GPU (it shows the display). An image without the
+    /// integrated GPU's driver (a release, NVK alone) sees no stack for it,
+    /// and an integrated GPU that draws already, or two cards, need none.
+    #[test]
+    fn room_is_kept_where_an_integrated_gpu_may_draw_in_a_discrete_ones_place() {
+        for integrated in [INTEGRATED, PROBED] {
+            for card_screen in [true, false] {
+                let pc = [gpu(integrated, !card_screen), gpu(DISCRETE, card_screen)];
+                assert!(
+                    integrated_may_draw_instead(&pc),
+                    "{integrated:?} {card_screen}"
+                );
+                assert_ne!(memory(&pc), Memory::Shared);
+                // The release: no stack drives the integrated GPU.
+                let release = [unsupported(!card_screen), gpu(DISCRETE, card_screen)];
+                assert!(!integrated_may_draw_instead(&release));
+                assert_eq!(memory(&release), Memory::Own);
+            }
+        }
+        // An integrated GPU whose stack does not draw cannot take the
+        // Metal device; one that draws alone has its share already.
+        assert!(!integrated_may_draw_instead(&[
+            gpu(SHOWS, true),
+            gpu(DISCRETE, false)
+        ]));
+        assert!(!integrated_may_draw_instead(&[gpu(INTEGRATED, true)]));
+        assert!(!integrated_may_draw_instead(&[
+            gpu(DISCRETE, true),
+            gpu(DISCRETE, false)
+        ]));
+        assert!(!integrated_may_draw_instead(&[gpu(DISCRETE, true)]));
     }
 
     #[test]

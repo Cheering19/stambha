@@ -54,6 +54,19 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     }
 }
 
+/// The screen line when the integrated GPU `gpu`, started in place of a GPU
+/// that could not draw, has only `room` bytes of Linux's pages, under what
+/// a desktop needs (`host_memory::FALLBACK_LEAST`).
+pub fn fallback_starved(gpu: &str, room: u64) -> String {
+    let tenths = room / 100_000_000;
+    format!(
+        "the {gpu} draws in place of a GPU that could not with {}.{} GB of this PC's RAM for its \
+         memory; some windows may not draw",
+        tenths / 10,
+        tenths % 10
+    )
+}
+
 /// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
 /// device and `instead` draws in its place.
 pub fn draws_instead(wanted: &str, instead: &str) -> String {
@@ -511,6 +524,19 @@ mod tests {
             ended.contains("stays dark: the driver's MODE2 reset ended its picture."),
             "{ended}"
         );
+    }
+
+    /// An integrated GPU left too little of Linux's pages says how much it
+    /// has, in tenths of a gigabyte, and what that costs.
+    #[test]
+    fn a_starved_fallback_says_how_little_ram_it_has() {
+        assert_eq!(
+            fallback_starved("AMD Radeon Graphics", 328 << 20),
+            "the AMD Radeon Graphics draws in place of a GPU that could not with 0.3 GB of this \
+             PC's RAM for its memory; some windows may not draw"
+        );
+        assert!(fallback_starved("Intel UHD Graphics 770", 0).contains("with 0.0 GB"));
+        assert!(fallback_starved("Intel UHD Graphics 770", 1 << 30).contains("with 1.0 GB"));
     }
 
     #[test]

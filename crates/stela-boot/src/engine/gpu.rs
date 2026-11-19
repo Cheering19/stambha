@@ -2715,7 +2715,52 @@ enum ProbeTurn {
     Fallback {
         searched: Vec<before::Searched>,
         stolen: Option<(u64, u64)>,
+        /// The pages Linux is held to before these probes, where the plan
+        /// held it to none and an integrated GPU draws now
+        /// (`host_memory::fallback_pages`).
+        pages: Option<usize>,
     },
+}
+
+/// Linux's page catalog, which `TaskRuntime::install` holds for the boot: a
+/// fallback holds Linux's pages to a bound with it ([`hold_pages`]).
+#[cfg(feature = "nvk")]
+static LINUX_PAGES: AtomicPtr<stela_linux::pages::Catalog<KernelPages>> =
+    AtomicPtr::new(ptr::null_mut());
+
+/// Holds Linux's pages to `pages` from now on, as the loader's plan would
+/// have ([`stela_linux::pages::Catalog::limit_current`]): the RAM Linux
+/// reports is then `pages`, from which the drivers probed after size their
+/// memory, and a request past it fails as a full GPU memory does. Said in a
+/// line either way.
+///
+/// # Safety
+/// Entered, on the canonical kernel task, quiescent.
+#[cfg(feature = "nvk")]
+unsafe fn hold_pages(kernel: &LinuxKernel, pages: usize) {
+    // SAFETY: stored once from the leaked catalog `TaskRuntime` holds.
+    let Some(catalog) = (unsafe { LINUX_PAGES.load(Ordering::Acquire).as_ref() }) else {
+        output::arguments(format_args!(
+            "GPU MEMORY Linux's pages stay unbounded: its page catalog is not kept\n"
+        ));
+        return;
+    };
+    // SAFETY: the caller's contract, with the catalog's own owner.
+    match unsafe { catalog.limit_current(kernel, pages) } {
+        Ok(()) => {
+            crate::native_memory::pages_held();
+            output::arguments(format_args!(
+                "GPU MEMORY Linux's pages are held to {}M from now on\n",
+                (pages as u64 * PAGE) >> 20
+            ));
+        }
+        Err(error) => output::arguments(format_args!(
+            "GPU MEMORY Linux's pages could not be held to {}M ({error:?}): they stay \
+             unbounded, and the integrated GPU's Metal device alone budgets its allocations \
+             to it\n",
+            (pages as u64 * PAGE) >> 20
+        )),
+    }
 }
 
 /// What Linux needs of every claimed GPU before the first probe: the words
@@ -2951,7 +2996,19 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
             publish_searched(&mut job, setup.searched);
         }
         ProbeTurn::Later => {}
-        ProbeTurn::Fallback { searched, stolen } => {
+        ProbeTurn::Fallback {
+            searched,
+            stolen,
+            pages,
+        } => {
+            #[cfg(feature = "nvk")]
+            if let Some(pages) = pages {
+                // SAFETY: entered, on the canonical kernel task, before the
+                // probes whose drivers size their memory from Linux's RAM.
+                unsafe { hold_pages(kernel, pages) };
+            }
+            #[cfg(not(feature = "nvk"))]
+            let _ = pages;
             if let Some((base, size)) = stolen {
                 // SAFETY: entered, on the canonical kernel task; no probe of
                 // the GPU it was reserved for has run, and no other GPU's
@@ -3417,31 +3474,48 @@ fn fall_back_after_metal(
             .filter(|(census, _)| !fallback.failed(*census))
             .collect();
         if stages.is_empty() {
-            return;
+            break;
         }
         if let Some(served) = gate::served_gpu(0) {
-            fallback.note(&stages, gpu.start.bound[served].census);
-            return;
+            if let Some(pages) = fallback.note(&stages, gpu.start.bound[served].census) {
+                hold_pages_now(gpu, pages);
+            }
+            break;
         }
         let from = gpu.start.bound.len();
-        let claimed = fallback.claim(stages);
-        if claimed.is_empty() {
-            return;
+        let round = fallback.claim(stages);
+        if round.claimed.is_empty() {
+            if let Some(pages) = round.pages {
+                hold_pages_now(gpu, pages);
+            }
+            break;
         }
-        if let Err(error) = start_more(gpu, claimed) {
+        if let Err(error) = start_more(gpu, round.claimed, round.pages) {
             output::arguments(format_args!(
                 "GPU FALLBACK: the GPUs claimed in place of the ones that could not draw did \
                  not start: {error}\n"
             ));
-            return;
+            break;
         }
         // A GPU claimed here whose probe failed gives way in turn.
         if fall_back_after_probe(Ok(()), fallback).is_err() || gpu.start.bound.len() == from {
-            return;
+            break;
         }
         client::find_new_minors();
         take_from(from);
         failed = gate::open_from(from);
+    }
+}
+
+/// Holds Linux's pages to `pages` now, in a turn of Linux's of its own,
+/// where an integrated GPU started already draws in place of one that could
+/// not ([`hold_pages`]).
+#[cfg(feature = "nvk")]
+fn hold_pages_now(gpu: &'static Installed, pages: usize) {
+    if let Err(error) = start_more(gpu, Vec::new(), Some(pages)) {
+        output::arguments(format_args!(
+            "GPU MEMORY Linux's pages could not be held to a bound: {error}\n"
+        ));
     }
 }
 
@@ -3836,6 +3910,9 @@ fn mount_and_start(
     // SAFETY: this same native dispatcher owns the already claimed kernel
     // and no task has been published. The catalogue must retain this owner.
     let pages = unsafe { work.register_linux_pages(owner.as_ref()) }?;
+    // Kept for a fallback's bound on Linux's pages (`hold_pages`).
+    #[cfg(feature = "nvk")]
+    LINUX_PAGES.store(ptr::from_ref(pages).cast_mut(), Ordering::Release);
     // SAFETY: the permanent, same-owner runtime, catalogue and service
     // domain were installed above. No original child has started yet.
     let threads = unsafe { TaskRuntime::install(owner.clone(), runtime, pages, SLOTS) }
@@ -4034,15 +4111,30 @@ impl Fallback {
             .is_none_or(|census| census.has_failed(index))
     }
 
+    /// Whether the GPU at census index `index` is integrated, or of a kind
+    /// only its probe tells.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    fn may_be_integrated(&self, index: usize) -> bool {
+        self.census.as_ref().is_some_and(|census| {
+            census.found[index]
+                .stack
+                .is_ok_and(|driven| driven.integrated.unwrap_or(true))
+        })
+    }
+
     /// Names each GPU of `failed`, census indices and the stage each failed
     /// at, in a `GPU FALLBACK` line, with `drawing`, the census index of a
-    /// started GPU that draws in its place; no claim is made.
+    /// started GPU that draws in its place; no claim is made. Where that GPU
+    /// is or may be integrated, the pages Linux is to be held to now
+    /// ([`drawing_pages`]).
     #[cfg(feature = "nvk")]
-    fn note(&mut self, failed: &[(usize, stela_boot_core::gpu_step::Stage)], drawing: usize) {
+    fn note(
+        &mut self,
+        failed: &[(usize, stela_boot_core::gpu_step::Stage)],
+        drawing: usize,
+    ) -> Option<usize> {
         use stela_boot_core::gpu_step::{self, Next};
-        let Some(census) = self.census.as_mut() else {
-            return;
-        };
+        let census = self.census.as_mut()?;
         for (index, stage) in failed {
             output::arguments(format_args!(
                 "GPU FALLBACK {}\n",
@@ -4050,73 +4142,158 @@ impl Fallback {
             ));
         }
         census.failed.extend(failed.iter().map(|&(index, _)| index));
+        let name = format!("{}", census.adapters[drawing].address);
+        self.may_be_integrated(drawing)
+            .then(|| drawing_pages(&name))
+            .flatten()
     }
 
     /// Claims the GPUs that start in place of `failed`, census indices and
     /// the stage each failed at, each named with its stage in a `GPU
     /// FALLBACK` line. Where the selection starts no GPU of the firmware's in
-    /// their place, no claim runs.
+    /// their place, no claim runs. An integrated GPU is claimed only where
+    /// Linux's pages leave its driver room to start, and Linux's pages are
+    /// then held to the plan's bound where the plan held them to none
+    /// ([`host_memory::fallback_pages`]).
+    ///
+    /// [`host_memory::fallback_pages`]: stela_boot_core::host_memory::fallback_pages
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
-    fn claim(&mut self, failed: Vec<(usize, stela_boot_core::gpu_step::Stage)>) -> Vec<Claimed> {
-        use stela_drivers::gpu::selection;
+    fn claim(&mut self, failed: Vec<(usize, stela_boot_core::gpu_step::Stage)>) -> Round {
+        use stela_boot_core::host_memory::FallbackPages;
+        use stela_drivers::gpu::selection::{self, Choice};
         let Some(mut census) = self.census.take() else {
-            return Vec::new();
+            return Round::default();
         };
         let mut without: Vec<usize> = census.failed.clone();
         without.extend(failed.iter().map(|&(index, _)| index));
         let unclaimed = |_: usize| true;
-        let wanted = selection::fall_back(&census.found, &census.chosen, &without, unclaimed);
+        let mut wanted = selection::fall_back(&census.found, &census.chosen, &without, unclaimed);
+        // An integrated GPU that would start is asked first whether
+        // Linux's pages leave its driver room; where not, it is left out as
+        // a failed one is, and the selection made again.
+        let mut pages = None;
+        // Said on the screen after the failed GPUs' own lines.
+        let mut starved = Vec::new();
+        for _ in 0..census.adapters.len() {
+            let integrated: Vec<usize> = selection::newly_claimed(&census.chosen, &wanted)
+                .into_iter()
+                .filter(|&index| {
+                    census.found[index]
+                        .stack
+                        .is_ok_and(|driven| driven.integrated.unwrap_or(true))
+                })
+                .collect();
+            if integrated.is_empty() {
+                break;
+            }
+            let decided = crate::native_memory::fallback_pages();
+            for &index in &integrated {
+                output::arguments(format_args!(
+                    "GPU MEMORY {} {}: {}\n",
+                    census.adapters[index].address,
+                    census.adapters[index].name(),
+                    decided.describe()
+                ));
+                if decided.starved() {
+                    starved.push(stela_boot_core::gpu_status::fallback_starved(
+                        &census.adapters[index].name(),
+                        decided.room().unwrap_or(0),
+                    ));
+                }
+            }
+            match decided {
+                FallbackPages::Short { .. } | FallbackPages::Over { .. } => {
+                    census.failed.extend(&integrated);
+                    without.extend(&integrated);
+                    wanted =
+                        selection::fall_back(&census.found, &census.chosen, &without, unclaimed);
+                }
+                FallbackPages::Hold { limit, .. } => {
+                    pages = usize::try_from(limit / PAGE).ok();
+                    break;
+                }
+                FallbackPages::Held { .. } => break,
+            }
+        }
+        let draws = |index: usize| census.found[index].stack.is_ok_and(|driven| driven.draws);
         if selection::newly_claimed(&census.chosen, &wanted).is_empty() {
             // Nothing to claim: the lines alone, without a continuation.
+            let drawing = wanted.claimed.iter().copied().find(|&index| {
+                wanted.choices[index] == Choice::First && draws(index) && !without.contains(&index)
+            });
             fall_back_census(&mut census, &failed, |_, _, _, _| None);
             self.census = Some(census);
-            return Vec::new();
+            #[cfg(feature = "nvk")]
+            let pages = drawing
+                .filter(|&index| self.may_be_integrated(index))
+                .and_then(|index| {
+                    let census = self.census.as_ref()?;
+                    drawing_pages(&format!("{}", census.adapters[index].address))
+                });
+            #[cfg(not(feature = "nvk"))]
+            let (_, pages) = (drawing, None);
+            return Round {
+                claimed: Vec::new(),
+                pages,
+            };
+        }
+        for line in &starved {
+            crate::status::warning(line);
         }
         match (self.claim)(census, failed) {
             Some((census, claimed, refused)) => {
                 for refused in &refused {
                     crate::status::warning(&refused.line());
                 }
-                for claimed in &claimed {
-                    memory_after_fallback(&census, claimed);
-                }
                 self.census = Some(census);
-                claimed
+                Round {
+                    pages: pages.filter(|_| !claimed.is_empty()),
+                    claimed,
+                }
             }
             None => {
                 output::arguments(format_args!(
                     "GPU FALLBACK: the claims in place of the GPUs that could not draw did not \
                      run, so none is claimed\n"
                 ));
-                Vec::new()
+                Round::default()
             }
         }
     }
 }
 
-/// Where `claimed`, claimed in place of a GPU that could not draw, is or
-/// may be integrated and the memory plan kept no share of RAM for one, a
-/// `GPU MEMORY` line says what it draws from: the plan stands for the boot.
-fn memory_after_fallback(census: &Census, claimed: &Claimed) {
-    let kind = census.found[claimed.census]
-        .stack
-        .map(|driven| driven.integrated);
-    if !matches!(kind, Ok(Some(true) | None)) || crate::native_memory::gpu_share() != 0 {
-        return;
-    }
-    output::arguments(format_args!(
-        "GPU MEMORY {}: starts in place of a GPU that could not draw, and {}; the memory plan \
-         kept no share of RAM for one, so it draws from the pages Linux may hold{}\n",
-        claimed.name,
-        match kind {
-            Ok(Some(true)) => "it is integrated",
-            _ => "its probe tells whether it is integrated",
-        },
-        match crate::native_memory::gpu_page_limit() {
-            Some(pages) => format!(", {} MiB", (pages as u64 * PAGE) >> 20),
-            None => String::from(", which the plan does not bound"),
+/// What a round of [`Fallback::claim`] came to.
+#[derive(Default)]
+pub(super) struct Round {
+    /// The GPUs claimed in the failed GPUs' place.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    claimed: Vec<Claimed>,
+    /// The pages Linux is to be held to, before the claimed GPUs' probes or
+    /// now, where the plan held it to none and an integrated GPU draws.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    pages: Option<usize>,
+}
+
+/// The pages Linux is to be held to now that the integrated GPU at `name`,
+/// started already, draws in place of a GPU that could not: the plan's
+/// bound, where the plan held Linux to none and Linux holds no more than
+/// it (`host_memory::drawing_pages`); none where Linux is held already.
+/// Said in a `GPU MEMORY` line.
+#[cfg(feature = "nvk")]
+fn drawing_pages(name: &str) -> Option<usize> {
+    let (held, limit) = stela_linux::pages::held_and_limit();
+    let decided = stela_boot_core::host_memory::drawing_pages(
+        crate::native_memory::fallback_bound(),
+        held as u64 * PAGE,
+        limit as u64 * PAGE,
+    );
+    output::arguments(format_args!("GPU MEMORY {name}: {}\n", decided.describe()));
+    match decided {
+        stela_boot_core::host_memory::FallbackPages::Hold { limit, .. } => {
+            usize::try_from(limit / PAGE).ok()
         }
-    ));
+        _ => None,
+    }
 }
 
 /// After the start, while a GPU chosen to draw is unbound and no fallback
@@ -4156,11 +4333,14 @@ pub(super) fn fall_back_after_probe(
         if failed.is_empty() {
             break;
         }
-        let claimed = fallback.claim(failed);
-        if claimed.is_empty() {
+        let round = fallback.claim(failed);
+        if round.claimed.is_empty() {
+            if let Some(pages) = round.pages {
+                hold_pages_now(gpu, pages);
+            }
             break;
         }
-        if let Err(error) = start_more(gpu, claimed) {
+        if let Err(error) = start_more(gpu, round.claimed, round.pages) {
             output::arguments(format_args!(
                 "GPU FALLBACK: the GPUs claimed in place of the ones that could not draw did \
                  not start: {error}\n"
@@ -4181,7 +4361,11 @@ pub(super) fn fall_back_after_probe(
 /// line a claim needs that the start did not set is named: Linux read its
 /// command line once.
 #[cfg(feature = "nvk")]
-fn start_more(gpu: &'static Installed, claimed: Vec<Claimed>) -> Result<(), Error> {
+fn start_more(
+    gpu: &'static Installed,
+    claimed: Vec<Claimed>,
+    pages: Option<usize>,
+) -> Result<(), Error> {
     for claimed in &claimed {
         let words = claimed.parameters.as_deref().unwrap_or_default();
         for word in words.split_whitespace() {
@@ -4203,7 +4387,7 @@ fn start_more(gpu: &'static Installed, claimed: Vec<Claimed>) -> Result<(), Erro
     let mut claimed = ManuallyDrop::new(claimed);
     let result = gpu
         .work
-        .dispatch_linux(|runtime| Ok(more_probes(gpu, runtime, &mut claimed)));
+        .dispatch_linux(|runtime| Ok(more_probes(gpu, runtime, &mut claimed, pages)));
     // On the boot screen too, as the start's are.
     warn_unbound(&gpu.start.unbound.borrow()[unbound_before..]);
     result?
@@ -4215,6 +4399,7 @@ fn more_probes(
     gpu: &'static Installed,
     runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>,
     claimed: &mut ManuallyDrop<Vec<Claimed>>,
+    pages: Option<usize>,
 ) -> Result<(), Error> {
     let kernel: &'static LinuxKernel = gpu.owner.as_ref();
     let host = kernel.platform();
@@ -4268,7 +4453,11 @@ fn more_probes(
     let job = Box::pin(Start {
         kernel,
         claimed: ManuallyDrop::new(core::mem::take(&mut **claimed)),
-        turn: Some(ProbeTurn::Fallback { searched, stolen }),
+        turn: Some(ProbeTurn::Fallback {
+            searched,
+            stolen,
+            pages,
+        }),
         completed: completed.clone(),
     });
     // SAFETY: as for the start's jobs; Linux and its drivers started.
