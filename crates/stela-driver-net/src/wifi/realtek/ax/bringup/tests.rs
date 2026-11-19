@@ -67,7 +67,9 @@ fn efuse_with_mac() -> Vec<u8> {
 ///   the kick, the device fills entries 0.. with `acks` and its index
 ///   (0x1218 [27:16]) reports them.
 ///
-/// `pre_inits` counts PCI pre-inits by their read of TXBD_RWPTR_CLR1. `m`
+/// `pre_inits` counts PCI pre-inits by their first step's read, the G1
+/// deglitch (0x3848); the deinit reads TXBD_RWPTR_CLR1 too, so that is no
+/// longer pre-init's alone. `m`
 /// is the DMA model the RXQ buffers live in.
 struct Chip {
     io: RegisterModel,
@@ -107,10 +109,10 @@ fn chip(
     let pre_inits = Arc::new(AtomicUsize::new(0));
     let counted = pre_inits.clone();
     io.on_read(
-        0x1014,
+        0x3848,
         Box::new(move |m: &mut RegisterModel| {
             counted.fetch_add(1, Ordering::Relaxed);
-            m.get32(0x1014)
+            m.get32(0x3848)
         }),
     );
     let seen = pre_inits.clone();
@@ -298,20 +300,29 @@ fn happy_path_reports_running() {
             mac: MAC,
             secure_boot: false,
             mac_init: true,
+            ltr: false,
             h2c: acked(true, true),
         }
     );
     assert_eq!(
         running.to_string(),
         "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-         secure boot off, MAC init done, H2C OFLD_CFG acknowledged (receive and done)"
+         secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and done)"
     );
     // One download attempt, one PCI pre-init.
     assert_eq!(count(&c.io, ATTEMPT), 1);
     assert_eq!(c.pre_inits.load(Ordering::Relaxed), 1);
     // RXQ's two entries were consumed and its host index written back once.
     assert_eq!(count(&c.io, Op::W16(0x1218, 2)), 1);
-    // rtw89_chip_info_setup ends in rtw89_mac_pwr_off on success too.
+    // rtw89_core_stop (core.c:6765-6767): rtw89_pci_ops_deinit after the
+    // OFLD_CFG and RXQ activity, then rtw89_mac_pwr_off.
+    assert_eq!(deinit_writes(&c.io), DEINIT);
+    let write_back = c.io.trace.iter().position(|o| *o == Op::W16(0x1218, 2));
+    let wake_off =
+        c.io.trace
+            .iter()
+            .rposition(|o| matches!(o, Op::W32(0x0074, _)));
+    assert!(write_back < wake_off, "{write_back:?} {wake_off:?}");
     assert_ends_with_power_off(&c.io);
     // The rings were programmed: the caller keeps them.
     assert!(!c.m.lock().unwrap().mappings.is_empty());
@@ -418,7 +429,7 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
             running.to_string(),
             alloc::format!(
                 "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-                 secure boot off, MAC init done, H2C OFLD_CFG acknowledged ({line})"
+                 secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged ({line})"
             )
         );
     }
@@ -431,14 +442,47 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     assert_eq!(
         running.to_string(),
         "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-         secure boot off, MAC init done, H2C OFLD_CFG acknowledged (receive and done), \
+         secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and done), \
          firmware log \"fw up\""
     );
 }
 
+/// The registers of `rtw89_pci_ops_deinit` (`pci.c:3053`) without LTR:
+/// `power_wake(false)`, `ctrl_dma_all(false)` (two writes), `clr_idx_all`.
+const DEINIT: [u32; 6] = [0x0074, 0x1000, 0x1000, 0x1014, 0x11C4, 0x1200];
+/// The same with `ltr_set_v1(false)` between the wake and the DMA stop.
+const DEINIT_LTR: [u32; 12] = [
+    0x0074, 0x8410, 0x8414, 0x8414, 0x1600, 0x1610, 0x1604, 0x1000, 0x1000, 0x1014, 0x11C4, 0x1200,
+];
+
+/// The registers of the 32-bit writes between the post-init's PCI IO
+/// release (its last 0x1010 write) and the power-off's first XTAL SI
+/// command: what the bring-up writes after post-init that is not H2C or
+/// RXQ traffic (those are 16-bit index writes).
+fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
+    let t = &io.trace;
+    let release = t
+        .iter()
+        .rposition(|o| matches!(o, Op::W32(0x1010, _)))
+        .unwrap();
+    let off = release
+        + t[release..]
+            .iter()
+            .position(|o| *o == xtal(0x90, 0x10, 0x10))
+            .unwrap();
+    t[release + 1..off]
+        .iter()
+        .filter_map(|o| match o {
+            Op::W32(reg, _) => Some(*reg),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Run a full bring-up of [`chip`] with `acks` on `host`, changed by
 /// `fault`, which must fail: its error, after checking the chip ended
-/// powered off.
+/// powered off, after `rtw89_pci_ops_deinit` exactly when the post-init
+/// had run (the `"h2c"` and `"c2h"` failures).
 fn mac_init_fails(
     acks: &'static [&'static [u8]],
     host: Host,
@@ -450,7 +494,24 @@ fn mac_init_fails(
     let err = failed(run_on(&mut c.io, &m, host));
     // The efuse ran: every failure here is past milestone 1's steps.
     assert!(c.io.trace.contains(&Op::W32(0x0030, 0)), "{err}");
-    // Linux's mac_init failure path is rtw89_mac_pwr_off (mac.c:4397).
+    let efuse =
+        c.io.trace
+            .iter()
+            .position(|o| *o == Op::W32(0x0030, 0))
+            .unwrap();
+    if matches!(err.step, "h2c" | "c2h") {
+        let want: &[u32] = if host.ltr { &DEINIT_LTR } else { &DEINIT };
+        assert_eq!(deinit_writes(&c.io), want, "{err}");
+    } else {
+        // Linux's mac_init failure path is rtw89_mac_pwr_off alone
+        // (mac.c:4397): no deinit write after the efuse dump.
+        assert!(
+            !c.io.trace[efuse..]
+                .iter()
+                .any(|o| matches!(o, Op::W32(0x0074 | 0x1014 | 0x11C4 | 0x1200, _))),
+            "{err}"
+        );
+    }
     assert_ends_with_power_off(&c.io);
     err
 }
@@ -537,6 +598,10 @@ fn mac_init_failure_names_step_and_powers_off() {
         alloc::format!("RTL8852CE bring-up: c2h: {}", err.error)
     );
 
+    // c2h on an LTR host: the deinit's ltr_set_v1(false) runs too.
+    let err = mac_init_fails(&[], Host { ltr: true }, |_| ());
+    assert_eq!(err.step, "c2h");
+
     // h2c: the firmware refuses OFLD_CFG with return 3.
     let err = mac_init_fails(&[&DONE_ACK_REFUSED], NO_LTR, |_| ());
     assert_eq!(
@@ -565,9 +630,31 @@ fn ltr_host_flag_controls_ltr_writes() {
     result.unwrap();
     assert_eq!(ltr_writes(&c.io), 0);
     assert!(!c.io.trace.contains(&Op::R32(0x1600)));
+    assert_eq!(deinit_writes(&c.io), DEINIT);
     let (c, result) = ran(BOTH, Host { ltr: true });
-    result.unwrap();
-    assert_eq!(ltr_writes(&c.io), 1);
+    let (running, _rings) = result.unwrap();
+    assert!(running.ltr);
+    assert!(
+        running
+            .to_string()
+            .contains(", MAC init done, LTR on, H2C OFLD_CFG")
+    );
+    // One write from post-init's ltr_set_v1(true), one from the deinit's
+    // ltr_set_v1(false): HW_DEC_EN (bit 2) set, then cleared with
+    // LTR_REQ_DRV (bit 7) and LTR_IDX_DRV = IDLE ([6:5] = 3).
+    let values: Vec<u32> =
+        c.io.writes()
+            .iter()
+            .filter_map(|o| match o {
+                Op::W32(0x1600, v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(values.len(), 2, "{values:x?}");
+    assert_eq!(ltr_writes(&c.io), 2);
+    assert!(values[0] & 1 << 2 != 0 && values[0] & 1 << 7 == 0);
+    assert_eq!(values[1] & 0xFC, 0xE0);
+    assert_eq!(deinit_writes(&c.io), DEINIT_LTR);
 }
 
 #[test]
@@ -658,7 +745,7 @@ fn ch12_failure_reruns_pci_pre_init_before_the_retry() {
     let second_pre_init =
         c.io.trace
             .iter()
-            .rposition(|o| *o == Op::R32(0x1014))
+            .rposition(|o| *o == Op::R16(0x3848))
             .unwrap();
     assert!(attempts[0] < second_pre_init && second_pre_init < attempts[1]);
     assert_ends_with_power_off(&c.io);
@@ -877,6 +964,7 @@ fn running_display_says_on_for_secure_boot() {
         mac: [0xFF, 0xAB, 0x01, 0x10, 0x00, 0x9C],
         secure_boot: true,
         mac_init: false,
+        ltr: false,
         h2c: acked(false, false),
     };
     // Without the MAC init no H2C was sent, so nothing is said of one.
@@ -887,12 +975,13 @@ fn running_display_says_on_for_secure_boot() {
     );
     let r = Running {
         mac_init: true,
+        ltr: true,
         ..r
     };
     assert_eq!(
         r.to_string(),
         "RTL8852CE firmware running: cut 0, firmware 0.27.97.0, MAC ff:ab:01:10:00:9c, \
-         secure boot on, MAC init done, H2C OFLD_CFG not acknowledged"
+         secure boot on, MAC init done, LTR on, H2C OFLD_CFG not acknowledged"
     );
 }
 

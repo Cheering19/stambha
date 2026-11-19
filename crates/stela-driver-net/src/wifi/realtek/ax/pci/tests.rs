@@ -618,6 +618,85 @@ fn post_init_refuses_ltr_error_value() {
     assert!(io.writes().is_empty());
 }
 
+/// The registers `deinit` reads and writes, as `post_init` with LTR left
+/// them: PCI wake set, LTR on (idle timer 3.2 ms, thresholds 0x28,
+/// `dec_ctrl` = HW_DEC_EN | SPACE_IDX 500 us), the HCI DMA enabled.
+fn deinit_model() -> RegisterModel {
+    let mut io = RegisterModel::new();
+    io.set32(0x0074, 0x0000_0021);
+    io.set32(0x8410, 0x0000_0703);
+    io.set32(0x8414, 0x0028_0028);
+    io.set32(0x1600, 0x0000_0016);
+    io.set32(0x1000, 0x0000_8080);
+    io
+}
+
+/// `rtw89_pci_ctrl_dma_all(false)` (`pci.c:2114`) on 0x8080, then
+/// `rtw89_pci_clr_idx_all_ax` (`pci.c:2867`) from zeroed index clears.
+const STOP_DMA_AND_INDICES: [Op; 5] = [
+    Op::W32(0x1000, 0x0002_8080),
+    Op::W32(0x1000, 0x0002_0000),
+    Op::W32(0x1014, 0x07FF),
+    Op::W32(0x11C4, 0x3),
+    Op::W32(0x1200, 0x3),
+];
+
+#[test]
+fn deinit_with_ltr_matches_rtw89_pci_ops_deinit() {
+    let (_m, rings, _) = running();
+    let mut io = deinit_model();
+    assert_eq!(deinit(&mut io, &rings, true), Ok(()));
+    let mut want = vec![
+        // rtw89_pci_power_wake_ax(false) (pci.c:2733): BIT_WAKE_CTRL cleared.
+        Op::W32(0x0074, 0x0000_0001),
+        // rtw89_pci_ltr_set_v1(false) (pci.c:3188): no LTR_CTRL_0 set; the
+        // idle timer and thresholds rewritten as they are,
+        Op::W32(0x8410, 0x0000_0703),
+        Op::W32(0x8414, 0x0028_0028),
+        Op::W32(0x8414, 0x0028_0028),
+        // dec_ctrl without LTR_EN_BITS, with LTR_IDX_DRV = IDLE (3) and
+        // LTR_REQ_DRV, SPACE_IDX_V1 still 500 us: 0x16 -> 0xE2.
+        Op::W32(0x1600, 0x0000_00E2),
+        Op::W32(0x1610, 0x9003_9003),
+        Op::W32(0x1604, 0x880B_880B),
+    ];
+    want.extend(STOP_DMA_AND_INDICES);
+    assert_eq!(io.writes(), want);
+    // The hardware indices restart, so CH12 needs a fresh pre-init.
+    assert!(rings.ch12_stopped());
+}
+
+#[test]
+fn deinit_without_ltr_touches_no_ltr_register() {
+    let (_m, rings, _) = running();
+    let mut io = deinit_model();
+    assert_eq!(deinit(&mut io, &rings, false), Ok(()));
+    assert!(
+        !io.trace
+            .iter()
+            .any(|op| matches!(op, Op::R32(0x8410 | 0x8414 | 0x1600 | 0x1610 | 0x1604)))
+    );
+    let mut want = vec![Op::W32(0x0074, 0x0000_0001)];
+    want.extend(STOP_DMA_AND_INDICES);
+    assert_eq!(io.writes(), want);
+}
+
+#[test]
+fn deinit_still_stops_dma_after_an_ltr_error_value() {
+    // rtw89_pci_ops_deinit ignores ltr_set's -EINVAL and goes on.
+    let (_m, rings, _) = running();
+    let mut io = deinit_model();
+    io.set32(0x1600, 0xEAEA_EAEA);
+    assert_eq!(
+        deinit(&mut io, &rings, true),
+        Err(AxError::Mac("LTR register reads an error value"))
+    );
+    let mut want = vec![Op::W32(0x0074, 0x0000_0001)];
+    want.extend(STOP_DMA_AND_INDICES);
+    assert_eq!(io.writes(), want);
+    assert!(rings.ch12_stopped());
+}
+
 /// Every later read of RXQ's IDX (0x1218) reports hardware index `hw`.
 fn hardware_index(io: &mut RegisterModel, hw: u32) {
     io.on_read(0x1218, Box::new(move |_m: &mut RegisterModel| hw << 16));

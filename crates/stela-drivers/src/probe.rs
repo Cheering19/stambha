@@ -4253,6 +4253,7 @@ mod tests {
                 mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
                 secure_boot: false,
                 mac_init: true,
+                ltr: true,
                 h2c: net::wifi::realtek::ax::H2cAck {
                     rec: true,
                     done: true,
@@ -4280,8 +4281,8 @@ mod tests {
                 "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
                  powered it off before taking the device over",
                 "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
-                 0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, H2C \
-                 OFLD_CFG acknowledged (receive and done)",
+                 0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, LTR on, \
+                 H2C OFLD_CFG acknowledged (receive and done)",
             ]
         );
         assert_eq!(devices.owners.len(), 1);
@@ -4349,6 +4350,7 @@ mod tests {
             mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
             secure_boot: false,
             mac_init: true,
+            ltr: false,
             h2c: net::wifi::realtek::ax::H2cAck {
                 rec: true,
                 done: false,
@@ -4368,8 +4370,8 @@ mod tests {
         assert_eq!(
             format!("HOST WARNING pci={address}: {warning}"),
             "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
-             0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, H2C OFLD_CFG \
-             acknowledged (receive only)"
+             0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, LTR off, H2C \
+             OFLD_CFG acknowledged (receive only)"
         );
         assert_eq!(
             Warning::Text(String::from("x")),

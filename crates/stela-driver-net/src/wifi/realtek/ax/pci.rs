@@ -15,7 +15,8 @@
 //! `rtw89_pci_txbd_recalc` (`pci.c:87`). The post-init is
 //! `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`) with
 //! `rtw89_pci_ltr_set_v1` (`pci.c:3188`) and `rtw89_pci_ctrl_txdma_ch_ax`
-//! (`pci.c:249`); the RXQ consumer is the index arithmetic and buffer
+//! (`pci.c:249`), and its teardown `rtw89_pci_ops_deinit` (`pci.c:3053`);
+//! the RXQ consumer is the index arithmetic and buffer
 //! handover of `rtw89_pci_poll_rxq_dma` (`pci.c:436`),
 //! `rtw89_pci_rxbd_recalc` / `rtw89_pci_dma_recalc` (`pci.c:146`, `:61`)
 //! and `rtw89_pci_rxbd_deliver` (`pci.c:413-434`). Register addresses are
@@ -153,7 +154,15 @@ const B_AX_WD_ADDR_INFO_LENGTH: u32 = 1 << 1;
 
 // LTR (reg.h:437-456, :594-619), as rtw89_pci_ltr_set_v1 uses them.
 const R_AX_LTR_DEC_CTRL: u32 = 0x1600;
+const B_AX_LTR_REQ_DRV: u32 = 1 << 7;
+const B_AX_LTR_IDX_DRV_MASK: u32 = 0x60; // GENMASK(6, 5)
+/// `PCIE_LTR_IDX_IDLE`.
+const PCIE_LTR_IDX_IDLE: u32 = 3;
+const B_AX_LTR_DRV_DEC_EN: u32 = 1 << 4;
+const B_AX_LTR_FW_DEC_EN: u32 = 1 << 3;
 const B_AX_LTR_HW_DEC_EN: u32 = 1 << 2;
+/// `LTR_EN_BITS`: the HW, FW and driver decision enables.
+const LTR_EN_BITS: u32 = B_AX_LTR_HW_DEC_EN | B_AX_LTR_FW_DEC_EN | B_AX_LTR_DRV_DEC_EN;
 const B_AX_LTR_SPACE_IDX_V1_MASK: u32 = 0x3; // GENMASK(1, 0)
 const R_AX_LTR_LATENCY_IDX0: u32 = 0x1604;
 const R_AX_LTR_LATENCY_IDX3: u32 = 0x1610;
@@ -542,7 +551,7 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
 /// so releasing their DMA hands the device nothing to fetch.
 pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError> {
     if ltr {
-        ltr_set_v1(io)?;
+        ltr_set_v1(io, true)?;
     }
     // rtw89_pci_ctrl_txdma_ch_ax(true) (pci.c:249).
     clear32(io, R_AX_HAXI_DMA_STOP1, B_AX_TX_STOP1_MASK)?;
@@ -551,10 +560,34 @@ pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError>
     clear32(io, R_AX_HAXI_DMA_STOP1, B_AX_STOP_WPDMA | B_AX_STOP_PCIEIO)
 }
 
-/// `rtw89_pci_ltr_set_v1(rtwdev, true)` (`pci.c:3188-3235`) once
+/// `rtw89_pci_ops_deinit` (`pci.c:3053-3068`) for an RTL8852C, which
+/// `rtw89_core_stop` runs between `rtw89_hci_stop` and `rtw89_mac_pwr_off`
+/// (`core.c:6765-6767`): `rtw89_pci_power_wake_ax(false)` (`pci.c:2733`,
+/// `BIT_WAKE_CTRL` cleared), `rtw89_pci_ltr_set_v1(false)` when `ltr`, the
+/// AXI master stopped and the TX/RX HCI DMA disabled
+/// (`rtw89_pci_ctrl_dma_all(false)`), then every ring index cleared
+/// (`rtw89_pci_clr_idx_all_ax`). The 8852A LTR trigger does not apply.
+///
+/// Linux's writes cannot fail and it ignores `ltr_set`'s `-EINVAL`, so every
+/// step runs whatever an earlier one returned; the first error is returned.
+/// The hardware indices restart, so CH12 is marked stopped and the RXQ host
+/// index restarts at 0: only another `pre_init` starts the rings again.
+pub fn deinit<I: AxIo + ?Sized>(io: &mut I, rings: &Rings, ltr: bool) -> Result<(), AxError> {
+    rings.ch12_ready.set(false);
+    rings.rxq_host.set(0);
+    let wake = clear32(io, R_AX_HCI_OPT_CTRL, BIT_WAKE_CTRL);
+    let ltr = if ltr { ltr_set_v1(io, false) } else { Ok(()) };
+    let dma = ctrl_dma_all(io, false);
+    let indices = clr_idx_all(io);
+    wake.and(ltr).and(dma).and(indices)
+}
+
+/// `rtw89_pci_ltr_set_v1(rtwdev, en)` (`pci.c:3188-3235`) once
 /// `rtw89_pci_dev_ltr_enabled` held: read and check all five LTR registers,
-/// then program them.
-fn ltr_set_v1<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+/// then program them. Disabling clears `LTR_EN_BITS` and selects the
+/// driver's idle index with `LTR_REQ_DRV`, and leaves `LTR_CTRL_0`'s enables
+/// as they are.
+fn ltr_set_v1<I: AxIo + ?Sized>(io: &mut I, en: bool) -> Result<(), AxError> {
     // rtw89_pci_ltr_is_err_reg_val (pci.h:1731).
     let checked = |io: &mut I, reg: u32| -> Result<u32, AxError> {
         let value = io.read32(reg)?;
@@ -568,14 +601,21 @@ fn ltr_set_v1<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let mut dec_ctrl = checked(io, R_AX_LTR_DEC_CTRL)?;
     checked(io, R_AX_LTR_LATENCY_IDX3)?;
     checked(io, R_AX_LTR_LATENCY_IDX0)?;
-    dec_ctrl |= B_AX_LTR_HW_DEC_EN;
+    if en {
+        dec_ctrl |= B_AX_LTR_HW_DEC_EN;
+    } else {
+        dec_ctrl &= !(LTR_EN_BITS | B_AX_LTR_IDX_DRV_MASK | B_AX_LTR_HW_DEC_EN);
+        dec_ctrl |= PCIE_LTR_IDX_IDLE << B_AX_LTR_IDX_DRV_MASK.trailing_zeros() | B_AX_LTR_REQ_DRV;
+    }
     // B_AX_LTR_SPACE_IDX_V1_MASK starts at bit 0.
     dec_ctrl = (dec_ctrl & !B_AX_LTR_SPACE_IDX_V1_MASK) | LTR_SPC_500US;
-    set32(
-        io,
-        R_AX_LTR_CTRL_0,
-        B_AX_LTR_WD_NOEMP_CHK_V1 | B_AX_LTR_HW_EN,
-    )?;
+    if en {
+        set32(
+            io,
+            R_AX_LTR_CTRL_0,
+            B_AX_LTR_WD_NOEMP_CHK_V1 | B_AX_LTR_HW_EN,
+        )?;
+    }
     field32(
         io,
         R_AX_LTR_CTRL_0,

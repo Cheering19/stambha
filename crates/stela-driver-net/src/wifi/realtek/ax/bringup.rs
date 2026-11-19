@@ -14,8 +14,11 @@
 //! (`mac.c:1701`), `trx_init_ax` (`mac.c:4029`) and
 //! `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`); then it sends one H2C,
 //! `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`), and waits for the firmware's
-//! acknowledgement on RXQ. Last comes `rtw89_mac_pwr_off` (`mac.c:1603`),
-//! which Linux runs on success and on every failure after power-on.
+//! acknowledgement on RXQ. Once the post-init has run, the HCI is torn down
+//! as `rtw89_core_stop` does (`core.c:6765-6767`): `rtw89_pci_ops_deinit`
+//! (`pci.c:3053`), then the power-off. Last comes `rtw89_mac_pwr_off`
+//! (`mac.c:1603`), which Linux runs on success and on every failure after
+//! power-on.
 //!
 //! This module does not grant a usable radio: the chip is powered off again
 //! before `bring_up` returns, and nothing past that one H2C is ported: no
@@ -51,7 +54,10 @@ pub struct Host {
     /// which decides whether `rtw89_pci_ltr_set_v1` programs the chip's LTR
     /// (`rtw89_pci_dev_ltr_enabled`, `pci.c:3042`). Linux reads it at
     /// post-init; the probe reads it while preparing the function, and
-    /// nothing writes DEVCTL2 between the two (spec S1.8).
+    /// nothing in Stela writes DEVCTL2 between the two (spec S1.8). Stela
+    /// reads what firmware left there. Linux's PCI core may itself set
+    /// `LTR_EN` at enumeration (`pci_configure_ltr`), so Linux can see true
+    /// on a machine where Stela reads false.
     pub ltr: bool,
 }
 
@@ -70,6 +76,8 @@ pub struct Running {
     /// The MAC init (BB/RF enable through PCI post-init) completed. Always
     /// true from [`bring_up`], kept for the line it prints.
     pub mac_init: bool,
+    /// The post-init programmed the chip's LTR ([`Host::ltr`]).
+    pub ltr: bool,
     /// What the firmware answered to OFLD_CFG: from [`bring_up`], a REC_ACK,
     /// a DONE_ACK with return 0, or both.
     pub h2c: H2cAck,
@@ -97,7 +105,11 @@ impl fmt::Display for Running {
         if !self.mac_init {
             return Ok(());
         }
-        f.write_str(", MAC init done, H2C OFLD_CFG ")?;
+        write!(
+            f,
+            ", MAC init done, LTR {}, H2C OFLD_CFG ",
+            if self.ltr { "on" } else { "off" }
+        )?;
         f.write_str(match (self.h2c.rec, self.h2c.done) {
             (true, true) => "acknowledged (receive and done)",
             (true, false) => "acknowledged (receive only)",
@@ -236,10 +248,21 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 /// 12. `"h2c"`, `"c2h"`: `command::ofld_cfg` at the sequence state a
 ///     download leaves (seq 0): a failed submit or a DONE_ACK with a
 ///     non-zero return is `"h2c"`; no matching ack within 100 ms, or a
-///     malformed RXQ, is `"c2h"`.
+///     malformed RXQ, is `"c2h"`. Neither failure has a Linux counterpart:
+///     Linux ignores `rtw89_fw_h2c_set_ofld_cfg`'s result (`mac.c:4394`)
+///     and never waits for its answer (spec S1.9).
 ///
-/// Success and every failure end as `rtw89_chip_info_setup` does after a
-/// power-on, and as `rtw89_mac_init`'s failure path does (`mac.c:4397`), in
+/// Once step 11 has succeeded (on success, and on the `"h2c"` and `"c2h"`
+/// failures) the HCI is torn down as `rtw89_core_stop` does between
+/// `rtw89_hci_stop` and `rtw89_mac_pwr_off` (`core.c:6765-6767`):
+/// `pci::deinit`, Linux's `rtw89_pci_ops_deinit` (`pci.c:3053`), which
+/// clears PCI wake, turns LTR off when `host.ltr`, stops the AXI master and
+/// HCI DMA, and clears every ring index. Its result is ignored, as Linux
+/// ignores it. A failure at or before step 11 skips it, as Linux's
+/// `rtw89_mac_init` failure path does (`mac.c:4397`).
+///
+/// Success and every failure then end as `rtw89_chip_info_setup` does after
+/// a power-on, and as `rtw89_mac_init`'s failure path does, in
 /// `rtw89_mac_pwr_off`: `power::power_off`, then, only if it succeeded, the
 /// `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard write. Linux ignores the result of
 /// that power-off, and so does this. A failed `"power on"` ends the same
@@ -249,7 +272,8 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 /// On success the result is reported with the `Rings` that DMA was started
 /// on. The caller must keep them (dropping them leaves every mapping
 /// quarantined, never returned): the power-off does not prove the engine
-/// stopped reading or writing them. On a failure after the rings were
+/// stopped reading or writing them (the deinit stops the HCI DMA but waits
+/// for nothing, as Linux does not). On a failure after the rings were
 /// programmed, they are dropped after the power-off and stay quarantined the
 /// same way.
 ///
@@ -288,7 +312,21 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
     // SAFETY: the caller's `pci::pre_init`, `Ch12::submit` and `Rxq::poll`
     // contracts; `rings` were installed on `domain` for the requester behind
     // `io`.
-    let result = unsafe { start(io, cut, &mut rings, image, host) };
+    let result = match unsafe { start(io, cut, &mut rings, image, host) } {
+        Ok(started) => {
+            // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts;
+            // `start` programmed `rings` through this `io` with
+            // `pci::pre_init`, and nothing since re-programmed or stopped
+            // them.
+            let acked = unsafe { acknowledge(io, &mut rings, started, host) };
+            // rtw89_core_stop (core.c:6765-6767): rtw89_hci_deinit between
+            // rtw89_hci_stop (interrupts and NAPI, neither ported) and
+            // rtw89_mac_pwr_off. Linux ignores its result, and so does this.
+            let _ = pci::deinit(io, &rings, host.ltr);
+            acked
+        }
+        Err(error) => Err(error),
+    };
     power_down(io);
     // On a failure `rings` drop here, after the power-off.
     Ok((result?, rings))
@@ -360,9 +398,18 @@ unsafe fn prepare<I: AxIo + ?Sized>(
     unsafe { Rings::install(source, domain) }.map_err(at("dma rings"))
 }
 
+/// What [`start`] leaves for [`acknowledge`].
+struct Started {
+    cut: u8,
+    firmware: (u8, u8, u8, u8),
+    mac: [u8; 6],
+    /// The H2C sequence state after the download.
+    h2c: H2c,
+}
+
 /// `rtw89_chip_efuse_info_setup` (`core.c:7274`) up to the MAC address:
 /// `rtw89_mac_partial_init` (`mac.c:4307`), then the efuse map; then the
-/// rest of `rtw89_mac_init` (`mac.c:4360`) and one OFLD_CFG H2C.
+/// rest of `rtw89_mac_init` (`mac.c:4360`) through the PCIe post-init.
 ///
 /// # Safety
 /// The `pci::pre_init`, `Ch12::submit` and `Rxq::poll` contracts for `io`
@@ -373,7 +420,7 @@ unsafe fn start<I: AxIo + ?Sized>(
     rings: &mut Rings,
     image: &AxImage<'_>,
     host: Host,
-) -> Result<Running, BringUpError> {
+) -> Result<Started, BringUpError> {
     // rtw89_mac_ctrl_hci_dma_trx and rtw89_mac_dmac_pre_init, then the
     // HCI's mac_pre_init. rtw89_mac_fwdl_preconfig is NULL for AX
     // (mac.c:7516).
@@ -385,7 +432,7 @@ unsafe fn start<I: AxIo + ?Sized>(
     unsafe { download(io, cut, rings, image) }?;
     // `h2c_seq` is zeroed by a download that reached the sections
     // (fw.c:2021), and the FWDL header does not advance it (fw.c:1657).
-    let mut h2c = H2c::after_download();
+    let h2c = H2c::after_download();
 
     // rtw89_parse_efuse_map_ax (efuse.c:281): the DDV physical map from 0,
     // its logical map, then rtw8852c_read_efuse's MAC (rtw8852c.c:648). The
@@ -402,20 +449,38 @@ unsafe fn start<I: AxIo + ?Sized>(
     sys::sys_init(io).map_err(at("sys init"))?;
     trx::init(io).map_err(|error| BringUpError::new(error.step, error.error))?;
     pci::post_init(io, host.ltr).map_err(at("pci post-init"))?;
+    Ok(Started {
+        cut,
+        firmware: image.version(),
+        mac: efuse::mac_address(&logical),
+        h2c,
+    })
+}
 
-    // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts; the
-    // download's `pci::pre_init` programmed `rings` through this `io`, and
-    // nothing since re-programmed or stopped them.
+/// `rtw89_fw_h2c_set_ofld_cfg` (`mac.c:4394`), the last step of
+/// `rtw89_mac_init`, with Stela's own wait for its acknowledgement.
+///
+/// # Safety
+/// The `Ch12::submit` and `Rxq::poll` contracts for `io` and `rings`.
+unsafe fn acknowledge<I: AxIo + ?Sized>(
+    io: &mut I,
+    rings: &mut Rings,
+    started: Started,
+    host: Host,
+) -> Result<Running, BringUpError> {
+    let mut h2c = started.h2c;
+    // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts.
     let ack = unsafe { command::ofld_cfg(io, rings, &mut h2c) }.map_err(|error| match error {
         CommandError::Submit(error) => BringUpError::new("h2c", error),
         CommandError::Wait(error) => BringUpError::new("c2h", error),
     })?;
     Ok(Running {
-        cut,
-        firmware: image.version(),
-        mac: efuse::mac_address(&logical),
+        cut: started.cut,
+        firmware: started.firmware,
+        mac: started.mac,
         secure_boot: false,
         mac_init: true,
+        ltr: host.ltr,
         h2c: ack,
     })
 }

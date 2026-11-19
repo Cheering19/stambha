@@ -707,8 +707,9 @@ pub struct Rtw89Up {
     /// powered off before its requester was taken over.
     pub was_on: bool,
     /// Its requester and bound domain, its BAR2 mapping and register window,
-    /// and the rings its firmware download ran on: kept for the rest of the
-    /// boot.
+    /// and the rings its firmware download, OFLD_CFG H2C (CH12) and C2H
+    /// wait (the RXQ buffers the device wrote) ran on: kept for the rest of
+    /// the boot.
     pub kept: Box<dyn Any>,
 }
 
@@ -2737,6 +2738,277 @@ mod tests {
             };
             let (_, _, _, host) = rtw89_decode(&mut function).unwrap();
             assert_eq!(host, Host { ltr });
+        }
+    }
+
+    /// Zeroed, aligned heap pages standing in for the mount's coherent WB
+    /// RAM. No device reaches them: the model below only records registers.
+    struct HeapPages {
+        pointer: core::ptr::NonNull<u8>,
+        layout: core::alloc::Layout,
+        physical: Vec<u64>,
+    }
+    // SAFETY: an exclusively kept test allocation; nothing aliases it
+    // across threads.
+    unsafe impl Send for HeapPages {}
+    // SAFETY: as for `Send`; no reference into it is handed out.
+    unsafe impl Sync for HeapPages {}
+    // SAFETY: `cpu_base` and `physical` describe the one kept, aligned
+    // allocation for its whole life.
+    unsafe impl crate::bus::dma::memory::PageBacking for HeapPages {
+        fn cpu_base(&self) -> core::ptr::NonNull<u8> {
+            self.pointer
+        }
+        fn physical_pages(&self) -> &[u64] {
+            &self.physical
+        }
+        fn page_shift(&self) -> u8 {
+            12
+        }
+        fn cache_attribute(&self) -> crate::bus::dma::memory::CacheAttribute {
+            crate::bus::dma::memory::CacheAttribute::WriteBack
+        }
+    }
+    impl Drop for HeapPages {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from `alloc_zeroed` with this layout
+            // and is freed once.
+            unsafe { alloc::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+        }
+    }
+    struct Heap;
+    impl PageSource for Heap {
+        fn allocate(
+            &self,
+            bytes: usize,
+            alignment: usize,
+            attribute: crate::bus::dma::memory::CacheAttribute,
+        ) -> Result<crate::bus::dma::memory::PinnedPages, crate::bus::dma::memory::MemoryError>
+        {
+            use crate::bus::dma::memory::{CacheAttribute, MemoryError, PinnedPages};
+            assert_eq!(attribute, CacheAttribute::WriteBack);
+            let rounded = bytes.next_multiple_of(4096);
+            let layout = core::alloc::Layout::from_size_align(rounded, alignment.max(4096))
+                .map_err(|_| MemoryError::OutOfMemory)?;
+            // SAFETY: the layout has a nonzero size.
+            let pointer = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                .ok_or(MemoryError::OutOfMemory)?;
+            let physical = (0..rounded / 4096)
+                .map(|i| pointer.as_ptr() as u64 + i as u64 * 4096)
+                .collect();
+            PinnedPages::new(
+                Box::new(HeapPages {
+                    pointer,
+                    layout,
+                    physical,
+                }),
+                bytes,
+                alignment,
+            )
+        }
+    }
+
+    /// A domain that hands out IOVAs below 4 GiB; syncs succeed. Nothing
+    /// reads or writes through it.
+    #[derive(Default)]
+    struct Counting(core::sync::atomic::AtomicU64);
+    // SAFETY: a model domain: the bring-up's allocations keep their own
+    // pins, and no device reaches the addresses it hands out.
+    unsafe impl DmaDomain for Counting {
+        unsafe fn map(
+            &self,
+            pages: &crate::bus::dma::pages::DmaPages,
+            _: crate::bus::dma::mapping::Direction,
+            _: u64,
+        ) -> Result<crate::bus::dma::mapping::DomainMapping, crate::bus::dma::mapping::DmaError>
+        {
+            let pin = pages
+                .as_single()
+                .ok_or(crate::bus::dma::mapping::DmaError::MappingFailed)?;
+            let next = self
+                .0
+                .fetch_add(0x10000, core::sync::atomic::Ordering::Relaxed);
+            let address = 0x1001_0000 + next;
+            Ok(crate::bus::dma::mapping::DomainMapping {
+                id: address,
+                address,
+                bytes: pin.bytes(),
+            })
+        }
+        unsafe fn unmap(
+            &self,
+            _: crate::bus::dma::mapping::DomainMapping,
+        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
+            Ok(())
+        }
+        unsafe fn sync_for_device(
+            &self,
+            _: crate::bus::dma::mapping::DomainMapping,
+            _: core::ops::Range<usize>,
+            _: crate::bus::dma::mapping::Direction,
+        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
+            Ok(())
+        }
+        unsafe fn sync_for_cpu(
+            &self,
+            _: crate::bus::dma::mapping::DomainMapping,
+            _: core::ops::Range<usize>,
+            _: crate::bus::dma::mapping::Direction,
+        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
+            Ok(())
+        }
+    }
+
+    /// An RTL8852CE register file every bring-up step up to OFLD_CFG passes
+    /// on: written values read back, power and XTAL SI polls complete, the
+    /// efuse reads blank (secure boot off), the DLE managers and STA
+    /// scheduler report ready, the CAM resets self-clear, CH12 consumes
+    /// every kick, and once the WCPU is enabled the firmware reports ready.
+    /// RXQ never fills, so the bring-up ends at `"c2h"`, after post-init.
+    struct Live {
+        regs: alloc::collections::BTreeMap<u32, u8>,
+        writes: Vec<(u32, u32)>,
+        now: u64,
+    }
+    impl Live {
+        fn new() -> Self {
+            let mut live = Self {
+                regs: alloc::collections::BTreeMap::new(),
+                writes: Vec::new(),
+                now: 0,
+            };
+            live.put(0x179C, 4, 0x0C9C);
+            live
+        }
+        fn get(&self, reg: u32, width: u32) -> u32 {
+            (0..width).fold(0, |v, i| {
+                v | u32::from(*self.regs.get(&(reg + i)).unwrap_or(&0)) << (8 * i)
+            })
+        }
+        fn put(&mut self, reg: u32, width: u32, value: u32) {
+            for i in 0..width {
+                self.regs.insert(reg + i, (value >> (8 * i)) as u8);
+            }
+        }
+        fn read(&mut self, reg: u32, width: u32) -> u32 {
+            let v = self.get(reg, 4);
+            let v = match reg {
+                0x0004 => (v | 1 << 17) & !(1 << 8 | 1 << 9),
+                0x0270 => v & 0x7FFF_FFFF,
+                0x0030 => (v & 0x07FF_0000) | 1 << 29 | 0xFF,
+                0x8D00 | 0x9100 => 3,
+                0x1000 => v & !(1 << 3),
+                0x1080 => (v & 0xFFF) | (v & 0xFFF) << 16,
+                0x01E0 if self.get(0x0088, 4) & 1 << 1 != 0 => (v & !0xE0) | 7 << 5 | 0x6,
+                0x9E10 => v | 0x8000_0000,
+                0xCE34 => v & !0x100,
+                0xCE3C => v & !0x3,
+                _ => v,
+            };
+            self.put(reg, 4, v);
+            self.get(reg, width)
+        }
+        fn write(&mut self, reg: u32, width: u32, value: u32) {
+            self.writes.push((reg, value));
+            self.put(reg, width, value);
+        }
+    }
+    impl AxIo for Live {
+        fn read8(&mut self, reg: u32) -> Result<u8, AxError> {
+            Ok(self.read(reg, 1) as u8)
+        }
+        fn read16(&mut self, reg: u32) -> Result<u16, AxError> {
+            Ok(self.read(reg, 2) as u16)
+        }
+        fn read32(&mut self, reg: u32) -> Result<u32, AxError> {
+            Ok(self.read(reg, 4))
+        }
+        fn write8(&mut self, reg: u32, v: u8) -> Result<(), AxError> {
+            self.write(reg, 1, v.into());
+            Ok(())
+        }
+        fn write16(&mut self, reg: u32, v: u16) -> Result<(), AxError> {
+            self.write(reg, 2, v.into());
+            Ok(())
+        }
+        fn write32(&mut self, reg: u32, v: u32) -> Result<(), AxError> {
+            self.write(reg, 4, v);
+            Ok(())
+        }
+        fn delay_us(&mut self, us: u64) {
+            self.now += us;
+        }
+        fn now_us(&mut self) -> Result<u64, AxError> {
+            Ok(self.now)
+        }
+    }
+
+    /// The device side of an attach over [`Live`], bound to a [`Counting`]
+    /// domain, whose preparation read `host`.
+    struct LiveDevice {
+        chip: Live,
+        host: Host,
+    }
+    impl Rtw89Device for LiveDevice {
+        type Io = Live;
+        fn io(&mut self) -> &mut Live {
+            &mut self.chip
+        }
+        fn host(&self) -> Host {
+            self.host
+        }
+        unsafe fn finalize(&mut self) -> Result<Arc<dyn DmaDomain>, Error> {
+            Ok(Arc::new(Counting::default()))
+        }
+        fn master(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// The `Host` an attach's device reports reaches `bring_up`: with
+    /// `ltr: true` the post-init programs the LTR decision register
+    /// (`R_AX_LTR_DEC_CTRL`, 0x1600) and the deinit clears it again; with
+    /// `ltr: false` it is never written.
+    #[test]
+    fn the_prepared_ltr_flag_reaches_the_bring_up() {
+        let catalog = empty_image();
+        for ltr in [true, false] {
+            let mut device = LiveDevice {
+                chip: Live::new(),
+                host: Host { ltr },
+            };
+            // SAFETY: `LiveDevice` is a model, not a device: `Counting`
+            // keeps every pin and no device reaches its addresses, and
+            // `Heap` is plain test memory.
+            let result = unsafe {
+                rtw89_attach(
+                    &mut device,
+                    rtl8852ce(),
+                    &crate::firmware::HandoffProvider::new(Some(&catalog)),
+                    &Heap,
+                )
+            };
+            // The model's RXQ never fills: the bring-up ran through
+            // post-init and failed waiting for the firmware's answer.
+            let Err((Error::Rtw89Wifi(BringUpError { step, .. }), false)) = result else {
+                panic!("the modeled bring-up did not fail at its C2H wait")
+            };
+            assert_eq!(step, "c2h");
+            let ltr_writes: Vec<u32> = device
+                .chip
+                .writes
+                .iter()
+                .filter(|(reg, _)| *reg == 0x1600)
+                .map(|(_, value)| *value)
+                .collect();
+            if ltr {
+                // ltr_set_v1(true), HW_DEC_EN set; then ltr_set_v1(false).
+                assert_eq!(ltr_writes.len(), 2, "{ltr_writes:x?}");
+                assert_ne!(ltr_writes[0] & 1 << 2, 0);
+                assert_eq!(ltr_writes[1] & 1 << 2, 0);
+            } else {
+                assert!(ltr_writes.is_empty(), "{ltr_writes:x?}");
+            }
         }
     }
 
