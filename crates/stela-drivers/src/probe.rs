@@ -4266,6 +4266,7 @@ mod tests {
                 secure_boot: false,
                 mac_init: true,
                 ltr: true,
+                bacam_reset_timed_out: false,
                 h2c: net::wifi::realtek::ax::H2cAck {
                     rec: true,
                     done: true,
@@ -4274,6 +4275,7 @@ mod tests {
                     skipped: 0,
                     log: None,
                 },
+                phy: None,
             },
             was_on: true,
             kept: Box::new(()),
@@ -4327,6 +4329,7 @@ mod tests {
                         mask: 0x0FFF_0000,
                     },
                 },
+                rf: None,
             }),
             was_on: true,
             kept: Some(Box::new(())),
@@ -4364,6 +4367,7 @@ mod tests {
             secure_boot: false,
             mac_init: true,
             ltr: false,
+            bacam_reset_timed_out: false,
             h2c: net::wifi::realtek::ax::H2cAck {
                 rec: true,
                 done: false,
@@ -4372,6 +4376,7 @@ mod tests {
                 skipped: 0,
                 log: None,
             },
+            phy: None,
         };
         let address = Address {
             segment: 0,

@@ -45,6 +45,70 @@ fn enable_bb_rf_matches_linux_sequence() {
 }
 
 #[test]
+fn reset_bb_rf_disables_then_enables() {
+    // rtw89_chip_reset_bb_rf (mac.h:1377-1391): rtw8852c_mac_disable_bb_rf
+    // (rtw8852c.c:3036-3043), then the M2a enable sequence unchanged.
+    let mut m = settled();
+    m.set32(0x02F0, 0x0002_0000);
+    m.set32(0x0002, 0x03);
+    m.set32(0x0444, 0xFFFF_FFFF);
+    reset_bb_rf(&mut m).unwrap();
+    assert_eq!(
+        without_delays(m.writes()),
+        vec![
+            Op::W32(0x02F0, 0),
+            Op::W8(0x0002, 0),
+            Op::W8(0x0002, 0x03),
+            Op::W32(0x02F0, 0x0002_0000),
+            Op::W32(0x02F0, 0),
+            Op::W32(0x02F0, 0x0002_0000),
+            Op::W32(0x0444, 0xFFBF_FFFF),
+            Op::W32(0x0444, 0xFDBF_FFFF),
+            Op::W32(0x0270, 0x80FF_0700),
+            Op::W32(0x0270, 0x80FF_6C90),
+            Op::W32(0x0270, 0x80FF_C780),
+            Op::W32(0x0270, 0x80FF_C781),
+            Op::W32(0x0270, 0x80FF_0D03),
+        ]
+    );
+    // Both disable steps are read-modify-writes that keep the other bits.
+    assert_eq!(
+        &m.trace[..4],
+        [
+            Op::R32(0x02F0),
+            Op::W32(0x02F0, 0),
+            Op::R8(0x0002),
+            Op::W8(0x0002, 0),
+        ]
+    );
+}
+
+#[test]
+fn disable_bb_rf_keeps_the_other_bits() {
+    let mut m = RegisterModel::new();
+    m.set32(0x02F0, 0xFFFF_FFFF);
+    m.set32(0x0000, 0xFFFF_FFFF);
+    disable_bb_rf(&mut m).unwrap();
+    assert_eq!(
+        m.writes(),
+        vec![Op::W32(0x02F0, 0xFFFD_FFFF), Op::W8(0x0002, 0xFC)]
+    );
+}
+
+#[test]
+fn reset_bb_rf_xtal_timeout_fails_after_the_disable() {
+    let mut m = RegisterModel::new(); // 0x0270 bit 31 never clears
+    assert_eq!(
+        reset_bb_rf(&mut m),
+        Err(AxError::Timeout {
+            register: 0x270,
+            mask: 0x8000_0000
+        })
+    );
+    assert_eq!(m.writes()[..2], [Op::W32(0x02F0, 0), Op::W8(0x0002, 0)]);
+}
+
+#[test]
 fn sys_init_matches_linux_sequence() {
     let mut m = RegisterModel::new();
     sys_init(&mut m).unwrap();

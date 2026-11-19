@@ -5,7 +5,8 @@
 //! then a polled RXQ wait for its acknowledgements, matched as the class 0
 //! handlers `rtw89_mac_c2h_rec_ack` and `rtw89_mac_c2h_done_ack`
 //! (`mac.c:5459`, `:5495`) decode them after `rtw89_fw_c2h_parse_attr`
-//! (`fw.c:9043`).
+//! (`fw.c:9043`). [`count_c2h`] reads RXQ once more without waiting and
+//! only counts the C2Hs it holds.
 //!
 //! Linux does not wait here: `rtw89_h2c_tx` returns after the kick, and
 //! `rtw89_fw_c2h_cmd_handle` drops every C2H before `RTW89_FLAG_RUNNING`
@@ -216,6 +217,36 @@ pub unsafe fn ofld_cfg<I: AxIo + ?Sized>(
         }));
     }
     Ok(ack)
+}
+
+/// The C2Hs that arrived since RXQ was last read: one `Rxq::poll` with no
+/// wait, counting the frames of the C2H packet type (spec S1.10, S11.3).
+/// Nothing is parsed past the RX descriptor and nothing is acted on; other
+/// frames and segments are consumed uncounted. A malformed buffer, or an
+/// RXQ failure, is the error. The count saturates. Stela's own: Linux
+/// reads RXQ only under NAPI.
+///
+/// # Safety
+/// The contract of `Rxq::poll`: `io` is the exclusive register window of
+/// the same RTL8852C requester that `pci::pre_init` programmed with `rings`,
+/// and the `pre_init` contract still holds: its DMA domain isolates that
+/// requester, the rings are coherent WB RAM with NoSnoop and ATS disabled,
+/// and one worker owns the device and its queues. `pre_init` must have
+/// succeeded on these rings.
+pub unsafe fn count_c2h<I: AxIo + ?Sized>(io: &mut I, rings: &mut Rings) -> Result<u8, AxError> {
+    let mut count: u8 = 0;
+    // SAFETY: the caller's contract is `poll`'s, word for word.
+    unsafe {
+        rings.rxq().poll(io, &mut |buffer| {
+            if let RxBuffer::Frame(frame) = rx::parse(buffer)?
+                && frame.pkt_type == RX_TYPE_C2H
+            {
+                count = count.saturating_add(1);
+            }
+            Ok(())
+        })
+    }?;
+    Ok(count)
 }
 
 #[cfg(test)]

@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
+// Copyright(c) 2020  Realtek Corporation
 //! RX buffer parser: the RX BD info word (`pci.h:1536`), the AX RX
 //! descriptor fields (`txrx.h:345-352`), the offset math of
 //! `rtw89_core_query_rxdesc` (`core.c:4107`, `:4140`) and the copy length of
-//! `rtw89_pci_rxbd_to_skb`/`deliver_skbs` (`pci.c:278-303`). Only FS && LS
-//! single-segment buffers are framed. It reads no register and grants no DMA.
+//! `rtw89_skb_put_rx_data` (`pci.c:278-303`). Linux copies `WRITE_SIZE` minus
+//! the offset; capping the payload at `RPKT_LEN` as well is a deliberate
+//! narrowing of Linux, so a buffer whose descriptor claims fewer bytes than
+//! the BD wrote yields only those. Only FS && LS single-segment buffers are
+//! framed. It reads no register and grants no DMA.
 use super::io::AxError;
 
 const RXBD_FS: u32 = 1 << 15;

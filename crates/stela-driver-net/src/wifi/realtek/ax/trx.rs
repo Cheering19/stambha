@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
 //! RTL8852CE TRX init, from `trx_init_ax` (`mac.c:4029`): `dmac::init`, then
 //! `cmac::init`, then `enable_imr_ax` for the DMAC (`mac.c:3936`, with
@@ -13,7 +14,10 @@
 //! `err_imr_ctrl_ax` skips the C1 error IMR because `c1_rx_qta` is 0. This
 //! module grants no band 1, no interrupt delivery (`R_AX_HIMR` and the PCI
 //! interrupt masks stay untouched), no TX or RX path and no firmware command;
-//! the bring-up runs it after `sys::sys_init`.
+//! the bring-up runs it after `sys::sys_init`. No band 1 CMAC register is
+//! touched. `R_AX_TXPKTCTL_B1_ERRFLAG_IMR` is a DMAC register, which
+//! `rtw89_mac_txpktctl_imr_enable` (`mac.c:3811-3816`) writes unconditionally
+//! as well, so it is written here as Linux does.
 use super::cmac::{self, check_cmac_en};
 use super::dmac::{self, check_dmac_en};
 use super::io::{AxError, AxIo, clear32, field32, set32};
@@ -250,10 +254,12 @@ fn imr_tail<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 }
 
 /// `trx_init_ax` (`mac.c:4029`) for an RTL8852C on PCIe with the SCC layout.
-pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), TrxError> {
+/// The result is whether the CMAC's BA CAM reset timed out (`cmac::init`).
+pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, TrxError> {
     dmac::init(io).map_err(at("dmac init"))?;
-    cmac::init(io).map_err(at("cmac init"))?;
-    imr_tail(io).map_err(at("imr"))
+    let bacam_reset_timed_out = cmac::init(io).map_err(at("cmac init"))?;
+    imr_tail(io).map_err(at("imr"))?;
+    Ok(bacam_reset_timed_out)
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
 //! RTL8852CE MAC pre-init for firmware download, from the part of
 //! `rtw89_mac_partial_init` (`mac.c:4307`) that runs before the PCI pre-init
@@ -208,6 +209,21 @@ const HFC_CH_CFG: [(u32, u32, u32); 12] = [
     (13, 1614, 1),
     (13, 1614, 1),
 ];
+// `hfc_ch_cfg_chk` (`mac.c:926`) for the constant table: a non-zero `min` is
+// not below `ch011_prec`, `max` is within `pub_max` and `grp` is 0 or 1
+// (`grp_num`).
+const _: () = {
+    let mut ch = 0;
+    while ch < HFC_CH_CFG.len() {
+        let (min, max, grp) = HFC_CH_CFG[ch];
+        assert!(min == 0 || min >= HFC_CH011_PREC);
+        assert!(max <= HFC_PUB_MAX);
+        assert!(grp < 2);
+        ch += 1;
+    }
+};
+// `hfc_pub_cfg_chk` (`mac.c:961`): the configured groups add up to `pub_max`.
+const _: () = assert!(HFC_PUB_GRP0 + HFC_PUB_GRP1 == HFC_PUB_MAX);
 /// `RTW89_DMA_CH_NUM`-bounded channel count `hfc_init` walks (`mac.c:1219`).
 const HFC_CH_COUNT: u32 = HFC_CH_CFG.len() as u32;
 // `chip->dma_ch_mask` of the 8852C is 0 (`rtw8852c.c:3288`), so `hfc_init`'s
@@ -491,9 +507,8 @@ fn hfc_init_h2c_only<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     hfc_func_en(io, false, true)
 }
 
-/// `hfc_ch_ctrl` (`mac.c:972`) for `ch` in 0..12. The `hfc_ch_cfg_chk`
-/// bounds (`mac.c:926`) hold for the constant table: a non-zero `min` is not
-/// below `ch011_prec`, `max` is within `pub_max` and `grp` is 0 or 1.
+/// `hfc_ch_ctrl` (`mac.c:972`) for `ch` in 0..12. Its `hfc_ch_cfg_chk`
+/// (`mac.c:926`) is the compile-time check on `HFC_CH_CFG`.
 fn hfc_ch_ctrl<I: AxIo + ?Sized>(io: &mut I, ch: u32) -> Result<(), AxError> {
     check_dmac_en(io)?;
     let (min, max, grp) = HFC_CH_CFG[ch as usize];
@@ -510,12 +525,10 @@ fn hfc_upd_ch_info<I: AxIo + ?Sized>(io: &mut I, ch: u32) -> Result<(), AxError>
     io.read32(R_AX_ACH0_PAGE_INFO_V1 + ch * 4).map(|_| ())
 }
 
-/// `hfc_pub_ctrl` (`mac.c:1027`) with `hfc_pub_cfg_chk` (`mac.c:961`).
+/// `hfc_pub_ctrl` (`mac.c:1027`); its `hfc_pub_cfg_chk` (`mac.c:961`) is the
+/// compile-time check on the group sizes.
 fn hfc_pub_ctrl<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     check_dmac_en(io)?;
-    if HFC_PUB_GRP0 + HFC_PUB_GRP1 != HFC_PUB_MAX {
-        return Err(AxError::Mac("HCI flow control public pages do not add up"));
-    }
     io.write32(
         R_AX_PUB_PAGE_CTRL1_V1,
         HFC_PUB_GRP0 | (HFC_PUB_GRP1 << B_AX_PUBPG_G1_SHIFT),

@@ -1,8 +1,13 @@
 extern crate std;
 use super::*;
+use crate::wifi::realtek::ax::elements::{
+    ID_BB_GAIN, ID_BB_REG, ID_RADIO_A, ID_RADIO_B, ID_RF_NCTL, PhyTables, RfPath, phy_tables,
+    tests::{container, element, pairs},
+};
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::pci::tests::{device_write, rxq_buffer};
-use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
+use crate::wifi::realtek::ax::radio::RfAt;
+use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
@@ -52,14 +57,51 @@ const NOT_C2H: [u8; 32] = rec_ack_with(7, 0x00);
 const BOTH: &[&[u8]] = &[&REC_ACK, &DONE_ACK];
 
 /// A 2048-byte physical efuse (0xFF = blank) whose logical map holds `MAC`
-/// at 0x400: one block header at physical 4 (block 0x80, words 0-2), then
-/// the six bytes. 0x5EC/0x5ED are left blank: secure boot off.
+/// at 0x400, crystal cap 0x2F at 0x2B9 and RFE type 1 at 0x2CA.
 fn efuse_with_mac() -> Vec<u8> {
+    efuse_with_rfe(1)
+}
+
+/// As [`efuse_with_mac`], with RFE type `rfe`: block 0x80 (words 0-2) holds
+/// the MAC, block 0x57 word 0 the crystal cap (0x2B8, 0x2B9) and block 0x59
+/// word 1 the RFE type (0x2CA, 0x2CB). 0x5EC/0x5ED are left blank: secure
+/// boot off; the phycap window 0x590..0x5F0 is blank too, so no trim.
+fn efuse_with_rfe(rfe: u8) -> Vec<u8> {
     let mut phys = vec![0xFF; 2048];
     phys[4..6].copy_from_slice(&[0x08, 0x08]);
     phys[6..12].copy_from_slice(&MAC);
+    phys[12..16].copy_from_slice(&[0x05, 0x7E, 0xFF, 0x2F]);
+    phys[16..20].copy_from_slice(&[0x05, 0x9D, rfe, 0xFF]);
     phys
 }
+
+/// The firmware tables every bring-up here runs: BB `[(0x4AD4, 0x40),
+/// (0x4AE0, 0x40)]`, BB gain `[(0, 1)]`, radio slot 0 path B and slot 1
+/// path A both `[(0x05, 0), (0x10005, 1)]` (one SWSI write, one direct
+/// window write, which alone is stored) behind a headline for RFE 1 at any
+/// cut, and NCTL `[(0x8008, 0)]`.
+fn tables_file() -> Vec<u8> {
+    let radio = pairs(&[(0xF001_00FF, 0), (0x05, 0), (0x10005, 1)]);
+    let mut b = container(32, 5);
+    element(
+        &mut b,
+        ID_BB_REG,
+        [0; 4],
+        0,
+        0,
+        &pairs(&[(0x4AD4, 0x40), (0x4AE0, 0x40)]),
+    );
+    element(&mut b, ID_BB_GAIN, [0; 4], 0, 0, &pairs(&[(0, 1)]));
+    element(&mut b, ID_RADIO_A, [0; 4], 0, 1, &radio);
+    element(&mut b, ID_RADIO_B, [0; 4], 0, 0, &radio);
+    element(&mut b, ID_RF_NCTL, [0; 4], 0, 0, &pairs(&[(0x8008, 0)]));
+    b
+}
+
+/// What [`tables_file`] reports through a full bring-up of [`chip`].
+const PHY: &str = ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 1+1, RF18 A \
+                   0x01001 B 0x01001, GNT 0x00000006, GNT RFC 0x06, GNT SW 0x00057ddf, GNT \
+                   before coex 0x00000018";
 
 /// The chip as every bring-up poll wants it:
 /// - power: RDY_SYSPWR (0x0004 bit17) reads set, APFN_ONMAC and APFM_OFFMAC
@@ -163,6 +205,22 @@ fn chip(
         Box::new(|m: &mut RegisterModel| m.get32(0xCE3C) & !0x3),
     );
     io.set32(0x179C, 0x0C9C);
+    // The radio: SWSI answers from the RF file, whose 0x18 reads 0x01001 on
+    // both paths, and R_AX_GNT_VAL_V1 reads BT granted on both paths (bits
+    // 3, 4) until the WL-only grant is written, then WL on both (bits 1, 2).
+    io.emulate_rf();
+    io.set_rf(0, 0x18, 0x01001);
+    io.set_rf(1, 0x18, 0x01001);
+    io.on_read(
+        0xDA4C,
+        Box::new(|m: &mut RegisterModel| {
+            if m.trace.contains(&Op::W32(0xDA48, 0x0005_7DDF)) {
+                0x6
+            } else {
+                0x18
+            }
+        }),
+    );
     let m = Arc::new(Mutex::new(Model::default()));
     let model = m.clone();
     let mut sent = false;
@@ -198,12 +256,32 @@ fn run_on(
     m: &Arc<Mutex<Model>>,
     host: Host,
 ) -> Result<(Running, Rings), BringUpError> {
+    let file = tables_file();
+    run_with(io, m, host, &phy_tables(&file, 0).unwrap())
+}
+
+fn run_with(
+    io: &mut RegisterModel,
+    m: &Arc<Mutex<Model>>,
+    host: Host,
+    tables: &PhyTables<'_>,
+) -> Result<(Running, Rings), BringUpError> {
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
     // SAFETY: the model domain isolates only the modeled requester behind
     // this test's `RegisterModel`; its pages are plain kept test RAM that no
     // real device can reach, and this test is the only worker.
-    unsafe { bring_up(io, &Source, Arc::new(Domain(m.clone())), 2, &fw.image, host) }
+    unsafe {
+        bring_up(
+            io,
+            &Source,
+            Arc::new(Domain(m.clone())),
+            2,
+            &fw.image,
+            host,
+            tables,
+        )
+    }
 }
 
 /// Bring up a chip as [`chip`] models it with `acks`, on `host`.
@@ -329,6 +407,21 @@ fn assert_ends_with_power_off(io: &RegisterModel) {
     assert!(matches!(got[tail.len() - 2], Op::W32(0x0004, v) if v & 1 << 10 != 0));
 }
 
+/// What a full bring-up of [`chip`] with [`tables_file`] applies and reads.
+const REPORT: PhyReport = PhyReport {
+    rfe: 1,
+    xtal: 0x2F,
+    bb: 2,
+    bb_gain: 1,
+    rf: [2, 2],
+    rf_words: [1, 1],
+    rf18: [0x01001, 0x01001],
+    gnt: 0x6,
+    gnt_sw: 0x0005_7DDF,
+    gnt_before: 0x18,
+    c2h_after: 0,
+};
+
 #[test]
 fn happy_path_reports_running() {
     let (c, result) = ran(BOTH, NO_LTR);
@@ -342,14 +435,27 @@ fn happy_path_reports_running() {
             secure_boot: false,
             mac_init: true,
             ltr: false,
+            bacam_reset_timed_out: false,
             h2c: acked(true, true),
+            phy: Some(REPORT),
         }
     );
     assert_eq!(
         running.to_string(),
-        "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-         secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and done)"
+        alloc::format!(
+            "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
+             secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
+             done){PHY}"
+        )
     );
+    // The brief's M2b1 text, then the grant reads appended in its style.
+    assert!(running.to_string().contains(
+        ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 1+1, RF18 A 0x01001 B \
+         0x01001, GNT 0x00000006, "
+    ));
+    // The RF pages carried seq 1 and 2, after OFLD_CFG's seq 0: neither
+    // asks for a REC_ACK, so nothing was left unread in RXQ.
+    assert_eq!(running.phy.map(|phy| phy.c2h_after), Some(0));
     // One download attempt, one PCI pre-init.
     assert_eq!(count(&c.io, ATTEMPT), 1);
     assert_eq!(c.pre_inits.load(Ordering::Relaxed), 1);
@@ -470,7 +576,8 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
             running.to_string(),
             alloc::format!(
                 "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-                 secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged ({line})"
+                 secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged \
+                 ({line}){PHY}"
             )
         );
     }
@@ -481,10 +588,10 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     );
     let (running, _rings) = result.unwrap();
     assert!(
-        running.to_string().ends_with(
+        running.to_string().ends_with(&alloc::format!(
             "H2C OFLD_CFG acknowledged (receive and done), other C2H 1, unmatched acks 1, \
-             skipped 1"
-        ),
+             skipped 1{PHY}"
+        )),
         "{running}"
     );
     let (_, result) = ran(&[&NOT_C2H, &DONE_ACK], NO_LTR);
@@ -492,7 +599,7 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     assert!(
         running
             .to_string()
-            .ends_with("acknowledged (done only), skipped 1"),
+            .ends_with(&alloc::format!("acknowledged (done only), skipped 1{PHY}")),
         "{running}"
     );
     let (_, result) = ran(&[&LOG, &REC_ACK, &DONE_ACK], NO_LTR);
@@ -503,9 +610,11 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     );
     assert_eq!(
         running.to_string(),
-        "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-         secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and done), \
-         firmware log \"fw up\""
+        alloc::format!(
+            "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
+             secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
+             done), firmware log \"fw up\"{PHY}"
+        )
     );
 }
 
@@ -520,8 +629,25 @@ const DEINIT_LTR: [u32; 12] = [
 /// The registers of the 32-bit writes between the post-init's PCI IO
 /// release (its last 0x1010 write) and the power-off's first XTAL SI
 /// command: what the bring-up writes after post-init that is not H2C or
-/// RXQ traffic (those are 16-bit index writes).
+/// RXQ traffic (those are 16-bit index writes) and not the radio's. The
+/// radio steps write the BB and RF windows (0x10000 up), XTAL SI (0x0270),
+/// the BB/RF reset's 0x02F0 and 0x0444, the CMAC's TX power and coex
+/// registers (0xC000-0xDFFF) and the coex scoreboard (0x00AC); the deinit
+/// writes none of them.
 fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
+    deinit_and_radio_writes(io)
+        .into_iter()
+        .filter(|reg| {
+            !(*reg >= 0x10000
+                || (0xC000..0xE000).contains(reg)
+                || matches!(*reg, 0x0270 | 0x02F0 | 0x0444 | 0x00AC))
+        })
+        .collect()
+}
+
+/// Every 32-bit write between the post-init's PCI IO release and the
+/// power-off's first XTAL SI command.
+fn deinit_and_radio_writes(io: &RegisterModel) -> Vec<u32> {
     let t = &io.trace;
     let release = t
         .iter()
@@ -544,13 +670,23 @@ fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
 /// Run a full bring-up of [`chip`] with `acks` on `host`, changed by
 /// `fault`, which must fail: its error, after checking the chip ended
 /// powered off, after `rtw89_pci_ops_deinit` exactly when the post-init
-/// had run (the `"h2c"` and `"c2h"` failures).
+/// had run (the `"h2c"` and `"c2h"` failures and every radio step's).
 fn mac_init_fails(
     acks: &'static [&'static [u8]],
     host: Host,
     fault: impl FnOnce(&mut RegisterModel),
 ) -> BringUpError {
-    let mut c = chip(efuse_with_mac(), 7, never, acks);
+    fails_on(efuse_with_mac(), acks, host, fault)
+}
+
+/// [`mac_init_fails`] on a chip whose physical efuse is `phys`.
+fn fails_on(
+    phys: Vec<u8>,
+    acks: &'static [&'static [u8]],
+    host: Host,
+    fault: impl FnOnce(&mut RegisterModel),
+) -> BringUpError {
+    let mut c = chip(phys, 7, never, acks);
     fault(&mut c.io);
     let m = c.m.clone();
     let err = failed(run_on(&mut c.io, &m, host));
@@ -561,7 +697,7 @@ fn mac_init_fails(
             .iter()
             .position(|o| *o == Op::W32(0x0030, 0))
             .unwrap();
-    if matches!(err.step, "h2c" | "c2h") {
+    if matches!(err.step, "h2c" | "c2h") || PHY_STEPS.contains(&err.step) {
         let want: &[u32] = if host.ltr { &DEINIT_LTR } else { &DEINIT };
         assert_eq!(deinit_writes(&c.io), want, "{err}");
     } else {
@@ -573,11 +709,38 @@ fn mac_init_fails(
                 .any(|o| matches!(o, Op::W32(0x0074 | 0x1014 | 0x11C4 | 0x1200, _))),
             "{err}"
         );
-        // The DMA live since pci pre-init is stopped before the power-off.
+        // The DMA live since mac pre-init is stopped before the power-off.
         assert_dma_stopped_before_power_off(&c.io);
     }
     assert_ends_with_power_off(&c.io);
     err
+}
+
+#[test]
+fn sys_init_failure_names_step_and_powers_off() {
+    // sys_init_ax has no check of its own: its read of the CMAC clock enable
+    // (R_AX_CK_EN, 0xC004) fails.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xC004));
+    assert_eq!(err, BringUpError::new("sys init", READ_FAILED));
+}
+
+#[test]
+fn imr_failure_names_step_and_powers_off() {
+    // dmac and cmac init finish, then ptcl_init's last read (0xC660) finds
+    // the DMAC disabled, which is the first check of enable_imr_ax.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0xC660,
+            Box::new(|m: &mut RegisterModel| {
+                m.set32(0x8400, 0);
+                m.get32(0xC660)
+            }),
+        );
+    });
+    assert_eq!(
+        err,
+        BringUpError::new("imr", AxError::Dma("DMAC function is not enabled"))
+    );
 }
 
 #[test]
@@ -902,6 +1065,7 @@ fn download_failure_names_the_first_attempt_when_it_differs() {
                     mask: 0x0FFF_0000,
                 },
             },
+            rf: None,
         }
     );
     assert_eq!(
@@ -949,6 +1113,7 @@ fn a_failed_pci_re_init_keeps_the_download_error_that_stopped_ch12() {
                 },
                 first: None,
             },
+            rf: None,
         }
     );
     assert_eq!(
@@ -975,6 +1140,7 @@ fn a_ch12_stop_after_a_different_first_failure_names_both() {
                 fw_ctrl: 0x0000_0047,
             }),
         },
+        rf: None,
     };
     assert_eq!(
         err.to_string(),
@@ -1019,6 +1185,7 @@ fn power_on_failure_keeps_both_errors_and_ends_powered_off() {
                 tries: 2,
                 error: AxError::AlreadyPowered,
             },
+            rf: None,
         }
     );
     assert_eq!(
@@ -1091,7 +1258,9 @@ fn running_display_says_on_for_secure_boot() {
         secure_boot: true,
         mac_init: false,
         ltr: false,
+        bacam_reset_timed_out: false,
         h2c: acked(false, false),
+        phy: None,
     };
     // Without the MAC init no H2C was sent, so nothing is said of one.
     assert_eq!(
@@ -1109,6 +1278,407 @@ fn running_display_says_on_for_secure_boot() {
         "RTL8852CE firmware running: cut 0, firmware 0.27.97.0, MAC ff:ab:01:10:00:9c, \
          secure boot on, MAC init done, LTR on, H2C OFLD_CFG not acknowledged"
     );
+    // A BA CAM reset that timed out is appended, and only then.
+    let r = Running {
+        bacam_reset_timed_out: true,
+        ..r
+    };
+    assert!(
+        r.to_string()
+            .ends_with("H2C OFLD_CFG not acknowledged, BA CAM reset timed out"),
+        "{r}"
+    );
+    // The radio's report comes last, and only when there is one.
+    let r = Running {
+        phy: Some(REPORT),
+        ..r
+    };
+    assert!(
+        r.to_string()
+            .ends_with(&alloc::format!("BA CAM reset timed out{PHY}")),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_rf_failure_names_its_path_and_page_between_step_and_error() {
+    let at = |path, page| BringUpError {
+        rf: Some(RfAt { path, page }),
+        ..BringUpError::new("rf h2c", AxError::Dma("CH12 is stopped"))
+    };
+    assert_eq!(
+        at(RfPath::A, Some(1)).to_string(),
+        "RTL8852CE bring-up: rf h2c: path A page 1: CH12 is stopped"
+    );
+    assert_eq!(
+        at(RfPath::B, None).to_string(),
+        "RTL8852CE bring-up: rf h2c: path B: CH12 is stopped"
+    );
+}
+
+/// The radio steps after OFLD_CFG, each of which is torn down as M2a's
+/// `"h2c"` and `"c2h"` failures are.
+const PHY_STEPS: [&str; 6] = [
+    "bb rf reset",
+    "bb init",
+    "rf init",
+    "rf h2c",
+    "coex init",
+    "phy report",
+];
+
+/// The trace index of the OFLD_CFG kick: the first CH12 kick after the
+/// efuse dump (the download's kicks all come before it).
+fn ofld_cfg_kick(t: &[Op]) -> usize {
+    let efuse = t.iter().position(|o| *o == Op::W32(0x0030, 0)).unwrap();
+    efuse
+        + t[efuse..]
+            .iter()
+            .position(|o| matches!(o, Op::W16(0x1080, _)))
+            .unwrap()
+}
+
+#[test]
+fn phy_steps_run_in_linux_order() {
+    let (c, result) = ran(BOTH, NO_LTR);
+    result.unwrap();
+    let t = &c.io.trace;
+    let first = |op: Op| {
+        t.iter()
+            .position(|o| *o == op)
+            .unwrap_or_else(|| panic!("no {op:x?}"))
+    };
+    let first_reg = |reg: u32| first_of_dyn(t, &|o| matches!(o, Op::W32(r, _) if *r == reg));
+    let after = |from: usize, want: &dyn Fn(&Op) -> bool| {
+        from + 1
+            + t[from + 1..]
+                .iter()
+                .position(want)
+                .unwrap_or_else(|| panic!("nothing after trace entry {from}"))
+    };
+    let kick = |o: &Op| matches!(o, Op::W16(0x1080, _));
+    let ofld_cfg = ofld_cfg_kick(t);
+    // rtw89_chip_reset_bb_rf: the disable's clear of AFC_AFEDIG.
+    let reset = after(ofld_cfg, &|o| matches!(o, Op::W32(0x02F0, _)));
+    // rtw89_phy_init_bb_reg: the BB table, the TX power unit, the BB reset.
+    let bb = first(Op::W32(0x14AD4, 0x40));
+    let txpwr = first_reg(0xD248);
+    let bb_reset = first(Op::W32(0x11200, 0x7000_0000));
+    // rtw89_phy_init_rf_reg: path B's direct-window write and its page,
+    // then path A's.
+    let rf_b = first_reg(0x1F014);
+    let page_b = after(rf_b, &kick);
+    let rf_a = first_reg(0x1E014);
+    let page_a = after(rf_a, &kick);
+    // rtw89_btc_ntfy_init: R_AX_BTC_CFG first, the scoreboard last.
+    let coex = first_reg(0xDA00);
+    let scoreboard = first(Op::W32(0x00AC, 0x8100_4003));
+    // Then rtw89_core_stop's deinit and the power-off.
+    let deinit = after(scoreboard, &|o| matches!(o, Op::W32(0x0074, _)));
+    let power_off = after(deinit, &|o| *o == xtal(0x90, 0x10, 0x10));
+    let order = [
+        ofld_cfg, reset, bb, txpwr, bb_reset, rf_b, page_b, rf_a, page_a, coex, scoreboard, deinit,
+        power_off,
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // Two H2Cs after OFLD_CFG, the RF pages, and no other.
+    assert_eq!(
+        t[ofld_cfg + 1..deinit].iter().filter(|o| kick(o)).count(),
+        2
+    );
+    // Nothing reached SWSI before the RF init: its first busy check is path
+    // B's first entry, an SWSI write, after the BB init.
+    let swsi = first(Op::R32(0x1174C));
+    assert!(bb_reset < swsi && swsi < rf_b, "{swsi}");
+    // The GNT sample before coex, between the last page and coex's first write.
+    let before = after(page_a, &|o| *o == Op::R32(0xDA4C));
+    assert!(before < coex);
+    // The report: RF18 A then B, GNT, the GNT SW readback, then one RXQ
+    // index read, all after the scoreboard and before the deinit.
+    let rf18_a = after(scoreboard, &|o| *o == Op::RfR(0, 0x18));
+    let rf18_b = after(rf18_a, &|o| *o == Op::RfR(1, 0x18));
+    let gnt = after(rf18_b, &|o| *o == Op::R32(0xDA4C));
+    let gnt_sw = after(gnt, &|o| *o == Op::R32(0xDA48));
+    let drain = after(gnt_sw, &|o| *o == Op::R32(0x1218));
+    assert!(drain < deinit);
+    // The report reads write nothing but the RF read latches.
+    assert!(
+        !t[rf18_a..deinit]
+            .iter()
+            .any(|o| matches!(o, Op::W8(..) | Op::W16(..) | Op::RfW(..))
+                || matches!(o, Op::W32(r, _) if *r != 0x10378)),
+        "{:x?}",
+        &t[rf18_a..deinit]
+    );
+}
+
+/// The first trace entry `want` accepts.
+fn first_of_dyn(t: &[Op], want: &dyn Fn(&Op) -> bool) -> usize {
+    t.iter()
+        .position(want)
+        .unwrap_or_else(|| panic!("no such trace entry"))
+}
+
+/// CH12 slot `slot`'s first `len` bytes, as the device would read them.
+fn ch12_packet(m: &Arc<Mutex<Model>>, slot: usize, len: usize) -> Vec<u8> {
+    use crate::wifi::realtek::ax::pci::{
+        FWCMD_SLOT_BYTES,
+        tests::{FWCMD, device_read},
+    };
+    let state = m.lock().unwrap();
+    device_read(
+        &state,
+        u64::from(FWCMD) + (slot * FWCMD_SLOT_BYTES) as u64,
+        len,
+    )
+}
+
+#[test]
+fn rf_pages_follow_ofld_cfg_at_seq_1_and_2_without_an_ack_request() {
+    let (c, result) = ran(BOTH, NO_LTR);
+    result.unwrap();
+    let t = &c.io.trace;
+    let ofld_cfg = ofld_cfg_kick(t);
+    let kicks: Vec<u16> = t[ofld_cfg..]
+        .iter()
+        .filter_map(|o| match o {
+            Op::W16(0x1080, v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kicks.len(), 3, "{kicks:?}");
+    // Each kick writes the host index past the slot it fills.
+    let slot = |kick: u16| (usize::from(kick) + pci::TX_ENTRIES - 1) % pci::TX_ENTRIES;
+    // OFLD_CFG: seq 0, which forces REC_ACK (bit 14), and DONE_ACK.
+    let p = ch12_packet(&c.m, slot(kicks[0]), 24);
+    assert_eq!(p[19], 0);
+    assert_eq!(
+        u32::from_le_bytes(p[20..24].try_into().unwrap()) & 0xC000,
+        0xC000
+    );
+    // RF_REG_B then RF_REG_A (cat 2, class 9 then 8, page 0) at seq 1 and
+    // 2, with neither ack asked for, each one stored word of RF 0x10005 = 1.
+    for (kick, class, seq) in [(kicks[1], 9u8, 1u8), (kicks[2], 8, 2)] {
+        let p = ch12_packet(&c.m, slot(kick), 28);
+        assert_eq!(p[16], 2 | class << 2, "seq {seq}");
+        assert_eq!(p[17], 0, "seq {seq}");
+        assert_eq!(p[19], seq);
+        let hdr1 = u32::from_le_bytes(p[20..24].try_into().unwrap());
+        assert_eq!(hdr1 & 0xC000, 0, "seq {seq}");
+        assert_eq!(hdr1 & 0x3FFF, 8 + 4, "seq {seq}");
+        assert_eq!(
+            u32::from_le_bytes(p[24..28].try_into().unwrap()),
+            crate::wifi::realtek::ax::radio::rf_reg_word(0x10005, 1)
+        );
+    }
+}
+
+#[test]
+fn phycap_is_dumped_after_the_efuse_map_and_before_the_mac_init() {
+    let (c, result) = ran(BOTH, NO_LTR);
+    result.unwrap();
+    let t = &c.io.trace;
+    // The 1216-byte map ends at 0x4BF; the phycap window is 0x590..0x5F0.
+    let map_end = first_of_dyn(t, &|o| *o == Op::W32(0x0030, 0x04BF_0000));
+    let phycap = first_of_dyn(t, &|o| *o == Op::W32(0x0030, 0x0590_0000));
+    let phycap_end = first_of_dyn(t, &|o| *o == Op::W32(0x0030, 0x05EF_0000));
+    let bb_rf = first_of_dyn(t, &|o| matches!(o, Op::W8(0x0002, _)));
+    assert!(map_end < phycap && phycap < phycap_end && phycap_end < bb_rf);
+    assert!(!t.contains(&Op::W32(0x0030, 0x05F0_0000)));
+}
+
+#[test]
+fn phycap_failure_names_step_and_stops_the_dma() {
+    // EF_RDY never comes for the phycap window once the whole map was read
+    // (the secure-boot read of 0x5EC/0x5ED before it still completes).
+    let err = fails_on(efuse_with_mac(), BOTH, NO_LTR, |io| {
+        let phys = efuse_with_mac();
+        // Set once the map's last byte, 0x4BF, has been polled.
+        let mut map_read = false;
+        io.on_read(
+            0x0030,
+            Box::new(move |m: &mut RegisterModel| {
+                let ctl = m.get32(0x0030);
+                let addr = ((ctl >> 16) & 0x7FF) as usize;
+                map_read |= addr == 0x4BF;
+                if addr >= 0x590 && map_read {
+                    ctl & 0x07FF_0000
+                } else {
+                    (ctl & 0x07FF_0000) | 1 << 29 | u32::from(phys[addr])
+                }
+            }),
+        );
+    });
+    assert_eq!(err.step, "phycap");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x0030,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn phy_failure_names_step_and_powers_off() {
+    // rf init: no radio headline is for RFE type 0xFF (BB, BB gain and NCTL
+    // take any RFE). Path B, slot 0, is the first radio table walked.
+    let err = fails_on(efuse_with_rfe(0xFF), BOTH, NO_LTR, |_| ());
+    assert_eq!(
+        err,
+        BringUpError {
+            step: "rf init",
+            error: AxError::PhyPackage {
+                table: "RADIO_B",
+                rfe: 0xFF,
+                cv: 2
+            },
+            earlier: Earlier::Nothing,
+            rf: Some(RfAt {
+                path: RfPath::B,
+                page: None
+            }),
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "RTL8852CE bring-up: rf init: path B: no RADIO_B branch for RFE type 255 at cut 2"
+    );
+
+    // rf init: SWSI stays write-busy. Nothing reads SWSI before the RF init
+    // (see `phy_steps_run_in_linux_order`), so this holds only after
+    // OFLD_CFG.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.swsi_status = 1 << 24);
+    assert_eq!(err.step, "rf init");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x1174C,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        err.rf,
+        Some(RfAt {
+            path: RfPath::B,
+            page: None
+        })
+    );
+
+    // rf h2c: CH12 stops consuming once path B's table has been written, so
+    // path B's page 0 is never taken.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0x1080,
+            Box::new(|m: &mut RegisterModel| {
+                let host = m.get32(0x1080) & 0xFFF;
+                if m.get32(0x1F014) == 0 {
+                    host | host << 16
+                } else {
+                    let hw = (host + pci::TX_ENTRIES as u32 - 1) % pci::TX_ENTRIES as u32;
+                    host | hw << 16
+                }
+            }),
+        );
+    });
+    assert_eq!(
+        err,
+        BringUpError {
+            step: "rf h2c",
+            error: AxError::Timeout {
+                register: 0x1080,
+                mask: 0x0FFF_0000
+            },
+            earlier: Earlier::Nothing,
+            rf: Some(RfAt {
+                path: RfPath::B,
+                page: Some(0)
+            }),
+        }
+    );
+    assert!(
+        err.to_string()
+            .starts_with("RTL8852CE bring-up: rf h2c: path B page 0: "),
+        "{err}"
+    );
+
+    // bb rf reset: the XTAL SI command that starts the reset's enable (the
+    // second write of XTAL0 = 0x07) never completes; the power-off's own
+    // commands do.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0x0270,
+            Box::new(|m: &mut RegisterModel| {
+                let v = m.get32(0x0270);
+                let enables = m
+                    .trace
+                    .iter()
+                    .filter(|o| **o == Op::W32(0x0270, 0x80FF_0700))
+                    .count();
+                if enables == 2 && v == 0x80FF_0700 {
+                    v
+                } else {
+                    v & 0x7FFF_FFFF
+                }
+            }),
+        );
+    });
+    assert_eq!(err.step, "bb rf reset");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x0270,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(err.rf, None);
+
+    // coex init: the CMAC reads disabled once R_AX_BTC_CFG is set, so the
+    // grant's PLT check fails.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0xC000,
+            Box::new(|m: &mut RegisterModel| {
+                if m.get32(0xDA00) != 0 {
+                    0
+                } else {
+                    m.get32(0xC000)
+                }
+            }),
+        );
+    });
+    assert_eq!(
+        err,
+        BringUpError::new("coex init", AxError::Mac("CMAC function is not enabled"))
+    );
+
+    // phy report: the GNT SW readback fails.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA48));
+    assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
+}
+
+#[test]
+fn tables_missing_one_are_refused_before_power_on() {
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    let m = c.m.clone();
+    let file = tables_file();
+    let mut tables = phy_tables(&file, 0).unwrap();
+    tables.nctl = None;
+    let err = failed(run_with(&mut c.io, &m, NO_LTR, &tables));
+    assert_eq!(
+        err,
+        BringUpError::new("phy tables", AxError::Phy("firmware carries no NCTL table"))
+    );
+    assert!(c.io.trace.is_empty(), "{:x?}", c.io.trace);
 }
 
 /// Power hooks only: RDY_SYSPWR reads set, APFN_ONMAC and APFM_OFFMAC

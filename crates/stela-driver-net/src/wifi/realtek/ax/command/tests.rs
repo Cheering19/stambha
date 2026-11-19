@@ -327,3 +327,65 @@ fn log_text_keeps_48_printable_ascii_bytes() {
     assert!(text.as_str().starts_with("abcdefghijklmnopqrstuvwxyz"));
     assert_eq!(LogText::new(b"").as_str(), "");
 }
+
+/// RXQ entries 0.. hold `buffers` and its index reports them from the first
+/// read; then [`count_c2h`] runs once.
+fn counted(buffers: Vec<Vec<u8>>) -> (Result<u8, AxError>, RegisterModel) {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for (entry, buffer) in buffers.iter().enumerate() {
+            device_write(&state, rxq_buffer(entry), buffer);
+        }
+    }
+    io.set32(0x1218, (buffers.len() as u32) << 16);
+    let began = io.now;
+    // SAFETY: as in `ran_with`: the modeled requester `running` programmed
+    // with these rings, and no real device behind the model domain.
+    let got = unsafe { count_c2h(&mut io, &mut rings) };
+    // It never waits.
+    assert_eq!(io.now, began);
+    (got, io)
+}
+
+#[test]
+fn count_c2h_counts_c2h_frames_in_one_poll_without_waiting() {
+    // Two C2Hs (an ack and a log) and a frame of another type.
+    let (got, io) = counted(vec![
+        rec_ack(),
+        c2h(1, 0, 2, b"late"),
+        rx_buffer(0, &[0; 8]),
+    ]);
+    assert_eq!(got, Ok(2));
+    // One index read, then the host index written back once for all three.
+    assert_eq!(
+        io.trace.iter().filter(|o| **o == Op::R32(0x1218)).count(),
+        1
+    );
+    assert_eq!(
+        io.trace
+            .iter()
+            .filter(|o| matches!(o, Op::W16(0x1218, _)))
+            .count(),
+        1
+    );
+    assert!(io.trace.contains(&Op::W16(0x1218, 3)));
+}
+
+#[test]
+fn count_c2h_of_an_empty_rxq_is_zero_and_writes_nothing() {
+    let (got, io) = counted(vec![]);
+    assert_eq!(got, Ok(0));
+    assert!(io.writes().is_empty(), "{:x?}", io.writes());
+}
+
+#[test]
+fn count_c2h_fails_on_a_malformed_buffer() {
+    let mut short = rec_ack();
+    short[..4].copy_from_slice(&(0xC000u32 | 10).to_le_bytes());
+    let (got, _) = counted(vec![rec_ack(), short]);
+    assert_eq!(
+        got,
+        Err(AxError::Rx("RX buffer shorter than its descriptor"))
+    );
+}

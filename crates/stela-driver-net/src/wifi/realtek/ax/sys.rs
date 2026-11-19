@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
-//! RTL8852CE baseband/RF enable and MAC function enables, from
-//! `rtw8852c_mac_enable_bb_rf` (`rtw8852c.c:2999`, reached through
-//! `rtw89_chip_enable_bb_rf`) and `sys_init_ax` (`mac.c:1701`) with
-//! `dmac_func_en_ax` (`:1656`), `cmac_func_en_ax` (`:1610`, band 0 only) and
-//! `chip_func_en_ax` (`:1690`, which does nothing for an RTL8852C). Register
-//! addresses and bits are from pinned rtw89 `reg.h` and `mac.h`. This module
-//! grants no band 1, no DLE, HFC or CMAC table setup, no BB or RF register
-//! tables and no calibration; the bring-up runs it after the efuse step.
-use super::io::{AxError, AxIo, clear32, field32, set8, set32};
+//! RTL8852CE baseband/RF enable, disable and reset, and MAC function
+//! enables, from `rtw8852c_mac_enable_bb_rf` (`rtw8852c.c:2999`, reached
+//! through `rtw89_chip_enable_bb_rf`), `rtw8852c_mac_disable_bb_rf`
+//! (`rtw8852c.c:3036`), `rtw89_chip_reset_bb_rf` (`mac.h:1377`) and
+//! `sys_init_ax` (`mac.c:1701`) with `dmac_func_en_ax` (`:1656`),
+//! `cmac_func_en_ax` (`:1610`, band 0 only) and `chip_func_en_ax`
+//! (`:1690`, which does nothing for an RTL8852C). Register addresses and
+//! bits are from pinned rtw89 `reg.h` and `mac.h`. This module grants no
+//! band 1, no DLE, HFC or CMAC table setup, no BB or RF register tables and
+//! no calibration; the bring-up runs its enable and system init after the
+//! efuse step, and the reset after OFLD_CFG (`phy::init_radio`).
+use super::io::{AxError, AxIo, clear8, clear32, field32, set8, set32};
 use super::power::xtal_si_write;
 
 // reg.h (pinned rtw89).
@@ -101,6 +104,22 @@ pub fn enable_bb_rf<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     xtal_si_write(io, XTAL_SI_WL_RFC_S0, 0xc7, FULL_BIT_MASK)?;
     xtal_si_write(io, XTAL_SI_WL_RFC_S1, 0xc7, FULL_BIT_MASK)?;
     xtal_si_write(io, XTAL3, 0xd, FULL_BIT_MASK)
+}
+
+/// `rtw8852c_mac_disable_bb_rf` (`rtw8852c.c:3036-3043`): gate the AFE
+/// digital clock, then hold the baseband in reset. Both are
+/// read-modify-writes that keep the other bits.
+pub fn disable_bb_rf<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    clear32(io, R_AX_WLRF_CTRL, B_AX_AFC_AFEDIG)?;
+    clear8(io, R_AX_SYS_FUNC_EN, B_AX_FEN_BBRSTB | B_AX_FEN_BB_GLB_RSTN)
+}
+
+/// `rtw89_chip_reset_bb_rf` (`mac.h:1377-1391`) for an AX chip:
+/// [`disable_bb_rf`], then [`enable_bb_rf`]. An XTAL SI failure in the
+/// enable fails it, with the baseband left as far as the enable got.
+pub fn reset_bb_rf<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    disable_bb_rf(io)?;
+    enable_bb_rf(io)
 }
 
 /// `sys_init_ax` (`mac.c:1701`) for an RTL8852C: `dmac_func_en_ax` writes

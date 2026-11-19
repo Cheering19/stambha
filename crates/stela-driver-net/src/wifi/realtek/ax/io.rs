@@ -85,6 +85,21 @@ pub enum AxError {
         seq: u8,
         ret: u8,
     },
+    /// A baseband or radio step failed; the message says which.
+    Phy(&'static str),
+    /// No headline of `table` selects a branch for this RFE type and cut
+    /// (`"invalid PHY package"`, phy.c:1836-1840).
+    PhyPackage {
+        table: &'static str,
+        rfe: u8,
+        cv: u8,
+    },
+    /// Entry `index` of `table` is an ELSE that no branch reached
+    /// (`"failed to load CR"`, phy.c:1851-1857).
+    PhyTable {
+        table: &'static str,
+        index: u16,
+    },
 }
 
 impl fmt::Display for AxError {
@@ -109,7 +124,14 @@ impl fmt::Display for AxError {
             | Self::Dma(what)
             | Self::Efuse(what)
             | Self::Mac(what)
-            | Self::Rx(what) => f.write_str(what),
+            | Self::Rx(what)
+            | Self::Phy(what) => f.write_str(what),
+            Self::PhyPackage { table, rfe, cv } => {
+                write!(f, "no {table} branch for RFE type {rfe} at cut {cv}")
+            }
+            Self::PhyTable { table, index } => {
+                write!(f, "{table} entry {index} is an ELSE no branch reached")
+            }
             Self::NoAck {
                 class,
                 func,

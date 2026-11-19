@@ -3,8 +3,10 @@
 //! H2C packet builder: `rtw89_h2c_pkt_set_hdr` (`fw.c:1632`) with its AX
 //! REC_ACK-every-fourth-sequence rule (`fw.c:1641`), the FWCMD TX descriptor
 //! of `rtw89_core_fill_txdesc_fwcmd_v1` (`core.c:1909`, reused from the
-//! firmware download), and `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`). It
-//! only builds bytes: it submits nothing and grants no register access.
+//! firmware download), `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`) and
+//! `rtw89_fw_h2c_rf_reg` (`fw.c:8090-8119`). It only builds bytes: it
+//! submits nothing and grants no register access.
+use super::elements::RfPath;
 use super::fwdl::{RX_TYPE_H2C, descriptor};
 use alloc::vec::Vec;
 
@@ -16,6 +18,11 @@ const H2C_HDR_TOTAL_LEN: u32 = 0x3FFF;
 pub(super) const H2C_CAT_MAC: u8 = 1;
 pub(super) const H2C_CL_MAC_FW_OFLD: u8 = 9;
 pub(super) const H2C_FUNC_OFLD_CFG: u8 = 0x14;
+/// `H2C_CAT_OUTSRC` (`fw.h:4877`).
+pub const H2C_CAT_OUTSRC: u8 = 2;
+/// `H2C_CL_OUTSRC_RF_REG_A` and `_B` (`fw.h:4890-4891`).
+pub const H2C_CL_OUTSRC_RF_REG_A: u8 = 8;
+pub const H2C_CL_OUTSRC_RF_REG_B: u8 = 9;
 
 /// `fw.c:5321`: the OFLD_CFG payload.
 pub const OFLD_CFG: [u8; 8] = [0x09, 0, 0, 0, 0x5E, 0, 0, 0];
@@ -72,6 +79,21 @@ impl H2c {
             true,
             &OFLD_CFG,
         )
+    }
+
+    /// `rtw89_fw_h2c_rf_reg`: one page of stored RF register words for
+    /// `path`, as OUTSRC / RF_REG_A (path A) or RF_REG_B (any other path,
+    /// as Linux's ternary has it) with func `page`, rack 0 and dack 0. The
+    /// payload is `words` as little-endian u32s; only the every-fourth
+    /// sequence rule can ask for a REC_ACK.
+    pub fn rf_reg(&mut self, path: RfPath, page: u8, words: &[u32]) -> (u8, Vec<u8>) {
+        let class = if path == RfPath::A {
+            H2C_CL_OUTSRC_RF_REG_A
+        } else {
+            H2C_CL_OUTSRC_RF_REG_B
+        };
+        let payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.packet(H2C_CAT_OUTSRC, class, page, false, &payload)
     }
 }
 

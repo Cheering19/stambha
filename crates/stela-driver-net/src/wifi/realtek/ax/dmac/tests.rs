@@ -329,10 +329,13 @@ fn sta_sch_mpdu_sec_match_linux_sequence() {
     );
 }
 
+/// `B_AX_TX_PARTIAL_MODE`, `R_AX_SEC_ENG_CTRL` bit 11 (`reg.h`).
+const B_AX_TX_PARTIAL_MODE: u32 = 1 << 11;
+
 #[test]
 fn sec_eng_keeps_tx_partial_mode() {
     let mut m = sta_model();
-    m.set32(0x9D00, 0x800);
+    m.set32(0x9D00, B_AX_TX_PARTIAL_MODE);
     sec_eng_init(&mut m).unwrap();
     assert_eq!(m.writes()[0], Op::W32(0x9D00, 0xF1F));
 }

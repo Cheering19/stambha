@@ -23,7 +23,8 @@ fn settled() -> RegisterModel {
 #[test]
 fn cmac_init_matches_linux_sequence() {
     let mut m = settled();
-    init(&mut m).unwrap();
+    // The BA CAM reset self-clears, so it did not time out.
+    assert_eq!(init(&mut m), Ok(false));
     let want: Vec<Op> = vec![
         // scheduler_init_ax, mac.c:2591
         Op::W32(0xC33C, 0x41),
@@ -108,7 +109,8 @@ fn addr_cam_reset_timeout() {
 fn bacam_reset_timeout_only_warns() {
     let mut m = settled();
     m.on_read(0xCE3C, Box::new(|_: &mut RegisterModel| 2));
-    assert_eq!(init(&mut m), Ok(()));
+    // The timeout is reported, not an error, and the init carries on.
+    assert_eq!(init(&mut m), Ok(true));
     assert!(m.trace.iter().any(|op| matches!(op, Op::W8(0xCE3C, _))));
 }
 

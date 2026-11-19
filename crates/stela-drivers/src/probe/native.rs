@@ -29,6 +29,8 @@ use crate::{
                 self as realtek_wifi,
                 ax::{
                     AxError, AxIo, BringUpError, Host, NativeAxIo, Rings, Running, bring_up,
+                    elements::{PhyTables, phy_tables},
+                    phy::check_tables,
                     quiesce,
                 },
             },
@@ -1003,11 +1005,13 @@ impl Rtw89Device for Rtw89Native {
 /// Bring the RTL8852CE `observed` describes up to running firmware through
 /// `device`, in this order:
 /// 1. stage `firmware`: a missing or unusable image fails here, before any
-///    register access;
+///    register access, and so does a file whose PHY table elements are
+///    unreadable or lack a table the bring-up applies (`"phy tables"`,
+///    [`check_tables`]);
 /// 2. [`quiesce`] the chip through BAR2, powering off a MAC left on;
 /// 3. acknowledge its quiescence and bind its own domain;
 /// 4. set Bus Master;
-/// 5. [`bring_up`] on that domain.
+/// 5. [`bring_up`] on that domain, with the file's PHY tables.
 ///
 /// Returns the report, the rings DMA ran on, and whether the MAC was on;
 /// a failure is returned with whether the MAC was on as well, since a MAC
@@ -1042,9 +1046,19 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
             AxError::FirmwareFile("rtw89/rtw8852c_fw-2.bin is not an rtw89 image"),
         ));
     };
+    // The PHY tables the radio steps apply are the file's own elements
+    // (`rtw89_build_phy_tbl_from_elm`, fw.c:1099); a file without them is
+    // refused here, before any register access.
+    let tables = phy_tables(staged.image.bytes(), 0).map_err(|_| {
+        fail(
+            "phy tables",
+            AxError::FirmwareFile("rtw89/rtw8852c_fw-2.bin elements are unreadable"),
+        )
+    })?;
+    check_tables(&tables).map_err(|error| fail("phy tables", error))?;
     let was_on = quiesce(device.io()).map_err(|error| fail("quiesce", error))?;
     // SAFETY: this function's contract, with the chip just quiesced.
-    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, pages) } {
+    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, &tables, pages) } {
         Ok((running, rings)) => Ok((running, rings, was_on)),
         Err(error) => Err((error, was_on)),
     }
@@ -1063,6 +1077,7 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     device: &mut D,
     cut: u8,
     image: &realtek_wifi::firmware::AxImage<'_>,
+    tables: &PhyTables<'_>,
     pages: &dyn PageSource,
 ) -> Result<(Running, Rings), Error> {
     // SAFETY: `device.finalize()` acknowledges the quiescence
@@ -1110,9 +1125,11 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     //   Bus Master, memory decode and INTx Disable).
     // - One worker: the probe drives this function alone, with no
     //   interrupt handler, reset or other engine reaching it.
-    // `host` is no part of that contract: it only decides whether the chip's
-    // own LTR registers are programmed.
-    unsafe { bring_up(device.io(), pages, domain, cut, image, host) }.map_err(Error::Rtw89Wifi)
+    // `host` and `tables` are no part of that contract: one decides whether
+    // the chip's own LTR registers are programmed, the other what the BB
+    // and RF registers are set to.
+    unsafe { bring_up(device.io(), pages, domain, cut, image, host, tables) }
+        .map_err(Error::Rtw89Wifi)
 }
 
 /// The RTL8852C profile of `observed`, and its firmware staged from
@@ -2350,9 +2367,35 @@ mod tests {
         .unwrap()
     }
 
-    /// The smallest image rtw89 accepts: a v0 header with no section.
+    /// The smallest image rtw89 accepts, a v0 header with no section, as
+    /// the one cut-0 normal entry of an MFW container, followed by every
+    /// PHY table the bring-up requires: BB, BB gain, radio B in slot 0, radio
+    /// A in slot 1 and NCTL.
     fn empty_image() -> crate::firmware::Catalog {
-        catalog(alloc::vec![0; 32])
+        catalog(container(&[(2, 0), (3, 0), (5, 0), (4, 1), (8, 0)]))
+    }
+
+    /// An MFW container (fw.c:668-691) whose one entry, cut 0 and type
+    /// NORMAL, is a 32-byte v0 header, then one element per `(id, idx)`,
+    /// each holding the single pair RF 0x05 = 0 (fw.c:1560-1612).
+    fn container(elements: &[(u32, u8)]) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 32];
+        b[0] = 0xff;
+        b[1] = 1;
+        b[17] = 1;
+        b[20..24].copy_from_slice(&32u32.to_le_bytes());
+        b[24..28].copy_from_slice(&32u32.to_le_bytes());
+        b.extend_from_slice(&[0; 32]);
+        for &(id, idx) in elements {
+            b.extend_from_slice(&id.to_le_bytes());
+            b.extend_from_slice(&8u32.to_le_bytes());
+            b.extend_from_slice(&[0; 4 + 2 + 10]);
+            b.push(idx);
+            b.extend_from_slice(&[0; 7]);
+            b.extend_from_slice(&[5, 0, 0, 0, 0, 0, 0, 0]);
+            b.resize(b.len().next_multiple_of(16), 0);
+        }
+        b
     }
 
     /// What [`rtw89_attach`] returns.
@@ -2438,6 +2481,55 @@ mod tests {
             "rtw89: RTL8852CE bring-up: firmware: rtw89/rtw8852c_fw-2.bin has a firmware header \
              version other than 0"
         );
+    }
+
+    /// A file whose elements cannot be walked, or that lacks a PHY table the
+    /// bring-up applies, fails the attach at `"phy tables"` before the
+    /// quiescence, with no register access.
+    #[test]
+    fn rtw89_attach_refuses_firmware_without_phy_tables() {
+        for (bytes, line) in [
+            (
+                // A plain image with no MFW container: no elements at all.
+                alloc::vec![0; 32],
+                "rtw89: RTL8852CE bring-up: phy tables: rtw89/rtw8852c_fw-2.bin elements are \
+                 unreadable",
+            ),
+            (
+                container(&[]),
+                "rtw89: RTL8852CE bring-up: phy tables: firmware carries no BB table",
+            ),
+            (
+                container(&[(2, 0), (3, 0), (5, 0), (4, 1)]),
+                "rtw89: RTL8852CE bring-up: phy tables: firmware carries no NCTL table",
+            ),
+            (
+                container(&[(2, 0), (3, 0), (4, 0), (5, 1), (8, 0)]),
+                "rtw89: RTL8852CE bring-up: phy tables: firmware radio slots are not B then A",
+            ),
+        ] {
+            let catalog = catalog(bytes);
+            let (events, result) = attach(
+                0x100,
+                false,
+                &crate::firmware::HandoffProvider::new(Some(&catalog)),
+            );
+            assert!(events.is_empty(), "{line}: {events:x?}");
+            let Err((error, false)) = result else {
+                panic!("{line}: an RTL8852CE came up without its PHY tables")
+            };
+            assert!(
+                matches!(
+                    error,
+                    Error::Rtw89Wifi(BringUpError {
+                        step: "phy tables",
+                        ..
+                    })
+                ),
+                "{line}"
+            );
+            assert_eq!(alloc::format!("{error}"), line);
+        }
     }
 
     /// A chip whose MAC reads off is only looked at before its quiescence

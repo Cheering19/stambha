@@ -2264,6 +2264,56 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_carries_every_phy_table",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/elements/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_tables_select_as_linux_does",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy_table/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_bb_init_writes_the_selected_table",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/bb/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_rf_init_sends_linux_pages",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/radio/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_passes_check_tables",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "unchanged_linux_selection_and_complete_payloads_agree",
     "source": "crates/stela-driver-net/src/wifi/realtek/firmware.rs",
     "kind": "oracle",

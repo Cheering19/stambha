@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Copyright(c) 2019-2020  Realtek Corporation
+extern crate std;
+use super::*;
+use crate::wifi::realtek::ax::elements::{
+    ID_BB_GAIN, ID_BB_REG, ID_RADIO_A, ID_RADIO_B, ID_RADIO_C, ID_RF_NCTL, phy_tables,
+    tests::{container, element, pairs},
+};
+use alloc::{string::ToString, vec::Vec};
+
+/// The elements of a file: (id, slot) in file order.
+fn file(elements: &[(u32, u8)]) -> Vec<u8> {
+    let mut b = container(32, 5);
+    for &(id, idx) in elements {
+        element(&mut b, id, [0; 4], 0, idx, &pairs(&[(0x05, 0)]));
+    }
+    b
+}
+
+/// Every table, radio B in slot 0 and A in slot 1, as the pinned file has
+/// them.
+const ALL: [(u32, u8); 5] = [
+    (ID_BB_REG, 0),
+    (ID_BB_GAIN, 0),
+    (ID_RADIO_A, 1),
+    (ID_RADIO_B, 0),
+    (ID_RF_NCTL, 0),
+];
+
+fn checked(elements: &[(u32, u8)]) -> Result<(), AxError> {
+    let b = file(elements);
+    check_tables(&phy_tables(&b, 0).unwrap())
+}
+
+#[test]
+fn check_tables_accepts_every_table_with_radio_b_then_a() {
+    assert_eq!(checked(&ALL), Ok(()));
+}
+
+#[test]
+fn check_tables_refuses_a_missing_or_swapped_table() {
+    for (dropped, message) in [
+        (0, "firmware carries no BB table"),
+        (1, "firmware carries no BB gain table"),
+        (2, "firmware carries no radio table for slot 1"),
+        (3, "firmware carries no radio table for slot 0"),
+        (4, "firmware carries no NCTL table"),
+    ] {
+        let mut elements = ALL.to_vec();
+        elements.remove(dropped);
+        assert_eq!(checked(&elements), Err(AxError::Phy(message)), "{message}");
+    }
+    // Radio A in slot 0 and B in slot 1.
+    assert_eq!(
+        checked(&[
+            (ID_BB_REG, 0),
+            (ID_BB_GAIN, 0),
+            (ID_RADIO_A, 0),
+            (ID_RADIO_B, 1),
+            (ID_RF_NCTL, 0),
+        ]),
+        Err(AxError::Phy("firmware radio slots are not B then A"))
+    );
+    // A third radio path, which the RTL8852C does not have.
+    let mut elements = ALL.to_vec();
+    elements.push((ID_RADIO_C, 2));
+    assert_eq!(
+        checked(&elements),
+        Err(AxError::Phy(
+            "firmware carries a radio table for a slot past 1"
+        ))
+    );
+}
+
+#[test]
+fn check_tables_names_the_first_missing_table_in_spec_order() {
+    // Nothing at all: the BB table is named first.
+    assert_eq!(
+        check_tables(&PhyTables::default()),
+        Err(AxError::Phy("firmware carries no BB table"))
+    );
+    // Only the radio tables missing: slot 0 before slot 1.
+    assert_eq!(
+        checked(&[(ID_BB_REG, 0), (ID_BB_GAIN, 0), (ID_RF_NCTL, 0)]),
+        Err(AxError::Phy("firmware carries no radio table for slot 0"))
+    );
+}
+
+/// The brief's report, with the extra grant reads at their expected values.
+fn report() -> PhyReport {
+    PhyReport {
+        rfe: 1,
+        xtal: 0x2F,
+        bb: 1426,
+        bb_gain: 336,
+        rf: [2013, 2046],
+        rf_words: [392, 392],
+        rf18: [0x01001, 0x01001],
+        gnt: 0x6,
+        gnt_sw: 0x0005_7DDF,
+        gnt_before: 0x18,
+        c2h_after: 0,
+    }
+}
+
+#[test]
+fn phy_report_display() {
+    assert_eq!(
+        report().to_string(),
+        ", PHY rfe 1 xtal 0x2f: BB 1426, BB gain 336, RF B 2013 A 2046, RF pages 392+392, \
+         RF18 A 0x01001 B 0x01001, GNT 0x00000006, GNT RFC 0x06, GNT SW 0x00057ddf, \
+         GNT before coex 0x00000018"
+    );
+    let late = PhyReport {
+        c2h_after: 2,
+        ..report()
+    };
+    assert_eq!(
+        late.to_string(),
+        alloc::format!("{}, C2H after RF pages 2", report())
+    );
+}
+
+#[test]
+fn phy_report_rfc_bits_are_gnt_bits_4_to_1() {
+    // BT granted on both paths and a status bit outside [4:1] set.
+    let bt = PhyReport {
+        gnt: 0x0000_0119,
+        ..report()
+    };
+    assert!(
+        bt.to_string().contains("GNT 0x00000119, GNT RFC 0x18,"),
+        "{bt}"
+    );
+}
+
+#[test]
+#[ignore = "oracle: STELA_REALTEK_WIFI_IMAGES"]
+fn real_8852c_fw_2_passes_check_tables() {
+    let root = std::path::PathBuf::from(std::env::var("STELA_REALTEK_WIFI_IMAGES").unwrap());
+    let f = std::fs::read(root.join("rtw89/rtw8852c_fw-2.bin")).unwrap();
+    let t = phy_tables(&f, 0).unwrap();
+    // The probe refuses nothing in the pinned file: radio B in slot 0, A in
+    // slot 1, as spec S3 lists them.
+    assert_eq!(check_tables(&t), Ok(()));
+    assert_eq!(t.radio[0].map(|r| r.path), Some(RfPath::B));
+    assert_eq!(t.radio[1].map(|r| r.path), Some(RfPath::A));
+}

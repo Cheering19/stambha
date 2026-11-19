@@ -7,29 +7,36 @@
 //! scoreboard), then `rtw89_chip_efuse_info_setup` (`core.c:7274`), i.e.
 //! `rtw89_mac_partial_init` (`mac.c:4307`: MAC pre-init, PCI pre-init,
 //! `rtw89_fw_download` with its 5-try loop, `fw.c:2043`) and
-//! `rtw89_parse_efuse_map_ax` (`efuse.c:281`) for the MAC address. From
-//! there it continues, on the same power-on and download (spec S1.1), with
-//! the rest of `rtw89_mac_init` (`mac.c:4360`): `rtw89_chip_enable_bb_rf`
-//! (`rtw8852c_mac_enable_bb_rf`, `rtw8852c.c:2999`), `sys_init_ax`
-//! (`mac.c:1701`), `trx_init_ax` (`mac.c:4029`) and
-//! `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`); then it sends one H2C,
-//! `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`), and waits for the firmware's
-//! acknowledgement on RXQ. Once the post-init has run, the HCI is torn down
-//! as `rtw89_core_stop` does (`core.c:6765-6767`): `rtw89_pci_ops_deinit`
-//! (`pci.c:3053`), then the power-off. Last comes `rtw89_mac_pwr_off`
-//! (`mac.c:1603`), which Linux runs on success and on every failure after
-//! power-on.
+//! `rtw89_parse_efuse_map_ax` (`efuse.c:281`) for the MAC address, RFE
+//! type and crystal cap, then `rtw89_parse_phycap_map_ax` (`efuse.c:350`)
+//! for the trims. From there it continues, on the same power-on and
+//! download (spec S1.1), with the rest of `rtw89_mac_init` (`mac.c:4360`):
+//! `rtw89_chip_enable_bb_rf` (`rtw8852c_mac_enable_bb_rf`,
+//! `rtw8852c.c:2999`), `sys_init_ax` (`mac.c:1701`), `trx_init_ax`
+//! (`mac.c:4029`) and `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`); then
+//! it sends one H2C, `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`), and waits for
+//! the firmware's acknowledgement on RXQ. Then `rtw89_core_start` goes on
+//! (`core.c:6687-6695`) with the radio steps of [`phy::init_radio`]: the
+//! BB/RF reset, the firmware's BB, BB gain and radio tables with the RF_REG
+//! H2Cs, and the coex init's Wi-Fi grant. Once the post-init has run, the
+//! HCI is torn down as `rtw89_core_stop` does (`core.c:6765-6767`):
+//! `rtw89_pci_ops_deinit` (`pci.c:3053`), then the power-off. Last comes
+//! `rtw89_mac_pwr_off` (`mac.c:1603`), which Linux runs on success and on
+//! every failure after power-on.
 //!
 //! This module does not grant a usable radio: the chip is powered off again
-//! before `bring_up` returns, and nothing past that one H2C is ported: no
-//! BB/RF tables, no calibration, no station, scan or interrupts. It does not
-//! support secure-boot chips, and it does not claim the MAC address read
-//! from the efuse is valid.
+//! before `bring_up` returns, and nothing past the coex init is ported: no
+//! `rtw89_phy_dm_init`, no calibration, no channel, station, scan or
+//! interrupts. It does not support secure-boot chips, and it does not claim
+//! the MAC address read from the efuse is valid.
 use super::command::{self, CommandError, H2cAck};
-use super::efuse::{self, SecureBoot};
+use super::efuse::{self, PhyEfuse, SecureBoot};
+use super::elements::PhyTables;
 use super::h2c::H2c;
 use super::io::{AxError, AxIo};
 use super::pci::Rings;
+use super::phy::{self, PhyReport};
+use super::radio::RfAt;
 use super::{dmac, fwdl, pci, power, sys, trx};
 use crate::bus::dma::{mapping::DmaDomain, memory::PageSource};
 use crate::wifi::realtek::firmware::AxImage;
@@ -78,9 +85,15 @@ pub struct Running {
     pub mac_init: bool,
     /// The post-init programmed the chip's LTR ([`Host::ltr`]).
     pub ltr: bool,
+    /// The CMAC's BA CAM reset (`rst_bacam`, `mac.c:2904`) never completed;
+    /// Linux only warns of it ("failed to reset BA CAM") and carries on.
+    pub bacam_reset_timed_out: bool,
     /// What the firmware answered to OFLD_CFG: from [`bring_up`], a REC_ACK,
     /// a DONE_ACK with return 0, or both.
     pub h2c: H2cAck,
+    /// What the radio steps after OFLD_CFG applied and read back: always
+    /// `Some` from [`bring_up`].
+    pub phy: Option<PhyReport>,
 }
 
 impl fmt::Display for Running {
@@ -129,6 +142,12 @@ impl fmt::Display for Running {
         if let Some(log) = &self.h2c.log {
             write!(f, ", firmware log \"{}\"", log.as_str())?;
         }
+        if self.bacam_reset_timed_out {
+            f.write_str(", BA CAM reset timed out")?;
+        }
+        if let Some(phy) = &self.phy {
+            write!(f, "{phy}")?;
+        }
         Ok(())
     }
 }
@@ -136,19 +155,24 @@ impl fmt::Display for Running {
 /// The step that failed and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BringUpError {
-    /// One of `"power on"`, `"secure boot"`, `"dma rings"`,
+    /// One of `"phy tables"`, `"power on"`, `"secure boot"`, `"dma rings"`,
     /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`,
-    /// `"bb rf enable"`, `"sys init"`, `"dmac init"`, `"cmac init"`, `"imr"`,
-    /// `"pci post-init"`, `"h2c"`, `"c2h"`; the probe that opens the
-    /// register window, stages the firmware and runs [`quiesce`] before
-    /// [`bring_up`] adds `"register window"`, `"identity"`, `"firmware"` and
-    /// `"quiesce"`.
+    /// `"phycap"`, `"bb rf enable"`, `"sys init"`, `"dmac init"`,
+    /// `"cmac init"`, `"imr"`, `"pci post-init"`, `"h2c"`, `"c2h"`,
+    /// `"bb rf reset"`, `"bb init"`, `"rf init"`, `"rf h2c"`, `"coex init"`,
+    /// `"phy report"`; the probe that opens the register window, stages the
+    /// firmware, checks its PHY tables (`"phy tables"`) and runs [`quiesce`]
+    /// before [`bring_up`] adds `"register window"`, `"identity"`,
+    /// `"firmware"` and `"quiesce"`.
     pub step: &'static str,
     /// The step's last failure.
     pub error: AxError,
     /// What the step's retries ran into before `error`, kept because the
     /// first failure is the likelier root cause.
     pub earlier: Earlier,
+    /// For `"rf init"` and `"rf h2c"`, the RF path, and for a page its
+    /// index, the step failed on; printed between the step and the error.
+    pub rf: Option<RfAt>,
 }
 
 /// What a retried bring-up step ran into before the error it reports.
@@ -192,13 +216,18 @@ impl BringUpError {
             step,
             error,
             earlier: Earlier::Nothing,
+            rf: None,
         }
     }
 }
 
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RTL8852CE bring-up: {}: {}", self.step, self.error)?;
+        write!(f, "RTL8852CE bring-up: {}: ", self.step)?;
+        if let Some(rf) = self.rf {
+            write!(f, "{rf}: ")?;
+        }
+        write!(f, "{}", self.error)?;
         match self.earlier {
             Earlier::Nothing => Ok(()),
             Earlier::First { tries, error } => write!(f, " (first of {tries} attempts: {error})"),
@@ -227,7 +256,12 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 
 /// Bring an RTL8852CE of chip cut `cut` up to running firmware `image`, read
 /// its MAC address, initialize its MAC for `host`, have its firmware
-/// acknowledge one H2C, then power it off again. Steps, in Linux's order:
+/// acknowledge one H2C, configure its BB and RF from `tables` and grant its
+/// RF to Wi-Fi, then power it off again.
+///
+/// First `tables` are checked ([`phy::check_tables`]); a file without the
+/// tables the radio steps apply is refused as `"phy tables"` before any I/O.
+/// Then, in Linux's order:
 ///
 /// 1. `"power on"`: `power::power_on`, with Linux's own power-off and
 ///    single retry (`rtw89_mac_pwr_on`). When the retry fails too, the error
@@ -246,6 +280,10 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///    reported as `"pci pre-init"`, with the download error that stopped
 ///    CH12 and, when earlier and different, the first one).
 /// 7. `"efuse"`: the whole physical map, its logical map and the MAC.
+///    `"phycap"`: the physical phycap window (`efuse::phycap`), which the
+///    1216-byte map does not reach; with the logical map it gives the RFE
+///    type, crystal cap and trims (`efuse::phy_efuse`, `"efuse"` if a map
+///    is short).
 ///
 /// Then, on the same power-on and download (spec S1.1), the rest of
 /// `rtw89_mac_init` and the first H2C:
@@ -262,8 +300,17 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///     Linux ignores `rtw89_fw_h2c_set_ofld_cfg`'s result (`mac.c:4394`)
 ///     and never waits for its answer (spec S1.9).
 ///
-/// Once step 11 has succeeded (on success, and on the `"h2c"` and `"c2h"`
-/// failures) the HCI is torn down as `rtw89_core_stop` does between
+/// Then the rest of `rtw89_core_start` through the coex init
+/// (`core.c:6687-6695`), [`phy::init_radio`] at RFE type and crystal cap
+/// from step 7 and cut `cut`, with the H2C sequence state OFLD_CFG left
+/// (seq 1), so the RF_REG pages carry seq 1 and 2 and ask for no ack:
+///
+/// 13. `"bb rf reset"`, `"bb init"`, `"rf init"` / `"rf h2c"`,
+///     `"coex init"`, `"phy report"`, in that order; an RF init failure
+///     names its path and page ([`BringUpError::rf`]).
+///
+/// Once step 11 has succeeded (on success, and on every failure from step
+/// 12 on) the HCI is torn down as `rtw89_core_stop` does between
 /// `rtw89_hci_stop` and `rtw89_mac_pwr_off` (`core.c:6765-6767`):
 /// `pci::deinit`, Linux's `rtw89_pci_ops_deinit` (`pci.c:3053`), which
 /// clears PCI wake, turns LTR off when `host.ltr`, stops the AXI master and
@@ -311,13 +358,16 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
     cut: u8,
     image: &AxImage<'_>,
     host: Host,
+    tables: &PhyTables<'_>,
 ) -> Result<(Running, Rings), BringUpError> {
+    phy::check_tables(tables).map_err(at("phy tables"))?;
     if let Err(error) = power::power_on(io) {
         power_down(io);
         return Err(BringUpError {
             step: "power on",
             error: error.retry,
             earlier: Earlier::first_of(POWER_ON_TRIES, error.first, error.retry),
+            rf: None,
         });
     }
     // SAFETY: the caller's `Rings::install` contract, forwarded unchanged.
@@ -337,7 +387,7 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
             // `start` programmed `rings` through this `io` with
             // `pci::pre_init`, and nothing since re-programmed or stopped
             // them.
-            let acked = unsafe { acknowledge(io, &mut rings, started, host) };
+            let acked = unsafe { acknowledge(io, &mut rings, started, host, tables) };
             // rtw89_core_stop (core.c:6765-6767): rtw89_hci_deinit between
             // rtw89_hci_stop (interrupts and NAPI, neither ported) and
             // rtw89_mac_pwr_off. Linux ignores its result, and so does this.
@@ -428,13 +478,18 @@ struct Started {
     cut: u8,
     firmware: (u8, u8, u8, u8),
     mac: [u8; 6],
+    /// `cmac::init`'s `rst_bacam` timed out.
+    bacam_reset_timed_out: bool,
     /// The H2C sequence state after the download.
     h2c: H2c,
+    /// The efuse RFE type, crystal cap and trims.
+    efuse: PhyEfuse,
 }
 
-/// `rtw89_chip_efuse_info_setup` (`core.c:7274`) up to the MAC address:
-/// `rtw89_mac_partial_init` (`mac.c:4307`), then the efuse map; then the
-/// rest of `rtw89_mac_init` (`mac.c:4360`) through the PCIe post-init.
+/// `rtw89_chip_efuse_info_setup` (`core.c:7274`) through the phycap map:
+/// `rtw89_mac_partial_init` (`mac.c:4307`), then the efuse map, then the
+/// phycap window; then the rest of `rtw89_mac_init` (`mac.c:4360`) through
+/// the PCIe post-init.
 ///
 /// # Safety
 /// The `pci::pre_init`, `Ch12::submit` and `Rxq::poll` contracts for `io`
@@ -465,6 +520,12 @@ unsafe fn start<I: AxIo + ?Sized>(
     let mut physical = vec![0u8; efuse::PHYSICAL_EFUSE_SIZE];
     efuse::read_physical(io, 0, &mut physical).map_err(at("efuse"))?;
     let logical = efuse::logical_map(&physical).map_err(at("efuse"))?;
+    // rtw89_parse_phycap_map_ax (efuse.c:350-381), which fails the setup as
+    // the efuse map does (core.c:7297-7299): its own DDV dump of physical
+    // 0x590..0x5F0, then rtw8852c_read_phycap's trims; rtw8852c_read_efuse's
+    // RFE type and crystal cap come from the logical map.
+    let window = efuse::phycap(io).map_err(at("phycap"))?;
+    let phy_efuse = efuse::phy_efuse(&logical, &window).map_err(at("efuse"))?;
 
     // rtw89_mac_init (mac.c:4360) after rtw89_mac_partial_init:
     // rtw89_chip_enable_bb_rf, sys_init_ax, trx_init_ax, then the HCI's
@@ -472,18 +533,23 @@ unsafe fn start<I: AxIo + ?Sized>(
     // nothing for an RTL8852C on PCIe (spec S1.2-S1.3).
     sys::enable_bb_rf(io).map_err(at("bb rf enable"))?;
     sys::sys_init(io).map_err(at("sys init"))?;
-    trx::init(io).map_err(|error| BringUpError::new(error.step, error.error))?;
+    let bacam_reset_timed_out =
+        trx::init(io).map_err(|error| BringUpError::new(error.step, error.error))?;
     pci::post_init(io, host.ltr).map_err(at("pci post-init"))?;
     Ok(Started {
         cut,
         firmware: image.version(),
         mac: efuse::mac_address(&logical),
+        bacam_reset_timed_out,
         h2c,
+        efuse: phy_efuse,
     })
 }
 
 /// `rtw89_fw_h2c_set_ofld_cfg` (`mac.c:4394`), the last step of
-/// `rtw89_mac_init`, with Stela's own wait for its acknowledgement.
+/// `rtw89_mac_init`, with Stela's own wait for its acknowledgement; then
+/// the radio steps of `rtw89_core_start` through the coex init
+/// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence.
 ///
 /// # Safety
 /// The `Ch12::submit` and `Rxq::poll` contracts for `io` and `rings`.
@@ -492,6 +558,7 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
     rings: &mut Rings,
     started: Started,
     host: Host,
+    tables: &PhyTables<'_>,
 ) -> Result<Running, BringUpError> {
     let mut h2c = started.h2c;
     // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts.
@@ -499,6 +566,18 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         CommandError::Submit(error) => BringUpError::new("h2c", error),
         CommandError::Wait(error) => BringUpError::new("c2h", error),
     })?;
+    // `h2c` is now past OFLD_CFG (seq 1), the state init_rf_reg expects:
+    // its pages go out at seq 1 and 2, where no REC_ACK is forced.
+    // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts, which
+    // are `init_radio`'s; the OFLD_CFG wait just polled the same rings.
+    let (phy, _gain) =
+        unsafe { phy::init_radio(io, rings, &mut h2c, tables, &started.efuse, started.cut) }
+            .map_err(|error| BringUpError {
+                rf: error.rf,
+                ..BringUpError::new(error.step, error.error)
+            })?;
+    // The BB gain table is memory only on AX (bb.rs), and nothing after the
+    // coex init that reads it is ported yet.
     Ok(Running {
         cut: started.cut,
         firmware: started.firmware,
@@ -506,7 +585,9 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         secure_boot: false,
         mac_init: true,
         ltr: host.ltr,
+        bacam_reset_timed_out: started.bacam_reset_timed_out,
         h2c: ack,
+        phy: Some(phy),
     })
 }
 
@@ -543,6 +624,7 @@ unsafe fn download<I: AxIo + ?Sized>(
                         stopped: last,
                         first: (attempt > 2 && first != last).then_some(first),
                     },
+                    rf: None,
                 });
             }
         }
@@ -557,6 +639,7 @@ unsafe fn download<I: AxIo + ?Sized>(
         step: "firmware download",
         error: last,
         earlier: Earlier::first_of(FWDL_TRIES, first, last),
+        rf: None,
     })
 }
 

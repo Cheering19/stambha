@@ -8,22 +8,36 @@
 //! pre-init with its rings; the firmware download; the MAC init of
 //! `rtw89_mac_init` (BB/RF function enable, system, DMAC, CMAC band 0 and
 //! IMR init, PCIe post-init); and one H2C, OFLD_CFG, whose acknowledgement
-//! is read from RXQ by polling. [`bring_up`] puts these in Linux's order
-//! before powering the chip off again. It grants no BB or RF register
-//! tables, no calibration, no station and no interrupts: the chip is
-//! powered off at the end, and nothing past that one H2C runs.
+//! is read from RXQ by polling. After it, the radio steps of
+//! `rtw89_core_start` through the Wi-Fi grant run ([`phy::init_radio`]):
+//! the BB/RF reset ([`sys::reset_bb_rf`]), `rtw89_phy_init_bb_reg`
+//! ([`bb::init_bb_reg`]) and `rtw89_phy_init_rf_reg` with its RF_REG H2C
+//! pages ([`radio::init_rf_reg`]) from the firmware file's own PHY tables
+//! (found by [`elements`], walked by RFE type and cut by [`phy_table`], BB
+//! and RF registers reached by [`bb`] and [`rf`]), then the register end
+//! state of the coex start with BT off ([`coex`]). [`bring_up`] puts these
+//! in Linux's order before powering the chip off again. It grants no
+//! `rtw89_phy_dm_init`, no calibration, no channel, no station and no
+//! interrupts: the chip is powered off at the end, and nothing past the
+//! coex init and its report reads runs.
+pub mod bb;
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
+pub mod coex;
 pub mod command;
 pub mod dmac;
 pub mod efuse;
+pub mod elements;
 pub mod fwdl;
 pub mod h2c;
 pub mod io;
 pub mod pci;
-
+pub mod phy;
+pub mod phy_table;
 pub mod power;
+pub mod radio;
+pub mod rf;
 pub mod rx;
 pub mod sys;
 #[cfg(test)]
@@ -38,6 +52,7 @@ pub use io::{
     poll_sample, poll_sample_atomic, poll32, poll32_atomic, poll32_value, poll32_value_atomic,
     set8, set16, set32,
 };
+pub use phy::PhyReport;
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};

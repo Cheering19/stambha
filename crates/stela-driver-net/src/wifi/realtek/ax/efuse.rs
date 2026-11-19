@@ -9,9 +9,11 @@
 //! `rtw89_efuse_recognize_mss_index_v0` / `_info_v1` and
 //! `rtw89_efuse_read_fw_secure_ax` (`efuse.c:427-516`), with the chip sizes of
 //! `rtw8852c_chip_info` and the MAC offset of `struct rtw8852c_efuse`
-//! (`rtw8852c.h:33-103`). Only the DDV (non-DAV) physical map is read; the
-//! DAV map, phycap, the efuse version byte and all other logical fields are
-//! not ported. This module does not grant firmware download, secure-boot
+//! (`rtw8852c.h:33-103`). The PHY fields come from `rtw8852c_read_efuse`
+//! (`rtw8852c.c:633-662`) and `rtw8852c_read_phycap` (`:807-814`), with the
+//! phycap window dumped as `rtw89_parse_phycap_map_ax` does (`efuse.c:350-381`).
+//! Only the DDV (non-DAV) physical map is read; the DAV map, the efuse
+//! version byte and all other logical fields are not ported. This module does not grant firmware download, secure-boot
 //! support or any claim that the MAC address is valid.
 use super::io::{AxError, AxIo, clear8, clear16, poll32_value_atomic, set8, set16};
 use alloc::{vec, vec::Vec};
@@ -204,6 +206,67 @@ pub fn logical_map(physical: &[u8]) -> Result<Vec<u8>, AxError> {
         }
     }
     Ok(log)
+}
+
+/// `chip->phycap_addr` and `chip->phycap_size` (`rtw8852c.c:3233-3234`).
+pub const PHYCAP_ADDR: u16 = 0x590;
+pub const PHYCAP_SIZE: usize = 0x60;
+
+/// Logical offsets of `xtal_k` and `rfe_type` in `struct rtw8852c_efuse`.
+pub const XTAL_K_OFFSET: usize = 0x2B9;
+pub const RFE_TYPE_OFFSET: usize = 0x2CA;
+/// Physical efuse addresses of the thermal and PA bias trims, path A then B
+/// (`rtw8852c.c:713`, `:761-779`).
+const THERMAL_TRIM: [usize; 2] = [0x5DF, 0x5DC];
+const PA_BIAS_TRIM: [usize; 2] = [0x5DE, 0x5DB];
+
+/// `rtw89_parse_phycap_map_ax` (`efuse.c:350-381`): dump physical
+/// `0x590..0x5F0` in one DDV dump. Milestone 1's 1216-byte map ends at 0x4C0,
+/// so these cells need their own dump, as in Linux.
+pub fn phycap<I: AxIo + ?Sized>(io: &mut I) -> Result<[u8; PHYCAP_SIZE], AxError> {
+    let mut window = [0u8; PHYCAP_SIZE];
+    read_physical(io, PHYCAP_ADDR, &mut window)?;
+    Ok(window)
+}
+
+/// The PHY fields of `rtw8852c_read_efuse` and `rtw8852c_read_phycap`.
+/// Index 0 of a trim is path A.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhyEfuse {
+    /// `efuse->rfe_type`, raw (`rtw8852c.c:658`).
+    pub rfe_type: u8,
+    /// `efuse->xtal_cap`, raw (`rtw8852c.c:659`).
+    pub xtal_cap: u8,
+    /// `pwr_trim.thermal_trim` when `pg_thermal_trim` (either byte != 0xFF).
+    pub thermal_trim: Option<[u8; 2]>,
+    /// `pwr_trim.pa_bias_trim` when `pg_pa_bias_trim` (either byte != 0xFF).
+    pub pa_bias_trim: Option<[u8; 2]>,
+}
+
+fn trim(window: &[u8], addrs: [usize; 2]) -> Option<[u8; 2]> {
+    let v = [
+        window[addrs[0] - usize::from(PHYCAP_ADDR)],
+        window[addrs[1] - usize::from(PHYCAP_ADDR)],
+    ];
+    (v[0] != 0xFF || v[1] != 0xFF).then_some(v)
+}
+
+/// `rtw8852c_read_efuse` fields from the logical map and the trims from the
+/// phycap window (`phycap_map[addr - phycap_addr]`, `rtw8852c.c:718`). A map
+/// or window shorter than Linux's is an error, never a default.
+pub fn phy_efuse(logical: &[u8], phycap: &[u8]) -> Result<PhyEfuse, AxError> {
+    if logical.len() < LOGICAL_EFUSE_SIZE {
+        return Err(AxError::Efuse("logical map is shorter than 2048 bytes"));
+    }
+    if phycap.len() < PHYCAP_SIZE {
+        return Err(AxError::Efuse("phycap window is shorter than 0x60 bytes"));
+    }
+    Ok(PhyEfuse {
+        rfe_type: logical[RFE_TYPE_OFFSET],
+        xtal_cap: logical[XTAL_K_OFFSET],
+        thermal_trim: trim(phycap, THERMAL_TRIM),
+        pa_bias_trim: trim(phycap, PA_BIAS_TRIM),
+    })
 }
 
 /// `ether_addr_copy(efuse->addr, map->e.mac_addr)` (`rtw8852c.c:648`). A map
@@ -535,6 +598,78 @@ mod tests {
         off += 32 + 10 + 32 + 94; // 6 GHz TSSI A, rsvd14, B, rsvd15
         off += 16 + 1 + 71; // rx_gain_6g pairs, channel_plan_6g, rsvd24
         assert_eq!(off, MAC_ADDR_OFFSET);
+    }
+
+    #[test]
+    fn phy_offsets_match_the_layout() {
+        let tssi = 6 + 5 + 7 + 14;
+        let mut off = 0x210;
+        off += tssi + 10 + tssi + 94; // path A, rsvd1, path B, rsvd2
+        off += 1; // channel_plan
+        assert_eq!(off, XTAL_K_OFFSET);
+        off += 1 + 1 + 1 + 5; // xtal_k, rsvd3, iqk_lck, rsvd4
+        off += 1 + 1 + 1 + 1 + 1; // bitfield, rsvd5, bitfield, eeprom_version, customer_id
+        off += 1 + 1 + 1; // swing 2g/5g, pwr_trk, then trx_path
+        off += 1;
+        assert_eq!(off, RFE_TYPE_OFFSET);
+    }
+
+    fn window(bytes: &[(usize, u8)]) -> Vec<u8> {
+        let mut w = vec![0xFF; PHYCAP_SIZE];
+        for &(addr, v) in bytes {
+            w[addr - 0x590] = v;
+        }
+        w
+    }
+
+    #[test]
+    fn phy_efuse_reads_raw_values() {
+        let mut log = vec![0xFFu8; 2048];
+        let p = phy_efuse(&log, &window(&[])).unwrap();
+        assert_eq!((p.rfe_type, p.xtal_cap), (0xFF, 0xFF));
+        log[0x2CA] = 0x35;
+        log[0x2B9] = 0x1D;
+        let p = phy_efuse(&log, &window(&[])).unwrap();
+        assert_eq!((p.rfe_type, p.xtal_cap), (0x35, 0x1D));
+    }
+
+    #[test]
+    fn trim_is_programmed_when_either_path_is() {
+        let log = vec![0xFFu8; 2048];
+        let p = phy_efuse(&log, &window(&[(0x5DF, 0x07)])).unwrap();
+        assert_eq!(p.thermal_trim, Some([0x07, 0xFF]));
+        assert_eq!(p.pa_bias_trim, None);
+        let p = phy_efuse(&log, &window(&[])).unwrap();
+        assert_eq!((p.thermal_trim, p.pa_bias_trim), (None, None));
+        let p = phy_efuse(&log, &window(&[(0x5DB, 0x5A), (0x5DC, 0x03)])).unwrap();
+        assert_eq!(p.pa_bias_trim, Some([0xFF, 0x5A]));
+        assert_eq!(p.thermal_trim, Some([0xFF, 0x03]));
+        let p = phy_efuse(&log, &window(&[(0x5DE, 0x11)])).unwrap();
+        assert_eq!(p.pa_bias_trim, Some([0x11, 0xFF]));
+    }
+
+    #[test]
+    fn short_maps_are_errors_not_defaults() {
+        assert!(phy_efuse(&[0xFF; 2048], &[0xFF; 0x5F]).is_err());
+        assert!(phy_efuse(&[0xFF; 2047], &[0xFF; 0x60]).is_err());
+        assert!(phy_efuse(&[0xFF; 2048], &[0xFF; 0x60]).is_ok());
+    }
+
+    #[test]
+    fn phycap_dump_is_the_per_byte_protocol_from_0x590() {
+        let mut phys = vec![0xFFu8; 2048];
+        phys[0x5DF] = 0x07;
+        let mut m = efuse_model(phys);
+        let w = phycap(&mut m).unwrap();
+        assert_eq!(w[0x5DF - 0x590], 0x07);
+        let mut want = enable_ops();
+        for a in 0x590u32..0x5F0 {
+            want.push(Op::W32(0x0030, a << 16));
+            want.push(Op::Delay(1));
+            want.push(Op::R32(0x0030));
+        }
+        want.extend(disable_ops());
+        assert_eq!(m.trace, want);
     }
 
     #[test]
