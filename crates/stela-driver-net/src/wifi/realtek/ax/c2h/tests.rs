@@ -82,3 +82,65 @@ fn c2h_other_and_short() {
     );
     assert_eq!(parse(&[0; 7]), None);
 }
+
+fn scanofld(w2: u32, w5: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    for w in [0x0000_0905u32, 36, w2, 0, 0, w5, 0, 0, 0] {
+        v.extend_from_slice(&w.to_le_bytes());
+    }
+    v
+}
+
+#[test]
+fn scanofld_rsp_decodes_w2_and_w5() {
+    assert_eq!(
+        parse(&scanofld(0x6913_0006, 0x0100_0002)),
+        Some(C2h::ScanOfld(ScanOfld {
+            pri_ch: 6,
+            reason: 3,
+            status: 1,
+            period: 105,
+            tx_fail: 2,
+            air_density: 0,
+            band: 1,
+            mac_idx: false,
+        }))
+    );
+    assert_eq!(
+        parse(&scanofld(0, 0x0500_00F5)[..24]),
+        Some(C2h::ScanOfld(ScanOfld {
+            pri_ch: 0,
+            reason: 0,
+            status: 0,
+            period: 0,
+            tx_fail: 5,
+            air_density: 15,
+            band: 1,
+            mac_idx: true,
+        }))
+    );
+    assert_eq!(
+        (
+            SCAN_ENTER_CH,
+            SCAN_LEAVE_CH,
+            SCAN_END,
+            SCAN_ENTER_OP,
+            SCAN_LEAVE_OP
+        ),
+        (3, 4, 5, 8, 9)
+    );
+    assert_eq!(SCAN_STATUS_SUCCESS, 1);
+}
+
+#[test]
+fn short_scanofld_rsp_is_none() {
+    let v = scanofld(0x6913_0006, 0x0100_0002);
+    assert_eq!(parse(&v[..20]), None);
+    for n in 0..24 {
+        assert_eq!(parse(&v[..n]), None);
+    }
+    // Other class-1 functions stay Other.
+    let mut o = v.clone();
+    o[1] = 0x0A;
+    assert!(matches!(parse(&o), Some(C2h::Other { .. })));
+}

@@ -133,3 +133,55 @@ fn dead_cmac_reads_refused() {
         assert!(matches!(check_cmac_en(&mut m), Err(AxError::Mac(_))));
     }
 }
+
+#[test]
+fn cfg_ppdu_status_matches_linux_sequence() {
+    // Enable from zero: the CMAC check, a plain write of RPT_EN |
+    // APP_MAC_INFO_RPT | APP_PLCP_HDR_RPT | RPT_CRC32, then the PPDU status
+    // forwarded to the host (`rtw89_mac_cfg_ppdu_status_ax`, mac.c:6289-6311).
+    let mut m = RegisterModel::new();
+    m.set32(0xC000, 0x4000_0000);
+    assert_eq!(cfg_ppdu_status(&mut m, true), Ok(()));
+    assert_eq!(
+        m.trace,
+        [
+            Op::R32(0xC000),
+            Op::W32(0xCE40, 0x2B),
+            Op::R32(0x9C18),
+            Op::W32(0x9C18, 1),
+        ]
+    );
+
+    // The plain write replaces whatever 0xCE40 held; the forward field is a
+    // read-modify-write that keeps 0x9C18's other bits.
+    let mut m = RegisterModel::new();
+    m.set32(0xC000, 0x4000_0000);
+    m.set32(0xCE40, 0xFFFF_FFFF);
+    m.set32(0x9C18, 0xFFFF_FFFE);
+    cfg_ppdu_status(&mut m, true).unwrap();
+    assert_eq!(m.get32(0xCE40), 0x2B);
+    assert_eq!(m.get32(0x9C18), 0xFFFF_FFFD);
+
+    // Disable: the CMAC check, then only RPT_EN is cleared.
+    let mut m = RegisterModel::new();
+    m.set32(0xC000, 0x4000_0000);
+    m.set32(0xCE40, 0x2B);
+    assert_eq!(cfg_ppdu_status(&mut m, false), Ok(()));
+    assert_eq!(
+        m.trace,
+        [Op::R32(0xC000), Op::R32(0xCE40), Op::W32(0xCE40, 0x2A)]
+    );
+}
+
+#[test]
+fn cfg_ppdu_status_refuses_cmac_off() {
+    for enable in [true, false] {
+        let mut m = RegisterModel::new();
+        m.set32(0xCE40, 0x2B);
+        assert_eq!(
+            cfg_ppdu_status(&mut m, enable),
+            Err(AxError::Mac("CMAC function is not enabled"))
+        );
+        assert_eq!(m.trace, [Op::R32(0xC000)]);
+    }
+}

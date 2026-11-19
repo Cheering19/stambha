@@ -13,22 +13,36 @@
 //! (`fw.c:9097`). The wait is Stela's own (spec S1.9-S1.10), budgeted at
 //! Linux's `RTW89_WAIT_FOR_COND_TIMEOUT` (`core.h:5930`). Nothing received is
 //! acted on: unrelated C2Hs and frames are only counted, a plain firmware log
-//! is kept as text, and formatted logs are not rendered. This module grants
-//! no interrupts, no C2H dispatch, no other H2C and no DMA beyond the
-//! contracts of `Ch12::submit` and `Rxq::poll`.
+//! is kept as text, and formatted logs are not rendered.
+//!
+//! Every H2C after `rtw89_phy_dm_init` goes through one [`Session`] (M2c
+//! spec S9.1): `rtw89_h2c_tx`'s CH12 submit, then RXQ drained through the
+//! scan's [`Receiver`], so acks, scan reports and frames are taken in RXQ
+//! order whatever wait is running, and none is dropped. Its acks are
+//! decoded as `rtw89_mac_c2h_rec_ack` and `rtw89_mac_c2h_done_ack` do
+//! (`mac.c:5459-5554`): [`Session::send_and_wait`] waits for a FW_OFLD
+//! DONE_ACK matched on cat, class and func but not seq, as Linux's
+//! `rtw89_complete_cond` does for ADD_SCANOFLD_CH and SCANOFLD (spec
+//! S1.13); every other DONE_ACK, which Linux ignores, is recorded in the
+//! [`Ledger`], the first non-zero return as its refusal (spec S1.14).
+//!
+//! This module grants no interrupts, no C2H handler beyond the ack
+//! decoding, no H2C it builds itself past OFLD_CFG (the session sends what
+//! its caller built) and no DMA beyond the contracts of `Ch12::submit` and
+//! `Rxq::poll`.
 use super::c2h::{self, C2h};
 use super::h2c::{H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, H2c};
 use super::io::{AxError, AxIo, poll_sample};
 use super::pci::Rings;
-use super::rx::{self, RxBuffer};
+use super::receive::{Event, Receiver, Tag};
+use super::rx::{self, RX_TYPE_C2H, RxBuffer};
+use alloc::vec::Vec;
 
 /// `RTW89_WAIT_FOR_COND_TIMEOUT` (`core.h:5930`): 100 ms.
 pub const ACK_WAIT_US: u64 = 100_000;
 /// The RXQ index sampling interval (spec S1.9).
 pub const ACK_POLL_US: u64 = 50;
 
-/// `RTW89_CORE_RX_TYPE_C2H` (`core.h:236`).
-const RX_TYPE_C2H: u8 = 10;
 const LOG_TEXT_BYTES: usize = 48;
 
 /// The first `LOG_TEXT_BYTES` printable ASCII bytes of a plain firmware
@@ -136,7 +150,7 @@ impl Seen {
                 ack.unmatched_ack = ack.unmatched_ack.saturating_add(1)
             }
             Some(C2h::Log(text)) if ack.log.is_none() => ack.log = Some(LogText::new(text)),
-            Some(C2h::Log(_) | C2h::FormattedLog | C2h::Other { .. }) => {
+            Some(C2h::Log(_) | C2h::FormattedLog | C2h::ScanOfld(_) | C2h::Other { .. }) => {
                 ack.other_c2h = ack.other_c2h.saturating_add(1)
             }
         }
@@ -247,6 +261,331 @@ pub unsafe fn count_c2h<I: AxIo + ?Sized>(io: &mut I, rings: &mut Rings) -> Resu
         })
     }?;
     Ok(count)
+}
+
+/// The first DONE_ACK with a non-zero `H2C_RETURN` that no
+/// [`Session::send_and_wait`] consumed (spec S1.14): the H2C's class, func
+/// and seq as the DONE_ACK names them, and the return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub class: u8,
+    pub func: u8,
+    pub seq: u8,
+    pub ret: u8,
+}
+
+/// Every C2H a [`Session`] has drained, counted by kind (saturating), and
+/// the first refusal. A DONE_ACK a wait consumed is counted in `done_acks`
+/// but never becomes `refused`. SCANOFLD_RSPs are not counted here: they go
+/// on to the sink, as frames do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ledger {
+    pub rec_acks: u16,
+    pub done_acks: u16,
+    /// Plain and formatted firmware logs.
+    pub logs: u16,
+    /// C2Hs of any other cat, class or func.
+    pub other_c2h: u16,
+    pub refused: Option<Refused>,
+}
+
+/// The DONE_ACK a running [`Session::send_and_wait`] waits for, and what
+/// else arrived meanwhile (saturating, for `NoAck`).
+struct Awaited {
+    func: u8,
+    /// The matching DONE_ACK's raw `H2C_RETURN`, once it arrived.
+    ret: Option<u8>,
+    /// C2Hs that were not acks, scan reports included.
+    other_c2h: u8,
+    /// Acks for another cat, class or func.
+    unmatched_ack: u8,
+}
+
+impl Awaited {
+    fn new(func: u8) -> Self {
+        Self {
+            func,
+            ret: None,
+            other_c2h: 0,
+            unmatched_ack: 0,
+        }
+    }
+}
+
+fn bump(counter: &mut u16) {
+    *counter = counter.saturating_add(1);
+}
+
+fn bump8(counter: &mut u8) {
+    *counter = counter.saturating_add(1);
+}
+
+/// One event from the receiver: C2Hs pass the ledger (and the running wait)
+/// first; SCANOFLD_RSPs and frames go on to `sink`.
+fn account(
+    ledger: &mut Ledger,
+    awaited: &mut Option<Awaited>,
+    event: Event<'_>,
+    sink: &mut dyn FnMut(Event<'_>),
+) {
+    let ofld = |cat, class| (cat, class) == (H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD);
+    let c2h = match event {
+        Event::Frame(_) => return sink(event),
+        Event::C2h(c2h) => c2h,
+    };
+    match c2h {
+        C2h::RecAck {
+            cat, class, func, ..
+        } => {
+            bump(&mut ledger.rec_acks);
+            if let Some(a) = awaited
+                && !(ofld(cat, class) && func == a.func)
+            {
+                bump8(&mut a.unmatched_ack);
+            }
+        }
+        C2h::DoneAck {
+            cat,
+            class,
+            func,
+            ret,
+            seq,
+        } => {
+            bump(&mut ledger.done_acks);
+            if let Some(a) = awaited {
+                if a.ret.is_none() && ofld(cat, class) && func == a.func {
+                    a.ret = Some(ret);
+                    return;
+                }
+                bump8(&mut a.unmatched_ack);
+            }
+            if ret != 0 && ledger.refused.is_none() {
+                ledger.refused = Some(Refused {
+                    class,
+                    func,
+                    seq,
+                    ret,
+                });
+            }
+        }
+        C2h::Log(_) | C2h::FormattedLog => {
+            bump(&mut ledger.logs);
+            if let Some(a) = awaited {
+                bump8(&mut a.other_c2h);
+            }
+        }
+        C2h::Other { .. } => {
+            bump(&mut ledger.other_c2h);
+            if let Some(a) = awaited {
+                bump8(&mut a.other_c2h);
+            }
+        }
+        C2h::ScanOfld(_) => {
+            if let Some(a) = awaited {
+                bump8(&mut a.other_c2h);
+            }
+            sink(Event::C2h(c2h));
+        }
+    }
+}
+
+/// The command channel after `rtw89_phy_dm_init`: CH12 for every H2C, RXQ
+/// drained through one [`Receiver`] after each and during every wait. The
+/// H2C sequence is the caller's `h2c`, so it continues from wherever the
+/// earlier steps left it.
+pub struct Session<'r> {
+    rings: &'r mut Rings,
+    pub h2c: &'r mut H2c,
+    pub rx: Receiver,
+    pub ledger: Ledger,
+    awaited: Option<Awaited>,
+    /// The last in-range RXQ hardware index a drain read.
+    rxq_hw: u16,
+}
+
+impl<'r> Session<'r> {
+    /// A session on `rings`, whose RXQ `pci::pre_init` started, numbering
+    /// H2Cs from `h2c`, with a receiver tagging frames with `tag` until the
+    /// firmware reports a channel.
+    pub fn new(rings: &'r mut Rings, h2c: &'r mut H2c, tag: Tag) -> Self {
+        Self {
+            rings,
+            h2c,
+            rx: Receiver::new(tag),
+            ledger: Ledger::default(),
+            awaited: None,
+            rxq_hw: 0,
+        }
+    }
+
+    pub fn rings(&self) -> &Rings {
+        self.rings
+    }
+
+    /// Submit `packet` (a builder's `(seq, bytes)`) on CH12 as
+    /// `rtw89_h2c_tx` does, then drain RXQ once without waiting. Returns
+    /// the seq. A failed submit leaves RXQ untouched.
+    ///
+    /// # Safety
+    /// The contract of `Ch12::submit` and `Rxq::poll`: `io` is the exclusive
+    /// register window of the same RTL8852C requester that `pci::pre_init`
+    /// programmed with this session's rings, and the `pre_init` contract
+    /// still holds: its DMA domain isolates that requester, the rings are
+    /// coherent WB RAM with NoSnoop and ATS disabled, and one worker owns the
+    /// device and its queues.
+    pub unsafe fn send<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        packet: (u8, Vec<u8>),
+        sink: &mut dyn FnMut(Event<'_>),
+    ) -> Result<u8, AxError> {
+        let (seq, bytes) = packet;
+        // SAFETY: the caller's contract is `submit`'s, word for word.
+        unsafe { self.rings.ch12().submit(io, &bytes) }?;
+        // SAFETY: the caller's contract is `poll`'s; the submit succeeded,
+        // which only a successful `pre_init` of these rings allows.
+        unsafe { self.drain(io, sink) }?;
+        Ok(seq)
+    }
+
+    /// One `Rxq::poll`: every filled RXQ entry goes through the receiver,
+    /// then the ledger, then `sink` (spec S9.1). Returns the number of RXQ
+    /// entries consumed, 0 when RXQ held none. A malformed buffer ends the
+    /// drain with its error after the buffers before it were handled.
+    ///
+    /// # Safety
+    /// As [`Session::send`], and `pre_init` must have succeeded on these
+    /// rings.
+    pub unsafe fn drain<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        sink: &mut dyn FnMut(Event<'_>),
+    ) -> Result<usize, AxError> {
+        let Self {
+            rings,
+            rx,
+            ledger,
+            awaited,
+            rxq_hw,
+            ..
+        } = self;
+        let mut rxq = rings.rxq();
+        // SAFETY: the caller's contract is `poll`'s, word for word.
+        let polled = unsafe {
+            rxq.poll(io, &mut |buffer| {
+                rx.buffer(buffer, &mut |event| account(ledger, awaited, event, sink))
+            })
+        };
+        *rxq_hw = rxq.hardware_index();
+        polled
+    }
+
+    /// Drain RXQ every `ACK_POLL_US` until `done` accepts an event handed to
+    /// `sink` (`Ok(true)`, after the rest of that batch) or `budget_us`
+    /// passes (`Ok(false)`). `done` sees each SCANOFLD_RSP and frame just
+    /// before `sink` does. A drain or clock failure is the error.
+    ///
+    /// # Safety
+    /// As [`Session::drain`].
+    pub unsafe fn wait<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        budget_us: u64,
+        sink: &mut dyn FnMut(Event<'_>),
+        done: &mut dyn FnMut(&Event<'_>) -> bool,
+    ) -> Result<bool, AxError> {
+        let mut met = false;
+        poll_sample(
+            io,
+            ACK_POLL_US,
+            budget_us,
+            |io| {
+                let mut each = |event: Event<'_>| {
+                    if !met && done(&event) {
+                        met = true;
+                    }
+                    sink(event);
+                };
+                // SAFETY: the caller's contract is `drain`'s.
+                unsafe { self.drain(io, &mut each) }?;
+                Ok(met)
+            },
+            |met| met,
+        )?;
+        Ok(met)
+    }
+
+    /// Send `packet`, then drain RXQ every `ACK_POLL_US` for up to
+    /// `ACK_WAIT_US` until a DONE_ACK for cat 1 / FW_OFLD (class 9) /
+    /// `func` arrives, whatever its seq, as `rtw89_mac_c2h_done_ack`
+    /// completes the wait for ADD_SCANOFLD_CH and SCANOFLD (`mac.c:5532-5554`,
+    /// spec S1.13). Returns the seq.
+    ///
+    /// - The H2C not sent: `Submit` with the submit's error; RXQ untouched.
+    /// - `ret & ret_mask != 0` (0x3F for ADD_SCANOFLD_CH,
+    ///   `RTW89_C2H_SCAN_DONE_ACK_RETURN`; 0xFF for SCANOFLD):
+    ///   `Submit(H2cRejected)` with the raw return. The wait consumed that
+    ///   DONE_ACK, so it never becomes the ledger's refusal.
+    /// - No matching DONE_ACK in time: `Wait(NoAck)` with the C2Hs that were
+    ///   not acks, the unmatched acks and the skipped buffers of this wait,
+    ///   and the last RXQ hardware index.
+    /// - A drain or clock failure: `Wait` with it.
+    ///
+    /// Frames and scan reports drained meanwhile reach `sink`.
+    ///
+    /// # Safety
+    /// As [`Session::send`].
+    pub unsafe fn send_and_wait<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        packet: (u8, Vec<u8>),
+        func: u8,
+        ret_mask: u8,
+        sink: &mut dyn FnMut(Event<'_>),
+    ) -> Result<u8, CommandError> {
+        let (seq, bytes) = packet;
+        // SAFETY: the caller's contract is `submit`'s, word for word.
+        unsafe { self.rings.ch12().submit(io, &bytes) }.map_err(CommandError::Submit)?;
+        let skipped = |rx: &Receiver| {
+            u32::from(rx.counts.segments).saturating_add(u32::from(rx.counts.c2h_skipped))
+        };
+        let skipped_before = skipped(&self.rx);
+        self.awaited = Some(Awaited::new(func));
+        let waited = poll_sample(
+            io,
+            ACK_POLL_US,
+            ACK_WAIT_US,
+            |io| {
+                // SAFETY: the caller's contract is `drain`'s; the submit
+                // succeeded, which only a successful `pre_init` allows.
+                unsafe { self.drain(io, sink) }?;
+                Ok(self.awaited.as_ref().is_some_and(|a| a.ret.is_some()))
+            },
+            |acked| acked,
+        );
+        // Set above and taken only here: the default is never used.
+        let awaited = self.awaited.take().unwrap_or_else(|| Awaited::new(func));
+        waited.map_err(CommandError::Wait)?;
+        match awaited.ret {
+            Some(ret) if ret & ret_mask != 0 => Err(CommandError::Submit(AxError::H2cRejected {
+                class: H2C_CL_MAC_FW_OFLD,
+                func,
+                seq,
+                ret,
+            })),
+            Some(_) => Ok(seq),
+            None => Err(CommandError::Wait(AxError::NoAck {
+                class: H2C_CL_MAC_FW_OFLD,
+                func,
+                seq,
+                other_c2h: awaited.other_c2h,
+                unmatched_ack: awaited.unmatched_ack,
+                skipped: u8::try_from(skipped(&self.rx).saturating_sub(skipped_before))
+                    .unwrap_or(u8::MAX),
+                rxq_hw: self.rxq_hw,
+            })),
+        }
+    }
 }
 
 #[cfg(test)]

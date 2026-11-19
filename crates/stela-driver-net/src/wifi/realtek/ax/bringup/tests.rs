@@ -1,5 +1,6 @@
 extern crate std;
 use super::*;
+use crate::wifi::realtek::ax::chan::HwBand;
 use crate::wifi::realtek::ax::elements::{
     ID_BB_GAIN, ID_BB_REG, ID_RADIO_A, ID_RADIO_B, ID_RF_NCTL, PhyTables, RfPath, phy_tables,
     tests::{container, element, pairs},
@@ -7,15 +8,22 @@ use crate::wifi::realtek::ax::elements::{
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::pci::tests::{device_write, rxq_buffer};
 use crate::wifi::realtek::ax::radio::RfAt;
+use crate::wifi::realtek::ax::scan::{self, Network, ScanEnd, ScanReport};
+use crate::wifi::realtek::ax::tests::firmware::{Firmware, rx_buffer};
 use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::ToString, sync::Arc, vec, vec::Vec};
+use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// A MAC whose bytes need lower-case hex and a leading zero.
 const MAC: [u8; 6] = [0x00, 0xE0, 0x4C, 0x88, 0x52, 0x0C];
+/// The access point [`home`] scripts, and its channel's place in
+/// `scan::SCAN_CHANNELS` (2.4 GHz channel 6).
+const HOME: [u8; 6] = [0x02, 0xAA, 0, 0, 0, 1];
+const CH6: usize = 5;
 
 /// Spec S10's crafted RXQ buffer: the REC_ACK of OFLD_CFG at seq 0 (RX BD
 /// info FS | LS | WRITE_SIZE 32, a short RX descriptor with RPKT_LEN 12 and
@@ -120,7 +128,8 @@ const PHY: &str = ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 
 ///   matches the SCC `pub_max`;
 /// - RXQ: at its first index read, which only the OFLD_CFG wait makes, after
 ///   the kick, the device fills entries 0.. with `acks` and its index
-///   (0x1218 [27:16]) reports them;
+///   (0x1218 [27:16]) reports them; from then on [`home`]'s scripted
+///   firmware answers CH12 and RXQ ([`chip_hearing`]);
 /// - radio and calibration: as the comments in the body say, every poll met.
 ///
 /// `pre_inits` counts PCI pre-inits by their first step's read, the G1
@@ -139,7 +148,35 @@ fn chip(
     ch12_holds: fn(usize) -> bool,
     acks: &'static [&'static [u8]],
 ) -> Chip {
+    chip_hearing(phys, status, ch12_holds, acks, &home)
+}
+
+/// The access point every scan of [`chip`] hears: a beacon from [`HOME`]
+/// naming `Home` on 2.4 GHz channel 6 at raw RSSI 0x70 (-54 dBm).
+fn home(fw: &mut Firmware) {
+    fw.beacon(CH6, HOME, b"Home", 0x70);
+}
+
+/// [`chip`], whose firmware `script` sets up for the scan: from the
+/// OFLD_CFG wait's first RXQ index read on, once `acks` are out, the
+/// scripted [`Firmware`] reads every later H2C from the CH12 slot past
+/// OFLD_CFG's and answers on RXQ from the entry past `acks`. For the scan
+/// the CMAC reads enabled (0xC000 b30), the RX filter is M2a's (0xCE20), and
+/// RF 0x18's direct window (DDV, 0x1E060 and 0x1F060) reads 0x01001 on both
+/// paths, as its SWSI register (DAV) does.
+fn chip_hearing(
+    phys: Vec<u8>,
+    status: u32,
+    ch12_holds: fn(usize) -> bool,
+    acks: &'static [&'static [u8]],
+    script: &dyn Fn(&mut Firmware),
+) -> Chip {
     let mut io = RegisterModel::new();
+    let m = Arc::new(Mutex::new(Model::default()));
+    let mut fw = Firmware::new(&m);
+    script(&mut fw);
+    let fw = fw.answering();
+    let answering = Rc::new(Cell::new(false));
     io.on_read(
         0x0004,
         Box::new(|m: &mut RegisterModel| (m.get32(0x0004) | 1 << 17) & !(1 << 8 | 1 << 9)),
@@ -169,9 +206,13 @@ fn chip(
         }),
     );
     let seen = pre_inits.clone();
+    let (fw_ch12, on) = (fw.clone(), answering.clone());
     io.on_read(
         0x1080,
         Box::new(move |m: &mut RegisterModel| {
+            if on.get() {
+                return fw_ch12.ch12(m);
+            }
             let host = m.get32(0x1080) & 0xFFF;
             if ch12_holds(seen.load(Ordering::Relaxed)) {
                 host
@@ -240,19 +281,23 @@ fn chip(
             }
         }),
     );
-    let m = Arc::new(Mutex::new(Model::default()));
+    io.set32(0x1E060, 0x01001);
+    io.set32(0x1F060, 0x01001);
+    io.set32(0xC000, 1 << 30);
+    io.set32(0xCE20, 0x0317_44BE);
     let model = m.clone();
-    let mut sent = false;
     io.on_read(
         0x1218,
-        Box::new(move |_: &mut RegisterModel| {
-            if !sent {
-                let state = model.lock().unwrap();
-                for (entry, buffer) in acks.iter().enumerate() {
-                    device_write(&state, rxq_buffer(entry), buffer);
-                }
-                sent = true;
+        Box::new(move |r: &mut RegisterModel| {
+            if answering.get() {
+                return fw.rxq(r);
             }
+            let state = model.lock().unwrap();
+            for (entry, buffer) in acks.iter().enumerate() {
+                device_write(&state, rxq_buffer(entry), buffer);
+            }
+            fw.resume_at((r.get32(0x1080) & 0xFFF) as usize, acks.len());
+            answering.set(true);
             (acks.len() as u32) << 16
         }),
     );
@@ -495,10 +540,62 @@ const RFK: RfkReport = RfkReport {
 const CALIBRATED: &str = ", calibrated: thermal A 30 B 31, xtal 0x2f/0x2f, RCK A 0x0f B 0x10, \
                           DRCK 0x0d, ADDCK A 0x201/0x1ff B 0x200/0x201, RX DCK rewrites A 0 B 0";
 
+/// RF 0x18 through both windows as [`chip`] presets it.
+const RF18: Rf18 = Rf18 {
+    dav: [0x01001; 2],
+    ddv: [0x01001; 2],
+};
+
+/// What a full bring-up of [`chip`] scans, `elapsed_ms` aside: the 38
+/// channels entered, END_SCAN with SUCCESS, and [`home`]'s beacon.
+fn scanned(elapsed_ms: u32) -> ScanReport {
+    let mut ssid = [0; 32];
+    ssid[..4].copy_from_slice(b"Home");
+    let mut networks = [None; scan::MAX_LISTED];
+    networks[0] = Some(Network {
+        bssid: HOME,
+        band: HwBand::G2,
+        channel: 6,
+        signal: Some(-54),
+        ssid,
+        ssid_len: 4,
+        hidden: false,
+        frames: 1,
+    });
+    ScanReport {
+        channels: 38,
+        entered: 38,
+        elapsed_ms,
+        end: ScanEnd::Ok,
+        frames: 1,
+        without_rssi: 0,
+        dropped: 0,
+        rxq_full: 0,
+        tail_capped: false,
+        refused: None,
+        networks_total: 1,
+        networks,
+    }
+}
+
+/// The scan suffix of [`scanned`].
+fn scan_line(elapsed_ms: u32) -> alloc::string::String {
+    alloc::format!(
+        ", scan 38/38 channels in {elapsed_ms} ms, end ok: 1 networks from 1 frames (0 without \
+         RSSI)"
+    )
+}
+
+/// The scan of a successful bring-up, which must have one.
+fn elapsed(running: &Running) -> u32 {
+    running.scan.expect("no scan report").elapsed_ms
+}
+
 #[test]
 fn happy_path_reports_running() {
     let (c, result) = ran(BOTH, NO_LTR);
     let (running, rings) = result.unwrap();
+    let ms = elapsed(&running);
     assert_eq!(
         running,
         Running {
@@ -512,15 +609,41 @@ fn happy_path_reports_running() {
             h2c: acked(true, true),
             phy: Some(REPORT),
             rfk: Some(RFK),
+            rf18: Some(RF18),
+            scan: Some(scanned(ms)),
         }
     );
+    // M2b2's line, then the scan's.
     assert_eq!(
         running.to_string(),
         alloc::format!(
             "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
              secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
-             done){PHY}{CALIBRATED}"
+             done){PHY}{CALIBRATED}{}",
+            scan_line(ms)
         )
+    );
+    // The networks and RF 0x18 print on lines of their own.
+    let lines: Vec<alloc::string::String> = running
+        .scan
+        .iter()
+        .flat_map(|s| s.listed().map(|l| l.to_string()).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        lines,
+        ["WIFI NETWORK 1/1 2G ch 6 -54 dBm 02:aa:00:00:00:01 \"Home\""]
+    );
+    let rf18: Vec<alloc::string::String> = running
+        .rf18
+        .iter()
+        .flat_map(|r| r.lines().map(|l| l.to_string()))
+        .collect();
+    assert_eq!(
+        rf18,
+        [
+            "WIFI RF18 A: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+            "WIFI RF18 B: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+        ]
     );
     // The M2b2 suffix ends the line, after the M2b1 report, and nothing
     // timed out.
@@ -536,8 +659,12 @@ fn happy_path_reports_running() {
     // One download attempt, one PCI pre-init.
     assert_eq!(count(&c.io, ATTEMPT), 1);
     assert_eq!(c.pre_inits.load(Ordering::Relaxed), 1);
-    // RXQ's two entries were consumed and its host index written back once.
-    assert_eq!(count(&c.io, Op::W16(0x1218, 2)), 1);
+    // RXQ's two entries were consumed and its host index written back past
+    // them, before the scan's traffic.
+    assert_eq!(
+        c.io.trace.iter().find(|o| matches!(o, Op::W16(0x1218, _))),
+        Some(&Op::W16(0x1218, 2))
+    );
     // rtw89_core_stop (core.c:6765-6767): rtw89_pci_ops_deinit after the
     // OFLD_CFG and RXQ activity, then rtw89_mac_pwr_off.
     assert_eq!(deinit_writes(&c.io), DEINIT);
@@ -550,6 +677,273 @@ fn happy_path_reports_running() {
     assert_ends_with_power_off(&c.io);
     // The rings were programmed: the caller keeps them.
     assert!(!c.m.lock().unwrap().mappings.is_empty());
+    drop(rings);
+}
+
+/// The CH12 kicks after `from`, each with the H2C seq and func of the slot
+/// it filled.
+fn kicks_after(c: &Chip, from: usize) -> Vec<(usize, u8, u8)> {
+    c.io.trace
+        .iter()
+        .enumerate()
+        .skip(from)
+        .filter_map(|(i, o)| match o {
+            Op::W16(0x1080, v) => {
+                let slot = (usize::from(*v) + pci::TX_ENTRIES - 1) % pci::TX_ENTRIES;
+                let p = ch12_packet(&c.m, slot, 20);
+                Some((i, p[19], p[17]))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn scan_steps_run_after_calibration_in_linux_order() {
+    let (c, result) = ran(BOTH, NO_LTR);
+    let (running, rings) = result.unwrap();
+    let t = &c.io.trace;
+    let after = |from: usize, want: &dyn Fn(&Op) -> bool| {
+        from + 1
+            + t[from + 1..]
+                .iter()
+                .position(want)
+                .unwrap_or_else(|| panic!("nothing after trace entry {from}"))
+    };
+    // dm tail: cfg_txrx_path's first write, M2b2's last step.
+    let dm_tail = first_of(t, |o| *o == Op::W32(0x14978, 3));
+    // core start: cfg_ppdu_status_bands(true).
+    let core_start = after(dm_tail, &|o| *o == Op::W32(0xCE40, 0x2B));
+    // set channel: help_enter's first write, the TX scheduler stop.
+    let set_channel = after(core_start, &|o| matches!(o, Op::W32(0xC398, _)));
+    // vif init: port 0's beacon interval.
+    let vif = after(set_channel, &|o| *o == Op::W32(0xC414, 0x64));
+    // scan start: the scan's RX filter.
+    let filter = after(vif, &|o| matches!(o, Op::W32(0xCE20, _)));
+    // Seventeen H2Cs after the calibration, seq 3 to 19: core start, vif
+    // init, the CAM, ADD_SCANOFLD_CH and SCANOFLD start (func 0x17) last.
+    // CH12 has 16 slots, so seq 19 reused seq 3's.
+    let kicks = kicks_after(&c, dm_tail);
+    assert_eq!(kicks.len(), 17);
+    let seqs: Vec<u8> = kicks[1..].iter().map(|k| k.1).collect();
+    assert_eq!(seqs, (4..=19).collect::<Vec<u8>>());
+    let (scanofld, _, func) = kicks[16];
+    assert_eq!(func, 0x17);
+    assert!(filter < kicks[15].0, "{filter} {kicks:?}");
+    // Then rtw89_core_stop's coex half, the deinit and the power-off.
+    let deinit = after(scanofld, &|o| matches!(o, Op::W32(0x0074, _)));
+    let power_off = after(deinit, &|o| *o == xtal(0x90, 0x10, 0x10));
+    let order = [
+        dm_tail,
+        core_start,
+        set_channel,
+        vif,
+        filter,
+        scanofld,
+        deinit,
+        power_off,
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    assert_radio_off_before_deinit(&c.io);
+    assert_eq!(deinit_writes(&c.io), DEINIT);
+    assert_ends_with_power_off(&c.io);
+    // The channel inputs reached the RF: RF 0x18 is 2.4 GHz channel 1 at
+    // 20 MHz on both paths and both windows.
+    assert_eq!(
+        (c.io.get_rf(0, 0x18), c.io.get_rf(1, 0x18)),
+        (0x01C01, 0x01C01)
+    );
+    assert_eq!(
+        (
+            c.io.get32(0x1E060) & 0xF_FFFF,
+            c.io.get32(0x1F060) & 0xF_FFFF
+        ),
+        (0x01C01, 0x01C01)
+    );
+    assert_eq!(running.scan, Some(scanned(elapsed(&running))));
+    drop(rings);
+}
+
+#[test]
+fn set_channel_takes_the_efuse_rx_gain_and_phy_0_rpl_bias() {
+    // Logical 0x2D6 (2.4 GHz CCK) holds path A +2, path B +3: block 0x5A
+    // word 3 alone (word enable 0x7). PHY 0's RPL bias reads 16 and PHY 1's
+    // 64.
+    let mut phys = efuse_with_mac();
+    phys[20..24].copy_from_slice(&[0x05, 0xA7, 0x23, 0xFF]);
+    let mut c = chip(phys, 7, never, BOTH);
+    c.io.set32(0x14DF0, 0x10);
+    c.io.set32(0x16DF0, 0x40);
+    let m = c.m.clone();
+    let (_, rings) = run_on(&mut c.io, &m, NO_LTR).unwrap();
+    // set_gain_offset's CCK RPL offset, shared by both paths, last written
+    // for path B: clamp((-3 << 3) + (16 >> 1)) = -16, in [14:8]. Without
+    // the offsets nothing is written; with PHY 1's bias it would be 8.
+    let rpl: Vec<Op> =
+        c.io.trace
+            .iter()
+            .copied()
+            .filter(|o| matches!(o, Op::W32(0x12340, _)))
+            .collect();
+    assert_eq!(rpl.len(), 2, "{rpl:x?}");
+    assert_eq!(rpl[1], Op::W32(0x12340, 0x70 << 8));
+    drop(rings);
+}
+
+/// The scan steps (spec S2), each torn down as a calibration failure is:
+/// the coex half of `rtw89_core_stop`, the deinit, then the power-off.
+const SCAN_STEPS: [&str; 5] = [
+    "core start",
+    "set channel",
+    "vif init",
+    "scan start",
+    "scan",
+];
+
+/// The CMAC reads disabled (0xC000 b30 clear) at its first read once
+/// `after` is in the trace, and enabled again from the next, so the
+/// teardown's coex half (whose PLT write checks it too) runs whole.
+fn cmac_off_after(io: &mut RegisterModel, after: Op) {
+    let mut done = false;
+    io.on_read(
+        0xC000,
+        Box::new(move |m: &mut RegisterModel| {
+            // What a hook returns is stored, so the bit is set again after.
+            let v = m.get32(0xC000);
+            if done {
+                v | 1 << 30
+            } else if m.trace.contains(&after) {
+                done = true;
+                v & !(1 << 30)
+            } else {
+                v
+            }
+        }),
+    );
+}
+
+#[test]
+fn scan_failure_names_step_and_powers_off() {
+    // scan start: the firmware refuses ADD_SCANOFLD_CH (seq 18) with 1.
+    let (err, c) = fails_hearing(&|fw| fw.refuse(9, 0x16, 1), |_| ());
+    assert_eq!(
+        err,
+        BringUpError::new(
+            "scan start",
+            AxError::H2cRejected {
+                class: 9,
+                func: 0x16,
+                seq: 18,
+                ret: 1
+            }
+        )
+    );
+    assert_eq!(
+        err.to_string(),
+        "RTL8852CE bring-up: scan start: firmware refused H2C class 9 func 0x16 seq 18 (raw \
+         return 0x01)"
+    );
+    // SCANOFLD was never sent: seq 3 to 18 after the calibration.
+    let dm_tail = first_of(&c.io.trace, |o| *o == Op::W32(0x14978, 3));
+    let seqs: Vec<u8> = kicks_after(&c, dm_tail).iter().map(|k| k.1).collect();
+    assert_eq!(seqs, (3..=18).collect::<Vec<u8>>());
+
+    // core start: the CMAC reads off once the calibration is done, so
+    // cfg_ppdu_status_bands refuses.
+    let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0x14978, 3)));
+    assert_eq!(
+        err,
+        BringUpError::new("core start", AxError::Mac("CMAC function is not enabled"))
+    );
+
+    // set channel: the CMAC reads off once help_enter read its scheduler.
+    let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::R32(0xC398)));
+    assert_eq!(err.step, "set channel");
+
+    // vif init: the CMAC reads off once port 0's beacon interval is set, so
+    // the macid pause's check refuses.
+    let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0xC414, 0x64)));
+    assert_eq!(err.step, "vif init");
+
+    // scan: a malformed RXQ buffer (WRITE_SIZE 4, no room for its RX
+    // descriptor) on channel 6, while the scan waits for END_SCAN.
+    let (err, _) = fails_hearing(
+        &|fw| {
+            let mut bad = rx_buffer(0, false, 0, 0, &[0x80; 30]);
+            bad[..4].copy_from_slice(&0xC004u32.to_le_bytes());
+            fw.buffers(CH6, vec![bad]);
+        },
+        |_| (),
+    );
+    assert_eq!(err.step, "scan");
+}
+
+/// A full bring-up of [`chip_hearing`] with BOTH acks and `script`,
+/// changed by `fault`, which must fail in a scan step: its error and the
+/// chip, after checking it was torn down as a calibration failure is (the
+/// coex half of the stop, the deinit, the power-off).
+fn fails_hearing(
+    script: &dyn Fn(&mut Firmware),
+    fault: impl FnOnce(&mut RegisterModel),
+) -> (BringUpError, Chip) {
+    let mut c = chip_hearing(efuse_with_mac(), 7, never, BOTH, script);
+    fault(&mut c.io);
+    let m = c.m.clone();
+    let err = failed(run_on(&mut c.io, &m, NO_LTR));
+    assert!(SCAN_STEPS.contains(&err.step), "{err}");
+    // The scan ran after the whole calibration.
+    assert!(c.io.trace.contains(&Op::W32(0x14978, 3)), "{err}");
+    assert_radio_off_before_deinit(&c.io);
+    assert_eq!(deinit_writes(&c.io), DEINIT, "{err}");
+    assert_ends_with_power_off(&c.io);
+    (err, c)
+}
+
+#[test]
+fn rf18_is_read_through_both_windows_after_the_radio_report() {
+    // Path B's direct window reads 0x01000 and path A's carries bits above
+    // the 20-bit field, which the read masks off.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    c.io.set32(0x1E060, 0xABC0_1001);
+    c.io.set32(0x1F060, 0x0000_1000);
+    let m = c.m.clone();
+    let (running, rings) = run_on(&mut c.io, &m, NO_LTR).unwrap();
+    let rf18 = running.rf18.unwrap();
+    assert_eq!(
+        rf18,
+        Rf18 {
+            dav: [0x01001, 0x01001],
+            ddv: [0x01001, 0x01000],
+        }
+    );
+    let lines: Vec<alloc::string::String> = rf18.lines().map(|l| l.to_string()).collect();
+    assert_eq!(
+        lines,
+        [
+            "WIFI RF18 A: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+            "WIFI RF18 B: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01000",
+        ]
+    );
+    // Read after the radio's report (its GNT SW readback) and before the
+    // calibration's first step (stat_init's thermal trigger): DAV A, DDV A,
+    // DAV B, DDV B, with nothing written but the SWSI read latches.
+    let t = &c.io.trace;
+    let gnt_sw = first_of(t, |o| *o == Op::R32(0xDA48));
+    let stat = first_of(t, |o| matches!(o, Op::RfW(0, 0x42, ..)));
+    let reads: Vec<Op> = t[gnt_sw..stat]
+        .iter()
+        .copied()
+        .filter(|o| matches!(o, Op::RfR(_, 0x18) | Op::R32(0x1E060 | 0x1F060)))
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            Op::RfR(0, 0x18),
+            Op::R32(0x1E060),
+            Op::RfR(1, 0x18),
+            Op::R32(0x1F060)
+        ]
+    );
     drop(rings);
 }
 
@@ -654,7 +1048,8 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
             alloc::format!(
                 "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
                  secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged \
-                 ({line}){PHY}{CALIBRATED}"
+                 ({line}){PHY}{CALIBRATED}{}",
+                scan_line(elapsed(&running))
             )
         );
     }
@@ -667,7 +1062,8 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     assert!(
         running.to_string().ends_with(&alloc::format!(
             "H2C OFLD_CFG acknowledged (receive and done), other C2H 1, unmatched acks 1, \
-             skipped 1{PHY}{CALIBRATED}"
+             skipped 1{PHY}{CALIBRATED}{}",
+            scan_line(elapsed(&running))
         )),
         "{running}"
     );
@@ -675,7 +1071,8 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     let (running, _rings) = result.unwrap();
     assert!(
         running.to_string().ends_with(&alloc::format!(
-            "acknowledged (done only), skipped 1{PHY}{CALIBRATED}"
+            "acknowledged (done only), skipped 1{PHY}{CALIBRATED}{}",
+            scan_line(elapsed(&running))
         )),
         "{running}"
     );
@@ -690,7 +1087,8 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
         alloc::format!(
             "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
              secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
-             done), firmware log \"fw up\"{PHY}{CALIBRATED}"
+             done), firmware log \"fw up\"{PHY}{CALIBRATED}{}",
+            scan_line(elapsed(&running))
         )
     );
 }
@@ -709,15 +1107,20 @@ const DEINIT_LTR: [u32; 12] = [
 /// RXQ traffic (those are 16-bit index writes) and not the radio's. The
 /// radio steps write the BB and RF windows (0x10000 up), XTAL SI (0x0270),
 /// the BB/RF reset's 0x02F0 and 0x0444, the CMAC's TX power and coex
-/// registers (0xC000-0xDFFF) and the coex scoreboard (0x00AC); the deinit
-/// writes none of them.
+/// registers (0xC000-0xDFFF) and the coex scoreboard (0x00AC); the scan
+/// steps write the PPDU status forwarding (0x9C18), the indirect table
+/// window's address (0x0C04, its data at 0x40000 up) and the RX interrupt
+/// mitigation (0x1184). The deinit writes none of them.
 fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
     deinit_and_radio_writes(io)
         .into_iter()
         .filter(|reg| {
             !(*reg >= 0x10000
                 || (0xC000..0xE000).contains(reg)
-                || matches!(*reg, 0x0270 | 0x02F0 | 0x0444 | 0x00AC))
+                || matches!(
+                    *reg,
+                    0x0270 | 0x02F0 | 0x0444 | 0x00AC | 0x9C18 | 0x0C04 | 0x1184
+                ))
         })
         .collect()
 }
@@ -787,6 +1190,7 @@ fn fails_traced(
     if matches!(err.step, "h2c" | "c2h")
         || PHY_STEPS.contains(&err.step)
         || CALIBRATION_STEPS.contains(&err.step)
+        || SCAN_STEPS.contains(&err.step)
     {
         let want: &[u32] = if host.ltr { &DEINIT_LTR } else { &DEINIT };
         assert_eq!(deinit_writes(&c.io), want, "{err}");
@@ -802,11 +1206,14 @@ fn fails_traced(
         // The DMA live since mac pre-init is stopped before the power-off.
         assert_dma_stopped_before_power_off(&c.io);
     }
-    // Only a failure after the coex init (its report or any calibration
-    // step) runs its undo, and then before the deinit; before it, no
-    // scoreboard word is written at all (the power-off's PWR_MAJOR is a byte
-    // write).
-    if err.step == "phy report" || CALIBRATION_STEPS.contains(&err.step) {
+    // Only a failure after the coex init (its report, any calibration step
+    // or any scan step) runs its undo, and then before the deinit; before
+    // it, no scoreboard word is written at all (the power-off's PWR_MAJOR is
+    // a byte write).
+    if err.step == "phy report"
+        || CALIBRATION_STEPS.contains(&err.step)
+        || SCAN_STEPS.contains(&err.step)
+    {
         assert_radio_off_before_deinit(&c.io);
     } else {
         assert!(
@@ -1400,6 +1807,8 @@ fn running_display_says_on_for_secure_boot() {
         h2c: acked(false, false),
         phy: None,
         rfk: None,
+        rf18: None,
+        scan: None,
     };
     // Without the MAC init no H2C was sent, so nothing is said of one.
     assert_eq!(
@@ -1446,6 +1855,23 @@ fn running_display_says_on_for_secure_boot() {
     assert!(
         r.to_string()
             .ends_with(&alloc::format!("BA CAM reset timed out{PHY}{CALIBRATED}")),
+        "{r}"
+    );
+    // RF 0x18 prints on lines of its own, never on this one.
+    let r = Running {
+        rf18: Some(RF18),
+        ..r
+    };
+    assert!(r.to_string().ends_with(CALIBRATED), "{r}");
+    // The scan's report follows the calibration's, and only when there is
+    // one.
+    let r = Running {
+        scan: Some(scanned(7)),
+        ..r
+    };
+    assert!(
+        r.to_string()
+            .ends_with(&alloc::format!("{CALIBRATED}{}", scan_line(7))),
         "{r}"
     );
 }
@@ -1536,9 +1962,13 @@ fn phy_steps_run_in_linux_order() {
         power_off,
     ];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
-    // Two H2Cs after OFLD_CFG, the RF pages, and no other.
+    // Two H2Cs after OFLD_CFG and before the coex init, the RF pages, and
+    // no other (the scan's come after the calibration).
     assert_eq!(
-        t[ofld_cfg + 1..deinit].iter().filter(|o| kick(o)).count(),
+        t[ofld_cfg + 1..scoreboard]
+            .iter()
+            .filter(|o| kick(o))
+            .count(),
         2
     );
     // Nothing reached SWSI before the RF init: its first busy check is path
@@ -1595,8 +2025,13 @@ fn ch12_packet(m: &Arc<Mutex<Model>>, slot: usize, len: usize) -> Vec<u8> {
 
 #[test]
 fn rf_pages_follow_ofld_cfg_at_seq_1_and_2_without_an_ack_request() {
-    let (c, result) = ran(BOTH, NO_LTR);
-    result.unwrap();
+    // The scan's seventeen H2Cs would reuse every CH12 slot, so the CMAC
+    // reads off once the calibration is done and core start fails before
+    // its first H2C, leaving the slots as the radio steps filled them.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    cmac_off_after(&mut c.io, Op::W32(0x14978, 3));
+    let m = c.m.clone();
+    assert_eq!(failed(run(&mut c.io, &m)).step, "core start");
     let t = &c.io.trace;
     let ofld_cfg = ofld_cfg_kick(t);
     let kicks: Vec<u16> = t[ofld_cfg..]
@@ -1933,7 +2368,7 @@ fn calibration_timeouts_are_reported_not_failed() {
     assert!(
         running
             .to_string()
-            .ends_with(&alloc::format!("{CALIBRATED}, timed out: DACK B")),
+            .contains(&alloc::format!("{CALIBRATED}, timed out: DACK B, scan ")),
         "{running}"
     );
     // The bring-up carried on: RX DCK and the tail ran, and the chip was
@@ -1960,7 +2395,7 @@ fn calibration_timeouts_are_reported_not_failed() {
     assert!(
         running
             .to_string()
-            .ends_with(&alloc::format!("{CALIBRATED}, timed out: NCTL")),
+            .contains(&alloc::format!("{CALIBRATED}, timed out: NCTL, scan ")),
         "{running}"
     );
     assert!(c.io.trace.contains(&Op::W32(0x18008, 0)));

@@ -636,9 +636,11 @@ const R_PATH1_BT_SHARE_V1: u32 = 0x4AA4;
 const B_PATH1_BT_SHARE_V1: u32 = 1 << 19;
 const R_PATH1_BTG_PATH_V1: u32 = 0x4AA4;
 const B_PATH1_BTG_PATH_V1: u32 = 1 << 22;
-/// `R_PMAC_GNT` with `B_PMAC_GNT_P1` [20:17] (reg.h:8935-8938).
+/// `R_PMAC_GNT` with `B_PMAC_GNT_P1` [20:17] and `B_PMAC_GNT_P2` [29:26]
+/// (reg.h:8935-8939).
 const R_PMAC_GNT: u32 = 0x0980;
 const B_PMAC_GNT_P1: u32 = 0x001E_0000;
+const B_PMAC_GNT_P2: u32 = 0x3C00_0000;
 /// `R_BT_DYN_DC_EST_EN` b31 (reg.h:9501, 9503) and `R_GNT_BT_WGT_EN` b21
 /// (reg.h:9024-9025).
 const R_BT_DYN_DC_EST_EN: u32 = 0x441C;
@@ -649,25 +651,35 @@ const B_GNT_BT_WGT_EN: u32 = 1 << 21;
 /// PHY_CAP reply is not read (spec S1.6).
 const RX_NSS: u32 = 2;
 
-/// `rtw8852c_ctrl_btg_bt_rx(en = true, PHY0)` (rtw8852c.c:2637-2659): let
-/// BT share path 0's and path 1's 2G front ends.
-fn ctrl_btg_bt_rx<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    bb::field32(io, R_PATH0_BT_SHARE_V1, B_PATH0_BT_SHARE_V1, 1)?;
+/// `rtw8852c_ctrl_btg_bt_rx(en, PHY0)` (rtw8852c.c:2637-2680). With `en`
+/// (2.4 GHz) BT shares path 0's and path 1's 2G front ends; without it
+/// (5 GHz, `rtw8852c_set_channel_bb`) the sharing is undone, path 1's G-band
+/// LNA6/TIA0 OP1dB go back to 0x1A/0x2A and the PMAC grant of P1 and P2 to
+/// 0xF and 4. Every write is a read-modify-write.
+pub(super) fn ctrl_btg_bt_rx<I: AxIo + ?Sized>(io: &mut I, en: bool) -> Result<(), AxError> {
+    let on = u32::from(en);
+    bb::field32(io, R_PATH0_BT_SHARE_V1, B_PATH0_BT_SHARE_V1, on)?;
     bb::field32(io, R_PATH0_BTG_PATH_V1, B_PATH0_BTG_PATH_V1, 0)?;
-    bb::field32(io, R_PATH1_G_LNA6_OP1DB_V1, B_PATH1_G_LNA6_OP1DB_V1, 0x20)?;
+    let (lna6, tia0) = if en { (0x20, 0x30) } else { (0x1A, 0x2A) };
+    bb::field32(io, R_PATH1_G_LNA6_OP1DB_V1, B_PATH1_G_LNA6_OP1DB_V1, lna6)?;
     bb::field32(
         io,
         R_PATH1_G_TIA0_LNA6_OP1DB_V1,
         B_PATH1_G_TIA0_LNA6_OP1DB_V1,
-        0x30,
+        tia0,
     )?;
-    bb::field32(io, R_PATH1_BT_SHARE_V1, B_PATH1_BT_SHARE_V1, 1)?;
-    bb::field32(io, R_PATH1_BTG_PATH_V1, B_PATH1_BTG_PATH_V1, 1)?;
-    bb::field32(io, R_PMAC_GNT, B_PMAC_GNT_P1, 0)?;
-    bb::field32(io, R_CHBW_MOD, B_BT_SHARE, 1)?;
-    bb::field32(io, R_FC0_BW, B_ANT_RX_BT_SEG0, 2)?;
-    bb::field32(io, R_BT_DYN_DC_EST_EN, B_BT_DYN_DC_EST_EN_MSK, 1)?;
-    bb::field32(io, R_GNT_BT_WGT_EN, B_GNT_BT_WGT_EN, 1)
+    bb::field32(io, R_PATH1_BT_SHARE_V1, B_PATH1_BT_SHARE_V1, on)?;
+    bb::field32(io, R_PATH1_BTG_PATH_V1, B_PATH1_BTG_PATH_V1, on)?;
+    if en {
+        bb::field32(io, R_PMAC_GNT, B_PMAC_GNT_P1, 0)?;
+    } else {
+        bb::field32(io, R_PMAC_GNT, B_PMAC_GNT_P1, 0xF)?;
+        bb::field32(io, R_PMAC_GNT, B_PMAC_GNT_P2, 0x4)?;
+    }
+    bb::field32(io, R_CHBW_MOD, B_BT_SHARE, on)?;
+    bb::field32(io, R_FC0_BW, B_ANT_RX_BT_SEG0, if en { 2 } else { 0 })?;
+    bb::field32(io, R_BT_DYN_DC_EST_EN, B_BT_DYN_DC_EST_EN_MSK, on)?;
+    bb::field32(io, R_GNT_BT_WGT_EN, B_GNT_BT_WGT_EN, on)
 }
 
 /// The HT, VHT, HE and HE TB stream limits for `rx_nss` streams, as
@@ -700,7 +712,7 @@ pub fn cfg_txrx_path<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     bb::field32(io, R_FC0_BW, B_ANT_RX_1RCCA_SEG1, 3)?;
     // The RF_PATH_AB branch writes two-stream limits whatever `rx_nss` is.
     rx_nss_limits(io, 2)?;
-    ctrl_btg_bt_rx(io)?;
+    ctrl_btg_bt_rx(io, true)?;
     for reg in [R_P0_TXPW_RSTB, R_P1_TXPW_RSTB] {
         bb::field32(io, reg, B_TXPW_RSTB_MANON_TSSI, 1)?;
         bb::field32(io, reg, B_TXPW_RSTB_MANON_TSSI, 3)?;

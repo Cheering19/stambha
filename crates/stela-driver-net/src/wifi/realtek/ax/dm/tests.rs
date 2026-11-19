@@ -593,3 +593,67 @@ fn cfg_txrx_path_keeps_the_bits_outside_each_field() {
     assert_eq!(m.get32(0x158DC), 0xFFFF_FFFF);
     assert_eq!(m.get32(0x178DC), 0xFFFF_FFFF);
 }
+
+#[test]
+fn ctrl_btg_bt_rx_5g_matches_linux() {
+    // rtw8852c_ctrl_btg_bt_rx(en = false) (rtw8852c.c:2660-2679), from zero.
+    let mut m = RegisterModel::new();
+    ctrl_btg_bt_rx(&mut m, false).unwrap();
+    let want: Vec<Op> = [
+        (0x14738, 0),
+        (0x14738, 0),
+        (0x1476C, 0x1A00_0000),
+        (0x14778, 0x2A),
+        (0x14AA4, 0),
+        (0x14AA4, 0),
+        (0x10980, 0x001E_0000),
+        (0x10980, 0x101E_0000),
+        (0x14978, 0),
+        (0x14974, 0),
+        (0x1441C, 0),
+        (0x10C6C, 0),
+    ]
+    .into_iter()
+    .flat_map(|(reg, v)| rmw(reg, v))
+    .collect();
+    assert_eq!(m.trace, want);
+
+    // From all ones only each named field changes; 0x14974 loses only
+    // B_ANT_RX_BT_SEG0 [25:22].
+    let mut m = RegisterModel::new();
+    for reg in [
+        0x14738, 0x1476C, 0x14778, 0x14AA4, 0x10980, 0x14978, 0x14974, 0x1441C, 0x10C6C,
+    ] {
+        m.set32(reg, 0xFFFF_FFFF);
+    }
+    ctrl_btg_bt_rx(&mut m, false).unwrap();
+    assert_eq!(m.get32(0x14738), 0xFFB7_FFFF);
+    assert_eq!(m.get32(0x1476C), 0x1AFF_FFFF);
+    assert_eq!(m.get32(0x14778), 0xFFFF_FF2A);
+    assert_eq!(m.get32(0x14AA4), 0xFFB7_FFFF);
+    // P1 [20:17] = 0xF, P2 [29:26] = 4.
+    assert_eq!(m.get32(0x10980), 0xD3FF_FFFF);
+    assert_eq!(m.get32(0x14978), 0xFFFF_BFFF);
+    assert_eq!(m.get32(0x14974), 0xFC3F_FFFF);
+    assert_eq!(m.get32(0x1441C), 0x7FFF_FFFF);
+    assert_eq!(m.get32(0x10C6C), 0xFFDF_FFFF);
+}
+
+#[test]
+fn ctrl_btg_bt_rx_2g_is_cfg_txrx_paths_block() {
+    let mut m = RegisterModel::new();
+    ctrl_btg_bt_rx(&mut m, true).unwrap();
+    let want: Vec<Op> = CFG_TXRX_PATH_FROM_ZERO[7..18]
+        .iter()
+        .flat_map(|&(reg, v)| {
+            // From zero, without cfg_txrx_path's earlier 0x14974/0x14978.
+            let v = match reg {
+                0x14978 => v & !0x3,
+                0x14974 => v & 0x03C0_0000,
+                _ => v,
+            };
+            rmw(reg, v)
+        })
+        .collect();
+    assert_eq!(m.trace, want);
+}

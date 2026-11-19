@@ -368,20 +368,25 @@ fn after_coex(step: &'static str) -> impl FnOnce(AxError) -> PhyError {
 /// which also clears the scoreboard's WLRFK bit a failed DACK leaves set. A
 /// `tables` without an NCTL table, which [`check_tables`] refuses before any
 /// I/O, fails as `"phy tables"`.
+///
+/// On success the report comes with `efuse_gain.offset_base` for PHY 0 and
+/// PHY 1, the RPL bias [`dm::bb_sethw`] read after the BB table (an s8 each,
+/// `rtw8852c.c:1827-1831`), which the channel set-up's gain offset uses
+/// (`super::channel::ChannelInputs::offset_base`, PHY 0's).
 pub fn calibrate<I: AxIo + ?Sized>(
     io: &mut I,
     tables: &PhyTables<'_>,
     efuse: &PhyEfuse,
     cv: u8,
-) -> Result<RfkReport, PhyError> {
+) -> Result<(RfkReport, [i8; 2]), PhyError> {
     let t = required(tables).map_err(after_coex("phy tables"))?;
-    let (thermal, xtal) = dm_init(io, efuse).map_err(after_coex("dm init"))?;
+    let (thermal, xtal, offset_base) = dm_init(io, efuse).map_err(after_coex("dm init"))?;
     let nctl_timed_out =
         bb::init_rf_nctl(io, &t.nctl, efuse.rfe_type, cv).map_err(after_coex("nctl init"))?;
     let ((rck, rck_timed_out), dack, (rx_dck_timed_out, rx_dck_rewrites)) =
         rfk_init(io).map_err(after_coex("rfk init"))?;
     dm_tail(io, efuse).map_err(after_coex("dm tail"))?;
-    Ok(RfkReport {
+    let report = RfkReport {
         thermal,
         xtal,
         rck,
@@ -394,22 +399,24 @@ pub fn calibrate<I: AxIo + ?Sized>(
         addck_timed_out: dack.addck_timed_out,
         dack_timed_out: dack.dack_timed_out,
         rx_dck_timed_out,
-    })
+    };
+    Ok((report, offset_base))
 }
 
-/// The first part of `rtw89_phy_dm_init` (phy.c:8237-8253). Returns the
-/// thermals and the crystal cap read back.
-fn dm_init<I: AxIo + ?Sized>(io: &mut I, efuse: &PhyEfuse) -> Result<([u8; 2], (u8, u8)), AxError> {
+/// What the first part of `rtw89_phy_dm_init` reads back: the thermals, the
+/// crystal cap and `efuse_gain.offset_base`.
+type DmInit = ([u8; 2], (u8, u8), [i8; 2]);
+
+/// The first part of `rtw89_phy_dm_init` (phy.c:8237-8253).
+fn dm_init<I: AxIo + ?Sized>(io: &mut I, efuse: &PhyEfuse) -> Result<DmInit, AxError> {
     let thermal = dm::stat_init(io, efuse.thermal_trim)?;
-    // The RPL bias Linux keeps in `efuse_gain.offset_base` is for the
-    // channel set-up, which is not ported.
-    dm::bb_sethw(io)?;
+    let offset_base = dm::bb_sethw(io)?;
     dm::env_monitor_init(io)?;
     dm::physts_parsing_init(io)?;
     dm::dig_init(io)?;
     let xtal = dm::cfo_init(io, efuse.xtal_cap)?;
     dm::edcca_init(io)?;
-    Ok((thermal, xtal))
+    Ok((thermal, xtal, offset_base))
 }
 
 /// What `rtw8852c_rfk_init`'s three calibrations return, in their order.

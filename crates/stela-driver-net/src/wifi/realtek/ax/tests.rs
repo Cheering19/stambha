@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{ptr::NonNull, sync::atomic::AtomicU32};
 use model::{Op, RegisterModel};
 
+pub(crate) mod firmware;
 pub(crate) mod model;
 
 #[test]
@@ -123,7 +124,7 @@ fn error_display_names_the_register() {
     assert!(AxError::Firmware("x").to_string().contains('x'));
 }
 
-const OK_BYTES: usize = 0x40004;
+const OK_BYTES: usize = 0x40020;
 const CLOCK: Clock = Clock {
     ticks_per_microsecond: 1,
 };
@@ -160,6 +161,24 @@ fn native_refuses_small_window() {
         ),
         Err(AxError::Clock)
     ));
+}
+
+#[test]
+fn window_must_reach_the_cmac_table_entry() {
+    // `rtw89_mac_cmac_tbl_init` writes R_AX_INDIR_ACCESS_ENTRY + 28
+    // (0x4001C, mac.c:4419-4434), so M1's 0x4_0004 bytes no longer suffice.
+    let words = window();
+    assert_eq!(
+        native(&words, 0x4_0004, CLOCK).err(),
+        Some(AxError::OutOfWindow { register: 0 })
+    );
+    let mut io = native(&words, 0x4_0020, CLOCK).unwrap();
+    io.write32(0x4001C, 0x000B_8109).unwrap();
+    assert_eq!(io.read32(0x4001C), Ok(0x000B_8109));
+    assert_eq!(
+        io.read32(0x40020),
+        Err(AxError::OutOfWindow { register: 0x40020 })
+    );
 }
 
 #[test]

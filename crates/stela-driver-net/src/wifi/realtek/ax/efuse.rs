@@ -11,9 +11,11 @@
 //! `rtw8852c_chip_info` and the MAC offset of `struct rtw8852c_efuse`
 //! (`rtw8852c.h:33-103`). The PHY fields come from `rtw8852c_read_efuse`
 //! (`rtw8852c.c:633-662`) and `rtw8852c_read_phycap` (`:807-814`), with the
-//! phycap window dumped as `rtw89_parse_phycap_map_ax` does (`efuse.c:350-381`).
-//! Only the DDV (non-DAV) physical map is read; the DAV map, the efuse
-//! version byte and all other logical fields are not ported. This module does not grant firmware download, secure-boot
+//! phycap window dumped as `rtw89_parse_phycap_map_ax` does (`efuse.c:350-381`),
+//! and the RX gain offsets of `rtw8852c_efuse_parsing_gain_offset`
+//! (`rtw8852c.c:565-622`). Only the DDV (non-DAV) physical map is read; the
+//! DAV map, the efuse version byte, the TSSI tables and all other logical
+//! fields are not ported. This module does not grant firmware download, secure-boot
 //! support or any claim that the MAC address is valid.
 use super::io::{AxError, AxIo, clear8, clear16, poll32_value_atomic, set8, set16};
 use alloc::{vec, vec::Vec};
@@ -267,6 +269,42 @@ pub fn phy_efuse(logical: &[u8], phycap: &[u8]) -> Result<PhyEfuse, AxError> {
         thermal_trim: trim(phycap, THERMAL_TRIM),
         pa_bias_trim: trim(phycap, PA_BIAS_TRIM),
     })
+}
+
+/// Logical offsets of `rx_gain_2g_cck`, `rx_gain_2g_ofdm`,
+/// `rx_gain_5g_{low,mid,high}` and `rx_gain_6g_{l0,l1,m0,m1,h0,h1,uh0,uh1}`
+/// in `struct rtw8852c_efuse` (`rtw8852c.h:33-103`), indexed by
+/// `enum rtw89_gain_offset` (`core.h:138-154`).
+pub const RX_GAIN_OFFSETS: [usize; 13] = [
+    0x2D6, 0x2D4, 0x2D8, 0x2DA, 0x2DC, 0x3A8, 0x3AA, 0x3AC, 0x3AE, 0x3B0, 0x3B2, 0x3B4, 0x3B6,
+];
+
+/// `rtwdev->efuse_gain.offset` and `offset_valid` as
+/// `rtw8852c_efuse_parsing_gain_offset` (`rtw8852c.c:575-622`) leaves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RxGain {
+    /// `offset_valid`: any of the 13 bytes is not 0xFF.
+    pub valid: bool,
+    /// `offset[path][enum rtw89_gain_offset]`, path A then B, S(8, 0).
+    pub offset: [[i8; 13]; 2],
+}
+
+/// `rtw8852c_efuse_parsing_gain_offset` with `_decode_efuse_gain`
+/// (`rtw8852c.c:565-573`): path A is the high nibble and path B the low
+/// one, each sign-extended from 4 bits (`FIELD_GET_SIGNED`). A map too short
+/// to hold a byte reads it as unprogrammed 0xFF.
+pub fn rx_gain(logical: &[u8]) -> RxGain {
+    let mut gain = RxGain {
+        valid: false,
+        offset: [[0; 13]; 2],
+    };
+    for (i, &at) in RX_GAIN_OFFSETS.iter().enumerate() {
+        let data = logical.get(at).copied().unwrap_or(0xFF);
+        gain.offset[0][i] = (data as i8) >> 4;
+        gain.offset[1][i] = ((data << 4) as i8) >> 4;
+        gain.valid |= data != 0xFF;
+    }
+    gain
 }
 
 /// `ether_addr_copy(efuse->addr, map->e.mac_addr)` (`rtw8852c.c:648`). A map
@@ -612,6 +650,77 @@ mod tests {
         off += 1 + 1 + 1; // swing 2g/5g, pwr_trk, then trx_path
         off += 1;
         assert_eq!(off, RFE_TYPE_OFFSET);
+    }
+
+    #[test]
+    fn rx_gain_offsets_match_the_layout() {
+        // rtw8852c.h:33-103, packed, from rfe_type onwards.
+        let mut off = RFE_TYPE_OFFSET + 1;
+        off += 2 + 3 + 1 + 1 + 2; // country_code, rsvd7, therm a/b, rsvd8
+        let ofdm_2g = off;
+        let cck_2g = ofdm_2g + 2; // rsvd9
+        let low_5g = cck_2g + 2; // rsvd10
+        let mid_5g = low_5g + 2; // rsvd11
+        let high_5g = mid_5g + 2; // rsvd12
+        off = high_5g + 1 + 35; // rsvd13
+        off += 32 + 10 + 32 + 94; // 6 GHz TSSI A, rsvd14, B, rsvd15
+        let l0_6g = off;
+        // l0, l1, m0, m1, h0, h1, uh0, uh1, each followed by one rsvd byte.
+        let six: [usize; 8] = core::array::from_fn(|i| l0_6g + 2 * i);
+        let mut want = [
+            cck_2g, ofdm_2g, low_5g, mid_5g, high_5g, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        want[5..].copy_from_slice(&six);
+        assert_eq!(RX_GAIN_OFFSETS, want);
+        // Spec S5's table, by enum rtw89_gain_offset (core.h:138-154).
+        assert_eq!(
+            RX_GAIN_OFFSETS,
+            [
+                0x2D6, 0x2D4, 0x2D8, 0x2DA, 0x2DC, 0x3A8, 0x3AA, 0x3AC, 0x3AE, 0x3B0, 0x3B2, 0x3B4,
+                0x3B6
+            ]
+        );
+        // channel_plan_6g and rsvd24 follow uh1's rsvd23 up to the MAC.
+        assert_eq!(six[7] + 2 + 1 + 71, MAC_ADDR_OFFSET);
+    }
+
+    #[test]
+    fn rx_gain_decodes_signed_nibbles() {
+        let mut log = vec![0xFFu8; 2048];
+        log[0x2D6] = 0x7F; // 2G_CCK
+        log[0x2D4] = 0x8F; // 2G_OFDM
+        log[0x2DC] = 0x18; // 5G_HIGH
+        log[0x3B6] = 0xE7; // 6G_UH1
+        let g = rx_gain(&log);
+        assert!(g.valid);
+        assert_eq!((g.offset[0][0], g.offset[1][0]), (7, -1));
+        assert_eq!((g.offset[0][1], g.offset[1][1]), (-8, -1));
+        assert_eq!((g.offset[0][4], g.offset[1][4]), (1, -8));
+        assert_eq!((g.offset[0][12], g.offset[1][12]), (-2, 7));
+        // An unprogrammed byte still decodes to -1/-1 (FIELD_GET_SIGNED).
+        assert_eq!((g.offset[0][2], g.offset[1][2]), (-1, -1));
+
+        let blank = rx_gain(&vec![0xFFu8; 2048]);
+        assert_eq!(
+            blank,
+            RxGain {
+                valid: false,
+                offset: [[-1; 13]; 2]
+            }
+        );
+        // One programmed byte among the 13 is enough, and bytes outside
+        // them do not count.
+        let mut log = vec![0x00u8; 2048];
+        for &o in &RX_GAIN_OFFSETS {
+            log[o] = 0xFF;
+        }
+        assert!(!rx_gain(&log).valid);
+        log[0x3B0] = 0xFE;
+        let g = rx_gain(&log);
+        assert!(g.valid);
+        assert_eq!((g.offset[0][9], g.offset[1][9]), (-1, -2));
+        // A map too short to hold the fields reads as unprogrammed.
+        assert!(!rx_gain(&[0u8; 0x2D4]).valid);
     }
 
     fn window(bytes: &[(usize, u8)]) -> Vec<u8> {

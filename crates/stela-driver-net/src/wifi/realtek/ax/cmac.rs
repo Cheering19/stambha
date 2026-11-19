@@ -15,7 +15,9 @@
 //! (`mac.c:1906`). Only the RTL8852C, PCIe, band 0 branches are ported;
 //! register addresses and bits are from pinned rtw89 `reg.h`. This module grants no band 1, no BB or RF
 //! setup, no MAC address or BSSID, no TX or RX path and no firmware command;
-//! `trx::init` runs it inside the bring-up.
+//! `trx::init` runs it inside the bring-up. `cfg_ppdu_status` is
+//! `rtw89_mac_cfg_ppdu_status_ax` (`mac.c:6289-6311`) for band 0, which
+//! turns the PPDU status report on or off; it delivers nothing itself.
 use super::io::{
     AxError, AxIo, Polled, clear8, clear32, field8, field32, poll_sample, poll32_atomic, set8,
     set32,
@@ -163,6 +165,16 @@ const R_AX_PTCLRPT_FULL_HDL: u32 = 0xC660;
 const B_AX_SPE_RPT_PATH_MASK: u8 = 0x30; // GENMASK(5, 4)
 const FWD_TO_WLCPU: u8 = 1;
 
+// rtw89_mac_cfg_ppdu_status_ax (reg.h:1832-1834, 3380-3388).
+const R_AX_PPDU_STAT: u32 = 0xCE40;
+const B_AX_PPDU_STAT_RPT_EN: u32 = 1 << 0;
+const B_AX_APP_MAC_INFO_RPT: u32 = 1 << 1;
+const B_AX_APP_PLCP_HDR_RPT: u32 = 1 << 3;
+const B_AX_PPDU_STAT_RPT_CRC32: u32 = 1 << 5;
+const R_AX_HW_RPT_FWD: u32 = 0x9C18;
+const B_AX_FWD_PPDU_STAT_MASK: u32 = 0x3; // GENMASK(1, 0)
+const RTW89_PRPT_DEST_HOST: u32 = 1;
+
 /// `rtw89_mac_check_mac_en_ax(RTW89_MAC_0, RTW89_CMAC_SEL)` (`mac.c:62`).
 pub(super) fn check_cmac_en<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let value = io.read32(R_AX_CMAC_FUNC_EN)?;
@@ -171,6 +183,33 @@ pub(super) fn check_cmac_en<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError>
         return Err(AxError::Mac("CMAC function is not enabled"));
     }
     Ok(())
+}
+
+/// `rtw89_mac_cfg_ppdu_status_ax(RTW89_MAC_0, enable)` (`mac.c:6289-6311`),
+/// the RTL8852C's `cfg_ppdu_status` (`mac.c:7497`). After the CMAC check,
+/// enabling is a plain write of 0xCE40 = `RPT_EN | APP_MAC_INFO_RPT |
+/// APP_PLCP_HDR_RPT | RPT_CRC32` (0x2B, so `APP_RX_CNT_RPT` and `RPT_A1M`
+/// end clear) and the PPDU status forwarded to the host (0x9C18 [1:0] = 1);
+/// disabling only clears `RPT_EN`. A disabled CMAC fails before any write,
+/// as Linux returns its `-EFAULT`.
+pub(super) fn cfg_ppdu_status<I: AxIo + ?Sized>(io: &mut I, enable: bool) -> Result<(), AxError> {
+    check_cmac_en(io)?;
+    if !enable {
+        return clear32(io, R_AX_PPDU_STAT, B_AX_PPDU_STAT_RPT_EN);
+    }
+    io.write32(
+        R_AX_PPDU_STAT,
+        B_AX_PPDU_STAT_RPT_EN
+            | B_AX_APP_MAC_INFO_RPT
+            | B_AX_APP_PLCP_HDR_RPT
+            | B_AX_PPDU_STAT_RPT_CRC32,
+    )?;
+    field32(
+        io,
+        R_AX_HW_RPT_FWD,
+        B_AX_FWD_PPDU_STAT_MASK,
+        RTW89_PRPT_DEST_HOST,
+    )
 }
 
 /// `scheduler_init_ax` (`mac.c:2591`), 8852C branches.

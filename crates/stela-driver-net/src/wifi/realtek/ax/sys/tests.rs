@@ -165,6 +165,6 @@ fn new_errors_display() {
                 ret: 3
             }
         ),
-        "firmware refused H2C class 1 func 0x10 seq 7 (return 3)"
+        "firmware refused H2C class 1 func 0x10 seq 7 (raw return 0x03)"
     );
 }

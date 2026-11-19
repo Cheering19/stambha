@@ -217,3 +217,32 @@ fn rfk_report_names_every_timeout_in_spec_order() {
         "{small}"
     );
 }
+
+#[test]
+fn calibrate_returns_the_rpl_bias_bb_sethw_read() {
+    use crate::wifi::realtek::ax::tests::model::RegisterModel;
+    let b = file(&ALL);
+    let t = phy_tables(&b, 0).unwrap();
+    let efuse = PhyEfuse {
+        rfe_type: 1,
+        xtal_cap: 0x2F,
+        thermal_trim: None,
+        pa_bias_trim: None,
+    };
+    let mut m = RegisterModel::new();
+    m.emulate_rf();
+    // CMAC on, for the DACK's coex RFK notify.
+    m.set32(0xC000, 0x4000_0000);
+    // XTAL SI: every command is done at its first read.
+    m.on_read(
+        0x0270,
+        alloc::boxed::Box::new(|m: &mut RegisterModel| m.get32(0x0270) & 0x7FFF_FFFF),
+    );
+    // R_RPL_BIAS_COMP [7:0] and R_RPL_BIAS_COMP1 [7:0], each an s8.
+    m.set32(0x14DF0, 0x0808_06F0);
+    m.set32(0x16DF0, 0xFFFF_FF05);
+    // The calibration polls time out, which is recorded, not a failure.
+    let (report, offset_base) = calibrate(&mut m, &t, &efuse, 1).unwrap();
+    assert_eq!(offset_base, [-16, 5]);
+    assert!(report.rck_timed_out[0]);
+}

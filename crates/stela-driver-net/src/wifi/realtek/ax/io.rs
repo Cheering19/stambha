@@ -8,8 +8,10 @@ use crate::{Clock, bus::mmio::Mmio};
 use alloc::sync::Arc;
 use core::{any::Any, fmt, ptr::NonNull};
 
-/// Smallest window: the S8 indirect watchdog registers sit at 0x40000.
-pub const MIN_WINDOW_BYTES: usize = 0x4_0004;
+/// Smallest window: the S8 indirect watchdog registers sit at 0x40000, and
+/// the highest register written is the CMAC table entry at 0x4001C
+/// (`rtw89_mac_cmac_tbl_init`, M2c spec S7.2).
+pub const MIN_WINDOW_BYTES: usize = 0x4_0020;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AxError {
@@ -78,7 +80,10 @@ pub enum AxError {
         /// The last RXQ hardware index read (`IDX` [27:16]).
         rxq_hw: u16,
     },
-    /// The firmware acknowledged an H2C with a non-zero return code.
+    /// The firmware acknowledged an H2C with a return code that fails it.
+    /// `ret` is the DONE_ACK's `H2C_RETURN` byte raw, before the mask that
+    /// decided the failure (ADD_SCANOFLD_CH fails on bits 5:0 only), and
+    /// prints so.
     H2cRejected {
         class: u8,
         func: u8,
@@ -100,6 +105,9 @@ pub enum AxError {
         table: &'static str,
         index: u16,
     },
+    /// The firmware scan offload could not be built, started or finished;
+    /// the message says why.
+    Scan(&'static str),
 }
 
 impl fmt::Display for AxError {
@@ -153,8 +161,10 @@ impl fmt::Display for AxError {
                 ret,
             } => write!(
                 f,
-                "firmware refused H2C class {class} func {func:#x} seq {seq} (return {ret})"
+                "firmware refused H2C class {class} func {func:#x} seq {seq} (raw return \
+                 {ret:#04x})"
             ),
+            Self::Scan(what) => write!(f, "scan: {what}"),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),

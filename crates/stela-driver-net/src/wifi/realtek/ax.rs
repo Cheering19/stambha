@@ -21,16 +21,44 @@
 //! (TX power reference, efuse trims, RX path) from [`dm`], the NCTL table
 //! ([`bb::init_rf_nctl`]), and `rtw8852c_rfk_init`'s RCK, DACK with its
 //! DRCK, ADDCK and coex notify, and RX DCK from [`rfk`]. [`bring_up`] puts
-//! these in Linux's order before powering the chip off again. It grants no
-//! channel, no IQK, DPK, TSSI or tracking, no station and no interrupts:
-//! the chip is powered off at the end, and nothing past
-//! `rtw89_phy_dm_init` runs.
+//! these in Linux's order before powering the chip off again. [`chan`]
+//! describes a 20 MHz 2.4 or 5 GHz channel as `rtw89_chan_create` does,
+//! without programming it. [`ppdu`] reads a PPDU status's per-path RSSI
+//! and channel index and matches it to the frames of its PPDU, without
+//! queueing them. [`receive`] routes each RXQ buffer as `rtw89_core_rx`
+//! does: C2Hs on, beacons and probe responses queued for their PPDU status,
+//! tagged with the channel the firmware reports and stripped of their FCS.
+//! [`channel`] is `__rtw89_set_channel` for a 20 MHz channel: the TX
+//! scheduler and PPDU status stopped and resumed around the change, the MAC
+//! rate checks, the baseband (gain tables, efuse RX gain offsets, CCK
+//! filters, spur notches, TX path table), and RF 0x18's channel and
+//! bandwidth on both paths. [`core_tail`] is the rest of
+//! `rtw89_core_start` (PPDU status reports, the RTS threshold, and the
+//! firmware log and BA CAM H2Cs), sent through a [`command::Session`],
+//! which submits every H2C after `rtw89_phy_dm_init` on CH12 and drains RXQ
+//! through one [`receive::Receiver`], waiting for a scan command's DONE_ACK
+//! and recording any other refusal. [`vif`] is `rtw89_mac_vif_init` for one
+//! unassociated station on port 0 and macid 0: the port registers, the DMAC
+//! and CMAC tables, then the macid unpause, role, join, address CAM and CMAC
+//! table H2Cs through the same session. [`scan`] runs these in Linux's order
+//! (core start, channel 1, vif init), then the firmware's passive scan
+//! offload over 38 channels, and keeps the beacons and probe responses it
+//! hears as networks by BSSID. [`bring_up`] runs [`scan::run`] after
+//! `rtw89_phy_dm_init`, with the BB gain table, efuse RX gain offsets, RPL
+//! bias and cut the steps before it produced, and reports the networks with
+//! RF 0x18 read through both of its windows ([`Rf18`]). The bring-up grants
+//! no channel but the scan's boot channel, no IQK, DPK, TSSI or tracking, no
+//! association, no transmission request and no interrupts; the chip is
+//! powered off at the end.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
+pub mod chan;
+pub mod channel;
 pub mod cmac;
 pub mod coex;
 pub mod command;
+pub mod core_tail;
 pub mod dm;
 pub mod dmac;
 pub mod efuse;
@@ -42,16 +70,20 @@ pub mod pci;
 pub mod phy;
 pub mod phy_table;
 pub mod power;
+pub mod ppdu;
 pub mod radio;
+pub mod receive;
 pub mod rf;
 pub mod rfk;
 pub mod rx;
+pub mod scan;
 pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod trx;
+pub mod vif;
 
-pub use bringup::{BringUpError, Earlier, Host, Running, bring_up, quiesce};
+pub use bringup::{BringUpError, Earlier, Host, Rf18, Rf18Line, Running, bring_up, quiesce};
 pub use command::H2cAck;
 pub use fwdl::download;
 pub use io::{
@@ -63,3 +95,4 @@ pub use phy::{PhyReport, RfkReport};
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};
+pub use scan::{Listed, Network, ScanEnd, ScanReport};

@@ -6,13 +6,13 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use std::sync::Mutex;
 
 // The beacon DMA model hands out IOVAs 0x1000_0000 + 0x10000 * n in mapping
-// order, and `Rings::install` maps the TX BD pool, the RX BD pool, the 16 RX
-// buffers (RXQ then RPQ) and the CH12 slots in that order.
+// order, and `Rings::install` maps the TX BD pool, the RX BD pool, the 64 RX
+// buffers (RXQ's 32, then RPQ's 32) and the CH12 slots in that order.
 pub(crate) const TX_POOL: u32 = 0x1001_0000;
 const RX_POOL: u32 = 0x1002_0000;
 const RX_BUFFER0: u32 = 0x1003_0000;
-pub(crate) const FWCMD: u32 = 0x1013_0000;
-const MAPPINGS: usize = 19;
+pub(crate) const FWCMD: u32 = 0x1043_0000;
+const MAPPINGS: usize = 67;
 
 fn install(m: &Arc<Mutex<Model>>) -> Rings {
     // SAFETY: the model domain isolates only the modeled requester behind
@@ -213,10 +213,10 @@ fn pre_init_matches_linux_sequence() {
         Op::W32(0x1280, t(12)),
         Op::W32(0x1284, 0),
         // RX: NUM, DESA_L, DESA_L + 4; no IDX (rx_ring_eq_is_full false).
-        Op::W16(0x1210, 8), // RXQ
+        Op::W16(0x1210, 32), // RXQ
         Op::W32(0x1220, RX_POOL),
         Op::W32(0x1224, 0),
-        Op::W16(0x1212, 8), // RPQ: its own page of the RX pool.
+        Op::W16(0x1212, 32), // RPQ: its own page of the RX pool.
         Op::W32(0x1228, RX_POOL + 4096),
         Op::W32(0x122C, 0),
         // rtw89_pci_init_wp_16sel (pci.c:1722).
@@ -309,7 +309,7 @@ fn txbd_layout() {
 fn install_points_every_rx_bd_at_a_zeroed_buffer() {
     let m = Arc::new(Mutex::new(Model::default()));
     let rings = install(&m);
-    let buffers: Vec<u32> = (0..16).map(|i| RX_BUFFER0 + i * 0x10000).collect();
+    let buffers: Vec<u32> = (0..64).map(|i| RX_BUFFER0 + i * 0x10000).collect();
     // Copy the device's view out before asserting: a failed assertion under
     // the lock would poison it for the rings' unmap on unwind.
     let (count, directions, tx_bds, rx_bds, contents) = {
@@ -337,15 +337,15 @@ fn install_points_every_rx_bd_at_a_zeroed_buffer() {
         Direction::Bidirectional,
         Direction::ToDevice,
     ];
-    want.extend([Direction::FromDevice; 16]);
+    want.extend([Direction::FromDevice; 64]);
     assert_eq!(directions, want);
     assert_eq!(tx_bds, vec![0; 13 * 16 * 8]);
-    // RXQ's 8 BDs start the pool and RPQ's start its second page; the rest
-    // of each page stays zero.
+    // RXQ's 32 BDs start the pool and RPQ's start its second page; the rest
+    // of each page stays zero. BD e of ring r is buffer r * 32 + e.
     let mut want = vec![0u8; 2 * 4096];
     for (i, buffer) in buffers.iter().enumerate() {
         // le16 buf_size 11498, le16 opt 0 (dma[39:32] = 0), le32 dma.
-        let at = (i / 8) * 4096 + (i % 8) * 8;
+        let at = (i / 32) * 4096 + (i % 32) * 8;
         want[at..at + 4].copy_from_slice(&[0xEA, 0x2C, 0, 0]);
         want[at + 4..at + 8].copy_from_slice(&buffer.to_le_bytes());
         assert_eq!(contents[i], vec![0; RX_BUFFER_BYTES]);
@@ -702,8 +702,10 @@ fn hardware_index(io: &mut RegisterModel, hw: u32) {
     io.on_read(0x1218, Box::new(move |_m: &mut RegisterModel| hw << 16));
 }
 
-/// RXQ entry `entry`'s buffer, as the device sees it.
+/// RXQ entry `entry`'s buffer, as the device sees it: RXQ is ring 0, so
+/// its entries are the first `RX_ENTRIES` buffers mapped.
 pub(crate) fn rxq_buffer(entry: usize) -> u64 {
+    assert!(entry < RX_ENTRIES);
     u64::from(RX_BUFFER0) + 0x10000 * entry as u64
 }
 
@@ -761,15 +763,17 @@ fn rxq_consumer_wraps_and_writes_back_host_index() {
     }
     let mut counts = Vec::new();
     let mut seen = Vec::new();
-    for hw in [6, 1, 1] {
+    for hw in [30, 1, 1] {
         hardware_index(&mut io, hw);
         counts.push(drain(&mut rings, &mut io, &mut seen).unwrap());
     }
-    assert_eq!(counts, [6, 3, 0]);
-    // Entries 0-5, then 6, 7 and (wrapped) 0.
+    assert_eq!(counts, [30, 3, 0]);
+    // Entries 0-29, then 30, 31 and (wrapped) 0.
     let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
-    assert_eq!(order, [1, 2, 3, 4, 5, 6, 7, 8, 1]);
-    assert_eq!(io.writes(), [Op::W16(0x1218, 6), Op::W16(0x1218, 1)]);
+    let mut want: Vec<u8> = (1..=32).collect();
+    want.push(1);
+    assert_eq!(order, want);
+    assert_eq!(io.writes(), [Op::W16(0x1218, 30), Op::W16(0x1218, 1)]);
     // The third poll only read the index.
     assert_eq!(io.trace[io.trace.len() - 1], Op::R32(0x1218));
 }
@@ -777,7 +781,8 @@ fn rxq_consumer_wraps_and_writes_back_host_index() {
 #[test]
 fn rxq_index_past_ring_is_refused() {
     let (m, mut rings, mut io) = running();
-    hardware_index(&mut io, 8);
+    // The largest index IDX [27:16] can carry.
+    hardware_index(&mut io, 0xFFF);
     let before = syncs(&m);
     let mut seen = Vec::new();
     assert_eq!(
@@ -794,6 +799,84 @@ fn rxq_index_past_ring_is_refused() {
         Err(AxError::AllOnes { register: 0x1218 })
     );
     assert!(io.writes().is_empty());
+}
+
+/// Put entry `entry`'s marker byte (`entry + 1`) at the start of each RXQ
+/// buffer.
+fn mark_every_rxq_entry(m: &Arc<Mutex<Model>>) {
+    let state = m.lock().unwrap();
+    for entry in 0..RX_ENTRIES {
+        device_write(&state, rxq_buffer(entry), &[entry as u8 + 1; 4]);
+    }
+}
+
+#[test]
+fn rxq_poll_counts_a_full_ring() {
+    let (m, mut rings, mut io) = running();
+    mark_every_rxq_entry(&m);
+    assert_eq!(rings.rxq_full_batches(), 0);
+    // Host index 0, hardware index 31: RX_ENTRIES - 1 entries filled, the
+    // ring full (`rx_ring_eq_is_full` false).
+    hardware_index(&mut io, 31);
+    let mut seen = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(31));
+    let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
+    assert_eq!(order, (1..=31).collect::<Vec<u8>>());
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::W16(0x1218, 31)]);
+    assert_eq!(rings.rxq_full_batches(), 1);
+    // Nothing new: nothing delivered, nothing counted.
+    io.trace.clear();
+    seen.clear();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(0));
+    assert!(seen.is_empty());
+    assert_eq!(io.trace, [Op::R32(0x1218)]);
+    assert_eq!(rings.rxq_full_batches(), 1);
+    // A batch of 30 (host 31, hardware 29) is not a full ring.
+    hardware_index(&mut io, 29);
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(30));
+    assert_eq!(rings.rxq_full_batches(), 1);
+    // The count saturates (host 29, hardware 28: full again).
+    rings.rxq_full.set(u16::MAX);
+    hardware_index(&mut io, 28);
+    seen.clear();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(31));
+    assert_eq!(rings.rxq_full_batches(), u16::MAX);
+}
+
+#[test]
+fn rxq_wraps_past_entry_31() {
+    let (m, mut rings, mut io) = running();
+    mark_every_rxq_entry(&m);
+    let mut seen = Vec::new();
+    hardware_index(&mut io, 30);
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(30));
+    // Host 30, hardware 2: entries 30, 31, 0, 1.
+    io.trace.clear();
+    seen.clear();
+    hardware_index(&mut io, 2);
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(4));
+    let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
+    assert_eq!(order, [31, 32, 1, 2]);
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::W16(0x1218, 2)]);
+    assert_eq!(rings.rxq_full_batches(), 0);
+}
+
+#[test]
+fn hardware_index_32_is_refused() {
+    let (m, mut rings, mut io) = running();
+    mark_every_rxq_entry(&m);
+    hardware_index(&mut io, 32);
+    let before = syncs(&m);
+    let mut seen = Vec::new();
+    assert_eq!(
+        drain(&mut rings, &mut io, &mut seen),
+        Err(AxError::Rx("RXQ hardware index out of range"))
+    );
+    // No buffer taken, given back or delivered; no host index written.
+    assert!(seen.is_empty());
+    assert_eq!(syncs(&m), before);
+    assert_eq!(io.trace, [Op::R32(0x1218)]);
+    assert_eq!(rings.rxq_full_batches(), 0);
 }
 
 #[test]

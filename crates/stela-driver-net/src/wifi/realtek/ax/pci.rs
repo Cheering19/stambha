@@ -46,8 +46,14 @@ use core::{
 /// (`BUILD_BUG_ON(RTW89_PCI_TXBD_NUM_MAX % 16)`, `pci.c:3647`), so the
 /// smallest length that keeps that invariant is used.
 pub const TX_ENTRIES: usize = 16;
-/// RX buffers per RX ring (RXQ and RPQ).
-pub const RX_ENTRIES: usize = 8;
+/// RX buffers per RX ring (RXQ and RPQ). Linux's rings hold
+/// `RTW89_PCI_RXBD_NUM_MAX` (256, `pci.h:1123`) because NAPI can lag; RXQ
+/// is polled here every 50 µs, but once a scan opens the RX filter every
+/// foreign frame takes an entry and its PPDU status another, and 8 entries
+/// left under a millisecond of slack. The rings' 64 buffers take 3 pages
+/// each: 211 pages in all with the BD rings and the CH12 slots, before any
+/// page the page source spends between allocations.
+pub const RX_ENTRIES: usize = 32;
 /// `RTW89_PCI_RX_BUF_SIZE` (`pci.h:1128`).
 pub const RX_BUFFER_BYTES: usize = 11454 + 40 + 4;
 /// Bytes of one CH12 packet slot. The largest FWDL packet is a 16-byte TX
@@ -319,6 +325,9 @@ pub struct Rings {
     /// up to the hardware index are filled and the host's; the rest are the
     /// device's.
     rxq_host: Cell<u16>,
+    /// RXQ polls that found the ring full, saturating; see
+    /// [`Rings::rxq_full_batches`].
+    rxq_full: Cell<u16>,
 }
 
 impl Rings {
@@ -376,6 +385,7 @@ impl Rings {
             ch12_host: Cell::new(0),
             ch12_ready: Cell::new(false),
             rxq_host: Cell::new(0),
+            rxq_full: Cell::new(0),
         };
         zero(&rings.tx, TX_CHANNELS * TX_RING_BYTES)?;
         rings
@@ -419,6 +429,14 @@ impl Rings {
     /// it again.
     pub fn ch12_stopped(&self) -> bool {
         !self.ch12_ready.get()
+    }
+
+    /// How many `Rxq::poll` batches found RXQ full: `RX_ENTRIES - 1` entries
+    /// filled, the most the ring holds with `rx_ring_eq_is_full` false
+    /// (`rtw89_pci_dma_recalc`, `pci.c:61`). Each such batch means the device
+    /// may have had no free buffer before the poll. Saturates at `u16::MAX`.
+    pub fn rxq_full_batches(&self) -> u16 {
+        self.rxq_full.get()
     }
 
     fn tx_ring(&self, channel: usize) -> Result<u32, AxError> {
@@ -856,7 +874,9 @@ impl Rxq<'_> {
     /// (`RX_BUFFER_BYTES`) out, call `each` with the copy, give the buffer
     /// back to the device and advance. The host index is written once after
     /// a batch that consumed anything (`pci.c:433`). Returns the number of
-    /// entries consumed.
+    /// entries consumed. A batch that finds `RX_ENTRIES - 1` entries filled,
+    /// the ring full, is counted in [`Rings::rxq_full_batches`] before any
+    /// of them is delivered.
     ///
     /// A hardware index past the ring, or all ones, is refused before any
     /// buffer is touched. An error from `each` ends the batch: as Linux's
@@ -898,6 +918,11 @@ impl Rxq<'_> {
         };
         if count == 0 {
             return Ok(0);
+        }
+        if count == RX_ENTRIES - 1 {
+            // Every entry the device can fill is filled: it may have had no
+            // free buffer since the last poll.
+            rings.rxq_full.set(rings.rxq_full.get().saturating_add(1));
         }
         // No buffer read may move before the index read that proved it full.
         fence(Ordering::Acquire);
