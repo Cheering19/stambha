@@ -43,7 +43,7 @@ use stela_drivers::{
     },
     firmware::Catalog,
     net::wifi::realtek::{
-        ax::{AxIo, NativeAxIo},
+        ax::{AxIo, Host, NativeAxIo},
         identity::Observed,
     },
     probe::{
@@ -204,6 +204,8 @@ struct Chip<'a> {
     function: &'a mut Function<EcamConfig>,
     io: NativeAxIo,
     domain: Arc<dyn DmaDomain>,
+    /// DEVCTL2's LTR enable as the firmware left it ([`ltr_enabled`]).
+    ltr: bool,
 }
 
 impl Rtw89Device for Chip<'_> {
@@ -211,6 +213,10 @@ impl Rtw89Device for Chip<'_> {
 
     fn io(&mut self) -> &mut NativeAxIo {
         &mut self.io
+    }
+
+    fn host(&self) -> Host {
+        Host { ltr: self.ltr }
     }
 
     /// The parked state checked again, after `quiesce`, then the
@@ -315,6 +321,7 @@ fn attach(
         identity.map_err(|error| at(&format!("subsystem: {error}")))?;
     // Memory decode on, MSI and MSI-X off, INTx disabled; Bus Master stays
     // clear.
+    let ltr = ltr_enabled(function);
     function
         .enable_polled_decode()
         .map_err(|error| at(&format!("memory decode: {error}")))?;
@@ -344,6 +351,7 @@ fn attach(
         function,
         io,
         domain: Arc::new(Passthrough::new(vec![dma])),
+        ltr,
     };
     // SAFETY: `rtw89_attach`'s contract, as the host check holds it:
     // - `chip.io` is the uncached BAR2 window of this function alone, which
@@ -396,6 +404,30 @@ fn provider(catalog: &Arc<Catalog>) -> &'static dyn stela_drivers::firmware::Pro
     Box::leak(Box::new(
         stela_loader::host_firmware::bundle::BundleProvider::new(catalog),
     ))
+}
+
+/// `rtw89_pci_dev_ltr_enabled` (`pci.c:3042`), as the probe reads it
+/// (`probe::native`'s `rtw89_decode`): DEVCTL2's LTR enable (bit 10 at PCIe
+/// capability + 0x28), false without a PCIe capability of version 2 or
+/// above, or when config space cannot be read.
+fn ltr_enabled(function: &mut Function<EcamConfig>) -> bool {
+    const CAP_ID_EXP: u8 = 0x10;
+    const EXP_FLAGS_VERS: u16 = 0x000f;
+    const EXP_DEVCTL2: u16 = 0x28;
+    const EXP_DEVCTL2_LTR_EN: u16 = 1 << 10;
+    let Ok(capabilities) = function.capabilities() else {
+        return false;
+    };
+    let Some(cap) = capabilities
+        .into_iter()
+        .find(|&(_, id)| id == CAP_ID_EXP)
+        .map(|(offset, _)| u16::from(offset))
+    else {
+        return false;
+    };
+    let config = function.config();
+    matches!(config.read16(cap + 2), Ok(flags) if flags & EXP_FLAGS_VERS > 1)
+        && matches!(config.read16(cap + EXP_DEVCTL2), Ok(v) if v & EXP_DEVCTL2_LTR_EN != 0)
 }
 
 fn failed(error: &Error) -> String {
