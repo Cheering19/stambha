@@ -2855,11 +2855,22 @@ struct Unbound {
     /// What became of the firmware's picture on it.
     picture: stela_boot_core::gpu_status::Picture<'static>,
     /// Its stack draws.
-    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     draws: bool,
+    /// The boot screen said it did not start ([`warn_one`]).
+    warned: Cell<bool>,
 }
 
 impl Unbound {
+    /// Why it did not start, for the boot screen: Linux's first error in
+    /// its probe, else what the start says of it.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    fn cause(&self) -> String {
+        match &self.error {
+            Some(error) => error.clone(),
+            None => format!("{}; Linux reported no error", self.what),
+        }
+    }
+
     /// A GPU whose probe never returned: a picture on it stays held.
     fn of(claimed: &Claimed) -> Self {
         use stela_boot_core::gpu_status::Picture;
@@ -2879,6 +2890,7 @@ impl Unbound {
                 (true, true) => Picture::Held,
             },
             draws: claimed.stack.draws(),
+            warned: Cell::new(false),
         }
     }
 }
@@ -3113,6 +3125,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
                         error: kernel.platform().probe_error.take(),
                         picture,
                         draws: claimed.stack.draws(),
+                        warned: Cell::new(false),
                     });
                 }
                 job._attached.push(attached);
@@ -3132,6 +3145,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
                     error: Some(format!("{:?}", error.error)),
                     picture,
                     draws: claimed.stack.draws(),
+                    warned: Cell::new(false),
                 });
             }
         }
@@ -3433,10 +3447,10 @@ pub(super) fn serve(
         let wanted = screen.unwrap_or((0, 0));
         display::take(wanted, shown, size);
         let failed = gate::open_service();
-        fall_back_after_metal(failed, fallback, |from| {
+        let errors = fall_back_after_metal(failed, fallback, |from| {
             display::take_from(from, wanted, shown, size);
         });
-        report_drawer();
+        report_drawer(&errors);
     }
 }
 
@@ -3451,10 +3465,11 @@ fn fall_back_after_metal(
     mut failed: Vec<(usize, String)>,
     fallback: &mut Fallback,
     take_from: impl Fn(usize),
-) {
+) -> Vec<(usize, String)> {
     use stela_boot_core::gpu_step::Stage;
+    let mut every = failed.clone();
     let Some(gpu) = installed() else {
-        return;
+        return every;
     };
     let stage = |index: usize, error: &str| {
         let bound = &gpu.start.bound[index];
@@ -3483,7 +3498,7 @@ fn fall_back_after_metal(
             break;
         }
         let from = gpu.start.bound.len();
-        let round = fallback.claim(stages);
+        let round = fallback.claim(stages, &mut |_| {});
         if round.claimed.is_empty() {
             if let Some(pages) = round.pages {
                 hold_pages_now(gpu, pages);
@@ -3504,7 +3519,9 @@ fn fall_back_after_metal(
         client::find_new_minors();
         take_from(from);
         failed = gate::open_from(from);
+        every.extend(failed.iter().cloned());
     }
+    every
 }
 
 /// Holds Linux's pages to `pages` now, in a turn of Linux's of its own,
@@ -3523,7 +3540,7 @@ fn hold_pages_now(gpu: &'static Installed, pages: usize) {
 /// did, the boot screen says which draws instead; the log names the GPU that
 /// draws and the one that shows the display either way.
 #[cfg(feature = "nvk")]
-fn report_drawer() {
+fn report_drawer(errors: &[(usize, String)]) {
     let Some(gpu) = installed() else {
         return;
     };
@@ -3534,9 +3551,14 @@ fn report_drawer() {
     if let (Some(wanted), Some(served)) = (wanted, served)
         && wanted != served
     {
+        let error = errors
+            .iter()
+            .find(|(index, _)| *index == wanted)
+            .map(|(_, error)| error.as_str());
         crate::status::warning(&stela_boot_core::gpu_status::draws_instead(
             &bound[wanted].market,
             &bound[served].market,
+            error,
         ));
     }
     let named = |index: Option<usize>| match index.and_then(|index| bound.get(index)) {
@@ -3806,8 +3828,9 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
             &fallback_words,
         ))
     })??;
-    // On the boot screen too, for the case that another adapter shows it.
-    warn_unbound(&job.unbound.borrow());
+    // On the boot screen too, for the case that another adapter shows it;
+    // a drawing GPU's after the fallback that may take its place.
+    warn_unbound(&job.unbound.borrow(), !cfg!(feature = "nvk"));
     let result = job.result.clone().map_err(Error::Init);
     #[cfg(feature = "nvk")]
     let result = result.and_then(|()| {
@@ -3845,17 +3868,29 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     result
 }
 
-/// Says on the boot screen, as in the log, that each GPU of `unbound` did
-/// not start, for the case that another adapter shows the screen.
-fn warn_unbound(unbound: &[Unbound]) {
+/// Says on the boot screen, as in the log, that each GPU of `unbound` not
+/// said yet did not start, for the case that another adapter shows the
+/// screen; a GPU that draws only where `drawing`: the fallback that may take
+/// its place says it with why ([`warn_one`]).
+fn warn_unbound(unbound: &[Unbound], drawing: bool) {
     for unbound in unbound {
-        crate::status::warning(&stela_boot_core::gpu_status::unbound(
-            &unbound.market,
-            &unbound.name,
-            unbound.driver,
-            unbound.picture,
-        ));
+        if !unbound.warned.get() && (drawing || !unbound.draws) {
+            warn_one(unbound, None);
+        }
     }
+}
+
+/// Says on the boot screen that `unbound` did not start, with `cause`, its
+/// stage and Linux's first error, where a fallback takes its place.
+fn warn_one(unbound: &Unbound, cause: Option<&str>) {
+    unbound.warned.set(true);
+    crate::status::warning(&stela_boot_core::gpu_status::unbound(
+        &unbound.market,
+        &unbound.name,
+        unbound.driver,
+        unbound.picture,
+        cause,
+    ));
 }
 
 /// TSC ticks [`open`] took to start Linux and for nouveau's probe.
@@ -4156,12 +4191,20 @@ impl Fallback {
     /// then held to the plan's bound where the plan held them to none
     /// ([`host_memory::fallback_pages`]).
     ///
+    /// `warn` is told, before the claims' own lines, whether a GPU takes
+    /// the failed GPUs' place: claimed now, or started already and drawing.
+    ///
     /// [`host_memory::fallback_pages`]: stela_boot_core::host_memory::fallback_pages
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
-    fn claim(&mut self, failed: Vec<(usize, stela_boot_core::gpu_step::Stage)>) -> Round {
+    fn claim(
+        &mut self,
+        failed: Vec<(usize, stela_boot_core::gpu_step::Stage)>,
+        warn: &mut dyn FnMut(bool),
+    ) -> Round {
         use stela_boot_core::host_memory::FallbackPages;
         use stela_drivers::gpu::selection::{self, Choice};
         let Some(mut census) = self.census.take() else {
+            warn(false);
             return Round::default();
         };
         let mut without: Vec<usize> = census.failed.clone();
@@ -4221,6 +4264,7 @@ impl Fallback {
             let drawing = wanted.claimed.iter().copied().find(|&index| {
                 wanted.choices[index] == Choice::First && draws(index) && !without.contains(&index)
             });
+            warn(drawing.is_some());
             fall_back_census(&mut census, &failed, |_, _, _, _| None);
             self.census = Some(census);
             #[cfg(feature = "nvk")]
@@ -4231,12 +4275,13 @@ impl Fallback {
                     drawing_pages(&format!("{}", census.adapters[index].address))
                 });
             #[cfg(not(feature = "nvk"))]
-            let (_, pages) = (drawing, None);
+            let pages = None;
             return Round {
                 claimed: Vec::new(),
                 pages,
             };
         }
+        warn(true);
         for line in &starved {
             crate::status::warning(line);
         }
@@ -4306,12 +4351,13 @@ pub(super) fn fall_back_after_probe(
     fallback: &mut Fallback,
 ) -> Result<(), Error> {
     use stela_boot_core::gpu_step::Stage;
-    if !matches!(opened, Ok(()) | Err(Error::NoDevices)) {
-        return opened;
-    }
     let Some(gpu) = installed() else {
         return opened;
     };
+    if !matches!(opened, Ok(()) | Err(Error::NoDevices)) {
+        warn_unbound(&gpu.start.unbound.borrow(), true);
+        return opened;
+    }
     // Each round claims GPUs that have not failed yet, so the census ends it.
     for _ in 0..MOST_BOUND {
         let failed: Vec<(usize, Stage)> = gpu
@@ -4333,7 +4379,16 @@ pub(super) fn fall_back_after_probe(
         if failed.is_empty() {
             break;
         }
-        let round = fallback.claim(failed);
+        let censuses: Vec<usize> = failed.iter().map(|&(index, _)| index).collect();
+        // Before the claims' own lines: each GPU's, with why it could not
+        // draw where another takes its place.
+        let round = fallback.claim(failed, &mut |replaced| {
+            for unbound in gpu.start.unbound.borrow().iter() {
+                if censuses.contains(&unbound.census) && !unbound.warned.get() {
+                    warn_one(unbound, replaced.then(|| unbound.cause()).as_deref());
+                }
+            }
+        });
         if round.claimed.is_empty() {
             if let Some(pages) = round.pages {
                 hold_pages_now(gpu, pages);
@@ -4348,6 +4403,7 @@ pub(super) fn fall_back_after_probe(
             break;
         }
     }
+    warn_unbound(&gpu.start.unbound.borrow(), true);
     match gpu.start.bound.is_empty() {
         true => Err(Error::NoDevices),
         false => Ok(()),
@@ -4388,8 +4444,9 @@ fn start_more(
     let result = gpu
         .work
         .dispatch_linux(|runtime| Ok(more_probes(gpu, runtime, &mut claimed, pages)));
-    // On the boot screen too, as the start's are.
-    warn_unbound(&gpu.start.unbound.borrow()[unbound_before..]);
+    // On the boot screen too, as the start's are; a drawing GPU's after
+    // the fallback that may take its place.
+    warn_unbound(&gpu.start.unbound.borrow()[unbound_before..], false);
     result?
 }
 

@@ -54,6 +54,46 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     }
 }
 
+/// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
+/// device and `instead` draws in its place; `error` is why its Metal device
+/// did not open, in one screen line ([`one_line`]).
+pub fn draws_instead(wanted: &str, instead: &str, error: Option<&str>) -> String {
+    let (why, log) = match error {
+        Some(error) => (format!(" ({})", one_line(error)), "more"),
+        None => (String::new(), "why"),
+    };
+    format!(
+        "the {wanted} could not draw for macOS: its Metal device did not open{why}, so the \
+         {instead} draws instead. The boot log on this USB says {log}"
+    )
+}
+
+/// The most characters of a cause the screen shows: one line of the
+/// narrowest console Stela draws on, past the mark's indent.
+pub const CAUSE_COLUMNS: usize = 96;
+
+/// The first line of `text`, its ends trimmed and a final period left
+/// off, at most [`CAUSE_COLUMNS`] characters, cut at a word where one
+/// ends in its last quarter, with an ellipsis where cut.
+pub fn one_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_end_matches('.');
+    if line.chars().count() <= CAUSE_COLUMNS {
+        return String::from(line);
+    }
+    let room = CAUSE_COLUMNS - 3;
+    let cut: String = line.chars().take(room).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if cut[..space].chars().count() >= room * 3 / 4 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    format!("{}...", cut.trim_end_matches([' ', ',', ';', ':']))
+}
+
 /// The screen line when the integrated GPU `gpu`, started in place of a GPU
 /// that could not draw, has only `room` bytes of Linux's pages, under what
 /// a desktop needs (`host_memory::FALLBACK_LEAST`).
@@ -64,15 +104,6 @@ pub fn fallback_starved(gpu: &str, room: u64) -> String {
          memory; some windows may not draw",
         tenths / 10,
         tenths % 10
-    )
-}
-
-/// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
-/// device and `instead` draws in its place.
-pub fn draws_instead(wanted: &str, instead: &str) -> String {
-    format!(
-        "the {wanted} could not draw for macOS: its Metal device did not open, so the {instead} \
-         draws instead. The boot log on this USB says why"
     )
 }
 
@@ -206,8 +237,16 @@ pub enum Picture<'a> {
 /// `address` that its Linux driver `driver` did not bind, with what became
 /// of the firmware's picture on it. A picture that ended leaves its display
 /// with nothing, so only another adapter's screen, or the log, carries this
-/// line.
-pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> String {
+/// line. Where another GPU takes its place, `cause` says why it could not
+/// draw: Linux's first error in its probe, in one screen line
+/// ([`one_line`]).
+pub fn unbound(
+    gpu: &str,
+    address: &str,
+    driver: &str,
+    picture: Picture<'_>,
+    cause: Option<&str>,
+) -> String {
     let screen = match picture {
         Picture::Elsewhere => String::new(),
         Picture::Kept => String::from(
@@ -227,10 +266,17 @@ pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> 
              probe holds the GPU.",
         ),
     };
-    format!(
-        "the {gpu} at {address} did not start: its driver {driver} stopped with an error.{screen} \
-         The boot log on this USB says why"
-    )
+    match cause {
+        Some(cause) => format!(
+            "the {gpu} at {address} did not start: its driver {driver} stopped in its probe: \
+             {}.{screen} The boot log on this USB says more",
+            one_line(cause)
+        ),
+        None => format!(
+            "the {gpu} at {address} did not start: its driver {driver} stopped with an \
+             error.{screen} The boot log on this USB says why"
+        ),
+    }
 }
 
 /// The reason the boot stops when Linux's GPU driver stops for good, `stop`
@@ -491,7 +537,8 @@ mod tests {
                 "Intel Iris Xe Graphics",
                 "00:02.0",
                 "xe",
-                Picture::Elsewhere
+                Picture::Elsewhere,
+                None
             ),
             "the Intel Iris Xe Graphics at 00:02.0 did not start: its driver xe stopped with an \
              error. The boot log on this USB says why"
@@ -501,6 +548,7 @@ mod tests {
             "00:02.0",
             "xe",
             Picture::ResetForClaim,
+            None,
         );
         assert!(
             reset.contains(
@@ -509,7 +557,13 @@ mod tests {
             ),
             "{reset}"
         );
-        let kept = unbound("AMD Radeon Graphics", "01:00.0", "amdgpu", Picture::Kept);
+        let kept = unbound(
+            "AMD Radeon Graphics",
+            "01:00.0",
+            "amdgpu",
+            Picture::Kept,
+            None,
+        );
         assert!(
             kept.contains("is wired to it and keeps its picture"),
             "{kept}"
@@ -519,11 +573,62 @@ mod tests {
             "01:00.0",
             "amdgpu",
             Picture::EndedBy("MODE2 reset"),
+            None,
         );
         assert!(
             ended.contains("stays dark: the driver's MODE2 reset ended its picture."),
             "{ended}"
         );
+    }
+
+    /// Where another GPU takes its place, the line says why the GPU did not
+    /// start: its probe and Linux's first error, in one screen line.
+    #[test]
+    fn an_unbound_gpu_another_replaces_says_why_in_one_line() {
+        let error = "nouveau 0000:01:00.0: gsp: init failed, -110";
+        assert_eq!(
+            unbound(
+                "NVIDIA GeForce RTX 5080",
+                "0000:01:00.0",
+                "nouveau",
+                Picture::ResetForClaim,
+                Some(error)
+            ),
+            "the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau \
+             stopped in its probe: nouveau 0000:01:00.0: gsp: init failed, -110. The screen the \
+             PC started on is wired to it and stays dark: the GPU was reset for its driver. The \
+             boot log on this USB says more"
+        );
+        assert_eq!(
+            draws_instead(
+                "NVIDIA GeForce RTX 5080",
+                "Intel UHD Graphics 770",
+                Some("Metal could not open: DeviceLost")
+            ),
+            "the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open \
+             (Metal could not open: DeviceLost), so the Intel UHD Graphics 770 draws instead. \
+             The boot log on this USB says more"
+        );
+        // A short cause is kept whole, its final period and other lines
+        // left off.
+        assert_eq!(
+            one_line("  amdgpu: probe failed.\nmore\n"),
+            "amdgpu: probe failed"
+        );
+        assert_eq!(one_line("\n\nsecond"), "second");
+        // A long one is cut at a word, within one screen line.
+        let long = "amdgpu 0000:65:00.0: amdgpu: PSP load kdb failed! the firmware at \
+                    amdgpu/psp_13_0_4_toc.bin was refused with status 0x0000000a, ret -22, \
+                    while the ring was being created";
+        let cut = one_line(long);
+        assert!(cut.chars().count() <= CAUSE_COLUMNS, "{cut}");
+        assert!(cut.ends_with("..."), "{cut}");
+        assert!(long.starts_with(cut.trim_end_matches("...")), "{cut}");
+        assert!(!cut.trim_end_matches("...").ends_with(' '), "{cut}");
+        // Without a space to cut at, the characters are cut, on a character
+        // boundary.
+        let word = "\u{e9}".repeat(200);
+        assert_eq!(one_line(&word).chars().count(), CAUSE_COLUMNS);
     }
 
     /// An integrated GPU left too little of Linux's pages says how much it
@@ -713,7 +818,7 @@ mod tests {
         );
         assert!(shows_only("Intel Arc A770", None).ends_with("no Vulkan driver for it"));
         assert_eq!(
-            draws_instead(nvidia, amd),
+            draws_instead(nvidia, amd, None),
             "the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not \
              open, so the AMD Radeon Graphics draws instead. The boot log on this USB says why"
         );

@@ -232,6 +232,9 @@ struct Booting<'a> {
     bound: Vec<usize>,
     /// The claimed GPUs no driver bound, by census index.
     unbound: Vec<usize>,
+    /// The unbound drawing GPUs the screen has not named yet: the fallback
+    /// that may take their place names them (`warn_one`).
+    pending: Vec<usize>,
     screen: Vec<(Mark, String)>,
     log: Vec<String>,
 }
@@ -242,25 +245,41 @@ impl Booting<'_> {
     }
 
     /// Each GPU's probe, in the order given; a driver that does not bind its
-    /// GPU says so as it happens (`warn_unbound`).
+    /// GPU says so as it happens (`warn_unbound`), a drawing GPU's after the
+    /// fallback that may take its place.
     fn probe(&mut self, indices: &[usize]) {
         for &index in indices {
-            let gpu = &self.pc[index];
-            if gpu.unbound {
-                let picture = match gpu.screen {
-                    true => Picture::ResetForClaim,
-                    false => Picture::Elsewhere,
-                };
-                let address = self.adapters[index].address.to_string();
-                self.screen.push((
-                    Mark::Warn,
-                    unbound(&self.names[index], &address, gpu.driver(), picture),
-                ));
+            if self.pc[index].unbound {
                 self.unbound.push(index);
+                match self.draws(index) {
+                    true => self.pending.push(index),
+                    false => self.warn_one(index, false),
+                }
             } else {
                 self.bound.push(index);
             }
         }
+    }
+
+    /// The screen's line for the unbound GPU `index`, with why it did not
+    /// start where another GPU takes its place (`replaced`).
+    fn warn_one(&mut self, index: usize, replaced: bool) {
+        let gpu = &self.pc[index];
+        let picture = match gpu.screen {
+            true => Picture::ResetForClaim,
+            false => Picture::Elsewhere,
+        };
+        let address = self.adapters[index].address.to_string();
+        let cause = replaced.then(|| probe_error(gpu));
+        let line = unbound(
+            &self.names[index],
+            &address,
+            gpu.driver(),
+            picture,
+            cause.as_deref(),
+        );
+        self.screen.push((Mark::Warn, line));
+        self.pending.retain(|&pending| pending != index);
     }
 
     /// A fallback's claims after the GPUs of `stages` failed, as the
@@ -268,6 +287,20 @@ impl Booting<'_> {
     fn fall_back(&mut self, stages: &[(usize, Stage)]) -> Vec<usize> {
         let before = self.chosen.clone();
         self.failed.extend(stages.iter().map(|&(index, _)| index));
+        // The failed GPUs' lines first, with why where a GPU takes their
+        // place: claimed now, or started already and drawing.
+        let ideal = fall_back(&self.found, &before, &self.failed, |_| true);
+        let replaced = !stela_drivers::gpu::selection::newly_claimed(&before, &ideal).is_empty()
+            || ideal.claimed.iter().any(|&index| {
+                ideal.choices[index] == Choice::First
+                    && self.draws(index)
+                    && !self.failed.contains(&index)
+            });
+        for &(index, _) in stages {
+            if self.pending.contains(&index) {
+                self.warn_one(index, replaced);
+            }
+        }
         let mut refused = Vec::new();
         let after = fall_back(&self.found, &before, &self.failed, |index| {
             match self.pc[index].refused {
@@ -319,13 +352,16 @@ impl Booting<'_> {
                 })
                 .collect();
             if stages.is_empty() {
-                return;
+                break;
             }
             let claimed = self.fall_back(&stages);
             if claimed.is_empty() {
-                return;
+                break;
             }
             self.probe(&claimed);
+        }
+        for index in self.pending.clone() {
+            self.warn_one(index, false);
         }
     }
 
@@ -430,6 +466,7 @@ fn boot(pc: &[Gpu], build: Build) -> (Vec<String>, Vec<String>) {
         failed: Vec::new(),
         bound: Vec::new(),
         unbound: Vec::new(),
+        pending: Vec::new(),
         screen: Vec::new(),
         log,
     };
@@ -536,6 +573,7 @@ fn boot(pc: &[Gpu], build: Build) -> (Vec<String>, Vec<String>) {
         let line = crate::gpu_status::draws_instead(
             &booting.names[booting.bound[wanted]],
             &booting.names[booting.bound[served]],
+            pc[booting.bound[wanted]].no_metal,
         );
         booting.screen.push((Mark::Warn, line));
     }
@@ -951,7 +989,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
     assert_boots(
         pc,
         Build::Full,
-        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: integrated, draws; started after NVIDIA GeForce RTX 5080 at 0000:01:00.0: it may only show the frames that GPU draws
@@ -979,7 +1017,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
     assert_boots(
         pc,
         Build::Full,
-        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
 --
@@ -1218,7 +1256,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GP
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
-                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
 --
@@ -1230,7 +1268,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
-[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the Intel UHD Graphics 770 draws instead. The boot log on this USB says why
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open (Metal could not open: DeviceLost), so the Intel UHD Graphics 770 draws instead. The boot log on this USB says more
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
             ),
@@ -1262,7 +1300,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GP
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
-                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
@@ -1274,7 +1312,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
           the Intel UHD Graphics 770 shows the picture on the screens wired to it
-[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the Intel UHD Graphics 770 draws instead. The boot log on this USB says why
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open (Metal could not open: DeviceLost), so the Intel UHD Graphics 770 draws instead. The boot log on this USB says more
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel UHD Graphics 770 at 0000:00:02.0, started beside it, draws in its place"#,
             ),
@@ -1306,7 +1344,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refu
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
-                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
@@ -1318,7 +1356,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
           the Intel Iris Xe Graphics shows the picture on the screens wired to it
-[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open, so the Intel Iris Xe Graphics draws instead. The boot log on this USB says why
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open (Metal could not open: DeviceLost), so the Intel Iris Xe Graphics draws instead. The boot log on this USB says more
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel Iris Xe Graphics at 0000:00:02.0, started beside it, draws in its place"#,
             ),
@@ -1351,7 +1389,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refu
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
-                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+                r#"[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
 [ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 4060 Laptop GPU, which did not start. Connect a screen to the Intel Iris Xe Graphics, and macOS shows on it
 --
@@ -1363,7 +1401,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its driver's probe
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
-[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open, so the Intel Iris Xe Graphics draws instead. The boot log on this USB says why
+[ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU could not draw for macOS: its Metal device did not open (Metal could not open: DeviceLost), so the Intel Iris Xe Graphics draws instead. The boot log on this USB says more
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the Intel Iris Xe Graphics at 0000:00:02.0 is claimed and started in its place"#,
             ),
@@ -1396,7 +1434,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GP
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
-                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+                r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
 [  ok  ]  Starting the GPU (AMD Radeon RX 7900 XTX, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the AMD Radeon RX 7900 XTX, and macOS shows on it
 --
@@ -1408,7 +1446,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
-[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open, so the AMD Radeon RX 7900 XTX draws instead. The boot log on this USB says why
+[ warn ]  the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open (Metal could not open: DeviceLost), so the AMD Radeon RX 7900 XTX draws instead. The boot log on this USB says more
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: nouveau bound it, and its Metal device did not open: Metal could not open: DeviceLost; it still shows the screens wired to it; the AMD Radeon RX 7900 XTX at 0000:03:00.0, started beside it, draws in its place"#,
             ),
@@ -1462,7 +1500,7 @@ fn a_gpu_claimed_in_place_of_another_fails_in_turn() {
     let pc: &[Gpu] = &[UHD_770.unbound(), RTX_5080.screen().unbound()];
     assert_eq!(
         fallback_text(pc, Build::Full),
-        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
 [ warn ]  the Intel UHD Graphics 770 at 0000:00:02.0 did not start: its driver i915 stopped with an error. The boot log on this USB says why
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
@@ -1472,8 +1510,8 @@ GPU FALLBACK 0000:00:02.0 Intel UHD Graphics 770: its driver's probe failed: i91
     let pc: &[Gpu] = &[RTX_5080.screen().unbound(), RX_7900_XTX.unbound(), UHD_770];
     assert_eq!(
         fallback_text(pc, Build::Full),
-        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
-[ warn ]  the AMD Radeon RX 7900 XTX at 0000:03:00.0 did not start: its driver amdgpu stopped with an error. The boot log on this USB says why
+        r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped in its probe: nouveau 0000:01:00.0: probe failed with error -5. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says more
+[ warn ]  the AMD Radeon RX 7900 XTX at 0000:03:00.0 did not start: its driver amdgpu stopped in its probe: amdgpu 0000:03:00.0: probe failed with error -5. The boot log on this USB says more
 [  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 and the AMD Radeon RX 7900 XTX did not start)
 [ warn ]  No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA GeForce RTX 5080, which did not start. Connect a screen to the Intel UHD Graphics 770, and macOS shows on it
 --
