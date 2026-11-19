@@ -363,7 +363,7 @@ fn attach(
     //   by the chip with No Snoop off.
     // - `chip` keeps BAR2 and the function through every outcome, and the
     //   rings are kept below.
-    let attached = unsafe { rtw89_attach(&mut chip, observed, &*firmware, pages) };
+    let attached = unsafe { rtw89_attach(&mut chip, observed, provider(&firmware), pages) };
     let Chip { io, domain, .. } = chip;
     kept.push(Box::new((io, domain, firmware)));
     let left_on = |was_on: bool| {
@@ -385,6 +385,19 @@ fn attach(
 /// A failed attach in words: a staging failure as `firmware: …`, a
 /// bring-up step as `BringUpError` writes it, anything else as the probe
 /// writes it.
+/// The verified catalog as a normal boot's drivers ask it
+/// (`engine::firmware_requests`): a request with no exact binding gets the
+/// USB bundle file its recipe pins, which the catalog holds by content
+/// (`stela-bundle`, `sha256/…`), not by its linux-firmware name. Both live
+/// for the rest of the boot, as the bring-up's rings borrow the image.
+fn provider(catalog: &Arc<Catalog>) -> &'static dyn stela_drivers::firmware::Provider {
+    let held: &'static Arc<Catalog> = Box::leak(Box::new(Arc::clone(catalog)));
+    let catalog: &'static Catalog = held;
+    Box::leak(Box::new(
+        stela_loader::host_firmware::bundle::BundleProvider::new(catalog),
+    ))
+}
+
 fn failed(error: &Error) -> String {
     match error {
         Error::Rtw89Wifi(error) if error.step == "firmware" => format!("firmware: {}", error.error),
