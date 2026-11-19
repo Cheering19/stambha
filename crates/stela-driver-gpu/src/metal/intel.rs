@@ -183,7 +183,12 @@ fn admit_i915(
 /// fallbacks: a commit's submission runs on the caller, and a refused
 /// submission loses the device. An image whose build host lacked the tools
 /// ANV's build runs holds no ANV, and then no driver here.
-#[cfg(all(feature = "metal-linked", not(test), stela_vulkan_intel))]
+#[cfg(all(
+    feature = "metal-linked",
+    not(test),
+    target_os = "uefi",
+    stela_vulkan_intel
+))]
 pub const DRIVER: super::native::Driver = {
     use super::native::{Driver, vk};
     use core::ffi::{c_char, c_void};

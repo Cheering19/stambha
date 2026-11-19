@@ -215,9 +215,11 @@ pub struct GpuStack {
     #[cfg(feature = "metal")]
     pub metal: Option<crate::metal::open::Admission>,
     /// The Vulkan driver linked into the image. A stack without one drives
-    /// displays only. This crate's own test binary links no driver archive,
-    /// so its descriptors hold none.
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    /// displays only. Only the UEFI image links the driver archives: this
+    /// crate's own test binary and every host binary that holds it with
+    /// `metal-linked` (a workspace build with every feature) have none, so
+    /// their descriptors name none of the archives' symbols.
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     pub vulkan: Option<crate::metal::native::Driver>,
 }
 
@@ -281,7 +283,7 @@ pub static NVIDIA: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     vulkan: Some(crate::metal::nvidia::DRIVER),
 };
 
@@ -330,7 +332,7 @@ pub static AMD: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     vulkan: AMD_VULKAN,
 };
 
@@ -339,6 +341,7 @@ pub static AMD: GpuStack = GpuStack {
     feature = "amdgpu-port",
     feature = "metal-linked",
     not(test),
+    target_os = "uefi",
     stela_vulkan_amd
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd::DRIVER);
@@ -347,6 +350,7 @@ const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd:
     feature = "amdgpu-port",
     feature = "metal-linked",
     not(test),
+    target_os = "uefi",
     not(stela_vulkan_amd)
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = None;
@@ -389,9 +393,19 @@ pub static INTEL: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test), stela_vulkan_intel))]
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        stela_vulkan_intel
+    ))]
     vulkan: Some(crate::metal::intel::DRIVER),
-    #[cfg(all(feature = "metal-linked", not(test), not(stela_vulkan_intel)))]
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        not(stela_vulkan_intel)
+    ))]
     vulkan: None,
 };
 
@@ -459,9 +473,19 @@ pub static INTEL_I915: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::I915_ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test), stela_vulkan_intel))]
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        stela_vulkan_intel
+    ))]
     vulkan: Some(crate::metal::intel::DRIVER),
-    #[cfg(all(feature = "metal-linked", not(test), not(stela_vulkan_intel)))]
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        not(stela_vulkan_intel)
+    ))]
     vulkan: None,
 };
 
@@ -521,9 +545,9 @@ impl GpuStack {
     /// the Metal device's frames. Otherwise its kernel driver only shows
     /// frames another GPU drew, on the displays wired to it.
     pub fn draws(&self) -> bool {
-        #[cfg(all(feature = "metal-linked", not(test)))]
+        #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
         return self.vulkan.is_some();
-        #[cfg(not(all(feature = "metal-linked", not(test))))]
+        #[cfg(not(all(feature = "metal-linked", not(test), target_os = "uefi")))]
         false
     }
 

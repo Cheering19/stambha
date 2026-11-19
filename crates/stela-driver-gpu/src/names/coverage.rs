@@ -18,7 +18,9 @@
 //!
 //! The few IDs no source names, engineering samples and devices sold under
 //! no name, are listed with the reason.
-use super::{ANY, market_name, table};
+#[cfg(feature = "amdgpu-port")]
+use super::ANY;
+use super::{market_name, table};
 use crate::Vendor;
 use alloc::{format, string::String, vec::Vec};
 use stela_loader::host_firmware::recipes::nvidia_chip;
