@@ -340,6 +340,7 @@ unsafe extern "C" {
     fn stela_linux_pci_bound(device: *const c_void) -> bool;
     fn stela_linux_pci_driver_name(device: *const c_void) -> *const c_char;
     fn stela_linux_pci_shutdown(device: *mut c_void);
+    fn stela_linux_pci_release(device: *mut c_void) -> bool;
     fn stela_linux_pci_remove_device(device: *mut c_void);
     fn stela_linux_pci_quarantined_functions() -> u64;
     fn stela_linux_pci_screen_ended_at(bus: c_uint, devfn: c_uint) -> *const c_char;
@@ -1100,6 +1101,21 @@ impl<H: Host> Attached<H> {
         // which lives as long as the image that registered it.
         (!name.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(name) })
     }
+}
+
+/// Unloads the driver of the function whose `struct pci_dev` is at
+/// `device` ([`Attached::device`]) while Linux runs on, as Linux's
+/// `device_release_driver` does, and stops what its remove left: its
+/// interrupt requests, MSI and bus mastering. The function stays published,
+/// with no driver. Whether a driver held it.
+///
+/// # Safety
+/// In an entered Linux owner, on a task that may sleep, with an attachment
+/// that keeps `device` alive and nothing outside Linux still using the
+/// driver's device (its DRM files closed).
+pub unsafe fn release_device(device: *mut c_void) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { stela_linux_pci_release(device) }
 }
 
 /// [`Attached::shutdown`] for the function whose `struct pci_dev` is at

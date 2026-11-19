@@ -698,6 +698,22 @@ static void unbind(struct pci_dev *dev)
 	dev->driver = NULL;
 }
 
+/* drivers/base/dd.c's device_release_driver for one function while Linux
+ * runs on: its driver's remove, then its managed resources; what the remove
+ * left (interrupt requests, MSI, bus mastering) is stopped as after a failed
+ * probe. The function stays published and unbound. Whether a driver held
+ * it. */
+bool stela_linux_pci_release(struct pci_dev *dev)
+{
+	const char *driver = dev->driver ? dev->driver->name : NULL;
+
+	if (!driver)
+		return false;
+	unbind(dev);
+	stela_linux_pci_quiesce(dev, driver, "unload");
+	return true;
+}
+
 bool stela_linux_pci_devices_present(void)
 {
 	return !list_empty(&devices);

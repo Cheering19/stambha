@@ -516,6 +516,11 @@ int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
  * or stays unbound, as its claim left it. */
 void stela_linux_pci_quiesce_failed(struct pci_dev *dev, const char *driver)
 {
+	stela_linux_pci_quiesce(dev, driver, "failed probe");
+}
+
+void stela_linux_pci_quiesce(struct pci_dev *dev, const char *driver, const char *after)
+{
 	struct host_function *host = host_of(dev);
 	unsigned int freed = 0;
 	u16 command;
@@ -528,17 +533,17 @@ void stela_linux_pci_quiesce_failed(struct pci_dev *dev, const char *driver)
 	if (dev->irq)
 		freed += stela_linux_irq_free_line(dev->irq);
 	if (freed)
-		pci_warn(dev, "%s's failed probe left %u interrupt requests; they are freed\n",
-			 driver, freed);
+		pci_warn(dev, "%s's %s left %u interrupt requests; they are freed\n", driver,
+			 after, freed);
 	if (dev->msi_enabled || dev->msix_enabled) {
-		pci_warn(dev, "%s's failed probe left %s on; it is turned off\n", driver,
+		pci_warn(dev, "%s's %s left %s on; it is turned off\n", driver, after,
 			 dev->msix_enabled ? "MSI-X" : "MSI");
 		pci_free_irq_vectors(dev);
 	}
 	if (!pci_read_config_word(dev, PCI_COMMAND, &command) && command != 0xffff &&
 	    (command & PCI_COMMAND_MASTER)) {
-		pci_warn(dev, "%s's failed probe left its bus mastering on; it is turned off\n",
-			 driver);
+		pci_warn(dev, "%s's %s left its bus mastering on; it is turned off\n", driver,
+			 after);
 		pci_write_config_word(dev, PCI_COMMAND, command & (u16)~PCI_COMMAND_MASTER);
 	}
 	dev->is_busmaster = 0;
@@ -1464,6 +1469,72 @@ static void test_failed_probe_leaves_nothing(void)
 	pci_unregister_driver(&failing);
 }
 
+/* A GPU whose driver bound it and is unloaded while Linux runs on, its
+ * display unused: its remove stops its hardware but leaves its interrupt
+ * requested, as a remove that leaves it to its managed release does. The
+ * release unbinds it and stops what the remove left. */
+static unsigned int unloaded_removes;
+
+static int unloaded_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	(void)id;
+	assert(!pci_enable_device(dev));
+	pci_set_master(dev);
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) == 1 && dev->msi_enabled);
+	assert(!request_irq((unsigned int)pci_irq_vector(dev, 0), failing_handler, 0, "unloaded",
+			    &unloaded_removes));
+	assert(devm_ioremap_wc(&dev->dev, pci_resource_start(dev, 0), PAGE_SIZE));
+	return 0;
+}
+
+static void unloaded_remove(struct pci_dev *dev)
+{
+	(void)dev;
+	unloaded_removes++;
+}
+
+static void test_release_leaves_nothing(void)
+{
+	static const struct pci_device_id table[] = {
+		{.vendor = PCI_VENDOR_ID_NVIDIA, .device = 0x2c02,
+		 .subvendor = (u32)PCI_ANY_ID, .subdevice = (u32)PCI_ANY_ID}, {}};
+	static struct pci_driver unloaded = {.name = "unloaded", .id_table = table,
+					     .probe = unloaded_probe, .remove = unloaded_remove};
+	unsigned int enables = line_enables, retires = line_retires, maps = device_maps;
+
+	memset(failing_config, 0, sizeof(failing_config));
+	memcpy(&failing_config[PCI_VENDOR_ID], "\xde\x10\x02\x2c", 4);
+	memcpy(&failing_config[PCI_CLASS_REVISION], "\xa1\x00\x00\x03", 4);
+	struct stela_linux_pci_function function = {
+		.context = failing_config, .read_config = fallback_read,
+		.write_config = fallback_write, .dma_map = test_map, .dma_unmap = test_unmap,
+		.enable_msi = test_enable_msi, .disable_msi = test_disable_msi,
+		.dma_limit = DMA_BIT_MASK(40), .bus = 1, .devfn = PCI_DEVFN(0, 0), .irq = 16,
+	};
+	function.regions[0] = (struct stela_linux_pci_region){BASE, PAGE_SIZE, IORESOURCE_MEM};
+	assert(!pci_register_driver(&unloaded));
+	struct pci_dev *dev = stela_linux_pci_attach(&function, NULL);
+
+	assert(dev && stela_linux_pci_bound(dev) && dev->msi_enabled && dev->is_busmaster);
+	assert(line_enables == enables + 1 && device_maps == maps + 1);
+	assert(stela_linux_pci_release(dev));
+	assert(unloaded_removes == 1 && !stela_linux_pci_bound(dev));
+	assert(!stela_linux_pci_driver_name(dev));
+	assert(line_retires == retires + 1 && !stela_linux_irq_actions_joined(16));
+	assert(!dev->msi_enabled && !on_message && !dev->is_busmaster);
+	assert(!(*(u16 *)&failing_config[PCI_COMMAND] & PCI_COMMAND_MASTER));
+	assert(device_unmaps == device_maps);
+	/* A function no driver holds has nothing to release. */
+	assert(!stela_linux_pci_release(dev) && unloaded_removes == 1);
+	/* Its line is free again, and the function's removal later finds no
+	 * driver to call. */
+	assert(!request_irq(16, failing_handler, 0, "again", &failing_handlers));
+	free_irq(16, &failing_handlers);
+	stela_linux_pci_remove_device(dev);
+	assert(unloaded_removes == 1);
+	pci_unregister_driver(&unloaded);
+}
+
 static const struct stela_linux_services test_services = {
 	.unsupported = test_unsupported,
 	.map_device = test_map_device,
@@ -1664,6 +1735,7 @@ int main(void)
 	 * allocations above. */
 #ifdef STELA_LINUX_PCI_HOST_FAILED_PROBE_TEST
 	test_failed_probe_leaves_nothing();
+	test_release_leaves_nothing();
 #endif
 	/* An atomic final put cannot destroy the host or callback context. */
 	function.release_context = test_release_context;

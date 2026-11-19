@@ -1359,6 +1359,22 @@ pub(super) fn served_gpu(service: usize) -> Option<usize> {
         .and_then(|served| served.get(service).copied())
 }
 
+/// Whether a Metal service serves the bound GPU at `index`.
+pub(super) fn served_index(index: usize) -> bool {
+    // SAFETY: published before macOS starts, and leaked.
+    unsafe { SERVED.load(Ordering::Acquire).as_ref() }.is_some_and(|served| served.contains(&index))
+}
+
+/// The bound GPUs, one bit each by index, whose Metal service was kept
+/// unreleased with its driver's file open ([`file_kept`]).
+static FILES_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the bound GPU at `index` keeps a file of a Metal service that
+/// did not open: its driver's reset during the first submission held it.
+pub(super) fn file_kept(index: usize) -> bool {
+    index >= 64 || FILES_KEPT.load(Ordering::Relaxed) & (1 << index) != 0
+}
+
 /// Which bound GPUs serve Metal devices, given the one whose output took
 /// the connected display.
 pub(super) fn metal_choice(
@@ -1505,6 +1521,9 @@ fn open_gpu(gpu: &Installed, index: usize, bound: &Bound) -> Result<Arc<Shared>,
                     },
                 ));
                 core::mem::forget(service);
+                if index < 64 {
+                    FILES_KEPT.fetch_or(1 << index, Ordering::Relaxed);
+                }
                 // The reset unmapped the display's buffers too.
                 super::display::abandon();
                 summarize(bound, &facts, shares_memory, None);

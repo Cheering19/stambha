@@ -2627,7 +2627,8 @@ struct Bound {
     /// The PCI Express port above it, read when it stops answering.
     port: Option<link::Port>,
     /// Its `struct pci_dev`, which its attachment keeps for the boot: its
-    /// driver is stopped through it at the boot's stop.
+    /// driver is stopped through it at the boot's stop, and unloaded where
+    /// its Metal device did not open and its display is unused.
     device: usize,
 }
 
@@ -3455,6 +3456,7 @@ pub(super) fn serve(
             display::take_from(from, wanted, shown, size);
         });
         report_drawer(&errors);
+        release_unshown(&errors);
     }
 }
 
@@ -3537,6 +3539,136 @@ fn hold_pages_now(gpu: &'static Installed, pages: usize) {
         output::arguments(format_args!(
             "GPU MEMORY Linux's pages could not be held to a bound: {error}\n"
         ));
+    }
+}
+
+/// The seconds a GPU's driver has to unload ([`release_unshown`]): nouveau
+/// bounds its GSP's unload wait in 4 s.
+#[cfg(feature = "nvk")]
+const RELEASE_SECONDS: u64 = 10;
+
+#[cfg(feature = "nvk")]
+static RELEASE: &str = "the unload of a GPU that cannot draw and shows no display";
+
+/// Unloads each GPU of `failed` (bound index, why its Metal device did not
+/// open) whose display is unused, another GPU's output having taken the
+/// display: bound with its interrupts on, it would only hold Linux's pages
+/// and answer its own interrupts. It stays where its output shows the
+/// display, where no GPU's output took it (a screen connected to it later
+/// may show macOS), and where its driver keeps a file of the Metal device's
+/// open (a reset during its first submission). Each in a line.
+#[cfg(feature = "nvk")]
+fn release_unshown(failed: &[(usize, String)]) {
+    let Some(gpu) = installed() else {
+        return;
+    };
+    // Without a GPU that draws the boot ends here, and nothing is unloaded
+    // before the stop's own unload.
+    if gate::served_gpu(0).is_none() {
+        return;
+    }
+    let taken = display::taken_index();
+    let mut done: Vec<usize> = Vec::new();
+    for &(index, _) in failed {
+        if done.contains(&index) || gate::served_index(index) {
+            continue;
+        }
+        done.push(index);
+        let bound = &gpu.start.bound[index];
+        let kept = match taken {
+            Some(taken) if taken == index => Some("its output shows the display"),
+            None => Some(
+                "no GPU's output took the display, and a screen connected to it later may show \
+                 macOS",
+            ),
+            Some(_) if gate::file_kept(index) => Some("its driver keeps the Metal device's file"),
+            Some(_) => None,
+        };
+        if let Some(why) = kept {
+            output::arguments(format_args!(
+                "GPU {}: its Metal device did not open, and it stays bound: {why}\n",
+                bound.name
+            ));
+            continue;
+        }
+        let device = bound.device;
+        let released = Rc::new(Cell::new(None));
+        let job = Box::pin(Release {
+            device,
+            released: released.clone(),
+        });
+        let time = gpu.time.as_ref();
+        let result = gpu.work.dispatch_linux(|runtime| {
+            Ok((|| -> Result<(), Error> {
+                let deadline = time
+                    .now_ns()
+                    .and_then(|now| {
+                        now.checked_add(RELEASE_SECONDS * 1_000_000_000)
+                            .ok_or(WorkError::Exhausted)
+                    })
+                    .map_err(environment_error)?;
+                // SAFETY: as for the start's jobs; nothing outside Linux
+                // holds a file of this GPU's: its Metal device did not open
+                // and the display's take closed its node.
+                let pending = unsafe { gpu.threads.submit(job) }
+                    .map_err(|refusal| Error::Submit(refusal.error))?;
+                wait_for_child(
+                    runtime,
+                    gpu.threads,
+                    time,
+                    deadline,
+                    &RELEASE,
+                    false,
+                    || pending.status().joined,
+                )?;
+                // SAFETY: physical return on the same dispatcher with the
+                // joined status.
+                let joined = unsafe { pending.try_join() }
+                    .map_err(|_| environment_error(WorkError::Pending))?;
+                drop(joined.into_job());
+                Ok(())
+            })())
+        });
+        let result = result.map_err(Error::from).and_then(|inner| inner);
+        match (result, released.get()) {
+            (Ok(()), Some(true)) => output::arguments(format_args!(
+                "GPU {}: its Metal device did not open and another GPU's output shows the \
+                 display, so {} is unloaded from it, its interrupts and bus mastering off\n",
+                bound.name, bound.stack.kernel.driver
+            )),
+            (Ok(()), _) => output::arguments(format_args!(
+                "GPU {}: no driver held it any more to unload\n",
+                bound.name
+            )),
+            (Err(Error::Timeout), _) => output::arguments(format_args!(
+                "GPU {}: {}'s unload did not finish in {RELEASE_SECONDS} s, and its task stays \
+                 held\n",
+                bound.name, bound.stack.kernel.driver
+            )),
+            (Err(error), _) => output::arguments(format_args!(
+                "GPU {}: {}'s unload did not run: {error}\n",
+                bound.name, bound.stack.kernel.driver
+            )),
+        }
+    }
+}
+
+/// The Linux task that unloads one GPU's driver ([`release_unshown`]).
+#[cfg(feature = "nvk")]
+struct Release {
+    device: usize,
+    released: Rc<Cell<Option<bool>>>,
+}
+
+// SAFETY: the original managed runtime enters the canonical owner on the
+// child before run; the function's attachment keeps its device for the boot.
+#[cfg(feature = "nvk")]
+unsafe impl ManagedJob for Release {
+    fn run(self: Pin<&mut Self>) {
+        // SAFETY: entered, on a task that may sleep, over the device the
+        // attachment keeps.
+        let released = unsafe { stela_linux::function::release_device(self.device as *mut c_void) };
+        self.released.set(Some(released));
     }
 }
 

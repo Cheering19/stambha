@@ -26,6 +26,13 @@ void stela_linux_pci_remove_device(struct pci_dev *dev);
  * turn its MSI or MSI-X and its bus mastering off, each said once. Nothing
  * for a function no owner attached. */
 void stela_linux_pci_quiesce_failed(struct pci_dev *dev, const char *driver);
+/* The same after `driver`'s `after` (its failed probe, its unload). */
+void stela_linux_pci_quiesce(struct pci_dev *dev, const char *driver, const char *after);
+/* Unload the driver bound to the function while Linux runs on, as
+ * device_release_driver does, and stop what its remove left
+ * (stela_linux_pci_quiesce); the function stays published. Whether a driver
+ * held it. */
+bool stela_linux_pci_release(struct pci_dev *dev);
 /* The function's driver ends the picture the firmware left on its outputs:
  * it resets the function, or starts its display engine, which blanks what
  * the firmware lit. `why` names that step and outlives the boot (a string
