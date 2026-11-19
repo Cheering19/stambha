@@ -702,8 +702,8 @@ crates/stela-driver-net/src/wifi/realtek/: Realtek RTL8822C station
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     net/mac80211/scan.c, net/mac80211/wpa.c, net/wireless/reg.c
 crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
-  PCIe power, efuse, DMA, firmware download, MAC init and H2C/C2H command
-  channel slice
+  PCIe power, efuse, DMA, firmware download, MAC init, H2C/C2H command
+  channel, BB/RF table, RF register page and coex Wi-Fi grant slice
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0 OR BSD-3-Clause ;
     GPL-2.0-only
     drivers/net/wireless/realtek/rtw89/coex.c,

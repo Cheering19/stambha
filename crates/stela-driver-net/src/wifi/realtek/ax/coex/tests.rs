@@ -212,3 +212,48 @@ fn grant_constant_is_the_gnt_v1_bit_arithmetic() {
     assert_eq!(SCBD_WL_ON, 1 | 1 << 1 | 1 << 14);
     assert_eq!(SCBD_WLRFK, 0x800);
 }
+
+#[test]
+fn radio_off_hands_the_antenna_to_bt_then_clears_the_driver_scoreboard() {
+    let mut m = model();
+    init(&mut m, 1).unwrap();
+    m.trace.clear();
+    radio_off(&mut m).unwrap();
+    assert_eq!(
+        m.trace,
+        [
+            Op::W32(0xDA48, 0x0007_D775),
+            Op::R32(0xC000),
+            Op::W16(0xC67C, 0x0111),
+            Op::R32(0x00AC),
+            // Toggle, the firmware's TP_MAJOR byte kept, every driver bit
+            // (ACTIVE, ON, BTLOG) cleared.
+            Op::W32(0x00AC, 0x8100_0000),
+            Op::Delay(1000),
+        ]
+    );
+}
+
+#[test]
+fn radio_off_still_clears_the_scoreboard_when_the_cmac_reads_off() {
+    let mut m = model();
+    m.set32(0x00AC, 0x8100_4003);
+    m.set32(0xC000, 0);
+    assert_eq!(
+        radio_off(&mut m),
+        Err(AxError::Mac("CMAC function is not enabled"))
+    );
+    assert!(!m.trace.iter().any(|o| matches!(o, Op::W16(0xC67C, _))));
+    assert_eq!(m.get32(0x00AC), 0x8100_0000);
+}
+
+#[test]
+fn wl_off_grant_is_the_gnt_v1_bit_arithmetic() {
+    // BT VAL: RFC S0 b5, S1 b9, TX b15, RX b17.
+    let bt_val = 1 << 5 | 1 << 9 | 1 << 15 | 1 << 17;
+    // BT SWCTRL: RFC S0 b4, S1 b8, TX b14, RX b16, and WL_ACT_SWCTRL b18.
+    let bt_sw = 1 << 4 | 1 << 8 | 1 << 14 | 1 << 16 | 1 << 18;
+    // WL SWCTRL with VAL 0: BB b0, RFC S0 b2, S1 b6, TX b10, RX b12.
+    let wl_sw = 1 | 1 << 2 | 1 << 6 | 1 << 10 | 1 << 12;
+    assert_eq!(GNT_WL_OFF, bt_val | bt_sw | wl_sw);
+}

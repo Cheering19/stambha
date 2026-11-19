@@ -37,7 +37,7 @@ use super::io::{AxError, AxIo};
 use super::pci::Rings;
 use super::phy::{self, PhyReport};
 use super::radio::RfAt;
-use super::{dmac, fwdl, pci, power, sys, trx};
+use super::{coex, dmac, fwdl, pci, power, sys, trx};
 use crate::bus::dma::{mapping::DmaDomain, memory::PageSource};
 use crate::wifi::realtek::firmware::AxImage;
 use alloc::{sync::Arc, vec};
@@ -309,6 +309,12 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///     `"coex init"`, `"phy report"`, in that order; an RF init failure
 ///     names its path and page ([`BringUpError::rf`]).
 ///
+/// Once `"coex init"` has succeeded (on success, and on a `"phy report"`
+/// failure), the coex half of `rtw89_core_stop` runs first
+/// ([`coex::radio_off`], `core.c:6738, 6760`): the grant handed to BT and
+/// the scoreboard's driver bits cleared, so WL is not left marked on for BT
+/// across the power-off. Its result is ignored, as Linux ignores it.
+///
 /// Once step 11 has succeeded (on success, and on every failure from step
 /// 12 on) the HCI is torn down as `rtw89_core_stop` does between
 /// `rtw89_hci_stop` and `rtw89_mac_pwr_off` (`core.c:6765-6767`):
@@ -387,7 +393,15 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
             // `start` programmed `rings` through this `io` with
             // `pci::pre_init`, and nothing since re-programmed or stopped
             // them.
-            let acked = unsafe { acknowledge(io, &mut rings, started, host, tables) };
+            let (acked, coex_up) = unsafe { acknowledge(io, &mut rings, started, host, tables) };
+            // rtw89_core_stop (core.c:6738, 6760): with the coex set up,
+            // rtw89_btc_ntfy_radio_state(WL_OFF) and rtw89_btc_ntfy_poweroff
+            // hand the antenna to BT and clear the driver's scoreboard bits
+            // before the HCI is touched. Linux ignores every result there,
+            // and so does this.
+            if coex_up {
+                let _ = coex::radio_off(io);
+            }
             // rtw89_core_stop (core.c:6765-6767): rtw89_hci_deinit between
             // rtw89_hci_stop (interrupts and NAPI, neither ported) and
             // rtw89_mac_pwr_off. Linux ignores its result, and so does this.
@@ -550,6 +564,8 @@ unsafe fn start<I: AxIo + ?Sized>(
 /// `rtw89_mac_init`, with Stela's own wait for its acknowledgement; then
 /// the radio steps of `rtw89_core_start` through the coex init
 /// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence.
+/// Also returns whether the coex init completed, which the teardown must
+/// undo ([`coex::radio_off`]).
 ///
 /// # Safety
 /// The `Ch12::submit` and `Rxq::poll` contracts for `io` and `rings`.
@@ -559,26 +575,33 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
     started: Started,
     host: Host,
     tables: &PhyTables<'_>,
-) -> Result<Running, BringUpError> {
+) -> (Result<Running, BringUpError>, bool) {
     let mut h2c = started.h2c;
     // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts.
-    let ack = unsafe { command::ofld_cfg(io, rings, &mut h2c) }.map_err(|error| match error {
-        CommandError::Submit(error) => BringUpError::new("h2c", error),
-        CommandError::Wait(error) => BringUpError::new("c2h", error),
-    })?;
+    let ack = match unsafe { command::ofld_cfg(io, rings, &mut h2c) } {
+        Ok(ack) => ack,
+        Err(CommandError::Submit(error)) => return (Err(BringUpError::new("h2c", error)), false),
+        Err(CommandError::Wait(error)) => return (Err(BringUpError::new("c2h", error)), false),
+    };
     // `h2c` is now past OFLD_CFG (seq 1), the state init_rf_reg expects:
     // its pages go out at seq 1 and 2, where no REC_ACK is forced.
     // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts, which
     // are `init_radio`'s; the OFLD_CFG wait just polled the same rings.
-    let (phy, _gain) =
-        unsafe { phy::init_radio(io, rings, &mut h2c, tables, &started.efuse, started.cut) }
-            .map_err(|error| BringUpError {
+    let (phy, _gain) = match unsafe {
+        phy::init_radio(io, rings, &mut h2c, tables, &started.efuse, started.cut)
+    } {
+        Ok(done) => done,
+        Err(error) => {
+            let failed = BringUpError {
                 rf: error.rf,
                 ..BringUpError::new(error.step, error.error)
-            })?;
+            };
+            return (Err(failed), error.coex_up);
+        }
+    };
     // The BB gain table is memory only on AX (bb.rs), and nothing after the
     // coex init that reads it is ported yet.
-    Ok(Running {
+    let running = Running {
         cut: started.cut,
         firmware: started.firmware,
         mac: started.mac,
@@ -588,7 +611,8 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         bacam_reset_timed_out: started.bacam_reset_timed_out,
         h2c: ack,
         phy: Some(phy),
-    })
+    };
+    (Ok(running), true)
 }
 
 /// `rtw89_fw_download(RTW89_FW_NORMAL)` (`fw.c:2043`): up to five attempts

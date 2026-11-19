@@ -30,6 +30,10 @@
 //! reached directly or through RF (SWSI); no BT-side indirect register is
 //! written, so nothing here needs its own poll.
 //!
+//! [`radio_off`] is the register end state of the coex half of
+//! `rtw89_core_stop`: the antenna handed to BT and the driver's scoreboard
+//! bits cleared.
+//!
 //! This module grants no coex H2C, no BT-on grant, no TDMA or policy, no
 //! second MAC and no RFK beyond [`rfk_notify`]'s register end state.
 use super::bb;
@@ -102,6 +106,12 @@ pub const GNT_WL_ONLY: u32 = 0x0005_7DDF;
 /// `B_AX_TX_PLT_GNT_WL | B_AX_RX_PLT_GNT_WL | B_AX_PLT_EN` (reg.h:2627-2635;
 /// mac.c:6583-6606).
 pub const PLT_GNT_WL: u16 = 0x0111;
+/// The `R_AX_GNT_SW_CTRL` value of `rtw89_mac_cfg_gnt_v1` for both bands
+/// with WL at SW low and BT at SW high (`_set_ant(BTC_ANT_WOFF)`,
+/// coex.c:5663-5667): WL RFC S0/S1, RX, TX and BB SWCTRL with VAL 0, BT
+/// RFC S0/S1, RX and TX SWCTRL and VAL, and `WL_ACT_SWCTRL`
+/// (reg.h:3707-3729; mac.c:6530-6580).
+pub const GNT_WL_OFF: u32 = 0x0007_D775;
 /// `BTC_WSCB_ACTIVE | BTC_WSCB_ON | BTC_WSCB_BTLOG` (coex.c:805-818).
 pub const SCBD_WL_ON: u32 = 0x4003;
 /// `BTC_WSCB_WLRFK` (coex.c:815).
@@ -220,6 +230,35 @@ pub fn rfk_notify<I: AxIo + ?Sized>(io: &mut I, start: bool) -> Result<(), AxErr
     } else {
         scoreboard(io, SCBD_WL_ON)
     }
+}
+
+/// The register end state of the coex half of `rtw89_core_stop`
+/// (core.c:6738, 6760) after [`init`], with BT off:
+/// 1. `rtw89_btc_ntfy_radio_state(BTC_RFCTRL_WL_OFF)` (coex.c:9345-9396)
+///    sets `rf_off` and queues `_write_scbd(BTC_ALL_BT, BTC_WSCB_ALL,
+///    false)`, then `_run_coex(BTC_RSN_NTFY_RADIO_STATE)` takes
+///    `_action_wl_off` (coex.c:8499-8502, 5729-5748): `_set_ant(WOFF)`,
+///    forced by the reason (coex.c:5615-5618), writes [`GNT_WL_OFF`]
+///    through `rtw89_mac_cfg_gnt_v1`; `rtw89_chip_cfg_ctrl_path` does no
+///    I/O on the RTL8852C; `_set_bt_plut` writes the WL PLT through
+///    `rtw89_mac_cfg_plt_ax` after its CMAC check (firmware 0.27.97 and up
+///    has `fwlrole` 101, so it is not cached, coex.c:5581-5592). The policy
+///    is H2C only, and the other `_action_common` steps find nothing
+///    changed since [`init`]; its scoreboard write then sends the cleared
+///    driver bits (coex.c:6704-6705, 6994-7000), as `scoreboard` with
+///    `scbd` 0.
+/// 2. `rtw89_btc_ntfy_poweroff` (coex.c:8671-8689) queues the same clear,
+///    but its `_run_coex` returns early: `rf_off` did not change
+///    (coex.c:8455-8464). It writes nothing of its own.
+///
+/// A failed CMAC check skips the PLT write and, as Linux's `_set_bt_plut`
+/// ignores it, the scoreboard is still cleared; the first error is
+/// returned.
+pub fn radio_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    io.write32(R_AX_GNT_SW_CTRL, GNT_WL_OFF)?;
+    let plt = check_cmac_en(io).and_then(|()| io.write16(R_AX_BT_PLT, PLT_GNT_WL));
+    scoreboard(io, 0)?;
+    plt
 }
 
 /// `R_AX_GNT_VAL_V1` (reg.h:3737-3741): `GNT_WL_RFC_S0` b1, `S1` b2,

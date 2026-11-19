@@ -105,9 +105,15 @@ pub struct PhyError {
     /// One of `"phy tables"`, `"bb rf reset"`, `"bb init"`, `"rf init"`,
     /// `"rf h2c"`, `"coex init"`, `"phy report"`.
     pub step: &'static str,
+    /// What failed in that step: an I/O or poll failure, a table that
+    /// selects nothing (`PhyPackage`, `PhyTable`), a missing table (`Phy`)
+    /// or a CH12 submit failure.
     pub error: AxError,
     /// For `"rf init"` and `"rf h2c"`, where.
     pub rf: Option<RfAt>,
+    /// [`coex::init`] had completed, so the scoreboard marks Wi-Fi on for
+    /// BT and the teardown must run [`coex::radio_off`] first.
+    pub coex_up: bool,
 }
 
 fn at(step: &'static str) -> impl FnOnce(AxError) -> PhyError {
@@ -115,6 +121,7 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> PhyError {
         step,
         error,
         rf: None,
+        coex_up: false,
     }
 }
 
@@ -170,15 +177,18 @@ pub fn check_tables(t: &PhyTables<'_>) -> Result<(), AxError> {
 /// 4. `"rf init"` / `"rf h2c"`: [`radio::init_rf_reg`], path B then A, each
 ///    table's stored words sent as RF_REG pages on CH12; the error names
 ///    the path and page.
-/// 5. `"phy report"`: `R_AX_GNT_VAL_V1` sampled before the coex init.
-/// 6. `"coex init"`: [`coex::init`].
-/// 7. `"phy report"`: RF 0x18 of path A, then B (SWSI reads), the GNT value
+/// 5. `"coex init"`: `R_AX_GNT_VAL_V1` sampled (Stela's own read), then
+///    [`coex::init`].
+/// 6. `"phy report"`: RF 0x18 of path A, then B (SWSI reads), the GNT value
 ///    and the GNT SW readback, then [`command::count_c2h`].
 ///
 /// `h2c` must be the state OFLD_CFG left (seq 1): the RF pages then carry
 /// seq 1 and 2 and ask for no acknowledgement ([`radio::init_rf_reg`]). On
 /// success the decoded BB gain table is returned with the report; on AX it
-/// is memory only, for later steps.
+/// is memory only, for later steps. Once [`coex::init`] has succeeded the
+/// scoreboard marks Wi-Fi on for BT, so whoever stops the chip runs
+/// [`coex::radio_off`] first, as `rtw89_core_stop` does: after success, and
+/// after a failure whose [`PhyError::coex_up`] is set.
 ///
 /// # Safety
 /// The contracts of `Ch12::submit` and `Rxq::poll`: `io` is the exclusive
@@ -205,8 +215,11 @@ pub unsafe fn init_radio<I: AxIo + ?Sized>(
             step: e.step(),
             error: e.error(),
             rf: Some(e.at()),
+            coex_up: false,
         })?;
-    let gnt_before = coex::gnt(io).map_err(at("phy report"))?;
+    // Stela's own sample of the grant before the coex init sets it; it is
+    // part of that step.
+    let gnt_before = coex::gnt(io).map_err(at("coex init"))?;
     coex::init(io, rfe).map_err(at("coex init"))?;
     let report = |io: &mut I, rings: &mut Rings| -> Result<PhyReport, AxError> {
         let rf18 = [
@@ -233,7 +246,10 @@ pub unsafe fn init_radio<I: AxIo + ?Sized>(
             c2h_after,
         })
     };
-    let report = report(io, rings).map_err(at("phy report"))?;
+    let report = report(io, rings).map_err(|error| PhyError {
+        coex_up: true,
+        ..at("phy report")(error)
+    })?;
     Ok((report, bb.gain))
 }
 

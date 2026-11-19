@@ -712,8 +712,55 @@ fn fails_on(
         // The DMA live since mac pre-init is stopped before the power-off.
         assert_dma_stopped_before_power_off(&c.io);
     }
+    // Only a failure after the coex init runs its undo, and then before the
+    // deinit; before it, no scoreboard word is written at all (the
+    // power-off's PWR_MAJOR is a byte write).
+    if err.step == "phy report" {
+        assert_radio_off_before_deinit(&c.io);
+    } else {
+        assert!(
+            !c.io
+                .trace
+                .iter()
+                .any(|o| matches!(o, Op::W32(0x00AC, _)) || *o == Op::W32(0xDA48, GNT_WL_OFF)),
+            "{err}"
+        );
+    }
     assert_ends_with_power_off(&c.io);
     err
+}
+
+/// `coex::GNT_WL_OFF`.
+const GNT_WL_OFF: u32 = 0x0007_D775;
+
+/// The coex half of `rtw89_core_stop` after the coex init: the WL-off grant,
+/// the PLT, then the scoreboard with every driver bit clear (0x8100_0000
+/// after the init's 0x8100_4003), all after the init's scoreboard and
+/// before the deinit's first write (PCI wake, 0x0074).
+fn assert_radio_off_before_deinit(io: &RegisterModel) {
+    let t = &io.trace;
+    let on = t
+        .iter()
+        .position(|o| *o == Op::W32(0x00AC, 0x8100_4003))
+        .unwrap();
+    let after = |from: usize, want: Op| {
+        from + 1
+            + t[from + 1..]
+                .iter()
+                .position(|o| *o == want)
+                .unwrap_or_else(|| panic!("no {want:x?} after trace entry {from}"))
+    };
+    let grant = after(on, Op::W32(0xDA48, GNT_WL_OFF));
+    let plt = after(grant, Op::W16(0xC67C, 0x0111));
+    let clear = after(plt, Op::W32(0x00AC, 0x8100_0000));
+    let delay = after(clear, Op::Delay(1000));
+    let deinit = on
+        + t[on..]
+            .iter()
+            .position(|o| matches!(o, Op::W32(0x0074, _)))
+            .unwrap();
+    assert!(delay < deinit, "{clear} {delay} {deinit}");
+    assert_eq!(delay, clear + 1);
 }
 
 #[test]
@@ -1400,15 +1447,20 @@ fn phy_steps_run_in_linux_order() {
     let gnt = after(rf18_b, &|o| *o == Op::R32(0xDA4C));
     let gnt_sw = after(gnt, &|o| *o == Op::R32(0xDA48));
     let drain = after(gnt_sw, &|o| *o == Op::R32(0x1218));
-    assert!(drain < deinit);
+    // Then rtw89_core_stop's coex half: the WL-off grant and the cleared
+    // scoreboard, before the deinit.
+    let wl_off = after(drain, &|o| *o == Op::W32(0xDA48, GNT_WL_OFF));
+    let cleared = after(wl_off, &|o| *o == Op::W32(0x00AC, 0x8100_0000));
+    assert!(cleared < deinit, "{drain} {wl_off} {cleared} {deinit}");
+    assert_radio_off_before_deinit(&c.io);
     // The report reads write nothing but the RF read latches.
     assert!(
-        !t[rf18_a..deinit]
+        !t[rf18_a..=drain]
             .iter()
             .any(|o| matches!(o, Op::W8(..) | Op::W16(..) | Op::RfW(..))
                 || matches!(o, Op::W32(r, _) if *r != 0x10378)),
         "{:x?}",
-        &t[rf18_a..deinit]
+        &t[rf18_a..=drain]
     );
 }
 
@@ -1661,9 +1713,16 @@ fn phy_failure_names_step_and_powers_off() {
         BringUpError::new("coex init", AxError::Mac("CMAC function is not enabled"))
     );
 
-    // phy report: the GNT SW readback fails.
+    // phy report: the GNT SW readback fails, after the coex init, so the
+    // coex half of rtw89_core_stop still runs before the deinit
+    // (`fails_on` checks it).
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA48));
     assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
+
+    // coex init: the grant sample before it fails; coex never ran, so
+    // nothing of it is undone.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA4C));
+    assert_eq!(err, BringUpError::new("coex init", READ_FAILED));
 }
 
 #[test]
