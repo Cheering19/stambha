@@ -5,7 +5,9 @@
 //! and deletes them.
 //!
 //! [`keep`] runs once a boot, on the first processor that stops, and only
-//! from a stop: a boot that does not stop writes no variable. The loader
+//! from a stop: a boot that does not stop writes no variable. The one
+//! exception is `--host-check --keep-lines`, whose results are kept once
+//! its checks end (`output::keep_lines_in_firmware`). The loader
 //! calls the services where the firmware left them. The engine reaches
 //! them in the loader's root, which keeps the firmware's runtime regions
 //! mapped by identity, as `SetVirtualAddressMap` is never called.
@@ -471,35 +473,83 @@ unsafe impl Sync for Lines {}
 /// The record's text, outside the stack a stop runs on.
 static LINES: Lines = Lines(UnsafeCell::new(Tail::new()));
 
+/// Why a write left no whole record.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Unkept {
+    /// No services ([`arm`]), or not after the firmware's exit.
+    Services = 1,
+    /// `QueryVariableInfo` failed.
+    Query,
+    /// No lines, or none whose record leaves the store's reserve free.
+    Room,
+    /// A `SetVariable` failed.
+    Refused,
+}
+
+impl Unkept {
+    const fn text(self) -> &'static str {
+        match self {
+            Self::Services => "the firmware's variable services are not called here",
+            Self::Query => "the firmware did not report its variable store",
+            Self::Room => "no lines, or too little room free in the firmware's variable store",
+            Self::Refused => "the firmware refused a write",
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        [Self::Services, Self::Query, Self::Room, Self::Refused]
+            .into_iter()
+            .find(|reason| *reason as u8 == value)
+    }
+}
+
+/// Why the first call of [`keep`] in this boot left no whole record, as an
+/// [`Unkept`]; zero until then.
+static UNKEPT: AtomicU8 = AtomicU8::new(0);
+
 /// Write the stop's record, the newest lines `fill` gives, into the
-/// firmware's variables; whether the firmware holds it whole. Only the
-/// first call writes, on whichever processor makes it: the firmware's
-/// services are not called by two processors at once, and a fault inside
-/// one comes back here and finds the write begun, so it is not tried
-/// again. Later calls say what the first did.
+/// firmware's variables; whether the firmware holds it whole, or why not.
+/// Only the first call writes, on whichever processor makes it: the
+/// firmware's services are not called by two processors at once, and a
+/// fault inside one comes back here and finds the write begun, so it is
+/// not tried again. Later calls say what the first did: a record kept
+/// before the boot's stop (`--host-check --keep-lines`) is the one its
+/// stop finds, and that stop writes no second one.
 ///
 /// Nothing is written without the services ([`arm`]), without lines, or
 /// where the record would leave less than the reserve of the firmware's store
 /// free (`Space::takes`).
-pub(crate) fn keep(fill: impl FnOnce(&mut Tail)) -> bool {
+pub(crate) fn keep(fill: impl FnOnce(&mut Tail)) -> Result<(), &'static str> {
     if STATE
         .compare_exchange(IDLE, WRITING, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return STATE.load(Ordering::Acquire) == WRITTEN;
+        return match STATE.load(Ordering::Acquire) {
+            WRITTEN => Ok(()),
+            SKIPPED => Err(Unkept::from_u8(UNKEPT.load(Ordering::Relaxed))
+                .map_or("an earlier write in this boot was not whole", Unkept::text)),
+            _ => Err("an earlier write in this boot did not end"),
+        };
     }
     let written = write(fill);
-    STATE.store(if written { WRITTEN } else { SKIPPED }, Ordering::Release);
-    written
+    if let Err(why) = written {
+        UNKEPT.store(why as u8, Ordering::Relaxed);
+    }
+    STATE.store(
+        if written.is_ok() { WRITTEN } else { SKIPPED },
+        Ordering::Release,
+    );
+    written.map_err(Unkept::text)
 }
 
-fn write(fill: impl FnOnce(&mut Tail)) -> bool {
+fn write(fill: impl FnOnce(&mut Tail)) -> Result<(), Unkept> {
     let (set, query) = (
         SET_VARIABLE.load(Ordering::Acquire) as usize,
         QUERY_VARIABLE_INFO.load(Ordering::Relaxed) as usize,
     );
     if set == 0 || query == 0 || AFTER_EXIT_REFUSED.load(Ordering::Relaxed) {
-        return false;
+        return Err(Unkept::Services);
     }
     // SAFETY: the firmware's entries, as `Services::capture` read them from
     // its runtime services table; code addresses fit a pointer.
@@ -531,12 +581,12 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
             )
         };
         if asked != SUCCESS {
-            return false;
+            return Err(Unkept::Query);
         }
         // A store too short for all of it keeps the newest lines that fit.
         let text = fitting(&space, text);
         let Some(header) = Header::of(boot, text) else {
-            return false;
+            return Err(Unkept::Room);
         };
         for (index, piece) in pieces(text).enumerate() {
             let name = piece_name(index);
@@ -551,7 +601,7 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
                 )
             };
             if status != SUCCESS {
-                return false;
+                return Err(Unkept::Refused);
             }
         }
         // Last, so pieces without it, or under an older one, are no record.
@@ -566,7 +616,10 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
                 header.as_ptr(),
             )
         };
-        status == SUCCESS
+        match status {
+            SUCCESS => Ok(()),
+            _ => Err(Unkept::Refused),
+        }
     };
     in_firmware(FirmwareCall::Record, store)
 }

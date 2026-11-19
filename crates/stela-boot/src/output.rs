@@ -827,7 +827,7 @@ pub fn carry_loader_lines(lines: &[u8]) {
 /// screen may be dead; whether the firmware holds them. The lines end with the stop's reason, which
 /// the caller has printed; `reason` stands for them where the record
 /// cannot be read, as in a stop raised while a line was being written.
-fn keep_stop_record(reason: Option<&str>) -> bool {
+fn keep_stop_record(reason: Option<&str>) -> Result<(), &'static str> {
     use stela_boot_core::stop_record::TEXT_BYTES;
     crate::stop_record::keep(|lines| {
         let _ = exclusive(|| {
@@ -849,6 +849,22 @@ fn keep_stop_record(reason: Option<&str>) -> bool {
             }
         }
     })
+}
+
+/// Leave the newest lines in the PC's firmware now, without a stop, as a
+/// stop does ([`keep_stop_record`]): for `--host-check --keep-lines`, whose
+/// results only the screen shows otherwise, so another start of Stela on
+/// this PC copies them into the USB's log, or Windows reads them from the
+/// `StelaStop` variables. `Ok` once the firmware holds them whole.
+///
+/// The record is written once a boot (`stop_record::keep`). A stop later in
+/// the same boot finds this record and writes no second one: its advice
+/// says the PC keeps the last lines, which are the check's up to this call,
+/// and its own reason stays on the screen and in a log `--nor-file` opened.
+/// The deadline's stop (`terminate`) writes no record either way.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn keep_lines_in_firmware() -> Result<(), &'static str> {
+    keep_stop_record(None)
 }
 
 /// The relocated engine has its own statics, not the loader image's updated
@@ -1266,7 +1282,7 @@ pub(crate) fn early_fatal(message: &str) -> ! {
     firmware_console(message);
     firmware_console("\n");
     crate::stop_record::arm(crate::stop_record::Services::capture_without_heap(), None);
-    keep_stop_record(Some(message));
+    let _ = keep_stop_record(Some(message));
     arguments(format_args!(
         "STELA STOPPED code=0x11; power off to continue\n"
     ));
@@ -1440,7 +1456,7 @@ pub fn stopped_text() -> &'static str {
 fn stop_advice(reason: Option<&str>) -> &'static str {
     if usb_log_kept() && !UNSTORED.load(Ordering::Relaxed) {
         STOPPED
-    } else if keep_stop_record(reason) {
+    } else if keep_stop_record(reason).is_ok() {
         STOPPED_RECORDED
     } else {
         STOPPED_UNLOGGED
@@ -1466,7 +1482,7 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // shows that this one stopped, and why (`stop_record::carry`).
     if crate::engine::inside_host_drivers() {
         flush_log();
-        keep_stop_record(Some(&message));
+        let _ = keep_stop_record(Some(&message));
     }
     // The reason is on the screen before the last store, which may be what
     // fails, and the advice after it says whether the log was kept.
