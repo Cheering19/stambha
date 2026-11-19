@@ -60,6 +60,8 @@ fn host_check_lines_round_trip_and_refuse_bad_values() {
         "--host-check --nor-file x",
         "--host-check --unknown",
         "--host-check --wifi-check=1",
+        "--host-check --keep-lines=1",
+        "--host-check --keep-lines 1",
     ] {
         assert!(HostCheck::parse(text).is_err(), "{text}");
     }
@@ -100,6 +102,33 @@ fn host_check_wifi_check_is_off_unless_named_and_round_trips() {
             .unwrap()
             .to_string(),
         "--host-check --key-seconds 5"
+    );
+}
+
+#[test]
+fn host_check_keep_lines_is_off_unless_named_and_round_trips() {
+    assert!(!HostCheck::parse("--host-check").unwrap().keep_lines);
+    assert!(
+        !HostCheck::parse("--host-check --wifi-check --deadline 30")
+            .unwrap()
+            .keep_lines
+    );
+    let options =
+        HostCheck::parse("--host-check --keep-lines --wifi-check --deadline 600").unwrap();
+    assert!(options.keep_lines);
+    assert!(options.wifi_check);
+    assert_eq!(options.deadline, Some(600));
+    assert_eq!(
+        options.to_string(),
+        "--host-check --deadline 600 --wifi-check --keep-lines"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    assert_eq!(
+        HostCheck::parse("--host-check --keep-lines --keep-lines").unwrap(),
+        HostCheck {
+            keep_lines: true,
+            ..HostCheck::default()
+        }
     );
 }
 

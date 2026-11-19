@@ -911,6 +911,9 @@ pub struct HostCheck {
     /// Bring an RTL8852CE up to running firmware and power it off again
     /// (`--wifi-check`).
     pub wifi_check: bool,
+    /// Keep the newest lines, the summary among them, in the firmware's
+    /// stop-record variables once the checks end (`--keep-lines`).
+    pub keep_lines: bool,
 }
 
 impl Default for HostCheck {
@@ -920,6 +923,7 @@ impl Default for HostCheck {
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
             wifi_check: false,
+            keep_lines: false,
         }
     }
 }
@@ -956,6 +960,7 @@ impl HostCheck {
                 "--deadline" => options.deadline = Some(seconds(words.next())?),
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
                 "--wifi-check" => options.wifi_check = true,
+                "--keep-lines" => options.keep_lines = true,
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -975,6 +980,7 @@ impl fmt::Display for HostCheck {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }
         line.flag("--wifi-check", self.wifi_check)?;
+        line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }
 }

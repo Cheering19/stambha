@@ -24,7 +24,8 @@ pub const WRITABLE: u64 = 1 << 1;
 const LARGE: u64 = 1 << 7;
 /// Write-through and cache-disable: PAT entry 3, uncached.
 const UNCACHED: u64 = 1 << 3 | 1 << 4;
-const DEVICE: u64 = PRESENT | WRITABLE | UNCACHED | NX;
+/// Device registers: uncached RW+NX.
+pub const DEVICE: u64 = PRESENT | WRITABLE | UNCACHED | NX;
 pub const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
