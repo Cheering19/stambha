@@ -351,7 +351,7 @@ fn main() -> Status {
     if options.starts_with(stela_boot_core::options::HOST_CHECK.as_bytes()) {
         drop(volume);
         #[cfg(feature = "diagnostics")]
-        host_check::boot(options);
+        host_check::boot(options, host_firmware);
         #[cfg(not(feature = "diagnostics"))]
         output::fatal("host checks require a diagnostics build");
     }

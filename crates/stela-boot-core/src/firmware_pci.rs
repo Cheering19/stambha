@@ -145,6 +145,57 @@ pub fn sole<T>(items: impl IntoIterator<Item = T>) -> Option<T> {
     items.next().is_none().then_some(first)
 }
 
+/// The bytes memory BAR `index` of a Type 0 function decodes, from its
+/// configuration `header` and the firmware's `regions` for that BAR: the one
+/// untranslated memory region of the BAR's width that starts at the address
+/// the BAR holds. Copied DATA, which a later native sizing of the same BAR is
+/// compared with before the range is accessed; it maps and grants nothing.
+pub fn memory_bar(
+    header: &[u8; 64],
+    index: u8,
+    regions: &[BarRegion],
+) -> Result<Range<u64>, &'static str> {
+    let word = |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+    if header[0x0e] & 0x7f != 0 {
+        return Err("its header is not a Type 0 header");
+    }
+    let index = usize::from(index);
+    if index >= 6 {
+        return Err("a Type 0 header has six BARs");
+    }
+    let low = word(0x10 + index * 4);
+    if low & 1 != 0 {
+        return Err("the BAR is an I/O BAR");
+    }
+    let (high, granularity) = match low >> 1 & 3 {
+        0 => (0, 32),
+        2 if index < 5 => (word(0x14 + index * 4), 64),
+        2 => return Err("the last BAR cannot hold a 64-bit address"),
+        _ => return Err("the BAR's memory type is reserved"),
+    };
+    let base = u64::from(low & !15) | u64::from(high) << 32;
+    if base == 0 {
+        return Err("the BAR holds no address");
+    }
+    let mut at = regions
+        .iter()
+        .filter(|region| region.resource_type == 0 && region.host.start == base);
+    let region = match (at.next(), at.next()) {
+        (Some(region), None) => region,
+        (None, _) => return Err("the firmware reports no memory region at the BAR's address"),
+        (Some(_), Some(_)) => {
+            return Err("the firmware reports two memory regions at the BAR's address");
+        }
+    };
+    if region.host != region.pci {
+        return Err("the firmware translates the BAR's address");
+    }
+    if region.granularity != granularity {
+        return Err("the firmware's region width is not the BAR's");
+    }
+    Ok(region.host.clone())
+}
+
 fn qword(bytes: &[u8; QWORD_BYTES], offset: usize) -> u64 {
     let mut value = [0; 8];
     value.copy_from_slice(&bytes[offset..offset + 8]);
@@ -327,5 +378,110 @@ mod tests {
         io[3] = 1;
         io[6] = 0;
         assert_eq!(decode_qword(&io).unwrap().granularity, 0);
+    }
+
+    /// A Type 0 header with BAR2 holding `low` and BAR3 `high`.
+    fn bar2_header(low: u32, high: u32) -> [u8; 64] {
+        let mut header = [0u8; 64];
+        header[..4].copy_from_slice(&0xc852_10ecu32.to_le_bytes());
+        header[0x18..0x1c].copy_from_slice(&low.to_le_bytes());
+        header[0x1c..0x20].copy_from_slice(&high.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn a_memory_bar_is_the_firmware_region_its_address_starts() {
+        // A 64-bit BAR2 at 0x1_fc10_0000, as an RTL8852CE's 1 MiB window.
+        let base = 0x1_fc10_0000;
+        let header = bar2_header(0xfc10_0004, 1);
+        let region = decode_qword(&descriptor(base, 0x10_0000, 0)).unwrap();
+        let elsewhere = decode_qword(&descriptor(base + 0x10_0000, 0x1000, 0)).unwrap();
+        assert_eq!(
+            memory_bar(&header, 2, &[elsewhere.clone(), region.clone()]),
+            Ok(base..base + 0x10_0000)
+        );
+        // A 32-bit BAR's region is of 32-bit granularity.
+        let mut narrow = descriptor(0xfc10_0000, 0x10_0000, 0);
+        narrow[6..14].copy_from_slice(&32u64.to_le_bytes());
+        let narrow = decode_qword(&narrow).unwrap();
+        assert_eq!(
+            memory_bar(
+                &bar2_header(0xfc10_0000, 0),
+                2,
+                core::slice::from_ref(&narrow)
+            ),
+            Ok(0xfc10_0000..0xfc20_0000)
+        );
+        // The same region against a 64-bit BAR, or a 32-bit BAR against a
+        // 64-bit region, is refused.
+        assert_eq!(
+            memory_bar(
+                &bar2_header(0xfc10_0004, 0),
+                2,
+                core::slice::from_ref(&narrow)
+            ),
+            Err("the firmware's region width is not the BAR's")
+        );
+        let wide = decode_qword(&descriptor(0xfc10_0000, 0x10_0000, 0)).unwrap();
+        assert_eq!(
+            memory_bar(&bar2_header(0xfc10_0000, 0), 2, &[wide]),
+            Err("the firmware's region width is not the BAR's")
+        );
+        // No region, two regions, or a translated one.
+        assert_eq!(
+            memory_bar(&header, 2, &[elsewhere]),
+            Err("the firmware reports no memory region at the BAR's address")
+        );
+        assert_eq!(
+            memory_bar(&header, 2, &[region.clone(), region.clone()]),
+            Err("the firmware reports two memory regions at the BAR's address")
+        );
+        let translated = decode_qword(&descriptor(base, 0x10_0000, 0x1000)).unwrap();
+        assert_eq!(
+            memory_bar(&header, 2, &[translated]),
+            Err("the firmware translates the BAR's address")
+        );
+        // An I/O region at the address is not a memory region.
+        let mut io = descriptor(base, 0x10_0000, 0);
+        io[3] = 1;
+        io[6..14].fill(0);
+        assert_eq!(
+            memory_bar(&header, 2, &[decode_qword(&io).unwrap()]),
+            Err("the firmware reports no memory region at the BAR's address")
+        );
+    }
+
+    #[test]
+    fn a_memory_bar_refuses_io_reserved_unassigned_and_non_type_0() {
+        let region = decode_qword(&descriptor(0x1_fc10_0000, 0x10_0000, 0)).unwrap();
+        let regions = core::slice::from_ref(&region);
+        assert_eq!(
+            memory_bar(&bar2_header(0x3001, 0), 2, regions),
+            Err("the BAR is an I/O BAR")
+        );
+        assert_eq!(
+            memory_bar(&bar2_header(0xfc10_0002, 1), 2, regions),
+            Err("the BAR's memory type is reserved")
+        );
+        assert_eq!(
+            memory_bar(&bar2_header(0x4, 0), 2, regions),
+            Err("the BAR holds no address")
+        );
+        let mut last = [0u8; 64];
+        last[0x24..0x28].copy_from_slice(&0xfc10_0004u32.to_le_bytes());
+        assert_eq!(
+            memory_bar(&last, 5, regions),
+            Err("the last BAR cannot hold a 64-bit address")
+        );
+        assert_eq!(
+            memory_bar(&bar2_header(0xfc10_0004, 1), 6, regions),
+            Err("a Type 0 header has six BARs")
+        );
+        let mut bridge = bar2_header(0xfc10_0004, 1);
+        bridge[0x0e] = 0x81;
+        assert_eq!(
+            memory_bar(&bridge, 2, regions),
+            Err("its header is not a Type 0 header")
+        );
     }
 }

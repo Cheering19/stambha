@@ -908,6 +908,9 @@ pub struct HostCheck {
     pub deadline: Option<u64>,
     /// How long a prompt waits for a key (`--key-seconds`).
     pub key_seconds: u64,
+    /// Bring an RTL8852CE up to running firmware and power it off again
+    /// (`--wifi-check`).
+    pub wifi_check: bool,
 }
 
 impl Default for HostCheck {
@@ -916,6 +919,7 @@ impl Default for HostCheck {
             nor_file: None,
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
+            wifi_check: false,
         }
     }
 }
@@ -951,6 +955,7 @@ impl HostCheck {
                 }
                 "--deadline" => options.deadline = Some(seconds(words.next())?),
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
+                "--wifi-check" => options.wifi_check = true,
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -969,6 +974,7 @@ impl fmt::Display for HostCheck {
         if self.key_seconds != DEFAULT_KEY_SECONDS {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }
+        line.flag("--wifi-check", self.wifi_check)?;
         Ok(())
     }
 }

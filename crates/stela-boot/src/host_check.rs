@@ -2,7 +2,7 @@
 //! (so no LA57) and no write to any internal disk.
 //!
 //! `stela.cfg`: `--host-check [--nor-file GUID:/PATH] [--deadline SECONDS]
-//! [--key-seconds SECONDS]`.
+//! [--key-seconds SECONDS] [--wifi-check]`.
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
@@ -18,6 +18,11 @@
 //! - `apic`, `interrupts`: the local APIC timer measured against the TSC,
 //!   then one one-shot and 100 ms of periodic interrupts through the IDT's
 //!   interrupt stacks.
+//! - `wifi`: with `--wifi-check`, the first RTL8852CE brought up to running
+//!   firmware (`rtw89/rtw8852c_fw-2.bin` from the USB stick's verified host
+//!   firmware), its MAC address read, then powered off again with its Bus
+//!   Master cleared ([`wifi`]). Only that function is touched, and no disk;
+//!   without the option it is skipped.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
@@ -27,6 +32,8 @@
 //! powers it off, and `--deadline` (counted from the start) stops it with
 //! `STELA STOPPED`. Every wait prints `BEAT` every 10 s and flushes the log;
 //! a fatal error, panic or x86 exception flushes it too (`output`).
+mod wifi;
+
 use crate::Result;
 use crate::{
     apic::{self, Apic, rdtsc},
@@ -45,6 +52,7 @@ use crate::{
 use alloc::string::ToString;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
+    any::Any,
     arch::asm,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
@@ -178,6 +186,10 @@ struct Machine {
     apic_base: u64,
     stack_top: usize,
     checks: Vec<Check>,
+    /// The `--wifi-check` bring-up, as prepared before ExitBootServices.
+    wifi: wifi::Plan,
+    /// What device DMA may still reach, kept for the rest of the boot.
+    kept: Vec<Box<dyn Any>>,
 }
 
 impl Machine {
@@ -193,9 +205,11 @@ impl Machine {
     }
 }
 
-/// Run the host check from `stela.cfg`'s `options`; never returns.
-pub fn boot(options: Vec<u8>) -> ! {
-    let (mut machine, tables) = prepare(&options).unwrap_or_else(|error| output::fatal(error));
+/// Run the host check from `stela.cfg`'s `options`, with the USB stick's
+/// host firmware for `--wifi-check`; never returns.
+pub fn boot(options: Vec<u8>, host_firmware: crate::host_firmware::Resources) -> ! {
+    let (mut machine, tables) =
+        prepare(&options, &host_firmware).unwrap_or_else(|error| output::fatal(error));
     let stack = machine.stack_top;
     // SAFETY: boot services have ended; the tables map the image, the heap,
     // the stack, every RAM byte in use, the framebuffer and the registers
@@ -222,7 +236,10 @@ pub fn boot(options: Vec<u8>) -> ! {
 
 /// Before ExitBootServices: the options, the CPU and TSC checks, and what
 /// the rest needs from the firmware; then leave boot services.
-fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
+fn prepare(
+    options: &[u8],
+    host_firmware: &crate::host_firmware::Resources,
+) -> Result<(Machine, paging::Tables)> {
     let text = core::str::from_utf8(options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let options = HostCheck::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let started = rdtsc();
@@ -247,6 +264,8 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
         apic_base: apic::base_msr(),
         stack_top: 0,
         checks: Vec::new(),
+        wifi: wifi::Plan::Off,
+        kept: Vec::new(),
     };
     let missing = cpu::missing_floor();
     machine.record(
@@ -275,6 +294,11 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
         Ok(handoff) => machine.storage = Some(handoff),
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
     }
+    let wifi = if machine.options.wifi_check {
+        wifi::prepare(machine.storage.as_ref(), host_firmware)
+    } else {
+        wifi::Plan::Off
+    };
     let guard = firmware::pages(firmware::STACK_PAGES + 1)?;
     machine.stack_top = guard + (firmware::STACK_PAGES + 1) * PAGE;
     let image = firmware::Image::loaded()?;
@@ -284,6 +308,7 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
     }
     let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
+    machine.wifi = wifi.map(&mut tables);
     let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
@@ -326,6 +351,7 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
         None => Vec::new(),
     };
     timer(machine);
+    wifi::check(machine);
     match (machine.screen, band) {
         (Some(screen), Some(top)) => bars(machine, &screen, top),
         _ => machine.record(

@@ -875,12 +875,14 @@ fn rtw89_master<C: ConfigSpace>(function: &mut Function<C>) -> Result<(), Error>
 }
 
 /// The device effects of an RTL8852CE attach, which [`rtw89_attach`] puts
-/// in order.
+/// in order: the mount's, over its cold-prepared requester, or the host
+/// check's (`--wifi-check`), which parks the function itself and gives it
+/// the passthrough domain.
 #[expect(
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-pub(super) trait Rtw89Device {
+pub trait Rtw89Device {
     type Io: AxIo;
     /// The register window over BAR2: memory decode on, Bus Master clear
     /// until [`Self::master`].
@@ -985,7 +987,7 @@ impl Rtw89Device for Rtw89Native {
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
+pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     device: &mut D,
     observed: realtek_wifi::identity::Observed,
     firmware: &dyn crate::firmware::Provider,
