@@ -309,6 +309,70 @@ pub fn driver_stopped(
     }
 }
 
+/// The turn of the GPUs' probes a driver's probe ran in ([`Probing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeTurn {
+    /// The start's first turn: the GPUs that may give the Metal device.
+    First,
+    /// The start's second turn: GPUs that may only show another's frames.
+    Later,
+    /// A turn of GPUs claimed after the start in place of GPUs that could
+    /// not draw.
+    Fallback,
+}
+
+/// A driver's probe running now, which a stop raised inside it names
+/// ([`probe_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probing<'a> {
+    /// The GPU's market name, or its maker alone.
+    pub gpu: &'a str,
+    pub address: &'a str,
+    pub driver: &'a str,
+    pub turn: ProbeTurn,
+    /// Another GPU of this PC whose stack draws, which could have drawn in
+    /// its place had its probe failed with an error rather than stopped.
+    pub beside: Option<&'a str>,
+    /// The processor the probe runs on.
+    pub processor: usize,
+}
+
+/// What a stop raised on `processor` adds to its reason while `probing`
+/// runs there: the GPU, its driver, the turn and, where one was present,
+/// the GPU that could have drawn in its place, with why that one cannot
+/// start after such a stop. None for a stop outside a probe, or on another
+/// processor, whose reason stays as it was.
+///
+/// No stop inside a probe is contained, whatever raised it: Linux's BUG or
+/// panic, a fault in its code, or an assertion of Stela's Linux layer. In
+/// atomic context (a spin lock, interrupts or preemption off, an RCU or
+/// interrupt callback) the processor's interrupt and preemption state is
+/// the stopped code's, and Linux itself panics there. In process context the
+/// stopped task keeps every lock it took, which nothing records (no
+/// lockdep), and Linux's mutexes name their owner task, so neither ending
+/// nor parking the task is sound for the next driver; the timers and work
+/// the driver armed keep running into its half-built state, and the first
+/// turn's GPUs already bound are held by that task until it returns.
+pub fn probe_stop(probing: Option<&Probing<'_>>, processor: usize) -> Option<String> {
+    let probing = probing.filter(|probing| probing.processor == processor)?;
+    let turn = match probing.turn {
+        ProbeTurn::First => "the GPUs' first turn of probes",
+        ProbeTurn::Later => "the turn of GPUs that only show another's frames",
+        ProbeTurn::Fallback => "the turn of GPUs started in place of GPUs that could not draw",
+    };
+    let beside = match probing.beside {
+        Some(other) => format!(
+            "; the {other} of this PC could draw in its place, but cannot start after a stop \
+             inside a driver's probe, which leaves Linux's locks and state as the driver had them"
+        ),
+        None => String::new(),
+    };
+    Some(format!(
+        "it came while {}'s probe of the {} at {} ran, in {turn}{beside}",
+        probing.driver, probing.gpu, probing.address
+    ))
+}
+
 /// The maker of the GPU whose start failed with `error`, the first error
 /// Linux reported, among the `claimed` GPUs by PCI address: the one whose
 /// address the error carries (a driver's `dev_err` names its device), else
@@ -579,6 +643,73 @@ mod tests {
             ended.contains("stays dark: the driver's MODE2 reset ended its picture."),
             "{ended}"
         );
+    }
+
+    /// A stop inside a driver's probe names the GPU, the turn and the GPU
+    /// that could have drawn in its place, for each kind of stop alike: the
+    /// reason it is added to is the stop's own. Only a stop on the probe's
+    /// processor while it runs is named; a stop outside it, or on another
+    /// processor, keeps its reason as it was.
+    #[test]
+    fn a_stop_inside_a_probe_names_the_gpu_and_the_one_beside_it() {
+        let probing = Probing {
+            gpu: "NVIDIA GeForce RTX 5080",
+            address: "0000:01:00.0",
+            driver: "nouveau",
+            turn: ProbeTurn::First,
+            beside: Some("Intel UHD Graphics 770"),
+            processor: 0,
+        };
+        let named = probe_stop(Some(&probing), 0).unwrap();
+        assert_eq!(
+            named,
+            "it came while nouveau's probe of the NVIDIA GeForce RTX 5080 at 0000:01:00.0 ran, \
+             in the GPUs' first turn of probes; the Intel UHD Graphics 770 of this PC could draw in \
+             its place, but cannot start after a stop inside a driver's probe, which leaves \
+             Linux's locks and state as the driver had them"
+        );
+        // Each kind of stop gets the same clause after its own reason: a
+        // Linux BUG through `Host::fatal`, a fault in Linux's code, a stop
+        // of Stela's Linux layer.
+        for reason in [
+            driver_stopped(
+                "kernel BUG at drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c:1290!",
+                None,
+                None,
+                None,
+            ),
+            String::from("page fault at 0x10 in Linux code, rip 0xffff80000123abcd"),
+            String::from("unsupported hrtimer mode; original timer retained"),
+        ] {
+            let stop = format!("{reason}; {named}");
+            assert!(stop.starts_with(&reason) && stop.contains("could draw in its place"));
+        }
+        // A fallback's turn, a later turn, a PC with no other GPU.
+        let fallback = Probing {
+            turn: ProbeTurn::Fallback,
+            beside: None,
+            gpu: "Intel UHD Graphics 770",
+            address: "0000:00:02.0",
+            driver: "i915",
+            ..probing
+        };
+        assert_eq!(
+            probe_stop(Some(&fallback), 0).unwrap(),
+            "it came while i915's probe of the Intel UHD Graphics 770 at 0000:00:02.0 ran, in the \
+             turn of GPUs started in place of GPUs that could not draw"
+        );
+        let later = Probing {
+            turn: ProbeTurn::Later,
+            ..probing
+        };
+        assert!(
+            probe_stop(Some(&later), 0)
+                .unwrap()
+                .contains("in the turn of GPUs that only show another's frames;")
+        );
+        // Outside a probe, or on another processor: as before.
+        assert_eq!(probe_stop(None, 0), None);
+        assert_eq!(probe_stop(Some(&probing), 3), None);
     }
 
     /// Where another GPU takes its place, the line says why the GPU did not

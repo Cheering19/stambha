@@ -1658,6 +1658,9 @@ pub(super) struct Claimed {
     /// another GPU draws ([`stela_drivers::gpu::selection::Choice::Later`]).
     #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
     later: bool,
+    /// Another GPU of the census that could draw in its place ([`beside`]),
+    /// which a stop inside its probe names.
+    beside: Option<String>,
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
     stack: &'static GpuStack,
     /// The kernel drivers Linux offers it to, in registration order: its
@@ -2043,6 +2046,7 @@ fn claim(
         market: adapter.name(),
         census: 0,
         later: false,
+        beside: None,
         stack,
         offered: offered(stack, adapter),
         #[cfg(feature = "nvk")]
@@ -2509,6 +2513,7 @@ pub(super) fn claim_all(
     }
     for function in &mut claimed {
         function.later = matches!(chosen.choices[function.census], Choice::Later { .. });
+        function.beside = beside(&found, adapters, &[], function.census);
     }
     let census = Census {
         adapters: adapters.to_vec(),
@@ -2583,10 +2588,69 @@ fn fall_back_census(
     }
     for function in &mut claimed {
         function.later = matches!(after.choices[function.census], Choice::Later { .. });
+        function.beside = beside(
+            &census.found,
+            &census.adapters,
+            &census.failed,
+            function.census,
+        );
     }
     census.claims += claimed.len() as u32;
     census.chosen = after;
     claimed
+}
+
+/// The name of a GPU of the census, other than the one at `index` and those
+/// of `failed`, whose stack draws: one that could draw in its place.
+fn beside(
+    found: &[stela_drivers::gpu::selection::Found],
+    adapters: &[gpu::Adapter],
+    failed: &[usize],
+    index: usize,
+) -> Option<String> {
+    (0..found.len())
+        .find(|&other| {
+            other != index
+                && !failed.contains(&other)
+                && found[other].stack.is_ok_and(|driven| driven.draws)
+        })
+        .map(|other| adapters[other].name())
+}
+
+/// The probe running now, with the processor it runs on, which a stop
+/// raised inside it names ([`probe_stop`]).
+struct Probing {
+    gpu: String,
+    address: String,
+    driver: &'static str,
+    turn: stela_boot_core::gpu_status::ProbeTurn,
+    beside: Option<String>,
+    processor: usize,
+}
+
+static PROBING: stela_boot_core::screen::Exclusive<Option<Probing>> =
+    stela_boot_core::screen::Exclusive::new(None);
+
+/// What a stop raised now adds to its reason: the GPU whose driver's probe
+/// runs on this processor, the turn, and the GPU that could have drawn in
+/// its place (`gpu_status::probe_stop`). None outside a probe.
+pub(in crate::engine) fn probe_stop() -> Option<String> {
+    PROBING
+        .try_with(|probing| {
+            let probing = probing.as_ref()?;
+            stela_boot_core::gpu_status::probe_stop(
+                Some(&stela_boot_core::gpu_status::Probing {
+                    gpu: &probing.gpu,
+                    address: &probing.address,
+                    driver: probing.driver,
+                    turn: probing.turn,
+                    beside: probing.beside.as_deref(),
+                    processor: probing.processor,
+                }),
+                this_processor() as usize,
+            )
+        })
+        .flatten()
 }
 
 /// Whether the firmware's picture may be on the function at `address`, as
@@ -2975,6 +3039,11 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
         bound: Bounds::new(),
         result: Ok(()),
     };
+    let probe_turn = match turn {
+        ProbeTurn::First(_) => stela_boot_core::gpu_status::ProbeTurn::First,
+        ProbeTurn::Later => stela_boot_core::gpu_status::ProbeTurn::Later,
+        ProbeTurn::Fallback { .. } => stela_boot_core::gpu_status::ProbeTurn::Fallback,
+    };
     match turn {
         ProbeTurn::First(setup) => {
             for word in &setup.left_out {
@@ -3062,11 +3131,23 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
         };
         // The first error Linux reports from here on is this probe's.
         kernel.platform().probe_error.take();
+        // A stop inside the probe names it.
+        PROBING.try_with(|probing| {
+            *probing = Some(Probing {
+                gpu: claimed.market.clone(),
+                address: claimed.name.clone(),
+                driver: claimed.stack.kernel.driver,
+                turn: probe_turn,
+                beside: claimed.beside.clone(),
+                processor: this_processor() as usize,
+            })
+        });
         // SAFETY: entered on the same canonical kernel task. The device and
         // enrolled catalogue retain the exact original configuration/attachment.
         let attached = unsafe {
             Attached::new_catalogued(kernel, claimed.device, claimed.placement, authority)
         };
+        PROBING.try_with(|probing| *probing = None);
         match attached {
             Ok(attached) => {
                 // SAFETY: entered.
@@ -4767,6 +4848,8 @@ fn wait_for_child(
         // The counter bounds the wait too, when Linux's clock stands still.
         if now >= deadline || waited_ms >= START_SECONDS * 1000 {
             super::storage::store_usb_log_in_gpu_start();
+            // A probe left running is no longer the one a stop comes in.
+            PROBING.try_with(|probing| *probing = None);
             return Err(Error::Timeout);
         }
         if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {
