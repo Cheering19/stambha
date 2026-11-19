@@ -58,9 +58,11 @@ const VENDOR: u16 = 0x10ec;
 const DEVICE: u16 = 0xc852;
 /// `rtw89_pci_setup_mapping` maps BAR2.
 const BAR: u8 = 2;
-/// The rings' pages: 13 TX BD rings, the RXQ and RPQ rings with sixteen
-/// 11498-byte buffers, and sixteen CH12 slots take 67; the rest is room.
-const DMA_PAGES: usize = 256;
+/// The rings' pages: 13 TX BD rings, the RXQ and RPQ rings with 32
+/// 11498-byte buffers of three pages each, and sixteen CH12 slots take 211
+/// pages of payload, 278 with the heap's per-allocation page (a 16-byte
+/// block header before each page-aligned block); the rest is room.
+const DMA_PAGES: usize = 320;
 const PAGE: usize = crate::paging::PAGE;
 /// How long the function may keep requests outstanding after Bus Master is
 /// cleared, about as long as Linux's `pci_wait_for_pending_transaction`.
@@ -185,17 +187,28 @@ pub(super) fn prepare(
     })
 }
 
-/// After ExitBootServices: the bring-up, recorded as `CHECK wifi`.
+/// After ExitBootServices: the bring-up, recorded as `CHECK wifi`, then
+/// RF 0x18 per path and the networks the scan heard, one per line.
 pub(super) fn check(machine: &mut Machine) {
+    let mut lines = Vec::new();
     let (verdict, detail) = match core::mem::replace(&mut machine.wifi, Plan::Off) {
         Plan::Off => (Verdict::Skip, String::from("no --wifi-check")),
         Plan::Decided(verdict, detail) => (verdict, detail),
         Plan::Ready(prepared) => match run(prepared, &mut machine.kept, machine.timing.tsc_hz) {
-            Ok(detail) => (Verdict::Pass, detail),
+            Ok((detail, found)) => {
+                lines = found;
+                (Verdict::Pass, detail)
+            }
             Err(detail) => (Verdict::Fail, detail),
         },
     };
     machine.record("wifi", verdict, detail);
+    for line in &lines {
+        crate::output::arguments(format_args!("{line}\n"));
+    }
+    if !lines.is_empty() {
+        crate::output::flush_log();
+    }
 }
 
 /// One RTL8852CE through `rtw89_attach`: its parked function, the window
@@ -236,7 +249,11 @@ impl Rtw89Device for Chip<'_> {
 /// The bring-up of `prepared`'s function. Whatever happens past the park,
 /// Bus Master ends clear and memory decode as the firmware left it; what
 /// DMA could still reach (the rings) is kept in `kept`.
-fn run(prepared: Prepared, kept: &mut Vec<Box<dyn Any>>, tsc_hz: u64) -> Result<String, String> {
+fn run(
+    prepared: Prepared,
+    kept: &mut Vec<Box<dyn Any>>,
+    tsc_hz: u64,
+) -> Result<(String, Vec<String>), String> {
     let address = prepared.address;
     // SAFETY: one CPU after ExitBootServices; the storage probe is done
     // with every function, and nothing else reaches this one's
@@ -273,7 +290,7 @@ fn run(prepared: Prepared, kept: &mut Vec<Box<dyn Any>>, tsc_hz: u64) -> Result<
     kept.push(Box::new(function));
     match (result, restored) {
         (result, Ok(())) => result,
-        (Ok(detail) | Err(detail), Err(error)) => Err(format!(
+        (Ok((detail, _)) | Err(detail), Err(error)) => Err(format!(
             "{detail}; then clearing Bus Master or restoring memory decode failed: {error}"
         )),
     }
@@ -284,7 +301,7 @@ fn attach(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
     tsc_hz: u64,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let Prepared {
         address,
         registers,
@@ -384,7 +401,16 @@ fn attach(
     match attached {
         Ok((running, rings, was_on)) => {
             kept.push(Box::new(rings));
-            Ok(format!("{running}{}", left_on(was_on)))
+            // RF 0x18 per path (both windows), then the networks, strongest
+            // first, at most 32 (`ScanReport::listed`), each on its own line.
+            let mut lines: Vec<String> = Vec::new();
+            if let Some(rf18) = &running.rf18 {
+                lines.extend(rf18.lines().map(|line| line.to_string()));
+            }
+            if let Some(scan) = &running.scan {
+                lines.extend(scan.listed().map(|listed| listed.to_string()));
+            }
+            Ok((format!("{running}{}", left_on(was_on)), lines))
         }
         Err((error, was_on)) => Err(format!("{}{}", failed(&error), left_on(was_on))),
     }
