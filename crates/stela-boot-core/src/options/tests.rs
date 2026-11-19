@@ -59,9 +59,48 @@ fn host_check_lines_round_trip_and_refuse_bad_values() {
         "--host-check --deadline 0",
         "--host-check --nor-file x",
         "--host-check --unknown",
+        "--host-check --wifi-check=1",
     ] {
         assert!(HostCheck::parse(text).is_err(), "{text}");
     }
+}
+
+#[test]
+fn host_check_wifi_check_is_off_unless_named_and_round_trips() {
+    assert!(!HostCheck::parse("--host-check").unwrap().wifi_check);
+    assert!(
+        !HostCheck::parse("--host-check --deadline 30")
+            .unwrap()
+            .wifi_check
+    );
+    let options = HostCheck::parse("--host-check --wifi-check --deadline 600").unwrap();
+    assert!(options.wifi_check);
+    assert_eq!(options.deadline, Some(600));
+    assert_eq!(
+        options.to_string(),
+        "--host-check --deadline 600 --wifi-check"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // Repeated, it stays on, as the other flags' repeats overwrite.
+    assert!(
+        HostCheck::parse("--host-check --wifi-check --wifi-check")
+            .unwrap()
+            .wifi_check
+    );
+    assert_eq!(
+        HostCheck::parse("--host-check --wifi-check").unwrap(),
+        HostCheck {
+            wifi_check: true,
+            ..HostCheck::default()
+        }
+    );
+    // Without it, the line prints as before.
+    assert_eq!(
+        HostCheck::parse("--host-check --key-seconds 5")
+            .unwrap()
+            .to_string(),
+        "--host-check --key-seconds 5"
+    );
 }
 
 const DISK: &str = "74EXN0LI:11111111-2222-3333-4444-555555555555";
