@@ -1102,6 +1102,16 @@ impl<H: Host> Attached<H> {
     }
 }
 
+/// [`Attached::shutdown`] for the function whose `struct pci_dev` is at
+/// `device` ([`Attached::device`]).
+///
+/// # Safety
+/// As [`Attached::shutdown`], with an attachment that keeps `device` alive.
+pub unsafe fn shutdown_device(device: *mut c_void) {
+    // SAFETY: the caller's contract.
+    unsafe { stela_linux_pci_shutdown(device) }
+}
+
 impl<H> Drop for Attached<H> {
     fn drop(&mut self) {
         // SAFETY: the type's entered serialized owner contract; registration

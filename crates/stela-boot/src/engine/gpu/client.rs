@@ -671,10 +671,12 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                         "GPU completion waiter still open at the stop\n"
                     ));
                 }
-                gpu.start
-                    ._attached
-                    .iter()
-                    .for_each(|attached| attached.shutdown());
+                // Every bound GPU, those a fallback started after the
+                // start among them, whose attachments the start's list does
+                // not hold.
+                for bound in gpu.start.bound.iter() {
+                    stela_linux::function::shutdown_device(bound.device as *mut c_void);
+                }
                 0
             }
         }

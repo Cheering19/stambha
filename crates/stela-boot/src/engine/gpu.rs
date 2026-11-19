@@ -2626,6 +2626,9 @@ struct Bound {
     link: Option<PcieLink>,
     /// The PCI Express port above it, read when it stops answering.
     port: Option<link::Port>,
+    /// Its `struct pci_dev`, which its attachment keeps for the boot: its
+    /// driver is stopped through it at the boot's stop.
+    device: usize,
 }
 
 /// The most GPUs one boot binds.
@@ -3095,6 +3098,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, turn: ProbeTurn) -> Starte
                         drm: claimed.drm,
                         link: claimed.link,
                         port: claimed.port,
+                        device: attached.device() as usize,
                     });
                 } else {
                     use stela_boot_core::gpu_status::Picture;
