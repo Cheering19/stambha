@@ -484,14 +484,19 @@ impl RuntimePages {
             .into_iter()
             .map(|(start, end)| (start as u64, end as u64))
             .collect();
-        let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
+        let map =
+            boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
         let mut runtime = Self::default();
         for entry in map
             .entries()
             .filter(|entry| entry.att.bits() & firmware_map::MEMORY_RUNTIME != 0)
         {
-            let (start, pages, kind, attributes) =
-                (entry.phys_start, entry.page_count, entry.ty.0, entry.att.bits());
+            let (start, pages, kind, attributes) = (
+                entry.phys_start,
+                entry.page_count,
+                entry.ty.0,
+                entry.att.bits(),
+            );
             let region = firmware_runtime::plan(start, pages, kind, attributes, &ram, devices);
             crate::output::arguments(format_args!("{}", region.line()));
             let mapping = firmware_map::runtime_mapping(kind, attributes);

@@ -328,8 +328,7 @@ fn prepare(
     } else {
         firmware::RuntimePages::default()
     };
-    let mut tables =
-        firmware::tables(&image, [0, guard], machine.screen.as_ref(), &runtime.pages)?;
+    let mut tables = firmware::tables(&image, [0, guard], machine.screen.as_ref(), &runtime.pages)?;
     for range in machine.storage.iter().flat_map(|handoff| &handoff.mapped) {
         tables.device(range.start as usize, range.end as usize)?;
     }
