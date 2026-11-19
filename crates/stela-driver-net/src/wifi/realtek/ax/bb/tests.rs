@@ -4,11 +4,11 @@
 extern crate std;
 use super::*;
 use crate::wifi::realtek::ax::elements::{
-    ID_BB_GAIN, ID_BB_REG, phy_tables,
+    ID_BB_GAIN, ID_BB_REG, ID_RF_NCTL, phy_tables,
     tests::{container, element, pairs},
 };
 use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
 #[test]
 fn bb_helpers_add_the_cr_base() {
@@ -428,4 +428,109 @@ fn real_8852c_fw_2_bb_init_writes_the_selected_table() {
     // to 0x0704.
     assert_eq!(m.trace.last(), Some(&Op::W32(0x10704, 0x601C_0502)));
     assert_eq!(m.get32(0x10704) & 0x2, 0x2);
+}
+
+/// A file with one RF_NCTL element; a TXPWR element follows so it is read.
+fn nctl_file(nctl: &[(u32, u32)]) -> Vec<u8> {
+    let mut b = container(32, 16);
+    element(&mut b, ID_RF_NCTL, [0; 4], 0, 0, &pairs(nctl));
+    element(&mut b, 9, [0; 4], 0, 0, &[0; 16]);
+    b
+}
+
+#[test]
+fn nctl_init_matches_linux_sequence() {
+    // phy.c:2041-2078: the IQK/DPK clock and reset bits are set, 0x8000 is
+    // written 8, 0x8080 is polled (write 4, 1 us, read), then the table.
+    let b = nctl_file(&[(0x8008, 0), (0x8000, 8), (0xFB, 0), (0x81C0, 0xBABE_CAFE)]);
+    let t = phy_tables(&b, 0).unwrap();
+    let mut m = RegisterModel::new();
+    m.on_read(0x18080, Box::new(|_| 4));
+    assert_eq!(init_rf_nctl(&mut m, &t.nctl.unwrap(), 1, 1), Ok(false));
+    assert_eq!(
+        m.writes(),
+        [
+            Op::W32(0x10C60, 3),
+            Op::W32(0x10C6C, 1),
+            Op::W32(0x158AC, 0x0800_0000),
+            Op::W32(0x178AC, 0x0800_0000),
+            Op::W32(0x18000, 8),
+            Op::W32(0x18080, 4),
+            Op::Delay(1),
+            Op::W32(0x18008, 0),
+            Op::W32(0x18000, 8),
+            Op::Delay(50),
+        ]
+    );
+}
+
+#[test]
+fn nctl_poll_timeout_is_recorded_and_the_table_still_loads() {
+    let b = nctl_file(&[(0x8008, 0), (0x8000, 8)]);
+    let t = phy_tables(&b, 0).unwrap();
+    let mut m = RegisterModel::new();
+    // The model stores the 4 the poll writes; hardware that never comes up
+    // reads something else.
+    m.on_read(0x18080, Box::new(|_| 0));
+    assert_eq!(init_rf_nctl(&mut m, &t.nctl.unwrap(), 1, 1), Ok(true));
+    let polls = m
+        .trace
+        .iter()
+        .filter(|op| **op == Op::W32(0x18080, 4))
+        .count();
+    // One sample every 11 us (the 1 us settle and the 10 us interval) until
+    // the clock passes 1000 us: samples at 0, 11, ..., 1001.
+    assert_eq!(polls, 92);
+    let waits = m.trace.iter().filter(|op| **op == Op::Delay(10)).count();
+    assert_eq!(waits, 91);
+    let tail = &m.trace[m.trace.len() - 2..];
+    assert_eq!(tail, [Op::W32(0x18008, 0), Op::W32(0x18000, 8)]);
+}
+
+#[test]
+fn nctl_init_refuses_an_unselected_table_after_the_poll() {
+    let b = nctl_file(&[(0xF002_0001, 0), (0x8008, 0)]);
+    let t = phy_tables(&b, 0).unwrap();
+    let mut m = RegisterModel::new();
+    m.on_read(0x18080, Box::new(|_| 4));
+    assert_eq!(
+        init_rf_nctl(&mut m, &t.nctl.unwrap(), 1, 1),
+        Err(AxError::PhyPackage {
+            table: "RF_NCTL",
+            rfe: 1,
+            cv: 1
+        })
+    );
+}
+
+#[test]
+#[ignore = "oracle: STELA_REALTEK_WIFI_IMAGES"]
+fn real_8852c_fw_2_nctl_writes_1774_entries() {
+    use sha2::{Digest, Sha256};
+    let root = std::path::PathBuf::from(std::env::var("STELA_REALTEK_WIFI_IMAGES").unwrap());
+    let b = std::fs::read(root.join("rtw89/rtw8852c_fw-2.bin")).unwrap();
+    let t = phy_tables(&b, 0).unwrap();
+    let mut m = RegisterModel::new();
+    m.on_read(0x18080, Box::new(|_| 4));
+    assert_eq!(init_rf_nctl(&mut m, &t.nctl.unwrap(), 1, 1), Ok(false));
+
+    // After the poll's Delay(1) the rest is the table: plain writes (and
+    // table delays, which are not writes).
+    let poll = first(&m, |op| *op == Op::Delay(1));
+    let mut hash = Sha256::new();
+    let mut writes = Vec::new();
+    for op in &m.trace[poll + 1..] {
+        if let Op::W32(a, d) = *op {
+            hash.update((a - CR_BASE).to_le_bytes());
+            hash.update(d.to_le_bytes());
+            writes.push((a - CR_BASE, d));
+        }
+    }
+    let hex: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(writes.len(), 1774);
+    assert_eq!(writes[..2], [(0x8008, 0), (0x8000, 8)]);
+    assert_eq!(
+        hex,
+        "fec1c1dcc061316be04e931aecde57a42eea8f4af0112147502c34c53cbf2df5"
+    );
 }

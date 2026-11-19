@@ -18,12 +18,17 @@
 //! `rtw8852c_bb_reset_all` (rtw8852c.c:1648-1671). `io_pack`/`unpack` do
 //! nothing on PCIe (fw.c:12682-12692) and are not ported.
 //!
+//! [`init_rf_nctl`] is `rtw89_phy_init_rf_nctl` (phy.c:2065-2078) with
+//! `rtw89_phy_preinit_rf_nctl_ax` (phy.c:2041-2063): the NCTL table goes
+//! through [`config_bb_reg`] too. The RTL8852C has no `nctl_post_table`
+//! (rtw8852c.c:3181).
+//!
 //! This module grants no PHY 1, no RF table, no channel, TX power by rate
 //! or limit, no gain-error write (the gain table is memory only on AX) and
 //! no calibration.
 use super::elements::Reg2;
 use super::io::{self, AxError, AxIo};
-use super::phy_table::{self, BB_GAIN, BB_REG};
+use super::phy_table::{self, BB_GAIN, BB_REG, RF_NCTL};
 
 /// `rtw89_phy_gen_ax.cr_base` (phy.c:9042).
 pub const CR_BASE: u32 = 0x10000;
@@ -370,6 +375,57 @@ pub fn init_bb_reg<I: AxIo + ?Sized>(
         bb_gain: gain_count,
         gain,
     })
+}
+
+// reg.h (pinned rtw89), BB offsets.
+const R_IOQ_IQK_DPK: u32 = 0x0C60;
+const R_GNT_BT_WGT_EN: u32 = 0x0C6C;
+const R_P0_PATH_RST: u32 = 0x58AC;
+const R_P1_PATH_RST: u32 = 0x78AC;
+const R_NCTL_CFG: u32 = 0x8000;
+/// The register `rtw89_phy_nctl_poll` (phy.c:1998-2003) writes 4 and reads.
+const R_NCTL_POLL: u32 = 0x8080;
+
+/// `rtw89_phy_init_rf_nctl` (phy.c:2065-2078) for an RTL8852C's PHY 0, at
+/// RFE type `rfe` and cut `cv`. `rtw89_phy_preinit_rf_nctl_ax`
+/// (phy.c:2041-2063) sets the IQK/DPK clock and reset bits, writes 8 to
+/// `R_NCTL_CFG` and polls `rtw89_phy_nctl_poll` (write 4 to 0x8080, 1 us,
+/// read it) every 10 us for 1000 us until it reads 4. The firmware's NCTL
+/// table then goes through [`config_bb_reg`]. The 8852C has no
+/// `nctl_post_table` (rtw8852c.c:3181).
+///
+/// Returns `true` when the poll timed out: Linux only logs "failed to poll
+/// nctl block" and loads the table anyway, so this does too and leaves the
+/// caller to report it. An unselected table or an I/O error is an `Err`.
+pub fn init_rf_nctl<I: AxIo + ?Sized>(
+    io: &mut I,
+    nctl: &Reg2<'_>,
+    rfe: u8,
+    cv: u8,
+) -> Result<bool, AxError> {
+    set32(io, R_IOQ_IQK_DPK, 0x3)?;
+    set32(io, R_GNT_BT_WGT_EN, 0x1)?;
+    set32(io, R_P0_PATH_RST, 0x800_0000)?;
+    set32(io, R_P1_PATH_RST, 0x800_0000)?;
+    write32(io, R_NCTL_CFG, 0x8)?;
+    let timed_out = match io::poll_sample(
+        io,
+        10,
+        1000,
+        |io| {
+            write32(io, R_NCTL_POLL, 4)?;
+            io.delay_us(1);
+            read32(io, R_NCTL_POLL)
+        },
+        |v| v == 4,
+    )? {
+        io::Polled::Met(_) => false,
+        io::Polled::Expired(_) => true,
+    };
+    phy_table::apply(nctl, RF_NCTL, rfe, cv, &mut |addr, data| {
+        config_bb_reg(io, addr, data)
+    })?;
+    Ok(timed_out)
 }
 
 #[cfg(test)]

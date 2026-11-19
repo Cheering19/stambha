@@ -2294,6 +2294,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_nctl_writes_1774_entries",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/bb/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "real_8852c_fw_2_rf_init_sends_linux_pages",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/radio/tests.rs",
     "kind": "oracle",

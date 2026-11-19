@@ -105,7 +105,8 @@ const PHY: &str = ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 
 
 /// The chip as every bring-up poll wants it:
 /// - power: RDY_SYSPWR (0x0004 bit17) reads set, APFN_ONMAC and APFM_OFFMAC
-///   (bits 8, 9) self-clear, and XTAL SI commands (0x0270 bit31) complete;
+///   (bits 8, 9) self-clear, and XTAL SI commands (0x0270 bit31) complete,
+///   a read returning what was written ([`xtal_si`]);
 /// - efuse: 0x0030 answers EF_RDY with the byte at the written address;
 /// - DMAC: the WDE and PLE managers (0x8D00, 0x9100) report ready;
 /// - PCI: the DMA busy registers read idle (zero) and the BD RAM reset
@@ -119,7 +120,8 @@ const PHY: &str = ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 
 ///   matches the SCC `pub_max`;
 /// - RXQ: at its first index read, which only the OFLD_CFG wait makes, after
 ///   the kick, the device fills entries 0.. with `acks` and its index
-///   (0x1218 [27:16]) reports them.
+///   (0x1218 [27:16]) reports them;
+/// - radio and calibration: as the comments in the body say, every poll met.
 ///
 /// `pre_inits` counts PCI pre-inits by their first step's read, the G1
 /// deglitch (0x3848); the deinit reads TXBD_RWPTR_CLR1 too, so that is no
@@ -142,10 +144,7 @@ fn chip(
         0x0004,
         Box::new(|m: &mut RegisterModel| (m.get32(0x0004) | 1 << 17) & !(1 << 8 | 1 << 9)),
     );
-    io.on_read(
-        0x0270,
-        Box::new(|m: &mut RegisterModel| m.get32(0x0270) & 0x7FFF_FFFF),
-    );
+    io.on_read(0x0270, xtal_si());
     io.on_read(
         0x0030,
         Box::new(move |m: &mut RegisterModel| {
@@ -211,6 +210,26 @@ fn chip(
     io.emulate_rf();
     io.set_rf(0, 0x18, 0x01001);
     io.set_rf(1, 0x18, 0x01001);
+    // The calibration: thermal meters ([6:1] of RF 0x42) at 30 and 31; RCK
+    // done (RF 0x1C b3) with RF 0x1B [14:10] reading 0x0F on path A and 0x10
+    // on B once triggered; RX DCK done (RF 0x93 b5) with every offset equal
+    // to its base, so nothing is rewritten; DRCK done (0xC0C8 b3) with code
+    // 0x0D in [19:15]; both ADDCK results done (b0) at A 0x201/0x1FF and B
+    // 0x200/0x201; every DACK done bit set; and NCTL's 0x8080 at 4.
+    io.set_rf(0, 0x42, 30 << 1);
+    io.set_rf(1, 0x42, 31 << 1);
+    for (p, rck) in [(0u8, 0x3C00), (1, 0x4000)] {
+        io.set_rf(p, 0x1C, 1 << 3);
+        io.on_rf_read(p, 0x1B, Box::new(move |m| rck | m.get_rf(p, 0x1B)));
+        io.set_rf(p, 0x93, 1 << 5);
+    }
+    io.set32(0x1C0C8, 0x0006_8008);
+    io.set32(0x1C0FC, 0x201 << 10 | 0x1FF);
+    io.set32(0x1C1FC, 0x200 << 10 | 0x201);
+    for (reg, bit) in DACK_DONE {
+        io.set32(reg, bit);
+    }
+    io.set32(0x18080, 4);
     io.on_read(
         0xDA4C,
         Box::new(|m: &mut RegisterModel| {
@@ -238,6 +257,40 @@ fn chip(
         }),
     );
     Chip { io, pre_inits, m }
+}
+
+/// `_check_dack_done`'s registers and bits (BB offsets plus 0x10000), S0
+/// then S1 (rtw8852c_rfk.c:489-506).
+const DACK_DONE: [(u32, u32); 8] = [
+    (0x1C040, 1 << 31),
+    (0x1C064, 1 << 31),
+    (0x1C05C, 1 << 2),
+    (0x1C080, 1 << 2),
+    (0x1C140, 1 << 31),
+    (0x1C164, 1 << 31),
+    (0x1C15C, 1 << 2),
+    (0x1C180, 1 << 2),
+];
+
+/// An XTAL SI controller behind 0x0270: a pending command (bit 31) is done
+/// at the first read; a write stores its value under its mask in a byte
+/// file, and a read (mode 1, [25:24]) returns the stored byte in [15:8].
+fn xtal_si() -> Box<dyn FnMut(&mut RegisterModel) -> u32> {
+    let mut file = [0u8; 256];
+    Box::new(move |m: &mut RegisterModel| {
+        let cmd = m.get32(0x0270);
+        if cmd & 1 << 31 == 0 {
+            return cmd;
+        }
+        let offset = usize::from(cmd as u8);
+        let (value, mask) = ((cmd >> 8) as u8, (cmd >> 16) as u8);
+        if (cmd >> 24) & 0x3 == 1 {
+            (cmd & 0x7FFF_00FF) | u32::from(file[offset]) << 8
+        } else {
+            file[offset] = (file[offset] & !mask) | (value & mask);
+            cmd & 0x7FFF_FFFF
+        }
+    })
 }
 
 fn never(_: usize) -> bool {
@@ -422,6 +475,26 @@ const REPORT: PhyReport = PhyReport {
     c2h_after: 0,
 };
 
+/// What a full bring-up of [`chip`] calibrates and reads back.
+const RFK: RfkReport = RfkReport {
+    thermal: [30, 31],
+    xtal: (0x2F, 0x2F),
+    rck: [0x0F, 0x10],
+    drck: 0x0D,
+    addck: [(0x201, 0x1FF), (0x200, 0x201)],
+    rx_dck_rewrites: [0, 0],
+    nctl_timed_out: false,
+    rck_timed_out: [false; 2],
+    drck_timed_out: false,
+    addck_timed_out: [false; 2],
+    dack_timed_out: [false; 2],
+    rx_dck_timed_out: [false; 2],
+};
+
+/// Spec S16's M2b2 suffix for [`RFK`].
+const CALIBRATED: &str = ", calibrated: thermal A 30 B 31, xtal 0x2f/0x2f, RCK A 0x0f B 0x10, \
+                          DRCK 0x0d, ADDCK A 0x201/0x1ff B 0x200/0x201, RX DCK rewrites A 0 B 0";
+
 #[test]
 fn happy_path_reports_running() {
     let (c, result) = ran(BOTH, NO_LTR);
@@ -438,6 +511,7 @@ fn happy_path_reports_running() {
             bacam_reset_timed_out: false,
             h2c: acked(true, true),
             phy: Some(REPORT),
+            rfk: Some(RFK),
         }
     );
     assert_eq!(
@@ -445,9 +519,12 @@ fn happy_path_reports_running() {
         alloc::format!(
             "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
              secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
-             done){PHY}"
+             done){PHY}{CALIBRATED}"
         )
     );
+    // The M2b2 suffix ends the line, after the M2b1 report, and nothing
+    // timed out.
+    assert!(!running.to_string().contains("timed out"), "{running}");
     // The brief's M2b1 text, then the grant reads appended in its style.
     assert!(running.to_string().contains(
         ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 1+1, RF18 A 0x01001 B \
@@ -577,7 +654,7 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
             alloc::format!(
                 "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
                  secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged \
-                 ({line}){PHY}"
+                 ({line}){PHY}{CALIBRATED}"
             )
         );
     }
@@ -590,16 +667,16 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
     assert!(
         running.to_string().ends_with(&alloc::format!(
             "H2C OFLD_CFG acknowledged (receive and done), other C2H 1, unmatched acks 1, \
-             skipped 1{PHY}"
+             skipped 1{PHY}{CALIBRATED}"
         )),
         "{running}"
     );
     let (_, result) = ran(&[&NOT_C2H, &DONE_ACK], NO_LTR);
     let (running, _rings) = result.unwrap();
     assert!(
-        running
-            .to_string()
-            .ends_with(&alloc::format!("acknowledged (done only), skipped 1{PHY}")),
+        running.to_string().ends_with(&alloc::format!(
+            "acknowledged (done only), skipped 1{PHY}{CALIBRATED}"
+        )),
         "{running}"
     );
     let (_, result) = ran(&[&LOG, &REC_ACK, &DONE_ACK], NO_LTR);
@@ -613,7 +690,7 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
         alloc::format!(
             "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
              secure boot off, MAC init done, LTR off, H2C OFLD_CFG acknowledged (receive and \
-             done), firmware log \"fw up\"{PHY}"
+             done), firmware log \"fw up\"{PHY}{CALIBRATED}"
         )
     );
 }
@@ -686,6 +763,16 @@ fn fails_on(
     host: Host,
     fault: impl FnOnce(&mut RegisterModel),
 ) -> BringUpError {
+    fails_traced(phys, acks, host, fault).0
+}
+
+/// [`fails_on`], with the register model for the caller's own checks.
+fn fails_traced(
+    phys: Vec<u8>,
+    acks: &'static [&'static [u8]],
+    host: Host,
+    fault: impl FnOnce(&mut RegisterModel),
+) -> (BringUpError, RegisterModel) {
     let mut c = chip(phys, 7, never, acks);
     fault(&mut c.io);
     let m = c.m.clone();
@@ -697,7 +784,10 @@ fn fails_on(
             .iter()
             .position(|o| *o == Op::W32(0x0030, 0))
             .unwrap();
-    if matches!(err.step, "h2c" | "c2h") || PHY_STEPS.contains(&err.step) {
+    if matches!(err.step, "h2c" | "c2h")
+        || PHY_STEPS.contains(&err.step)
+        || CALIBRATION_STEPS.contains(&err.step)
+    {
         let want: &[u32] = if host.ltr { &DEINIT_LTR } else { &DEINIT };
         assert_eq!(deinit_writes(&c.io), want, "{err}");
     } else {
@@ -712,10 +802,11 @@ fn fails_on(
         // The DMA live since mac pre-init is stopped before the power-off.
         assert_dma_stopped_before_power_off(&c.io);
     }
-    // Only a failure after the coex init runs its undo, and then before the
-    // deinit; before it, no scoreboard word is written at all (the
-    // power-off's PWR_MAJOR is a byte write).
-    if err.step == "phy report" {
+    // Only a failure after the coex init (its report or any calibration
+    // step) runs its undo, and then before the deinit; before it, no
+    // scoreboard word is written at all (the power-off's PWR_MAJOR is a byte
+    // write).
+    if err.step == "phy report" || CALIBRATION_STEPS.contains(&err.step) {
         assert_radio_off_before_deinit(&c.io);
     } else {
         assert!(
@@ -727,7 +818,7 @@ fn fails_on(
         );
     }
     assert_ends_with_power_off(&c.io);
-    err
+    (err, c.io)
 }
 
 /// `coex::GNT_WL_OFF`.
@@ -1308,6 +1399,7 @@ fn running_display_says_on_for_secure_boot() {
         bacam_reset_timed_out: false,
         h2c: acked(false, false),
         phy: None,
+        rfk: None,
     };
     // Without the MAC init no H2C was sent, so nothing is said of one.
     assert_eq!(
@@ -1345,6 +1437,17 @@ fn running_display_says_on_for_secure_boot() {
             .ends_with(&alloc::format!("BA CAM reset timed out{PHY}")),
         "{r}"
     );
+    // The calibration's report follows the radio's, and only when there is
+    // one.
+    let r = Running {
+        rfk: Some(RFK),
+        ..r
+    };
+    assert!(
+        r.to_string()
+            .ends_with(&alloc::format!("BA CAM reset timed out{PHY}{CALIBRATED}")),
+        "{r}"
+    );
 }
 
 #[test]
@@ -1373,6 +1476,11 @@ const PHY_STEPS: [&str; 6] = [
     "coex init",
     "phy report",
 ];
+
+/// The M2b2 steps after the radio's report (spec S2), each torn down as a
+/// `"phy report"` failure is: the coex half of `rtw89_core_stop`, the
+/// deinit, then the power-off.
+const CALIBRATION_STEPS: [&str; 4] = ["dm init", "nctl init", "rfk init", "dm tail"];
 
 /// The trace index of the OFLD_CFG kick: the first CH12 kick after the
 /// efuse dump (the download's kicks all come before it).
@@ -1723,6 +1831,245 @@ fn phy_failure_names_step_and_powers_off() {
     // nothing of it is undone.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA4C));
     assert_eq!(err, BringUpError::new("coex init", READ_FAILED));
+}
+
+#[test]
+fn calibration_steps_run_in_linux_order() {
+    // Programmed thermal trims (A 0x07, B 0x03), so the power trim writes.
+    let mut phys = efuse_with_mac();
+    phys[0x5DF] = 0x07;
+    phys[0x5DC] = 0x03;
+    let mut c = chip(phys, 7, never, BOTH);
+    let m = c.m.clone();
+    let (running, rings) = run_on(&mut c.io, &m, NO_LTR).unwrap();
+    let t = &c.io.trace;
+    let at = |want: &dyn Fn(&Op) -> bool| first_of_dyn(t, want);
+    let op = |want: Op| at(&|o: &Op| *o == want);
+    let w32 = |reg: u32| at(&|o: &Op| matches!(o, Op::W32(r, _) if *r == reg));
+    let rfw = |path: u8, addr: u8| {
+        at(&|o: &Op| matches!(o, Op::RfW(p, a, ..) if (*p, *a) == (path, addr)))
+    };
+    let after = |from: usize, want: Op| {
+        from + 1
+            + t[from + 1..]
+                .iter()
+                .position(|o| *o == want)
+                .unwrap_or_else(|| panic!("no {want:x?} after trace entry {from}"))
+    };
+    // rtw89_btc_ntfy_init's scoreboard, the last M2b1 write.
+    let coex = op(Op::W32(0x00AC, 0x8100_4003));
+    // rtw89_phy_dm_init (phy.c:8235-8261): stat_init's thermal trigger,
+    // bb_sethw's EVM report, env_monitor's CCX, physts' fail trigger, DIG's
+    // PD bound, cfo's crystal cap to XO, edcca's T2R collision.
+    let stat = rfw(0, 0x42);
+    let sethw = w32(0x10A10);
+    let env = w32(0x10C00);
+    let physts = w32(0x10738);
+    let dig = w32(0x1481C);
+    let cfo = op(xtal(0x05, 0x2F, 0xFF));
+    let edcca = w32(0x10C70);
+    // rtw89_phy_init_rf_nctl: the IQK/DPK clock, the poll, the table.
+    let nctl = w32(0x10C60);
+    let nctl_poll = op(Op::W32(0x18080, 4));
+    let nctl_table = op(Op::W32(0x18008, 0));
+    // rtw8852c_rfk_init: RCK's trigger, DACK's coex RFK START and STOP, RX
+    // DCK's clear.
+    let rck = rfw(0, 0x1B);
+    let dack = op(Op::W32(0x00AC, 0x8100_4803));
+    let dack_stop = after(dack, Op::W32(0x00AC, 0x8100_4003));
+    let rx_dck = rfw(0, 0x93);
+    // The tail: the TX power reference, the thermal trim (path A first),
+    // then cfg_txrx_path's first write.
+    let txpwr = w32(0xD200);
+    let trim_a = rfw(0, 0x43);
+    let trim_b = rfw(1, 0x43);
+    let txrx = op(Op::W32(0x14978, 3));
+    // Then rtw89_core_stop: the coex half, the deinit, the power-off.
+    let wl_off = after(txrx, Op::W32(0xDA48, GNT_WL_OFF));
+    let deinit = wl_off
+        + t[wl_off..]
+            .iter()
+            .position(|o| matches!(o, Op::W32(0x0074, _)))
+            .unwrap();
+    let power_off = after(deinit, xtal(0x90, 0x10, 0x10));
+    let order = [
+        coex, stat, sethw, env, physts, dig, cfo, edcca, nctl, nctl_poll, nctl_table, rck, dack,
+        dack_stop, rx_dck, txpwr, trim_a, trim_b, txrx, wl_off, deinit, power_off,
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // The trims are `__thm_setting` of each path's byte.
+    assert!(t.contains(&Op::RfW(0, 0x43, 0xF_0000, 0xB_0000)));
+    assert!(t.contains(&Op::RfW(1, 0x43, 0xF_0000, 0x9_0000)));
+    // Nothing of the calibration runs after the coex half of the stop.
+    assert!(
+        !t[wl_off..]
+            .iter()
+            .any(|o| matches!(o, Op::RfW(..)) || matches!(o, Op::W32(r, _) if *r >= 0x10000)),
+        "{:x?}",
+        &t[wl_off..]
+    );
+    assert_radio_off_before_deinit(&c.io);
+    assert_ends_with_power_off(&c.io);
+    assert_eq!(running.rfk, Some(RFK));
+    drop(rings);
+}
+
+#[test]
+fn calibration_timeouts_are_reported_not_failed() {
+    // DACK S1's first done bit never sets.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    c.io.set32(0x1C140, 0);
+    let m = c.m.clone();
+    let (running, rings) = run_on(&mut c.io, &m, NO_LTR).unwrap();
+    let rfk = running.rfk.unwrap();
+    assert_eq!(rfk.dack_timed_out, [false, true]);
+    assert_eq!(
+        rfk,
+        RfkReport {
+            dack_timed_out: [false, true],
+            ..RFK
+        }
+    );
+    assert!(
+        running
+            .to_string()
+            .ends_with(&alloc::format!("{CALIBRATED}, timed out: DACK B")),
+        "{running}"
+    );
+    // The bring-up carried on: RX DCK and the tail ran, and the chip was
+    // stopped as after any success.
+    assert!(c.io.trace.iter().any(|o| matches!(o, Op::RfW(_, 0x93, ..))));
+    assert!(c.io.trace.contains(&Op::W32(0x14978, 3)));
+    assert_radio_off_before_deinit(&c.io);
+    assert_ends_with_power_off(&c.io);
+    drop(rings);
+
+    // The NCTL poll never reads 4: Linux logs "failed to poll nctl block"
+    // and loads the table anyway, and the report names it.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    c.io.on_read(0x18080, Box::new(|_: &mut RegisterModel| 0));
+    let m = c.m.clone();
+    let (running, rings) = run_on(&mut c.io, &m, NO_LTR).unwrap();
+    assert_eq!(
+        running.rfk,
+        Some(RfkReport {
+            nctl_timed_out: true,
+            ..RFK
+        })
+    );
+    assert!(
+        running
+            .to_string()
+            .ends_with(&alloc::format!("{CALIBRATED}, timed out: NCTL")),
+        "{running}"
+    );
+    assert!(c.io.trace.contains(&Op::W32(0x18008, 0)));
+    drop(rings);
+}
+
+#[test]
+fn calibration_failure_names_step_and_powers_off() {
+    // dm init: cfo's first XTAL SI command, the crystal cap to XO, never
+    // completes; every other command does. `fails_on` checks the coex half
+    // of the stop, the deinit and the power-off for each failure here.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        let mut file = xtal_si();
+        io.on_read(
+            0x0270,
+            Box::new(move |m: &mut RegisterModel| {
+                let v = m.get32(0x0270);
+                if Op::W32(0x0270, v) == xtal(0x05, 0x2F, 0xFF) {
+                    v
+                } else {
+                    file(m)
+                }
+            }),
+        );
+    });
+    assert_eq!(err.step, "dm init");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x0270,
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    // nctl init: the NCTL poll register cannot be read.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0x18080));
+    assert_eq!(err, BringUpError::new("nctl init", READ_FAILED));
+
+    // rfk init: SWSI stays write-busy once the NCTL poll has run, so RCK's
+    // first RF access fails.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0x18080,
+            Box::new(|m: &mut RegisterModel| {
+                m.swsi_status = 1 << 24;
+                m.get32(0x18080)
+            }),
+        );
+    });
+    assert_eq!(err.step, "rfk init");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x1174C,
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    // rfk init in DACK: DRCK's poll register cannot be read, after the coex
+    // RFK START marked WLRFK in the scoreboard. No STOP follows; the stop's
+    // coex half clears every driver bit, WLRFK with them.
+    let (err, io) = fails_traced(efuse_with_mac(), BOTH, NO_LTR, |io| {
+        io.fail_reads_of(0x1C0C8)
+    });
+    assert_eq!(err, BringUpError::new("rfk init", READ_FAILED));
+    let t = &io.trace;
+    let start = t
+        .iter()
+        .position(|o| *o == Op::W32(0x00AC, 0x8100_4803))
+        .unwrap();
+    assert_eq!(count(&io, Op::W32(0x00AC, 0x8100_4003)), 1);
+    assert!(t[start..].contains(&Op::W32(0x00AC, 0x8100_0000)));
+    assert!(!t.iter().any(|o| matches!(o, Op::RfW(_, 0x93, ..))));
+
+    // rfk init in RX DCK: SWSI turns read-busy once path A's done bit has
+    // been read, so the toggle's next RF write fails, after DACK finished.
+    let (err, io) = fails_traced(efuse_with_mac(), BOTH, NO_LTR, |io| {
+        io.on_rf_read(
+            0,
+            0x93,
+            Box::new(|m: &mut RegisterModel| {
+                m.swsi_status = 1 << 25;
+                m.get_rf(0, 0x93)
+            }),
+        )
+    });
+    assert_eq!(err.step, "rfk init");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x1174C,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(count(&io, Op::W32(0x00AC, 0x8100_4003)), 2);
+    assert!(!io.trace.iter().any(|o| matches!(o, Op::W32(0xD200, _))));
+
+    // dm tail: the TX power rate control word cannot be read.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xD200));
+    assert_eq!(err, BringUpError::new("dm tail", READ_FAILED));
 }
 
 #[test]

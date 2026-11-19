@@ -11,7 +11,7 @@
 //! `MAC_AX_NOTIFY_TP_MAJOR` and its efuse read belong to the caller. This
 //! module does not handle USB or SDIO, an unplugged device, or the vcore
 //! reset of thermal protection.
-use super::io::{AxError, AxIo, clear8, clear32, field32, poll32, set8, set32};
+use super::io::{AxError, AxIo, clear8, clear32, field32, poll32, poll32_value, set8, set32};
 
 // reg.h / mac.h (pinned rtw89), PCIe AX.
 const R_AX_SYS_ISO_CTRL: u32 = 0x0000;
@@ -156,7 +156,9 @@ pub fn xtal_si_read<I: AxIo + ?Sized>(io: &mut I, offset: u8) -> Result<u8, AxEr
         R_AX_WLAN_XTAL_SI_CTRL,
         u32::from(offset) | XTAL_SI_NORMAL_READ << 24 | B_AX_WL_XTAL_SI_CMD_POLL,
     )?;
-    poll32(
+    // The poll's last sample is the result word; Linux reuses it
+    // (mac.c:7237-7249) and reads nothing more.
+    let done = poll32_value(
         io,
         R_AX_WLAN_XTAL_SI_CTRL,
         B_AX_WL_XTAL_SI_CMD_POLL,
@@ -164,8 +166,7 @@ pub fn xtal_si_read<I: AxIo + ?Sized>(io: &mut I, offset: u8) -> Result<u8, AxEr
         XTAL_POLL_INTERVAL_US,
         XTAL_POLL_TIMEOUT_US,
     )?;
-    // The poll's last sample is the result word; Linux reuses it.
-    Ok((io.read32(R_AX_WLAN_XTAL_SI_CTRL)? >> 8) as u8)
+    Ok((done >> 8) as u8)
 }
 
 /// `rtw89_mac_reset_pwr_state_ax` (PCIe): refuse if the MAC is already on.
@@ -470,6 +471,9 @@ mod tests {
         // mac.c:7227: mode 1 at [25:24], data comes back in [15:8].
         assert_eq!(xtal_si_read(&mut m, 0x41).unwrap(), 0xA5);
         assert_eq!(m.writes(), vec![Op::W32(0x0270, 0x8100_0041)]);
+        // mac.c:7237-7249: the data is the poll's own last sample; nothing
+        // reads 0x0270 again.
+        assert_eq!(m.trace, vec![Op::W32(0x0270, 0x8100_0041), Op::R32(0x0270)]);
     }
 
     #[test]

@@ -16,26 +16,29 @@
 //! (`mac.c:4029`) and `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`); then
 //! it sends one H2C, `rtw89_fw_h2c_set_ofld_cfg` (`fw.c:5320`), and waits for
 //! the firmware's acknowledgement on RXQ. Then `rtw89_core_start` goes on
-//! (`core.c:6687-6695`) with the radio steps of [`phy::init_radio`]: the
+//! (`core.c:6687-6697`) with the radio steps of [`phy::init_radio`]: the
 //! BB/RF reset, the firmware's BB, BB gain and radio tables with the RF_REG
-//! H2Cs, and the coex init's Wi-Fi grant. Once the post-init has run, the
-//! HCI is torn down as `rtw89_core_stop` does (`core.c:6765-6767`):
-//! `rtw89_pci_ops_deinit` (`pci.c:3053`), then the power-off. Last comes
-//! `rtw89_mac_pwr_off` (`mac.c:1603`), which Linux runs on success and on
-//! every failure after power-on.
+//! H2Cs, and the coex init's Wi-Fi grant; then `rtw89_phy_dm_init` with
+//! NCTL, RCK, DACK and RX DCK ([`phy::calibrate`]). After the coex init the
+//! coex half of `rtw89_core_stop` (`core.c:6738, 6760`) hands the antenna
+//! back; once the post-init has run, the HCI is torn down as
+//! `rtw89_core_stop` does (`core.c:6765-6767`): `rtw89_pci_ops_deinit`
+//! (`pci.c:3053`), then the power-off. Last comes `rtw89_mac_pwr_off`
+//! (`mac.c:1603`), which Linux runs on success and on every failure after
+//! power-on.
 //!
 //! This module does not grant a usable radio: the chip is powered off again
-//! before `bring_up` returns, and nothing past the coex init is ported: no
-//! `rtw89_phy_dm_init`, no calibration, no channel, station, scan or
-//! interrupts. It does not support secure-boot chips, and it does not claim
-//! the MAC address read from the efuse is valid.
+//! before `bring_up` returns, and nothing past `rtw89_phy_dm_init` is
+//! ported: no channel, IQK, DPK, TSSI, station, scan or interrupts. It does
+//! not support secure-boot chips, and it does not claim the MAC address
+//! read from the efuse is valid.
 use super::command::{self, CommandError, H2cAck};
 use super::efuse::{self, PhyEfuse, SecureBoot};
 use super::elements::PhyTables;
 use super::h2c::H2c;
 use super::io::{AxError, AxIo};
 use super::pci::Rings;
-use super::phy::{self, PhyReport};
+use super::phy::{self, PhyReport, RfkReport};
 use super::radio::RfAt;
 use super::{coex, dmac, fwdl, pci, power, sys, trx};
 use crate::bus::dma::{mapping::DmaDomain, memory::PageSource};
@@ -94,6 +97,9 @@ pub struct Running {
     /// What the radio steps after OFLD_CFG applied and read back: always
     /// `Some` from [`bring_up`].
     pub phy: Option<PhyReport>,
+    /// What `rtw89_phy_dm_init` calibrated and read back, and which of its
+    /// polls timed out: always `Some` from [`bring_up`].
+    pub rfk: Option<RfkReport>,
 }
 
 impl fmt::Display for Running {
@@ -148,6 +154,9 @@ impl fmt::Display for Running {
         if let Some(phy) = &self.phy {
             write!(f, "{phy}")?;
         }
+        if let Some(rfk) = &self.rfk {
+            write!(f, "{rfk}")?;
+        }
         Ok(())
     }
 }
@@ -160,7 +169,8 @@ pub struct BringUpError {
     /// `"phycap"`, `"bb rf enable"`, `"sys init"`, `"dmac init"`,
     /// `"cmac init"`, `"imr"`, `"pci post-init"`, `"h2c"`, `"c2h"`,
     /// `"bb rf reset"`, `"bb init"`, `"rf init"`, `"rf h2c"`, `"coex init"`,
-    /// `"phy report"`; the probe that opens the register window, stages the
+    /// `"phy report"`, `"dm init"`, `"nctl init"`, `"rfk init"`,
+    /// `"dm tail"`; the probe that opens the register window, stages the
     /// firmware, checks its PHY tables (`"phy tables"`) and runs [`quiesce`]
     /// before [`bring_up`] adds `"register window"`, `"identity"`,
     /// `"firmware"` and `"quiesce"`.
@@ -256,8 +266,8 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 
 /// Bring an RTL8852CE of chip cut `cut` up to running firmware `image`, read
 /// its MAC address, initialize its MAC for `host`, have its firmware
-/// acknowledge one H2C, configure its BB and RF from `tables` and grant its
-/// RF to Wi-Fi, then power it off again.
+/// acknowledge one H2C, configure its BB and RF from `tables`, grant its RF
+/// to Wi-Fi and calibrate it, then power it off again.
 ///
 /// First `tables` are checked ([`phy::check_tables`]); a file without the
 /// tables the radio steps apply is refused as `"phy tables"` before any I/O.
@@ -309,11 +319,20 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///     `"coex init"`, `"phy report"`, in that order; an RF init failure
 ///     names its path and page ([`BringUpError::rf`]).
 ///
-/// Once `"coex init"` has succeeded (on success, and on a `"phy report"`
-/// failure), the coex half of `rtw89_core_stop` runs first
+/// Then `rtw89_phy_dm_init` (`core.c:6697`), [`phy::calibrate`] with the
+/// same tables, efuse fields and cut:
+///
+/// 14. `"dm init"`, `"nctl init"`, `"rfk init"`, `"dm tail"`, in that
+///     order. A calibration poll that times out does not fail its step: it
+///     is reported in [`Running::rfk`], as Linux only logs it.
+///
+/// Once `"coex init"` has succeeded (on success, and on a failure of
+/// `"phy report"` or of any step of 14, a DACK or RX DCK I/O failure
+/// included), the coex half of `rtw89_core_stop` runs first
 /// ([`coex::radio_off`], `core.c:6738, 6760`): the grant handed to BT and
-/// the scoreboard's driver bits cleared, so WL is not left marked on for BT
-/// across the power-off. Its result is ignored, as Linux ignores it.
+/// the scoreboard's driver bits cleared (the WLRFK bit a failed DACK leaves
+/// set with them), so WL is not left marked on for BT across the power-off.
+/// Its result is ignored, as Linux ignores it.
 ///
 /// Once step 11 has succeeded (on success, and on every failure from step
 /// 12 on) the HCI is torn down as `rtw89_core_stop` does between
@@ -563,9 +582,11 @@ unsafe fn start<I: AxIo + ?Sized>(
 /// `rtw89_fw_h2c_set_ofld_cfg` (`mac.c:4394`), the last step of
 /// `rtw89_mac_init`, with Stela's own wait for its acknowledgement; then
 /// the radio steps of `rtw89_core_start` through the coex init
-/// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence.
-/// Also returns whether the coex init completed, which the teardown must
-/// undo ([`coex::radio_off`]).
+/// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence, and
+/// `rtw89_phy_dm_init` (`core.c:6697`, [`phy::calibrate`]). Also returns
+/// whether the coex init completed, which the teardown must undo
+/// ([`coex::radio_off`]): on success, and on any failure from the coex
+/// init's report on.
 ///
 /// # Safety
 /// The `Ch12::submit` and `Rxq::poll` contracts for `io` and `rings`.
@@ -599,8 +620,14 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
             return (Err(failed), error.coex_up);
         }
     };
-    // The BB gain table is memory only on AX (bb.rs), and nothing after the
-    // coex init that reads it is ported yet.
+    // rtw89_phy_dm_init (core.c:6697). Every failure here follows the coex
+    // init, so the teardown undoes it.
+    let rfk = match phy::calibrate(io, tables, &started.efuse, started.cut) {
+        Ok(rfk) => rfk,
+        Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
+    };
+    // The BB gain table is memory only on AX (bb.rs), and nothing ported
+    // reads it yet: the channel set-up does.
     let running = Running {
         cut: started.cut,
         firmware: started.firmware,
@@ -611,6 +638,7 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         bacam_reset_timed_out: started.bacam_reset_timed_out,
         h2c: ack,
         phy: Some(phy),
+        rfk: Some(rfk),
     };
     (Ok(running), true)
 }

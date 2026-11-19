@@ -146,3 +146,74 @@ fn real_8852c_fw_2_passes_check_tables() {
     assert_eq!(t.radio[0].map(|r| r.path), Some(RfPath::B));
     assert_eq!(t.radio[1].map(|r| r.path), Some(RfPath::A));
 }
+
+/// The brief's all-clear calibration report.
+fn rfk() -> RfkReport {
+    RfkReport {
+        thermal: [30, 31],
+        xtal: (0x2F, 0x2F),
+        rck: [0x0F, 0x10],
+        drck: 0x0D,
+        addck: [(0x201, 0x1FF), (0x200, 0x200)],
+        rx_dck_rewrites: [0, 1],
+        nctl_timed_out: false,
+        rck_timed_out: [false; 2],
+        drck_timed_out: false,
+        addck_timed_out: [false; 2],
+        dack_timed_out: [false; 2],
+        rx_dck_timed_out: [false; 2],
+    }
+}
+
+/// Spec S16's M2b2 suffix.
+const CALIBRATED: &str = ", calibrated: thermal A 30 B 31, xtal 0x2f/0x2f, RCK A 0x0f B 0x10, \
+                          DRCK 0x0d, ADDCK A 0x201/0x1ff B 0x200/0x200, RX DCK rewrites A 0 B 1";
+
+#[test]
+fn rfk_report_display() {
+    assert_eq!(rfk().to_string(), CALIBRATED);
+    let mut dack_b = [false; 2];
+    dack_b[1] = true;
+    let late = RfkReport {
+        nctl_timed_out: true,
+        dack_timed_out: dack_b,
+        ..rfk()
+    };
+    assert_eq!(
+        late.to_string(),
+        alloc::format!("{CALIBRATED}, timed out: NCTL, DACK B")
+    );
+}
+
+#[test]
+fn rfk_report_names_every_timeout_in_spec_order() {
+    let all = RfkReport {
+        nctl_timed_out: true,
+        rck_timed_out: [true; 2],
+        drck_timed_out: true,
+        addck_timed_out: [true; 2],
+        dack_timed_out: [true; 2],
+        rx_dck_timed_out: [true; 2],
+        ..rfk()
+    };
+    assert_eq!(
+        all.to_string(),
+        alloc::format!(
+            "{CALIBRATED}, timed out: NCTL, RCK A, RCK B, DRCK, ADDCK A, ADDCK B, DACK A, DACK B, \
+             RX DCK A, RX DCK B"
+        )
+    );
+    // Each field's values are zero-padded to their width.
+    let small = RfkReport {
+        rck: [0x01, 0x1F],
+        drck: 0x02,
+        addck: [(0x003, 0x00F), (0, 0x3FF)],
+        ..rfk()
+    };
+    assert!(
+        small
+            .to_string()
+            .contains("RCK A 0x01 B 0x1f, DRCK 0x02, ADDCK A 0x003/0x00f B 0x000/0x3ff,"),
+        "{small}"
+    );
+}
