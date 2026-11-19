@@ -67,9 +67,12 @@ pub struct H2cAck {
     pub rec: bool,
     /// A matching DONE_ACK arrived (with return 0, or the command fails).
     pub done: bool,
-    /// C2Hs that matched nothing kept: other acks, other classes, formatted
-    /// logs and plain logs after the first. Saturates.
+    /// C2Hs that matched nothing kept and were not acks: other classes and
+    /// functions, formatted logs and plain logs after the first. Saturates.
     pub other_c2h: u8,
+    /// Class 0 REC_ACKs and DONE_ACKs for another cat, class, func or seq.
+    /// Saturates.
+    pub unmatched_ack: u8,
     /// RXQ buffers that were not one whole C2H: multi-buffer segments,
     /// non-C2H packet types and C2Hs too short to parse. Saturates.
     pub skipped: u8,
@@ -128,8 +131,13 @@ impl Seen {
                     self.done_ret = ret;
                 }
             }
+            Some(C2h::RecAck { .. } | C2h::DoneAck { .. }) => {
+                ack.unmatched_ack = ack.unmatched_ack.saturating_add(1)
+            }
             Some(C2h::Log(text)) if ack.log.is_none() => ack.log = Some(LogText::new(text)),
-            Some(_) => ack.other_c2h = ack.other_c2h.saturating_add(1),
+            Some(C2h::Log(_) | C2h::FormattedLog | C2h::Other { .. }) => {
+                ack.other_c2h = ack.other_c2h.saturating_add(1)
+            }
         }
         Ok(())
     }
@@ -139,7 +147,8 @@ impl Seen {
 /// every `ACK_POLL_US` until its DONE_ACK arrives or `ACK_WAIT_US` passes
 /// (spec S1.9-S1.10). A REC_ACK alone succeeds once the wait expires; a
 /// DONE_ACK with a non-zero return is `Submit(H2cRejected)`; no matching ack
-/// is `Wait(NoAck)`; an RXQ or clock failure is `Wait`. A malformed RXQ
+/// is `Wait(NoAck)` with what did arrive (the counts of [`H2cAck`]) and the
+/// last RXQ hardware index read; an RXQ or clock failure is `Wait`. A malformed RXQ
 /// buffer wins over any ack already seen, in the same batch or an earlier
 /// one: a DONE_ACK followed by a buffer shorter than its descriptor is
 /// `Wait(Rx)`, not success. A failed submit leaves RXQ untouched.
@@ -163,6 +172,7 @@ pub unsafe fn ofld_cfg<I: AxIo + ?Sized>(
             rec: false,
             done: false,
             other_c2h: 0,
+            unmatched_ack: 0,
             skipped: 0,
             log: None,
         },
@@ -199,6 +209,10 @@ pub unsafe fn ofld_cfg<I: AxIo + ?Sized>(
             class: H2C_CL_MAC_FW_OFLD,
             func: H2C_FUNC_OFLD_CFG,
             seq,
+            other_c2h: ack.other_c2h,
+            unmatched_ack: ack.unmatched_ack,
+            skipped: ack.skipped,
+            rxq_hw: rxq.hardware_index(),
         }));
     }
     Ok(ack)

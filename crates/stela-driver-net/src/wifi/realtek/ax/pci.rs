@@ -410,6 +410,7 @@ impl Rings {
         Rxq {
             rings: self,
             copy: Vec::new(),
+            hw: 0,
         }
     }
 
@@ -835,9 +836,17 @@ pub struct Rxq<'r> {
     rings: &'r mut Rings,
     /// The CPU's copy of the buffer being delivered, reused for every entry.
     copy: Vec<u8>,
+    /// The last in-range hardware index `poll` read.
+    hw: u16,
 }
 
 impl Rxq<'_> {
+    /// The last in-range RXQ hardware index (`IDX` [27:16]) `poll` read; 0
+    /// before the first.
+    pub fn hardware_index(&self) -> u16 {
+        self.hw
+    }
+
     /// Deliver every RXQ entry the device has filled, as
     /// `rtw89_pci_poll_rxq_dma` (`pci.c:436`) does with an unlimited budget:
     /// read the hardware index (`IDX` [27:16], `rtw89_pci_rxbd_recalc`
@@ -879,6 +888,7 @@ impl Rxq<'_> {
         if hw >= RX_ENTRIES {
             return Err(AxError::Rx("RXQ hardware index out of range"));
         }
+        self.hw = hw as u16;
         let rings = &mut *self.rings;
         let start = usize::from(rings.rxq_host.get());
         let count = if hw >= start {

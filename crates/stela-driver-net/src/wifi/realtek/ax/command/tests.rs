@@ -115,6 +115,7 @@ fn acked(rec: bool, done: bool) -> H2cAck {
         rec,
         done,
         other_c2h: 0,
+        unmatched_ack: 0,
         skipped: 0,
         log: None,
     }
@@ -178,7 +179,11 @@ fn ofld_cfg_without_ack_fails_after_100ms() {
         Err(CommandError::Wait(AxError::NoAck {
             class: 9,
             func: 0x14,
-            seq: 0
+            seq: 0,
+            other_c2h: 0,
+            unmatched_ack: 0,
+            skipped: 0,
+            rxq_hw: 0,
         }))
     );
     assert!(r.elapsed >= 100_000, "elapsed {}", r.elapsed);
@@ -214,7 +219,8 @@ fn unrelated_c2h_and_frames_are_counted_not_matched() {
         Ok(H2cAck {
             rec: false,
             done: true,
-            other_c2h: 2,
+            other_c2h: 1,
+            unmatched_ack: 1,
             skipped: 1,
             log: None
         })
@@ -231,12 +237,17 @@ fn acks_for_another_seq_or_category_are_not_matched() {
         ack(0, 0x0000_1424),
         ack(1, 0x0000_1424),
     ]);
+    // Four acks, none for OFLD_CFG at seq 0, in RXQ entries 0-3.
     assert_eq!(
         r.got,
         Err(CommandError::Wait(AxError::NoAck {
             class: 9,
             func: 0x14,
-            seq: 0
+            seq: 0,
+            other_c2h: 0,
+            unmatched_ack: 4,
+            skipped: 0,
+            rxq_hw: 4,
         }))
     );
 }

@@ -36,6 +36,18 @@ const LOG: [u8; 33] = [
     0x21, 0xC0, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02,
     0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, b'f', b'w', b' ', b'u', b'p',
 ];
+/// `REC_ACK` with byte `at` replaced by `value`.
+const fn rec_ack_with(at: usize, value: u8) -> [u8; 32] {
+    let mut b = REC_ACK;
+    b[at] = value;
+    b
+}
+/// A REC_ACK for seq 1 (w2 [23:16]): an ack, but not OFLD_CFG's.
+const REC_ACK_SEQ1: [u8; 32] = rec_ack_with(30, 0x01);
+/// A class 1 MAC C2H (w0 = cat 1 | class 1 << 2): not an ack at all.
+const OTHER_C2H: [u8; 32] = rec_ack_with(20, 0x05);
+/// An RX packet of type 0 (WIFI, RX descriptor byte 3), not a C2H.
+const NOT_C2H: [u8; 32] = rec_ack_with(7, 0x00);
 /// Both acks, as the firmware may send them.
 const BOTH: &[&[u8]] = &[&REC_ACK, &DONE_ACK];
 
@@ -211,6 +223,7 @@ fn acked(rec: bool, done: bool) -> H2cAck {
         rec,
         done,
         other_c2h: 0,
+        unmatched_ack: 0,
         skipped: 0,
         log: None,
     }
@@ -268,6 +281,34 @@ fn power_off_tail() -> Vec<(Op, bool)> {
         at(0x0004),
         exact(Op::W8(0x00AF, 0x80)),
     ]
+}
+
+/// The three writes just before the power-off tail are `pci::stop_dma`'s:
+/// STOP_WPDMA (0x1010 bit 19) set, then `rtw89_pci_ctrl_dma_all(false)`:
+/// STOP_AXI_MST (0x1000 bit 17) set and TXHCI_EN/RXHCI_EN (bits 7, 15)
+/// cleared.
+fn assert_dma_stopped_before_power_off(io: &RegisterModel) {
+    let writes = io.writes();
+    let start = writes.len() - power_off_tail().len();
+    let stop = &writes[start - 3..start];
+    assert!(
+        matches!(stop[0], Op::W32(0x1010, v) if v & 1 << 19 != 0)
+            && matches!(stop[1], Op::W32(0x1000, v) if v & 1 << 17 != 0)
+            && matches!(stop[2], Op::W32(0x1000, v) if v & (1 << 7 | 1 << 15) == 0 && v & 1 << 17 != 0),
+        "{stop:x?}"
+    );
+}
+
+/// No `pci::stop_dma` and no deinit: no write to 0x1010 or 0x1000 at all,
+/// which only the MAC pre-init and later steps make.
+fn assert_no_dma_writes(io: &RegisterModel) {
+    assert!(
+        !io.writes()
+            .iter()
+            .any(|o| matches!(o, Op::W32(0x1010 | 0x1000, _))),
+        "{:x?}",
+        io.writes()
+    );
 }
 
 fn assert_ends_with_power_off(io: &RegisterModel) {
@@ -433,6 +474,27 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
             )
         );
     }
+    // Counts are named only when nonzero, after the acks.
+    let (_, result) = ran(
+        &[&OTHER_C2H, &REC_ACK_SEQ1, &NOT_C2H, &REC_ACK, &DONE_ACK],
+        NO_LTR,
+    );
+    let (running, _rings) = result.unwrap();
+    assert!(
+        running.to_string().ends_with(
+            "H2C OFLD_CFG acknowledged (receive and done), other C2H 1, unmatched acks 1, \
+             skipped 1"
+        ),
+        "{running}"
+    );
+    let (_, result) = ran(&[&NOT_C2H, &DONE_ACK], NO_LTR);
+    let (running, _rings) = result.unwrap();
+    assert!(
+        running
+            .to_string()
+            .ends_with("acknowledged (done only), skipped 1"),
+        "{running}"
+    );
     let (_, result) = ran(&[&LOG, &REC_ACK, &DONE_ACK], NO_LTR);
     let (running, _rings) = result.unwrap();
     assert_eq!(
@@ -511,6 +573,8 @@ fn mac_init_fails(
                 .any(|o| matches!(o, Op::W32(0x0074 | 0x1014 | 0x11C4 | 0x1200, _))),
             "{err}"
         );
+        // The DMA live since pci pre-init is stopped before the power-off.
+        assert_dma_stopped_before_power_off(&c.io);
     }
     assert_ends_with_power_off(&c.io);
     err
@@ -589,13 +653,40 @@ fn mac_init_failure_names_step_and_powers_off() {
             AxError::NoAck {
                 class: 9,
                 func: 0x14,
-                seq: 0
+                seq: 0,
+                other_c2h: 0,
+                unmatched_ack: 0,
+                skipped: 0,
+                rxq_hw: 0,
             }
         )
     );
+    // A dead RX path: nothing arrived, and RXQ's index never moved.
     assert_eq!(
         err.to_string(),
-        alloc::format!("RTL8852CE bring-up: c2h: {}", err.error)
+        "RTL8852CE bring-up: c2h: firmware sent no acknowledgement of H2C class 9 func 0x14 \
+         seq 0 within 100 ms (RXQ index 0, other C2H 0, unmatched acks 0, skipped 0)"
+    );
+
+    // c2h with traffic: a C2H that is not an ack, an ack for another seq
+    // and a non-C2H packet arrived, and RXQ's index reads 3.
+    let err = mac_init_fails(&[&OTHER_C2H, &REC_ACK_SEQ1, &NOT_C2H], NO_LTR, |_| ());
+    assert_eq!(
+        err.error,
+        AxError::NoAck {
+            class: 9,
+            func: 0x14,
+            seq: 0,
+            other_c2h: 1,
+            unmatched_ack: 1,
+            skipped: 1,
+            rxq_hw: 3,
+        }
+    );
+    assert!(
+        err.to_string()
+            .ends_with("(RXQ index 3, other C2H 1, unmatched acks 1, skipped 1)"),
+        "{err}"
     );
 
     // c2h on an LTR host: the deinit's ltr_set_v1(false) runs too.
@@ -675,9 +766,42 @@ fn secure_boot_on_refuses_and_powers_off() {
         "RTL8852CE bring-up: secure boot: secure-boot firmware is unsupported"
     );
     assert_ends_with_power_off(&c.io);
+    assert_no_dma_writes(&c.io);
     // Nothing past the secure-boot read: no rings, no MAC pre-init.
     assert!(m.lock().unwrap().mappings.is_empty());
     assert!(!c.io.trace.contains(&Op::R32(0x7880)));
+}
+
+#[test]
+fn mac_pre_init_failure_stops_the_dma_it_enabled_before_powering_off() {
+    // The DLFW WDE manager never reports ready, so dmac::pre_init fails
+    // after rtw89_mac_dmac_func_pre_en_ax enabled the TX/RX HCI DMA (0x1000
+    // bits 7 and 15): the DMA is stopped before the power-off.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    c.io.on_read(0x8D00, Box::new(|_: &mut RegisterModel| 1));
+    let m = c.m.clone();
+    let err = failed(run(&mut c.io, &m));
+    assert_eq!(err.step, "mac pre-init");
+    assert!(
+        c.io.writes()
+            .iter()
+            .any(|o| matches!(o, Op::W32(0x1000, v) if v & (1 << 7 | 1 << 15) == 1 << 7 | 1 << 15))
+    );
+    assert_ends_with_power_off(&c.io);
+    assert_dma_stopped_before_power_off(&c.io);
+}
+
+#[test]
+fn a_ring_failure_powers_off_without_a_dma_stop() {
+    // No ring memory can be mapped: "dma rings" fails before any HCI
+    // register is written, so only the power-off follows.
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    let m = c.m.clone();
+    m.lock().unwrap().address_overflow = true;
+    let err = failed(run(&mut c.io, &m));
+    assert_eq!(err.step, "dma rings");
+    assert_ends_with_power_off(&c.io);
+    assert_no_dma_writes(&c.io);
 }
 
 #[test]
@@ -718,6 +842,7 @@ fn download_retries_five_times_then_fails() {
             .unwrap();
     assert!(off > last_attempt);
     assert_ends_with_power_off(&c.io);
+    assert_dma_stopped_before_power_off(&c.io);
 }
 
 #[test]
@@ -954,6 +1079,7 @@ fn efuse_failure_powers_off() {
     assert_eq!(err.step, "efuse");
     assert!(matches!(err.error, AxError::Efuse(_)));
     assert_ends_with_power_off(&c.io);
+    assert_dma_stopped_before_power_off(&c.io);
 }
 
 #[test]

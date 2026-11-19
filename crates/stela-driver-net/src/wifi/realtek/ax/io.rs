@@ -59,11 +59,24 @@ pub enum AxError {
     /// The receive queue failed or returned a malformed frame; the message
     /// says how.
     Rx(&'static str),
-    /// The firmware did not acknowledge an H2C within 100 ms.
+    /// The firmware did not acknowledge an H2C within 100 ms. The counts
+    /// tell a dead RX path (nothing arrived, the RXQ index never moved) from
+    /// firmware that sent something else (`other_c2h`, `skipped`) or acked
+    /// another H2C (`unmatched_ack`); they saturate.
     NoAck {
         class: u8,
         func: u8,
         seq: u8,
+        /// C2Hs that were not acks, formatted logs and plain logs after the
+        /// first.
+        other_c2h: u8,
+        /// Class 0 REC_ACKs and DONE_ACKs for another cat, class, func or
+        /// seq.
+        unmatched_ack: u8,
+        /// RXQ buffers that were not one whole C2H.
+        skipped: u8,
+        /// The last RXQ hardware index read (`IDX` [27:16]).
+        rxq_hw: u16,
     },
     /// The firmware acknowledged an H2C with a non-zero return code.
     H2cRejected {
@@ -97,10 +110,19 @@ impl fmt::Display for AxError {
             | Self::Efuse(what)
             | Self::Mac(what)
             | Self::Rx(what) => f.write_str(what),
-            Self::NoAck { class, func, seq } => write!(
+            Self::NoAck {
+                class,
+                func,
+                seq,
+                other_c2h,
+                unmatched_ack,
+                skipped,
+                rxq_hw,
+            } => write!(
                 f,
                 "firmware sent no acknowledgement of H2C class {class} func {func:#x} seq {seq} \
-                 within 100 ms"
+                 within 100 ms (RXQ index {rxq_hw}, other C2H {other_c2h}, unmatched acks \
+                 {unmatched_ack}, skipped {skipped})"
             ),
             Self::H2cRejected {
                 class,

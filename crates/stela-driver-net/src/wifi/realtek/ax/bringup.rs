@@ -116,6 +116,16 @@ impl fmt::Display for Running {
             (false, true) => "acknowledged (done only)",
             (false, false) => "not acknowledged",
         })?;
+        // What else RXQ delivered, named only when something did.
+        for (count, what) in [
+            (self.h2c.other_c2h, "other C2H"),
+            (self.h2c.unmatched_ack, "unmatched acks"),
+            (self.h2c.skipped, "skipped"),
+        ] {
+            if count != 0 {
+                write!(f, ", {what} {count}")?;
+            }
+        }
         if let Some(log) = &self.h2c.log {
             write!(f, ", firmware log \"{}\"", log.as_str())?;
         }
@@ -261,6 +271,15 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 /// ignores it. A failure at or before step 11 skips it, as Linux's
 /// `rtw89_mac_init` failure path does (`mac.c:4397`).
 ///
+/// A failure from step 4 through step 11 first runs `pci::stop_dma`:
+/// `B_AX_STOP_WPDMA`, the AXI master stopped and the TX/RX HCI DMA
+/// disabled, the start of `rtw89_pci_ops_mac_pre_init_ax`. Step 4 already
+/// enables the HCI DMA (`rtw89_mac_dmac_func_pre_en_ax`, `mac.c:4222`, sets
+/// `TXHCI_EN`/`RXHCI_EN` and clears `STOP_AXI_MST` and the channel stops),
+/// so this keeps it from running across the power-off. It is Stela's own
+/// (Linux powers off straight away), and its result is ignored. A failure in
+/// steps 1-3 has started no DMA and powers off alone.
+///
 /// Success and every failure then end as `rtw89_chip_info_setup` does after
 /// a power-on, and as `rtw89_mac_init`'s failure path does, in
 /// `rtw89_mac_pwr_off`: `power::power_off`, then, only if it succeeded, the
@@ -325,7 +344,13 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
             let _ = pci::deinit(io, &rings, host.ltr);
             acked
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            // From "mac pre-init" on the HCI DMA is enabled
+            // (rtw89_mac_dmac_func_pre_en_ax): stop it before the power-off.
+            // Stela's own; its result is ignored like the power-off's.
+            let _ = pci::stop_dma(io);
+            Err(error)
+        }
     };
     power_down(io);
     // On a failure `rings` drop here, after the power-off.

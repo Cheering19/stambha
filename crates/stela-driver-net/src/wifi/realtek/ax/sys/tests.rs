@@ -81,10 +81,15 @@ fn new_errors_display() {
             AxError::NoAck {
                 class: 1,
                 func: 0x10,
-                seq: 7
+                seq: 7,
+                other_c2h: 2,
+                unmatched_ack: 3,
+                skipped: 4,
+                rxq_hw: 5,
             }
         ),
-        "firmware sent no acknowledgement of H2C class 1 func 0x10 seq 7 within 100 ms"
+        "firmware sent no acknowledgement of H2C class 1 func 0x10 seq 7 within 100 ms (RXQ \
+         index 5, other C2H 2, unmatched acks 3, skipped 4)"
     );
     assert_eq!(
         format!(
