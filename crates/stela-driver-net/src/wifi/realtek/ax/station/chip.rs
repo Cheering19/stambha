@@ -30,6 +30,7 @@ use crate::wifi::realtek::ax::assoc::HtPeer;
 use crate::wifi::realtek::ax::c2h::RaReport;
 use crate::wifi::realtek::ax::regd::Regd;
 use crate::wifi::realtek::ax::rx::Rate;
+use crate::wifi::realtek::ax::txd::Aggregate;
 use crate::wifi::station::phy::AccessCategory;
 use alloc::{string::String, vec::Vec};
 
@@ -105,12 +106,15 @@ pub struct Management<'a> {
 /// [`Management::basic_rates`]' order: the lowest is the retry floor. `key`
 /// is the security CAM entry, key ID and packet number the frame is
 /// encrypted under (`Protection::HostIv`'s, the IV already removed).
+/// `aggregate` is the A-MPDU it goes in, when its TID's TX Block Ack agreement
+/// is operational (M4 spec S10.3).
 pub struct Data<'a> {
     pub bytes: &'a [u8],
     pub tid: u8,
     pub eapol: bool,
     pub supported_rates: u16,
     pub key: Option<(u8, u8, u64)>,
+    pub aggregate: Option<Aggregate>,
 }
 
 /// An association as mac80211 holds it at `BSS_CHANGED_ASSOC`: the AP's
@@ -226,6 +230,14 @@ pub trait Chip {
     fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String>;
     /// End the agreement on `tid`, `IEEE80211_AMPDU_RX_STOP`.
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String>;
+    /// The station's TX Block Ack agreement on `tid` is operational with a
+    /// window of `window` (`IEEE80211_AMPDU_TX_OPERATIONAL`), or, `None`,
+    /// stopped (`IEEE80211_AMPDU_TX_STOP_*`), M4 spec S10.2; nothing for a chip
+    /// that keeps no aggregation state.
+    fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), String> {
+        let _ = (tid, window);
+        Ok(())
+    }
     /// The chip's own counts, naming no address.
     fn diagnostic(&self) -> String;
     /// The counts the station's progress line prints (M4 spec S3.4); none

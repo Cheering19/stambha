@@ -44,9 +44,9 @@
 //! it), a frame on the air or an acknowledgement. It builds no H2C
 //! descriptor (`fill_txdesc_fwcmd_v1`), no HE HT Control
 //! (`rtw89_core_tx_update_he_qos_htc` adds none and so sets no BK: no HE
-//! association, `core.c:1057-1078`), no TX A-MPDU (`agg_en`,
-//! `ampdu_density`, `ampdu_num`: no session is started), no injected rate
-//! (`core.c:1226-1262`), no high queue (`hiq`, so `port` stays 0), no TX
+//! association, `core.c:1057-1078`), no TX A-MPDU but the WD fields of one
+//! the caller names ([`Aggregate`]: the agreement itself is the station's),
+//! no injected rate (`core.c:1226-1262`), no high queue (`hiq`, so `port` stays 0), no TX
 //! report (`report`, `sn`, `tx_cnt_lmt*`: `rtw89_tx_rpt_init` returns
 //! without `tx_rpt_enabled`, which PCIe never sets, `mac.h:1835-1849`), no
 //! ER SU (`er_cap`), no MLO, and no hardware-encrypted management frame (a
@@ -71,6 +71,19 @@ pub struct TxSec {
     /// The host-reserved PN (`atomic64_inc_return(&key->tx_pn)`), 1 to
     /// 2^48 - 1: BODY4/5. It must be the PN [`strip_ccmp`] checked.
     pub pn: u64,
+}
+
+/// A data frame's A-MPDU, `rtw89_core_tx_update_ampdu_info`'s inputs
+/// (`core.c:636-675`) for a frame mac80211 marks `IEEE80211_TX_CTL_AMPDU`, one
+/// of a TID whose TX Block Ack agreement is operational: the agreement's
+/// window (`ampdu_params[tid].agg_num`, 0 until TX_OPERATIONAL set it), and
+/// the peer's HT A-MPDU length exponent (`ht_cap.ampdu_factor`) and minimum
+/// MPDU start spacing (`ht_cap.ampdu_density`, 0-7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Aggregate {
+    pub agg_num: u16,
+    pub factor: u8,
+    pub density: u8,
 }
 
 /// The peer's RA capabilities a data frame's info carries
@@ -144,6 +157,7 @@ const BODY2_TID_INDICATE: u32 = 1 << 23;
 const BODY2_QSEL: u32 = 0x3F << 17;
 const BODY2_TXPKT_SIZE: u32 = 0x3FFF;
 const BODY3_BK: u32 = 1 << 13;
+const BODY3_AGG_EN: u32 = 1 << 12;
 const BODY3_SW_SEQ: u32 = 0xFFF;
 const BODY4_SEC_IV_L1: u32 = 0xFF << 24;
 const BODY4_SEC_IV_L0: u32 = 0xFF << 16;
@@ -157,6 +171,8 @@ const INFO0_DATA_STBC: u32 = 1 << 12;
 const INFO0_DATA_LDPC: u32 = 1 << 11;
 const INFO0_DISDATAFB: u32 = 1 << 10;
 const INFO1_DATA_RTY_LOWEST_RATE: u32 = 0x1FF << 16;
+const INFO1_MAX_AGGNUM: u32 = 0xFF;
+const INFO2_AMPDU_DENSITY: u32 = 0x7 << 18;
 const INFO2_FORCE_KEY_EN: u32 = 1 << 8;
 const INFO2_SEC_CAM_IDX: u32 = 0xFF;
 const INFO4_HW_RTS_EN: u32 = 1 << 31;
@@ -263,6 +279,9 @@ pub fn management(
 /// address, and the 802.11 header length. With `sec`, the frame is
 /// encrypted as CCMP-128 by the hardware under CAM entry `sec.cam` with
 /// `sec.pn` in BODY4/5 and `wp_offset` 1.
+/// With `agg`, a frame that is not EAPOL goes in an A-MPDU: AGG_EN,
+/// MAX_AGGNUM and AMPDU_DENSITY as `rtw89_core_tx_update_ampdu_info` sets
+/// them (`core.c:636-675`); an EAPOL frame never does, whatever `agg` says.
 ///
 /// `tid` is `skb->priority`, whose TID mac80211 also writes into a QoS
 /// frame's QoS control (`ieee80211_set_qos_hdr`, `net/mac80211/wme.c:193-232`)
@@ -278,6 +297,10 @@ pub fn management(
 /// hands a hardware key only with a Protected frame), and a key the
 /// descriptor cannot carry (key ID past 3, PN 0 or past 48 bits, CAM entry
 /// past 127).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rtw89_core_tx_update_desc_info's inputs for one data frame, each a field of its own."
+)]
 pub fn data(
     bytes: &[u8],
     tid: u8,
@@ -286,6 +309,7 @@ pub fn data(
     supported: u16,
     caps: RateCaps,
     sec: Option<TxSec>,
+    agg: Option<Aggregate>,
 ) -> Result<(TxChannel, [u8; WD_HEAD_BYTES]), AxError> {
     let fc = frame_control(bytes)?;
     if !is_data(fc) || is_any_nullfunc(fc) {
@@ -322,8 +346,22 @@ pub fn data(
         update_sec_key(&mut info, sec)?;
     }
     info.data_retry_lowest_rate = u16::from(lowest_data_rate(band, supported));
-    // rtw89_core_tx_update_ampdu_info: an EAPOL frame goes with BK.
+    // rtw89_core_tx_update_ampdu_info: an EAPOL frame goes with BK and
+    // returns before any aggregation (core.c:649-651); an aggregated frame
+    // takes its agreement's size, or 4 << factor without one, less one as a
+    // byte (core.c:668-674).
     info.bk = eapol;
+    if let Some(agg) = agg.filter(|_| !eapol) {
+        let num = if agg.agg_num != 0 {
+            agg.agg_num
+        } else {
+            // The HT exponent is two bits (`IEEE80211_HT_AMPDU_PARM_FACTOR`).
+            4 << (agg.factor & 0x3)
+        };
+        info.agg_en = true;
+        info.ampdu_num = num.wrapping_sub(1) as u8;
+        info.ampdu_density = agg.density;
+    }
     // rtw89_core_tx_update_llc_hdr: in units of 2 bytes.
     info.hdr_llc_len = (frame.header >> 1) as u8;
     Ok((ch, fill_txdesc_v1(&info)))
@@ -538,6 +576,9 @@ struct DescInfo {
     dis_data_fb: bool,
     tid_indicate: bool,
     bk: bool,
+    agg_en: bool,
+    ampdu_num: u8,
+    ampdu_density: u8,
     sec_en: bool,
     sec_keyid: u8,
     sec_type: u8,
@@ -572,7 +613,9 @@ fn fill_txdesc_v1(d: &DescInfo) -> [u8; WD_HEAD_BYTES] {
         | prep(BODY2_QSEL, d.qsel.into())
         | prep(BODY2_TXPKT_SIZE, d.pkt_size.into())
         | prep(BODY2_MACID, d.mac_id.into());
-    body[3] = prep(BODY3_SW_SEQ, d.seq.into()) | prep(BODY3_BK, d.bk.into());
+    body[3] = prep(BODY3_SW_SEQ, d.seq.into())
+        | prep(BODY3_AGG_EN, d.agg_en.into())
+        | prep(BODY3_BK, d.bk.into());
     if d.sec_en {
         let s = d.sec_seq.map(u32::from);
         body[4] = prep(BODY4_SEC_IV_L0, s[0]) | prep(BODY4_SEC_IV_L1, s[1]);
@@ -588,8 +631,10 @@ fn fill_txdesc_v1(d: &DescInfo) -> [u8; WD_HEAD_BYTES] {
         info[0] = prep(INFO0_DATA_STBC, d.stbc.into())
             | prep(INFO0_DATA_LDPC, d.ldpc.into())
             | prep(INFO0_DISDATAFB, d.dis_data_fb.into());
-        info[1] = prep(INFO1_DATA_RTY_LOWEST_RATE, d.data_retry_lowest_rate.into());
-        info[2] = prep(INFO2_FORCE_KEY_EN, d.sec_en.into())
+        info[1] = prep(INFO1_MAX_AGGNUM, d.ampdu_num.into())
+            | prep(INFO1_DATA_RTY_LOWEST_RATE, d.data_retry_lowest_rate.into());
+        info[2] = prep(INFO2_AMPDU_DENSITY, d.ampdu_density.into())
+            | prep(INFO2_FORCE_KEY_EN, d.sec_en.into())
             | prep(INFO2_SEC_CAM_IDX, d.sec_cam_idx.into());
         info[4] = prep(INFO4_RTS_EN, (!d.is_bmc).into()) | prep(INFO4_HW_RTS_EN, 1);
     }

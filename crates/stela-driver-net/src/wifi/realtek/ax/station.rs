@@ -1009,6 +1009,7 @@ impl<C: Chip> Rtl8852c<C> {
                 eapol: held.eapol,
                 supported_rates: held.supported,
                 key: held.key,
+                aggregate: None,
             };
             let Some(token) = Self::chip(self.chip.transmit_data(&frame))? else {
                 return Ok(());

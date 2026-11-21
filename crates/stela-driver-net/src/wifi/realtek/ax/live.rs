@@ -159,7 +159,7 @@ use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
 use super::station::chip::{
     self, Association, Chip, Data, HardwareKey, Incoming, LinkCounts, Management, Token, TxCounts,
 };
-use super::txd::{self, RateCaps, TxSec};
+use super::txd::{self, Aggregate, RateCaps, TxSec};
 use super::txpwr_tables::TxPowerTables;
 use super::vif;
 use crate::Mac;
@@ -294,6 +294,9 @@ pub struct Live<I: AxIo> {
     ba: BaCam,
     /// The AP's station's `tid_rx_stats`, for the PN check.
     rx_stats: RxStats,
+    /// The AP's station's `ampdu_map` with each TID's `ampdu_params[tid].agg_num`:
+    /// the TX agreements [`Live::aggregation`] made operational.
+    ampdu: [Option<u16>; 8],
     tx: TxTally,
     /// [`Live::tx_counts`].
     counts: TxCounts,
@@ -566,6 +569,7 @@ pub unsafe fn start<I: AxIo>(
         keys: KeyCam::default(),
         ba: BaCam::default(),
         rx_stats: RxStats::default(),
+        ampdu: [None; 8],
         tx: TxTally::default(),
         counts: TxCounts::default(),
         ba_counts: BaCounts::default(),
@@ -1199,6 +1203,9 @@ impl<I: AxIo> Live<I> {
         let mut cam = core::mem::take(&mut self.keys);
         let mut agreements = core::mem::take(&mut self.ba);
         self.rx_stats.forget();
+        // The station goes with its `ampdu_map`; the limit register keeps
+        // its last value, as Linux writes it only from `ampdu_action`.
+        self.ampdu = [None; 8];
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
         let band = self.chan.band;
@@ -1363,6 +1370,35 @@ impl<I: AxIo> Live<I> {
         Ok(())
     }
 
+    /// `rtw89_ops_ampdu_action`'s TX half (`mac80211.c:1041-1061`, M4 spec
+    /// S10.2) for the AP's station's agreement on `tid`: `Some(window)` is
+    /// TX_OPERATIONAL, the TID's `agg_num` set and its bit in `ampdu_map`;
+    /// `None` is TX_STOP, the bit cleared. Either then runs
+    /// `rtw89_phy_ra_recalc_agg_limit` ([`assoc::set_ra_agg_limit`]). TX_START
+    /// takes nothing here (`IEEE80211_AMPDU_TX_START_IMMEDIATE`), no LPS is
+    /// left, and `h2c_ampdu_cmac_tbl` is NULL on the 8852C
+    /// (`rtw8852c.c:3115`), so no H2C is sent. Refused before any I/O,
+    /// changing nothing, on a chip off ([`POWERED_OFF`]), while a scan has
+    /// not been ended ([`SCAN_NOT_ENDED`]), while not associated
+    /// ([`BA_WITHOUT_ASSOCIATION`]) and for a TID past 7. A failed register
+    /// access is returned with the map changed and the chip left on, as
+    /// Linux's write cannot fail.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), AxError> {
+        self.idle()?;
+        if self.associated.is_none() {
+            return Err(BA_WITHOUT_ASSOCIATION);
+        }
+        let slot = self
+            .ampdu
+            .get_mut(usize::from(tid))
+            .ok_or(AxError::Mac("a TX Block Ack agreement on a TID past 7"))?;
+        *slot = window;
+        assoc::set_ra_agg_limit(&mut self.io, &self.ampdu)
+    }
+
     /// `rtw89_ops_ampdu_action`'s RX_STOP (`mac80211.c:1066-1069`) of the
     /// agreement on `tid`: its PN check stopped, then [`ba::stop`], the
     /// oldest entry it holds freed and its stop H2C sent without a wait; an
@@ -1517,6 +1553,7 @@ impl<I: AxIo> Live<I> {
     /// Protected frame goes under (`rtw89_core_tx_update_sec_key`), whose
     /// CCMP header [`txd::strip_ccmp`] removed. The key's CAM entry is the
     /// caller's to have installed ([`Chip::transmit_data`] checks it).
+    /// With `agg`, the frame goes in its TID's A-MPDU ([`txd::data`]).
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1527,6 +1564,7 @@ impl<I: AxIo> Live<I> {
         eapol: bool,
         supported: u16,
         sec: Option<TxSec>,
+        agg: Option<Aggregate>,
     ) -> Result<Option<Token>, AxError> {
         if self.off {
             return Err(POWERED_OFF);
@@ -1547,7 +1585,7 @@ impl<I: AxIo> Live<I> {
                 ldpc: false,
             },
         };
-        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec)?;
+        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec, agg)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
         unsafe { self.submit(ch, &head, bytes) }
     }
@@ -1812,6 +1850,7 @@ impl<I: AxIo> Live<I> {
         self.associated = None;
         self.keys = KeyCam::default();
         self.ba = BaCam::default();
+        self.ampdu = [None; 8];
         self.rx_stats.forget();
     }
 
@@ -1979,10 +2018,11 @@ impl<I: AxIo> Chip for Live<I> {
             tid,
             eapol,
             supported_rates,
+            aggregate,
             ..
         } = *frame;
         // SAFETY: `start`'s contract holds for the live chip's every use.
-        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec) }
+        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec, aggregate) }
             .map_err(|e| e.to_string())
     }
 
@@ -2043,6 +2083,12 @@ impl<I: AxIo> Chip for Live<I> {
     fn remove_key(&mut self, cam: u8) -> Result<(), String> {
         // SAFETY: `start`'s contract holds for the live chip's every use.
         unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::aggregation`].
+    fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::aggregation(self, tid, window) }.map_err(|e| e.to_string())
     }
 
     /// [`Live::kick`].

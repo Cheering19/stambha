@@ -93,7 +93,7 @@
 use super::chan::HwBand;
 use super::command::Session;
 use super::dm::Dig;
-use super::io::{AxError, AxIo, clear32};
+use super::io::{AxError, AxIo, clear32, field32};
 use super::receive::Event;
 use super::vif::{self, MAC_ID, NET_TYPE_INFRA, NET_TYPE_NO_LINK, PORT};
 use crate::wifi::station::phy::AccessCategory;
@@ -348,6 +348,37 @@ pub fn ra_info(peer: &RaPeer, band: HwBand) -> RaInfo {
         0
     };
     info
+}
+
+/// `R_AX_AMPDU_AGG_LIMIT` and its `B_AX_RA_TRY_RATE_AGG_LMT_MASK`
+/// (`reg.h:2563-2565`), the 8852C's `ra_agg_limit` (`mac.c:7479-7480`).
+const R_AX_AMPDU_AGG_LIMIT: u32 = 0xC610;
+const B_AX_RA_TRY_RATE_AGG_LMT: u32 = 0x00FF_0000;
+
+/// `rtw89_phy_ra_recalc_agg_limit`'s value (`phy.c:778-797`) for the one
+/// station's TX agreements, `windows[tid]` the window of each TID in
+/// `ampdu_map` (`ampdu_params[tid].agg_num`): the smallest, clamped to 1-256,
+/// less one; 0x3F with none.
+pub fn ra_agg_limit(windows: &[Option<u16>; 8]) -> u32 {
+    match windows.iter().flatten().min() {
+        Some(&least) => u32::from(least.clamp(1, 256)) - 1,
+        None => 0x3F,
+    }
+}
+
+/// `rtw89_phy_ra_recalc_agg_limit` (`phy.c:778-803`): [`ra_agg_limit`] into
+/// `R_AX_AMPDU_AGG_LIMIT` [23:16] of MAC 0, a read-modify-write
+/// (`rtw89_write32_idx`, `mac.h:1204-1209`); no DBCC, so no MAC 1.
+pub fn set_ra_agg_limit<I: AxIo + ?Sized>(
+    io: &mut I,
+    windows: &[Option<u16>; 8],
+) -> Result<(), AxError> {
+    field32(
+        io,
+        R_AX_AMPDU_AGG_LIMIT,
+        B_AX_RA_TRY_RATE_AGG_LMT,
+        ra_agg_limit(windows),
+    )
 }
 
 /// `____rtw89_conf_tx_edca`'s word for one access category (M3 spec S10.8):

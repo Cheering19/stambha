@@ -13,7 +13,7 @@ use crate::wifi::realtek::ax::station::chip::{
     Association, Chip, Data, HardwareKey, Incoming, Management, Received as Heard, Token,
 };
 use crate::wifi::realtek::ax::tests::firmware::{Air, Sent, c2h as c2h_buffer, rx_buffer};
-use crate::wifi::realtek::ax::txd::{self, RateCaps, TxSec};
+use crate::wifi::realtek::ax::txd::{self, Aggregate, RateCaps, TxSec};
 use crate::wifi::{Band, Channel};
 use alloc::string::{String, ToString};
 
@@ -99,6 +99,7 @@ fn data(bytes: &[u8], tid: u8) -> Data<'_> {
         eapol: false,
         supported_rates: 0xFFF,
         key: None,
+        aggregate: None,
     }
 }
 
@@ -241,7 +242,7 @@ fn transmit_data_maps_tid_to_its_channel() {
         stbc: false,
         ldpc: false,
     };
-    let (_, head) = txd::data(&eapol, 7, true, HwBand::G2, 0xFFF, caps, None).unwrap();
+    let (_, head) = txd::data(&eapol, 7, true, HwBand::G2, 0xFFF, caps, None, None).unwrap();
     assert_eq!(sent[2].head, head);
     assert_eq!(sent[2].bytes, eapol);
 }
@@ -998,7 +999,7 @@ fn keyed_data_goes_under_its_cam_entry_and_pn() {
         cam: 0,
         pn: 0x0605_0403_0201,
     };
-    let (_, head) = txd::data(&frame, 0, false, HwBand::G2, 0xFFF, caps, Some(sec)).unwrap();
+    let (_, head) = txd::data(&frame, 0, false, HwBand::G2, 0xFFF, caps, Some(sec), None).unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].head, head);
     assert_eq!(sent[0].bytes, frame);
@@ -1525,4 +1526,72 @@ fn a_flush_kicks_what_was_submitted_first() {
     let t = &live.io().trace[before..];
     assert_eq!(t.first(), Some(&Op::W16(0x1058, 1)));
     assert_eq!(tx_kicks(t, 0x1058), 1);
+}
+
+/// `rtw89_ops_ampdu_action`'s TX half (`mac80211.c:1041-1061`, M4 spec
+/// S10.2): TX_OPERATIONAL records the TID's window, TX_STOP forgets it, and
+/// each recalculates the RA aggregation limit (`rtw89_phy_ra_recalc_agg_limit`,
+/// `phy.c:778-803`) into 0xC610 [23:16]; no H2C (`h2c_ampdu_cmac_tbl` is
+/// NULL on 8852C, `rtw8852c.c:3115`). The WD carries the agreement.
+#[test]
+fn aggregation_sets_the_ra_limit_and_the_wd() {
+    let (mut live, m, _air) = on_air(&|_| {});
+    // Not associated: refused before any access.
+    let before = live.io().trace.len();
+    assert_eq!(
+        Chip::aggregation(&mut live, 0, Some(64)),
+        Err(BA_WITHOUT_ASSOCIATION.to_string())
+    );
+    assert_eq!(live.io().trace.len(), before);
+    let ch36 = channel(HwBand::G5, 36);
+    Chip::tune(&mut live, ch36).unwrap();
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch36, 0xFF, None)).unwrap();
+    let limit = |live: &Live<RegisterModel>| (live.io().get32(0xC610) >> 16) & 0xFF;
+    for (tid, window, want) in [
+        (0, Some(64), 0x3F),
+        (5, Some(128), 0x3F),
+        (0, None, 0x7F),
+        (5, None, 0x3F),
+    ] {
+        let before = live.io().trace.len();
+        Chip::aggregation(&mut live, tid, window).unwrap();
+        let t = &live.io().trace[before..];
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t[0], Op::R32(0xC610));
+        assert!(matches!(t[1], Op::W32(0xC610, _)));
+        assert_eq!(limit(&live), want, "TID {tid}");
+        assert_eq!(kicks(t), 0);
+    }
+    // A TID past 7 is refused.
+    assert!(Chip::aggregation(&mut live, 8, Some(64)).is_err());
+    // The agreement's frames carry AGG_EN, MAX_AGGNUM and the spacing.
+    let air = Air::install(live.io_mut(), &m);
+    let frame = qos_frame(1, 0, 1);
+    let aggregate = Aggregate {
+        agg_num: 64,
+        factor: 3,
+        density: 5,
+    };
+    let aggregated = Data {
+        aggregate: Some(aggregate),
+        ..data(&frame, 0)
+    };
+    send(&mut live, &aggregated).unwrap();
+    poll(&mut live);
+    let head = air.sent()[0].head;
+    let word = |i: usize| u32::from_le_bytes(head[4 * i..4 * i + 4].try_into().unwrap());
+    assert_eq!(word(3) & 1 << 12, 1 << 12);
+    assert_eq!(word(8 + 1) & 0xFF, 63);
+    assert_eq!(word(8 + 2) & 0x7 << 18, 5 << 18);
+    // Leaving forgets the agreements without a write: the next association
+    // starts from none.
+    Chip::aggregation(&mut live, 2, Some(32)).unwrap();
+    Chip::disassociate(&mut live).unwrap();
+    let before = live.io().trace.len();
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch36, 0xFF, None)).unwrap();
+    Chip::aggregation(&mut live, 0, Some(128)).unwrap();
+    assert!(!live.io().trace[before..].is_empty());
+    assert_eq!(limit(&live), 0x7F);
 }
