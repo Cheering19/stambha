@@ -33,16 +33,30 @@
 //! prints the beat's share as `overhead=`, and a PE over 0.1% in a beat
 //! doubles its periods for the next. Without `--profile` no counter
 //! interrupts and the gate's question is one load.
+//!
+//! A cycles sample in native code also names the block running (`PES PC`,
+//! `step_timing::pc_samples`): each native run enters with its chain
+//! control known ([`enter`]), whose `block` word every link and probe
+//! writes, and the NMI keeps that word and the sample's period in the
+//! processor's ring (`stela_boot_core::block_samples`), which the engine
+//! takes after the run (`Host::profile_blocks`, [`take_blocks`]).
 use super::super::run::EXIT_NAMES;
 use super::local;
 use crate::output;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
+use stela_boot_core::block_samples::BlockRing;
 use stela_boot_core::host_samples::{
     CLASSES, Counts, IDLE, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, native, shares,
 };
-use stela_engine::machine::engine::step_timing::{self, CodeRegion, Phase};
+use stela_compiler::x86_64::chain::ChainControl;
+use stela_engine::machine::engine::step_timing::{
+    self, BlockSample, CodeRegion, NO_BLOCK, Phase,
+};
+
+/// Where a chain control holds the index of the block running.
+const BLOCK_OFFSET: usize = core::mem::offset_of!(ChainControl, block);
 
 /// Events between samples at first, per counter, and when RDPMC traps
 /// (a hypervisor's NMIs and MSR writes cost far more).
@@ -121,6 +135,10 @@ struct Sampler {
     /// look ([`host_service`]).
     lost: AtomicU64,
     checked: AtomicU64,
+    /// The chain control of the native run in progress ([`enter`]), or 0.
+    control: AtomicU64,
+    /// The block samples the engine has not taken yet ([`take_blocks`]).
+    blocks: BlockRing,
 }
 
 static CORES: [AtomicPtr<Sampler>; MAX_CORES] =
@@ -227,6 +245,8 @@ pub(super) fn start(pe: usize, counters: [u32; SAMPLED], clear: Option<u32>, rea
         service_calls,
         lost: AtomicU64::new(0),
         checked: AtomicU64::new(0),
+        control: AtomicU64::new(0),
+        blocks: BlockRing::new(),
     });
     for counter in 0..SAMPLED {
         sampler.period[counter].store(period, Relaxed);
@@ -301,6 +321,51 @@ impl Sampler {
         }
         .class()
     }
+
+    /// What the chain control of the native run in progress names as the
+    /// block running, or [`NO_BLOCK`] for a run [`enter`] did not see.
+    fn running_block(&self) -> u64 {
+        match self.control.load(Relaxed) {
+            0 => NO_BLOCK,
+            // SAFETY: the chain control of the native run this NMI
+            // interrupted ([`enter`]), which the engine keeps for the run's
+            // whole life; one aligned word, which native code on this
+            // processor writes whole.
+            control => unsafe { ((control as usize + BLOCK_OFFSET) as *const u64).read_volatile() },
+        }
+    }
+}
+
+/// A native run enters with its chain control at `control` (the guest
+/// state's `Anchor::Control`), until [`leave`]: its cycles samples name
+/// the block running there (`PES PC`).
+#[inline]
+pub(super) fn enter(control: u64) {
+    if ACTIVE.load(Relaxed)
+        && let Some(sampler) = sampler()
+    {
+        sampler.control.store(control, Relaxed);
+    }
+}
+
+/// The native run [`enter`] saw returned.
+#[inline]
+pub(super) fn leave() {
+    if ACTIVE.load(Relaxed)
+        && let Some(sampler) = sampler()
+    {
+        sampler.control.store(0, Relaxed);
+    }
+}
+
+/// The block samples this processor's NMIs took since the last call,
+/// oldest first, as many as `into` holds; how many
+/// (`Host::profile_blocks`).
+pub(super) fn take_blocks(into: &mut [BlockSample]) -> usize {
+    if !ACTIVE.load(Relaxed) {
+        return 0;
+    }
+    sampler().map_or(0, |sampler| sampler.blocks.take(into))
 }
 
 /// The value of one of this processor's local slots.
@@ -345,6 +410,10 @@ pub(crate) fn overflow(rip: u64, rsp: u64) -> u64 {
                 add(&sampler.counts[IDLE][counter], events);
             } else {
                 add(&sampler.pending[class][counter], events);
+            }
+            // A cycles sample in native code names the block running.
+            if counter == 0 && top != 0 {
+                sampler.blocks.push(sampler.running_block(), events);
             }
             sampler.reload(counter);
             bits |= 1 << counter;

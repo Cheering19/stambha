@@ -691,6 +691,9 @@ pub struct Hub {
     /// Every PE's hot-block samples since the home machine last took them
     /// ([`Hub::add_hot_samples`]).
     hot: Mutex<step_timing::HotBlocks>,
+    /// Every PE's host samples of native code by block since the home
+    /// machine last took them ([`Hub::add_pc_samples`]).
+    pc: Mutex<step_timing::PcSamples>,
 }
 
 /// Which physical fetch pages any PE may have compiled from, as a filter:
@@ -793,6 +796,7 @@ impl Hub {
             source_observations: AtomicBool::new(false),
             installs: super::install_census::Live::default(),
             hot: Mutex::new(step_timing::HotBlocks::default()),
+            pc: Mutex::new(step_timing::PcSamples::default()),
             board: super::board::Board::new(pes),
             code: Mutex::new(None),
         })
@@ -1414,6 +1418,17 @@ impl Hub {
     /// Every PE's hot-block samples added since the last call.
     pub fn take_hot_samples(&self) -> step_timing::HotBlocks {
         core::mem::take(&mut *self.hot.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Add the samples by block `take` puts in the board's table
+    /// (`Machine::take_pc_samples`), for the home machine's reports.
+    pub fn add_pc_samples(&self, take: impl FnOnce(&mut step_timing::PcSamples)) {
+        take(&mut self.pc.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// Every PE's samples by block added since the last call.
+    pub fn take_pc_samples(&self) -> step_timing::PcSamples {
+        core::mem::take(&mut *self.pc.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// PE `pe`'s System exits added since the last call.

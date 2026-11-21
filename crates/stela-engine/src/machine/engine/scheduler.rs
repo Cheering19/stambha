@@ -448,6 +448,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         });
         self.cpu.state.account = 0;
+        // The host's samples of the run, named while their blocks are
+        // still in their slots ([`step_timing::pc_samples`]).
+        if self.step_timing.is_some() {
+            self.take_native_samples();
+        }
         self.set_doing(step_timing::BLOCKER_RETURNED);
         // Native code switched no thread, woke no PE and spun on no event.
         let quiet = self.mirrors.switches.len == 0

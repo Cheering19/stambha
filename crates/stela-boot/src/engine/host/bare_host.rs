@@ -371,8 +371,12 @@ impl Host for BareHost<'_> {
         state().native = true;
         state().load_pan();
         let entered = rdtsc();
+        // `--profile`'s samples name the block running through the run's
+        // chain control.
+        super::sampling::enter(guest.anchors[stela_compiler::Anchor::Control]);
         // SAFETY: the engine passes installed system-mode block code.
         let exit = unsafe { stela_enter_block(guest, code.0) };
+        super::sampling::leave();
         state().follow_native();
         state().follow_pan(guest.pan != 0);
         native_return(code, exit, entered)
@@ -789,6 +793,13 @@ impl Host for BareHost<'_> {
         regions: &[(u32, stela_engine::machine::engine::step_timing::CodeRegion)],
     ) {
         super::sampling::tag(code.0 as u64, bytes, regions);
+    }
+
+    fn profile_blocks(
+        &mut self,
+        into: &mut [stela_engine::machine::engine::step_timing::BlockSample],
+    ) -> usize {
+        super::sampling::take_blocks(into)
     }
 
     fn counter(&mut self) -> u64 {

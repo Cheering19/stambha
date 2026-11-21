@@ -161,8 +161,18 @@ impl KnownKeys {
     /// The key of the page at `frame` whose bytes check `check`, if a PE
     /// read it so before.
     pub(super) fn get(&self, slots: usize, frame: u64, check: u64) -> Option<Known> {
+        self.find(self.table(slots), frame, check)
+    }
+
+    /// [`Self::get`] without allocating the slots: `None` before their
+    /// first use.
+    pub(super) fn peek(&self, frame: u64, check: u64) -> Option<Known> {
+        self.find(self.allocated()?, frame, check)
+    }
+
+    fn find(&self, table: &[Slot], frame: u64, check: u64) -> Option<Known> {
         let tag = self.tag(frame);
-        Self::set(self.table(slots), frame)
+        Self::set(table, frame)
             .into_iter()
             .filter_map(Self::read)
             .find(|&(word, held, _)| word & !ABSENT == tag && held == check)
@@ -235,6 +245,20 @@ mod tests {
         assert_eq!(keys.get(16, 0x2000, 8), Some(known(2, true)));
         keys.forget_all();
         assert_eq!(keys.get(16, 0x2000, 8), None);
+    }
+
+    /// A peek finds what a get finds, and before the first get or put it
+    /// finds nothing and allocates no slots.
+    #[test]
+    fn a_peek_finds_known_keys_and_allocates_nothing() {
+        let keys = KnownKeys::default();
+        assert_eq!(keys.peek(0x1000, 7), None);
+        assert!(keys.allocated().is_none());
+        keys.put(16, 0x1000, 7, known(1, false));
+        assert_eq!(keys.peek(0x1000, 7), Some(known(1, false)));
+        assert_eq!(keys.peek(0x1000, 8), None);
+        keys.forget_all();
+        assert_eq!(keys.peek(0x1000, 7), None);
     }
 
     #[test]

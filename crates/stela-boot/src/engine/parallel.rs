@@ -334,6 +334,9 @@ impl Pe {
                     if machine.has_hot_samples() {
                         hub.add_hot_samples(|hot| machine.take_hot_samples(hot));
                     }
+                    if machine.has_pc_samples() {
+                        hub.add_pc_samples(|samples| machine.take_pc_samples(samples));
+                    }
                 });
             }
             // A PE whose guest waits sends the serial queue in its wait; one
@@ -507,6 +510,21 @@ pub(crate) fn hot_samples<H: Host>(
     };
     home.take_hot_samples(&mut hot);
     hot
+}
+
+/// The host's samples of native code by block of every PE since the last
+/// call, under step timing (`PES PC`): the home machine's own and those the
+/// others added (`Hub::add_pc_samples`).
+pub(crate) fn pc_samples<H: Host>(
+    home: &mut Machine<H, Board>,
+) -> stela_engine::machine::engine::step_timing::PcSamples {
+    let mut samples = if home.runs_parallel() {
+        home.devices.hub().take_pc_samples()
+    } else {
+        Default::default()
+    };
+    home.take_pc_samples(&mut samples);
+    samples
 }
 
 /// The System exits of every PE since the last call, under step timing:

@@ -53,6 +53,7 @@ mod native_failure;
 mod native_timing;
 mod numbering;
 mod parallel;
+mod pc_sampling;
 mod pointer_authentication;
 mod regime_state;
 mod scheduler;
@@ -796,6 +797,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// The sampled runs among those whose last transfer was their block's
     /// RET, BLR or BR form's ([`step_timing::HotBlocks::dynamic`]).
     dynamic_samples: Vec<step_timing::DynamicSample>,
+    /// The host's samples of native code, named by block, not yet taken,
+    /// under step timing ([`step_timing::pc_samples`],
+    /// [`Self::take_pc_samples`]).
+    pc_sampling: pc_sampling::PcSampling,
     /// Native runs since the engine started, the cells their cell probes
     /// named since the last promotion step ([`scheduler`]'s
     /// `promote_hot_exits`), and how often recent steps read each exit's.
@@ -1385,6 +1390,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             exit_trace: step_timing::ExitTrace::default(),
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
+            pc_sampling: Default::default(),
             promotion_runs: 0,
             cell_samples: Vec::new(),
             sampled_exits: BTreeMap::new(),

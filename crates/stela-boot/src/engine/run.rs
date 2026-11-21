@@ -759,6 +759,32 @@ fn hot_asids_report(
 /// Beats between [`hot_total_report`]s.
 const HOT_TOTAL_BEATS: u64 = 16;
 
+/// `PES PC ...`: where native code spent its host cycles since the last
+/// beat, by guest block, from every PE's cycles samples
+/// (`step_timing::pc_samples`), each block with its code page's key, which
+/// `cargo xtask symbolize` maps to functions; every [`HOT_TOTAL_BEATS`]
+/// beats, `PES PC TOTAL ...` over every beat since the first. No lines
+/// where the host took no such samples.
+fn pc_blocks_report<H: Host>(
+    machine: &mut Machine<H, parallel::Board>,
+    total: &mut step_timing::PcSamples,
+    whole: bool,
+) {
+    /// The blocks a beat's line and a total's show per level.
+    const SHOWN: usize = 64;
+    const TOTAL_SHOWN: usize = 256;
+    let beat = parallel::pc_samples(machine);
+    total.merge(&beat);
+    for line in beat.lines("PES PC", SHOWN) {
+        output::arguments(format_args!("{line}\n"));
+    }
+    if whole {
+        for line in total.lines("PES PC TOTAL", TOTAL_SHOWN) {
+            output::arguments(format_args!("{line}\n"));
+        }
+    }
+}
+
 /// ` pc:count` for a [`hot_blocks_report`] line.
 fn push_hot_block(line: &mut String, level: step_timing::Level, block: &step_timing::HotBlock) {
     if level == step_timing::Level::User {
@@ -1599,6 +1625,9 @@ pub(super) struct Heartbeat {
     pub(super) dynamic: step_timing::DynamicSites,
     /// The hot blocks sampled since the first beat (`hot_total_report`).
     pub(super) hot_total: step_timing::HotBlocks,
+    /// The host's samples of native code by block since the first beat
+    /// (`pc_blocks_report`).
+    pub(super) pc_total: step_timing::PcSamples,
     /// Every System exit key's exits since the last `PES SYSTEM TOTAL`
     /// line (`system_total_report`).
     pub(super) system_total: BTreeMap<u32, step_timing::SystemExit>,
@@ -1676,6 +1705,7 @@ impl Heartbeat {
             pmu: host::pmu::Seen::new(),
             dynamic: Default::default(),
             hot_total: Default::default(),
+            pc_total: Default::default(),
             system_total: BTreeMap::new(),
             exit_paths: step_timing::ExitPaths::default(),
         }
@@ -2028,6 +2058,11 @@ impl Heartbeat {
                         machine,
                         &mut self.dynamic,
                         &mut self.hot_total,
+                        self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    );
+                    pc_blocks_report(
+                        machine,
+                        &mut self.pc_total,
                         self.beats.is_multiple_of(HOT_TOTAL_BEATS),
                     );
                 }
