@@ -21,7 +21,7 @@
 //! (`core.c:6687-6697`) with the radio steps of [`phy::init_radio`]: the
 //! BB/RF reset, the firmware's BB, BB gain and radio tables with the RF_REG
 //! H2Cs, and the coex init's Wi-Fi grant; then `rtw89_phy_dm_init` with
-//! NCTL, RCK, DACK and RX DCK ([`phy::calibrate`]). [`power_up`] is these
+//! NCTL, RCK, DACK and RX DCK ([`phy::calibrate`]). `power_up` is these
 //! steps, which the live chip ([`live::start`]) continues from with
 //! `rtw89_leave_ips` (the rest of `rtw89_core_start`, `rtw89_set_channel`
 //! to 2.4 GHz channel 1 with its TX power, `rtw89_mac_vif_init`). Then, as
@@ -32,7 +32,7 @@
 //! (`core.c:6738, 6760`) hands the antenna back; once the post-init has run,
 //! the HCI is torn down as `rtw89_core_stop` does (`core.c:6765-6767`):
 //! `rtw89_pci_ops_deinit` (`pci.c:3053`), then the power-off
-//! ([`shut_down`]). Last comes `rtw89_mac_pwr_off` (`mac.c:1603`), which
+//! (`shut_down`). Last comes `rtw89_mac_pwr_off` (`mac.c:1603`), which
 //! Linux runs on success and on every failure after power-on.
 //!
 //! [`bring_up`] does not grant a usable radio: the chip is powered off again
@@ -693,7 +693,7 @@ fn power_down<I: AxIo + ?Sized>(io: &mut I) {
 /// (`R_AX_IC_PWR_STATE[9:8]`, `reg.h:332-334`):
 /// - 0, `MAC_AX_MAC_OFF`: nothing runs; nothing is written.
 /// - 1, `MAC_AX_MAC_ON`: the PCIe WPDMA is stopped and the AXI master and
-///   TX/RX HCI DMA disabled ([`pci::stop_dma`], the start of
+///   TX/RX HCI DMA disabled (`pci::stop_dma`, the start of
 ///   `rtw89_pci_ops_mac_pre_init_ax`), then `rtw89_mac_power_switch(false)`
 ///   runs `rtw8852c_pwr_off_func` (XTAL SI power-down commands, then
 ///   `B_AX_APFM_OFFMAC` set and polled clear, then the PCIe low-power

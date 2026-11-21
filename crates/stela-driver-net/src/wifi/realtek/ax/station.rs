@@ -760,7 +760,12 @@ impl<C: Chip> Rtl8852c<C> {
     /// `IEEE80211_TX_CTL_REQ_TX_STATUS`, rtw89 reporting TX status
     /// (`REPORTS_TX_ACK_STATUS`, `core.c:7495`), and the status times the
     /// exchange's next try (`ieee80211_mgd_conn_tx_status`). A protected
-    /// frame was sealed as it was queued.
+    /// frame was sealed as it was queued. A frame the chip refuses (a chip
+    /// off, or one the encoder or the submit refuses) stays at the head and
+    /// its error is returned, as rtw88's does, so the frames behind it wait
+    /// until a departure clears the outbox; rtw89 frees just that frame
+    /// (`ieee80211_free_txskb` after `rtw89_core_tx_write` fails,
+    /// `mac80211.c:39-43`).
     fn send_management(&mut self) -> Result<(), Error> {
         let basic_rates = self.basic_rates();
         while let Some((_, bytes)) = self.outbox.front() {

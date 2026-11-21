@@ -64,7 +64,7 @@
 //! is the live chip's `end_scan`, which [`super::bringup::bring_up`] never
 //! runs, as it powers the chip off instead.
 //!
-//! [`hw_scan_complete`] is `rtw89_hw_scan_complete_cb` (`fw.c:10444-10471`)
+//! `hw_scan_complete` is `rtw89_hw_scan_complete_cb` (`fw.c:10444-10471`)
 //! for an unassociated station after its channel switch (M3 spec S8.3): the
 //! RX filter back to `hal.rx_fltr`, then the receiver keeps every frame a
 //! station receives again; `rtw89_core_scan_complete` (`core.c:7083-7122`)
@@ -262,7 +262,7 @@ pub struct Network {
 /// `Scanner::begin` on, those it refused, those too short to be a frame,
 /// those that are no MPDU, and those past a bound: a new BSSID past 512, or
 /// more than 64 frames before `Scanner::submitted`.
-/// `rxq_full` is [`Rings::rxq_full_batches`]; `tail_capped` says the drain
+/// `rxq_full` is [`super::pci::Rings::rxq_full_batches`]; `tail_capped` says the drain
 /// after END_SCAN or the stop hit its cap, 64 polls that each found RXQ
 /// entries, so RXQ was never seen empty and frames may have been left in
 /// it; `refused` the session ledger's first refused H2C, its return raw.

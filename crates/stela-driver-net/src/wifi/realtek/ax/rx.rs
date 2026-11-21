@@ -9,8 +9,8 @@
 //! narrowing of Linux, so a buffer whose descriptor claims fewer bytes than
 //! the BD wrote yields only those. The descriptor fields are those of
 //! `rtw89_core_query_rxdesc` (`core.c:4107-4160`, `txrx.h:345-424`) for the
-//! RTL8852C (`BW` is the `_v1` mask, d1 [31:29]); of a long descriptor's
-//! d5 and d7 only the MAC ID [23:16] and the security type [20:17], which
+//! RTL8852C (`BW` is the `_v1` mask, d1 `[31:29]`); of a long descriptor's
+//! d5 and d7 only the MAC ID `[23:16]` and the security type `[20:17]`, which
 //! `rtw89_core_skb_pn_valid` reads; the fields Stela does not use are not
 //! read. Only FS && LS single-segment buffers are framed. It reads no
 //! register and grants no DMA.

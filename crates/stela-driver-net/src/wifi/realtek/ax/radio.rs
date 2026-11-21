@@ -48,8 +48,8 @@ const STORED_FROM: u32 = 0x100;
 
 /// The stored word for RF register `addr` set to `data`
 /// (`(reg->addr << 20) | reg->data`, phy.c:1638-1639): the shift drops
-/// addr bits from 12 up, so in practice bits [27:20] carry addr [7:0] and
-/// [19:0] the data.
+/// addr bits from 12 up, so in practice bits `[27:20]` carry addr `[7:0]` and
+/// `[19:0]` the data.
 pub fn rf_reg_word(addr: u32, data: u32) -> u32 {
     addr.wrapping_shl(20) | data
 }

@@ -94,14 +94,14 @@ use crate::wifi::station::phy::AccessCategory;
 pub use super::vif::PortConfig;
 
 /// The address CAM's security fields (`cam.c:906-927`): the key IDs of
-/// w9 [31:18] in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
+/// w9 `[31:18]` in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
 /// holds them; 0 before any key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CamKeys {
-    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 [31:18]; other bits are
+    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 `[31:18]`; other bits are
     /// ignored.
     pub keyids: u32,
-    /// w10: `SEC_ENT_VALID` [7:0], `SEC_ENT0` to `SEC_ENT2`.
+    /// w10: `SEC_ENT_VALID` `[7:0]`, `SEC_ENT0` to `SEC_ENT2`.
     pub valid_and_ents: u32,
     /// w11: `SEC_ENT3` to `SEC_ENT6`.
     pub ents_hi: u32,
@@ -344,8 +344,8 @@ pub fn ra_info(peer: &RaPeer, band: HwBand) -> RaInfo {
 }
 
 /// `____rtw89_conf_tx_edca`'s word for one access category (M3 spec S10.8):
-/// TXOPLMT [26:16] = `txop_32us`, CWMAX [15:12] and CWMIN [11:8] the
-/// exponents, AIFS [7:0] = `aifsn * slot + sifs` with slot 9 (short) or 20
+/// TXOPLMT `[26:16]` = `txop_32us`, CWMAX `[15:12]` and CWMIN `[11:8]` the
+/// exponents, AIFS `[7:0]` = `aifsn * slot + sifs` with slot 9 (short) or 20
 /// and SIFS 10 on 2.4 GHz, else 16 (`rtw89_aifsn_to_aifs`,
 /// `mac80211.c:393-412`, which returns it as a u8). mac80211 hands rtw89
 /// `cw = 2^ecw - 1`, of which rtw89 takes `ilog2(cw + 1)`, the exponent
@@ -618,7 +618,7 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 /// (`rtw89_cam_fill_addr_cam_info` reads the vif's entry, `cam.c:906-927`);
 /// the association's EDCA parameters ([`AssocInputs::params`]) with the
 /// long slot (`BSS_CHANGED_ERP_SLOT`, which `ieee80211_reset_erp_info`
-/// always raises), the GID table cleared, then [`wmm_defaults`] with the
+/// always raises), the GID table cleared, then `wmm_defaults` with the
 /// long slot. Nothing of the port or DIG.
 ///
 /// # Safety
