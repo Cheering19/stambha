@@ -267,6 +267,10 @@ impl HostBluetooth {
             }
         };
         guest.capture = options.bluetooth_trace;
+        if guest.capture {
+            let line = stela_boot_core::guest_bluetooth::TRACE_LINE;
+            output::arguments(format_args!("{line}"));
+        }
         Some(guest)
     }
 

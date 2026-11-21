@@ -14,6 +14,13 @@
 //! [`lend_line`] names it instead.
 use alloc::{format, string::String};
 
+/// The line for a boot that logs the guest's Bluetooth packets
+/// (`--bluetooth-trace`): what is hidden of them, and what is not.
+pub const TRACE_LINE: &str = "BLUETOOTH TRACE the guest's Bluetooth packets are logged masked: \
+     addresses keep their vendor half and last byte, and names, payloads and keys are hidden; \
+     the log still names nearby devices' classes and signal strengths, so keep it private \
+     until it has been checked\n";
+
 /// The line for a boot that lends the host's controller at `location` to
 /// the guest behind Apple's module.
 pub fn lend_line(location: &str) -> String {
@@ -51,6 +58,17 @@ mod tests {
             assert!(line.contains("finds no devices and has none paired"));
             assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
         }
+    }
+
+    /// `--bluetooth-trace` says once what its lines hide and that the log
+    /// still needs checking before it is posted.
+    #[test]
+    fn the_capture_says_what_it_hides_and_that_the_log_stays_private() {
+        assert!(TRACE_LINE.starts_with("BLUETOOTH TRACE "));
+        for said in ["masked", "names", "keys", "hidden", "private"] {
+            assert!(TRACE_LINE.contains(said), "{said}");
+        }
+        assert!(TRACE_LINE.ends_with('\n') && TRACE_LINE.matches('\n').count() == 1);
     }
 
     /// `--bluetooth-lend`: the line names the controller lent, the module it

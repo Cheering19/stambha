@@ -10,8 +10,19 @@
 //! B 2), so the kind names it. The capture holds at most
 //! [`CAPTURED_PACKETS`] packets per configuration, and none unless the owner
 //! asks for it.
+//!
+//! A packet is masked as it is captured ([`Captured::new`], `mask`), so no
+//! raw byte leaves the function: its headers and the parameters that say
+//! nothing of anyone show; the middle bytes of addresses, names, opaque
+//! payloads, keys and secrets are held as 0 and printed `xx`, keeping their
+//! length, and [`Captured::parse`] reads `xx` back as a hidden 0, so a
+//! masked log is itself a fixture. Even so the log names nearby devices'
+//! classes, signal strengths and address ends: keep it private until it
+//! has been checked.
 use alloc::vec::Vec;
 use core::fmt;
+
+mod mask;
 
 /// Packets captured after each configuration.
 pub const CAPTURED_PACKETS: u16 = 1024;
@@ -70,19 +81,30 @@ impl Kind {
 pub struct Captured {
     pub direction: Direction,
     pub kind: Kind,
-    /// Its first [`CAPTURED_BYTES`].
+    /// Its first [`CAPTURED_BYTES`], each hidden one as 0.
     pub bytes: Vec<u8>,
+    /// Which of those are hidden.
+    pub hidden: Vec<bool>,
     /// How many bytes followed those.
     pub cut: usize,
 }
 
 impl Captured {
+    /// `packet`, masked: what is hidden of it is never held.
     pub fn new(direction: Direction, kind: Kind, packet: &[u8]) -> Self {
         let shown = packet.len().min(CAPTURED_BYTES);
+        let mut hidden = mask::hidden(kind, packet);
+        hidden.truncate(shown);
+        let bytes = packet[..shown]
+            .iter()
+            .zip(&hidden)
+            .map(|(&byte, &hidden)| if hidden { 0 } else { byte })
+            .collect();
         Self {
             direction,
             kind,
-            bytes: packet[..shown].to_vec(),
+            bytes,
+            hidden,
             cut: packet.len() - shown,
         }
     }
@@ -95,7 +117,7 @@ impl Captured {
         let direction = *Direction::ALL.iter().find(|d| d.token() == direction)?;
         let kind = words.next()?;
         let kind = *Kind::ALL.iter().find(|k| k.token() == kind)?;
-        let mut bytes = Vec::new();
+        let (mut bytes, mut hidden) = (Vec::new(), Vec::new());
         let mut cut = 0;
         for word in words {
             if cut != 0 {
@@ -108,12 +130,19 @@ impl Captured {
             if word.len() != 2 {
                 return None;
             }
-            bytes.push(u8::from_str_radix(word, 16).ok()?);
+            let masked = word == "xx";
+            bytes.push(if masked {
+                0
+            } else {
+                u8::from_str_radix(word, 16).ok()?
+            });
+            hidden.push(masked);
         }
         (!bytes.is_empty() && (cut == 0 || bytes.len() == CAPTURED_BYTES)).then_some(Self {
             direction,
             kind,
             bytes,
+            hidden,
             cut,
         })
     }
@@ -122,8 +151,12 @@ impl Captured {
 impl fmt::Display for Captured {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.direction.token(), self.kind.token())?;
-        for byte in &self.bytes {
-            write!(f, " {byte:02x}")?;
+        for (byte, &hidden) in self.bytes.iter().zip(&self.hidden) {
+            if hidden {
+                f.write_str(" xx")?;
+            } else {
+                write!(f, " {byte:02x}")?;
+            }
         }
         if self.cut != 0 {
             write!(f, " +{}", self.cut)?;
@@ -226,7 +259,12 @@ mod tests {
         let cut = Captured::new(Direction::FromChip, Kind::Acl, &long);
         assert_eq!((cut.bytes.len(), cut.cut), (CAPTURED_BYTES, 725));
         let line = cut.to_string();
-        assert!(line.starts_with("chip< acl 00 01 02 ") && line.ends_with(" 2b +725"));
+        // The HCI and L2CAP headers show, the payload is hidden.
+        assert!(
+            line.starts_with("chip< acl 00 01 02 03 04 05 06 07 xx "),
+            "{line}"
+        );
+        assert!(line.ends_with(" xx +725"), "{line}");
         assert_eq!(Captured::parse(&line), Some(cut));
         // Extra spaces between words read the same.
         assert_eq!(
@@ -236,6 +274,195 @@ mod tests {
                 Kind::Command,
                 &[1, 4, 5, 0x33, 0x8b, 0x9e, 8, 0]
             ))
+        );
+    }
+
+    /// A neighbour's address 32:31:30:b8:a7:10, in HCI order.
+    const NEIGHBOUR: [u8; 6] = [0x10, 0xa7, 0xb8, 0x30, 0x31, 0x32];
+    const NAME: &[u8] = b"Garvits Mac";
+    const KEY: [u8; 16] = [0x5a; 16];
+
+    /// Whether `secret` is anywhere in what the capture holds of a packet.
+    fn holds(captured: &Captured, secret: &[u8]) -> bool {
+        captured.bytes.windows(secret.len()).any(|w| w == secret)
+    }
+
+    /// An extended inquiry result, a Write Local Name and a Link Key Request
+    /// Reply as the capture holds them: no address's middle bytes, no name,
+    /// no key and no manufacturer data leave the function, while the headers
+    /// stay, so lines still diff and replay.
+    #[test]
+    fn the_capture_never_holds_an_addresss_middle_a_name_or_a_key() {
+        let mut eir = vec![NAME.len() as u8 + 1, 0x09];
+        eir.extend_from_slice(NAME);
+        eir.extend_from_slice(&[5, 0xff, 0x4c, 0x00, 0x99, 0x98, 3, 0x03, 0x0b, 0x11]);
+        eir.resize(240, 0);
+        let mut result = vec![0x2f, 255, 1];
+        result.extend_from_slice(&NEIGHBOUR);
+        result.extend_from_slice(&[1, 0, 0x04, 0x04, 0x24, 0x34, 0x12, 0xd0]);
+        result.extend_from_slice(&eir);
+        let mut local_name = vec![0x13, 0x0c, 248];
+        local_name.extend_from_slice(NAME);
+        local_name.resize(3 + 248, 0);
+        let mut reply = vec![0x0b, 0x04, 22];
+        reply.extend_from_slice(&NEIGHBOUR);
+        reply.extend_from_slice(&KEY);
+        for (direction, kind, packet) in [
+            (Direction::FromChip, Kind::Event, &result),
+            (Direction::FromGuest, Kind::Command, &local_name),
+            (Direction::ToChip, Kind::Command, &reply),
+        ] {
+            let captured = Captured::new(direction, kind, packet);
+            for secret in [&NEIGHBOUR[1..3], NAME, &KEY[..], &[0x99, 0x98][..]] {
+                assert!(!holds(&captured, secret), "{captured}");
+            }
+            let line = captured.to_string();
+            assert!(!line.contains("a7 b8"), "{line}");
+            assert_eq!(captured.bytes[..3], packet[..3], "the header");
+            assert!(!captured.hidden[..3].contains(&true));
+            // A masked line reads back as the packet it shows, hidden
+            // bytes as 00, so a masked log is itself a fixture.
+            assert_eq!(Captured::parse(&line), Some(captured));
+        }
+        let line = Captured::new(Direction::FromChip, Kind::Event, &result).to_string();
+        let name = " xx".repeat(NAME.len());
+        assert!(
+            line.starts_with(&alloc::format!(
+                "chip< evt 2f ff 01 10 xx xx 30 31 32 01 00 04 04 24 34 12 d0 0c 09{name} \
+                 05 ff xx xx xx xx 03 03 0b 11 00 xx"
+            )),
+            "{line}"
+        );
+        let line = Captured::new(Direction::ToChip, Kind::Command, &reply).to_string();
+        assert!(line.starts_with("chip> cmd 0b 04 16 xx xx xx"), "{line}");
+    }
+
+    /// Keys and secrets are never held, wherever they travel: the commands
+    /// that carry them, their returns, the events and the ACL channels.
+    #[test]
+    fn keys_and_secrets_are_never_held() {
+        const SECRET: u8 = 0xa5;
+        let none_held = |captured: Captured, from: usize| {
+            assert!(captured.bytes[from..].iter().all(|&b| b == 0), "{captured}");
+            assert!(captured.hidden[from..].iter().all(|&h| h), "{captured}");
+            assert!(!captured.hidden[..from].contains(&true), "{captured}");
+        };
+        let with = |head: &[u8], length: usize| {
+            let mut packet = head.to_vec();
+            packet.resize(head.len() + length, SECRET);
+            packet
+        };
+        // Link key, PIN, passkey and OOB replies, stored link keys, LE
+        // encryption, LTK replies and resolving list IRKs.
+        for opcode in [
+            0x040b, 0x040d, 0x042e, 0x0430, 0x0445, 0x0c11, 0x2017, 0x2019, 0x201a, 0x2027,
+        ] {
+            let [low, high] = u16::to_le_bytes(opcode);
+            let command = with(&[low, high, 32], 32);
+            none_held(
+                Captured::new(Direction::FromGuest, Kind::Command, &command),
+                3,
+            );
+        }
+        // LE Encrypt's result, the local OOB data, and every vendor
+        // command's returns past the status.
+        for opcode in [0x2017, 0x0c57, 0x0c7d, 0xfc79] {
+            let [low, high] = u16::to_le_bytes(opcode);
+            let complete = with(&[0x0e, 36, 1, low, high, 0], 32);
+            none_held(
+                Captured::new(Direction::FromChip, Kind::Event, &complete),
+                6,
+            );
+        }
+        // Return Link Keys, Link Key Notification, a vendor event, and LE
+        // Generate DHKey Complete past its status.
+        for (head, from) in [
+            (&[0x15, 23][..], 2),
+            (&[0x18, 23][..], 2),
+            (&[0xff, 23][..], 2),
+            (&[0x3e, 34, 0x09, 0x00][..], 4),
+        ] {
+            let event = with(head, usize::from(head[1]) + 2 - head.len());
+            none_held(Captured::new(Direction::ToGuest, Kind::Event, &event), from);
+        }
+        // SMP (channels 6 and 7) and every other channel's payload: the HCI
+        // and L2CAP headers stay; a continuation has no L2CAP header.
+        for cid in [6u8, 7, 0x40] {
+            let acl = with(&[0x01, 0x20, 24, 0, 20, 0, cid, 0], 20);
+            none_held(Captured::new(Direction::FromChip, Kind::Acl, &acl), 8);
+        }
+        let continuation = with(&[0x01, 0x10, 20, 0], 20);
+        none_held(
+            Captured::new(Direction::FromGuest, Kind::Acl, &continuation),
+            4,
+        );
+        // Vendor parameters, the Mac's name and LE advertising data.
+        for (head, from) in [
+            (&[0x4c, 0xfc, 9][..], 3),
+            (&[0x13, 0x0c, 248][..], 3),
+            (&[0x08, 0x20, 32, 31][..], 4),
+            (&[0x09, 0x20, 32, 31][..], 4),
+        ] {
+            let command = with(head, usize::from(head[2]) + 3 - head.len());
+            none_held(
+                Captured::new(Direction::FromGuest, Kind::Command, &command),
+                from,
+            );
+        }
+        // Read Local Name's return and a remote name past the address.
+        let read_name = with(&[0x0e, 252, 1, 0x14, 0x0c, 0], 248);
+        none_held(
+            Captured::new(Direction::ToGuest, Kind::Event, &read_name),
+            6,
+        );
+        let mut named = vec![0x07, 255, 0];
+        named.extend_from_slice(&NEIGHBOUR);
+        let named = with(&named, 248);
+        let captured = Captured::new(Direction::ToGuest, Kind::Event, &named);
+        assert_eq!(captured.bytes[3..9], [0x10, 0, 0, 0x30, 0x31, 0x32]);
+        none_held(
+            Captured {
+                bytes: captured.bytes[9..].to_vec(),
+                hidden: captured.hidden[9..].to_vec(),
+                ..captured
+            },
+            0,
+        );
+    }
+
+    /// Commands whose parameters say nothing of anyone stay whole, and the
+    /// addresses in them keep their vendor half and last byte.
+    #[test]
+    fn plain_commands_stay_whole_and_addresses_keep_their_ends() {
+        for plain in [
+            &[0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 8, 0][..],
+            &[
+                0x01, 0x0c, 8, 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d,
+            ][..],
+            &[0x45, 0x0c, 1, 2][..],
+            &[0x0e, 12, 1, 0x01, 0x10, 0, 6, 0, 0, 6, 15, 0, 0x0e, 0x41][..],
+        ] {
+            let kind = if plain[0] == 0x0e {
+                Kind::Event
+            } else {
+                Kind::Command
+            };
+            let captured = Captured::new(Direction::FromGuest, kind, plain);
+            assert_eq!(captured.bytes, plain);
+            assert!(!captured.hidden.contains(&true), "{captured}");
+        }
+        let mut request = vec![0x19, 0x04, 10];
+        request.extend_from_slice(&NEIGHBOUR);
+        request.extend_from_slice(&[1, 0, 0x34, 0x12]);
+        assert_eq!(
+            Captured::new(Direction::ToChip, Kind::Command, &request).to_string(),
+            "chip> cmd 19 04 0a 10 xx xx 30 31 32 01 00 34 12"
+        );
+        let mut address = vec![0x0e, 10, 1, 0x09, 0x10, 0];
+        address.extend_from_slice(&NEIGHBOUR);
+        assert_eq!(
+            Captured::new(Direction::FromChip, Kind::Event, &address).to_string(),
+            "chip< evt 0e 0a 01 09 10 00 10 xx xx 30 31 32"
         );
     }
 

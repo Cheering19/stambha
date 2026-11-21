@@ -277,8 +277,9 @@ pub struct System {
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
     /// Log every packet of the guest's Bluetooth controller, 1024 per
-    /// configuration (`--bluetooth-trace`). The packets name nearby devices'
-    /// addresses and names.
+    /// configuration (`--bluetooth-trace`), masked: addresses keep their
+    /// vendor half and last byte, names, payloads and keys are hidden. A raw
+    /// capture is not offered.
     pub bluetooth_trace: bool,
     /// Lend the host's Bluetooth controller to the guest behind the model of
     /// Apple's module, which answers its vendor commands and takes over

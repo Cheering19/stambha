@@ -1526,29 +1526,26 @@ mod tests {
         hci.packet(ACL_OUT, Token::Out, &mut rest.to_vec()).unwrap();
         hci.deliver_acl(&long);
         hci.deliver_event(&[0x0e, 4, 1, 0x03, 0x0c, 0]);
-        let shown = long[..CAPTURED_BYTES].to_vec();
-        let cut = long.len() - CAPTURED_BYTES;
+        let captured = hci.take_captured();
+        assert_eq!(captured.len(), 3);
+        for (packet, direction) in captured[..2]
+            .iter()
+            .zip([Direction::FromGuest, Direction::ToGuest])
+        {
+            assert_eq!((packet.direction, packet.kind), (direction, Kind::Acl));
+            assert_eq!(packet.bytes.len(), CAPTURED_BYTES);
+            assert_eq!(packet.cut, long.len() - CAPTURED_BYTES);
+            // The HCI and L2CAP headers, then the payload hidden.
+            assert_eq!(packet.bytes[..8], long[..8]);
+            assert!(packet.hidden[8..].iter().all(|&h| h));
+        }
         assert_eq!(
-            hci.take_captured(),
-            [
-                Captured {
-                    direction: Direction::FromGuest,
-                    kind: Kind::Acl,
-                    bytes: shown.clone(),
-                    cut,
-                },
-                Captured {
-                    direction: Direction::ToGuest,
-                    kind: Kind::Acl,
-                    bytes: shown,
-                    cut,
-                },
-                Captured::new(
-                    Direction::ToGuest,
-                    Kind::Event,
-                    &[0x0e, 4, 1, 0x03, 0x0c, 0]
-                ),
-            ]
+            captured[2],
+            Captured::new(
+                Direction::ToGuest,
+                Kind::Event,
+                &[0x0e, 4, 1, 0x03, 0x0c, 0]
+            )
         );
     }
 
