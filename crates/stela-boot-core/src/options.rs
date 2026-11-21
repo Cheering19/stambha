@@ -40,6 +40,11 @@ pub const CODE_WINDOW: &str = "--code-window";
 /// Issue no indirect branch prediction barrier at guest context switches
 /// (`--no-ibpb`): see [`System::no_ibpb`].
 pub const NO_IBPB: &str = "--no-ibpb";
+/// The latest a busy PE's timer interrupt comes, in microseconds
+/// (`--timer-delay-us N`): see [`System::timer_delay`].
+pub const TIMER_DELAY: &str = "--timer-delay-us";
+/// [`TIMER_DELAY`]'s bounds.
+pub const TIMER_DELAY_MICROS: core::ops::RangeInclusive<u64> = 100..=100_000;
 /// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
 /// place of the monitor's preferred mode: for a capture device that cannot
 /// take the mode its EDID prefers.
@@ -299,6 +304,14 @@ pub struct System {
     /// translation regimes, for the time each barrier and the predictions
     /// it discards cost; a measurement option, off unless asked for.
     pub no_ibpb: bool,
+    /// The latest a busy PE's timer interrupt comes after its previous one,
+    /// in microseconds ([`TIMER_DELAY`]), in place of the engine's 10 ms: a
+    /// PE that has not waited since its last timer interrupt takes the next
+    /// once it had the time to retire the timer path's share of work at its
+    /// rate, or after this delay if that is sooner. A shorter delay brings a
+    /// slow PE's timers closer to their deadlines and spends more of its
+    /// time in timer interrupts.
+    pub timer_delay: Option<u64>,
     /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
     pub display_size: Option<(u32, u32)>,
     /// Check owned AP startup/host resources, then stop before guest entry.
@@ -417,6 +430,7 @@ impl Default for System {
             guest_pes: None,
             code_window: None,
             no_ibpb: false,
+            timer_delay: None,
             display_size: None,
             native_bootstrap_check: false,
             native_shared_check: false,
@@ -869,6 +883,7 @@ impl fmt::Display for System {
         line.value(GUEST_PES, self.guest_pes)?;
         line.value(CODE_WINDOW, self.code_window)?;
         line.flag(NO_IBPB, self.no_ibpb)?;
+        line.value(TIMER_DELAY, self.timer_delay)?;
         line.value(
             DISPLAY_SIZE,
             self.display_size

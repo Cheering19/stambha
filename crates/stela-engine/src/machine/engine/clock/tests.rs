@@ -464,20 +464,47 @@ fn a_busy_pe_s_timers_wait_for_its_share_of_work() {
     let (_, mut first, _) = pair();
     // Its first timer interrupt waits for nothing.
     assert_eq!(first.timer_due(Some(900)), Some(900));
-    first.timer_taken(1000, 0);
+    first.timer_taken(1000, 0, Some(900));
     assert_eq!(first.timer_due(Some(900)), Some(1000));
     // It then retired half the work in 100 counts: its timers wait 200
     // counts from the next interrupt.
-    first.timer_taken(1100, TIMER_WORK / 2);
+    first.timer_taken(1100, TIMER_WORK / 2, Some(1100));
     assert_eq!(first.timer_due(Some(1150)), Some(1300));
     assert_eq!(first.timer_due(Some(1400)), Some(1400));
     // A PE that waits had time to spare: its timers signal when due.
     first.wait(|| 1200);
     assert_eq!(first.timer_due(Some(1250)), Some(1250));
-    first.timer_taken(1250, TIMER_WORK);
+    first.timer_taken(1250, TIMER_WORK, Some(1250));
     assert_eq!(first.timer_due(Some(1250)), Some(1250));
     // A serialized clock's timers are never held.
     assert_eq!(Clock::default().timer_due(Some(5)), Some(5));
+}
+
+/// The latest a busy PE's timer comes is the boot's (`--timer-delay-us`),
+/// 10 ms unless set, from the next interrupt on; and the shared clock
+/// counts the timer interrupts its PEs took, those the gate held past their
+/// deadline, how long in all and the longest, until it is asked.
+#[test]
+fn a_busy_pe_s_timer_delay_is_the_boot_s_and_its_holds_are_counted() {
+    let (shared, mut first, _) = pair();
+    assert_eq!(shared.timer_delay_micros(), 10_000);
+    // A PE that retires a hundredth of its work in 1000 counts waits out
+    // the whole delay: 240 counts, 10 ms at 24 kHz.
+    first.timer_taken(1000, 0, Some(1000));
+    first.timer_taken(2000, TIMER_WORK / 100, Some(2000));
+    assert_eq!(first.timer_due(Some(2001)), Some(2240));
+    shared.set_timer_delay(2000);
+    assert_eq!(shared.timer_delay_micros(), 2000);
+    assert_eq!(first.timer_due(Some(2001)), Some(2240));
+    first.timer_taken(3000, TIMER_WORK / 50, Some(3000));
+    assert_eq!(first.timer_due(Some(3001)), Some(3048));
+    // Its deadline at 3001 came 47 counts late.
+    first.timer_taken(3048, TIMER_WORK / 25, Some(3001));
+    assert_eq!(shared.take_timer_gates(), [4, 1, 47, 47]);
+    assert_eq!(shared.take_timer_gates(), [0; 4]);
+    // An interrupt without a timer deadline due counts as taken alone.
+    first.timer_taken(4000, TIMER_WORK / 20, None);
+    assert_eq!(shared.take_timer_gates(), [1, 0, 0, 0]);
 }
 
 #[test]
@@ -493,7 +520,7 @@ fn a_pe_back_from_a_long_host_pause_takes_no_flood_of_timer_interrupts() {
             retired += TIMER_WORK / 100;
         }
         if !paused && first.timer_due(Some(0)).is_some_and(|due| count >= due) {
-            first.timer_taken(count, retired);
+            first.timer_taken(count, retired, Some(0));
             deliveries.push(count);
         }
     }

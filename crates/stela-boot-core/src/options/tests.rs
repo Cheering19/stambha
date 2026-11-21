@@ -319,6 +319,33 @@ fn native_core_counts_refuse_duplicates_zero_and_over_capacity() {
     );
 }
 
+/// `--timer-delay-us` bounds how late a busy PE's timer interrupt comes,
+/// from 100 us to 100 ms; without it the engine's 10 ms holds.
+#[test]
+fn a_timer_delay_takes_microseconds_within_its_bounds() {
+    assert_eq!(System::default().timer_delay, None);
+    let options = round_trip("--system --timer-delay-us 2000");
+    assert_eq!(options.timer_delay, Some(2000));
+    assert_eq!(options.to_string(), "--system --timer-delay-us 2000");
+    for micros in [100, 10_000, 100_000] {
+        let line = format!("--system --timer-delay-us {micros}");
+        assert_eq!(round_trip(&line).timer_delay, Some(micros), "{line}");
+    }
+    for (text, error) in [
+        ("--system --timer-delay-us", Error::TimerDelay),
+        ("--system --timer-delay-us x", Error::TimerDelay),
+        ("--system --timer-delay-us 0", Error::TimerDelay),
+        ("--system --timer-delay-us 99", Error::TimerDelay),
+        ("--system --timer-delay-us 100001", Error::TimerDelay),
+        (
+            "--system --timer-delay-us 1000 --timer-delay-us 1000",
+            Error::DuplicateTimerDelay,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
 /// `--no-ibpb` drops the prediction barrier at guest context switches; a
 /// boot without it isolates as before.
 #[test]

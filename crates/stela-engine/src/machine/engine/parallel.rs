@@ -847,6 +847,25 @@ impl Hub {
         self.clock.take_stalled()
     }
 
+    /// Since the last call, the timer interrupts every PE took, those a
+    /// busy PE's gate held past their deadline, the counts it held them in
+    /// all and the longest hold ([`SharedClock::take_timer_gates`]).
+    pub fn clock_timer_gates(&self) -> [u64; 4] {
+        self.clock.take_timer_gates()
+    }
+
+    /// The latest a busy PE's timer interrupt comes, in microseconds
+    /// ([`SharedClock::set_timer_delay`]).
+    pub fn clock_timer_delay(&self) -> u64 {
+        self.clock.timer_delay_micros()
+    }
+
+    /// Hold every PE's timer interrupts while busy at most `micros` after
+    /// its last one ([`SharedClock::set_timer_delay`]).
+    pub fn set_timer_delay(&self, micros: u64) {
+        self.clock.set_timer_delay(micros);
+    }
+
     /// Host counts of those a lease held while a kernel spin was old,
     /// since the last call ([`SharedClock::take_leased`]).
     pub fn clock_leased(&self) -> u64 {

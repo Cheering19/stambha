@@ -2085,6 +2085,18 @@ impl Heartbeat {
             }
             self.clock_count = count;
             output::arguments(format_args!("CLOCK count={count:#x}\n"));
+            // The timer interrupts the PEs took since the last beat, those
+            // a busy PE's gate held past their deadline, and how long: the
+            // average and the longest.
+            let hub = machine.devices.hub();
+            let [taken, held, held_counts, longest] = hub.clock_timer_gates();
+            let micros = |counts: u64| u128::from(counts) * 1_000_000 / u128::from(host::COUNTER_HZ);
+            output::arguments(format_args!(
+                "CLOCK TIMERS taken={taken} held={held} held_us={}/{} delay_us={}\n",
+                micros(held_counts) / u128::from(held.max(1)),
+                micros(longest),
+                hub.clock_timer_delay(),
+            ));
             report_stalls(machine);
         }
         let per_pe = parallel::counts(machine);
