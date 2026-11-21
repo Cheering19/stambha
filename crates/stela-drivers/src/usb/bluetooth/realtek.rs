@@ -70,6 +70,9 @@ pub struct Attempt {
     pub rom_version: Option<u8>,
     pub security: Option<[u8; 2]>,
     pub identity: Option<Identity>,
+    /// The absence of the profile's first image when a later one was asked
+    /// for (`Identity::firmware_images`, btrtl.c:1204-1209).
+    pub fallback: Option<crate::firmware::Error>,
     pub firmware: Option<FirmwareReceipt>,
     pub configuration: Option<core::result::Result<FirmwareReceipt, crate::firmware::Error>>,
     pub container_version: Option<ContainerVersion>,
@@ -91,6 +94,9 @@ pub struct OwnedReport {
     pub before: Identity,
     pub after: LocalVersion,
     pub address: [u8; 6],
+    /// The absence of the profile's first image, when `firmware` is a later
+    /// one (btrtl.c:1204-1209).
+    pub fallback: Option<Box<crate::firmware::Error>>,
     pub firmware: Box<FirmwareReceipt>,
     pub configuration: ConfigurationEvidence,
     pub container_version: ContainerVersion,

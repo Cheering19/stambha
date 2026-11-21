@@ -183,17 +183,37 @@ impl<B: Io> Engine<'_, B> {
         self.attempt.security = Some(security);
         let identity = Identity::select(usb, version, subversion, revision, rom[1], security)?;
         self.attempt.identity = Some(identity.clone());
-        let (name, container) = identity.firmware_images()[0];
+        let images = identity.firmware_images();
+        let (mut name, mut container) = images[0];
         let hardware = identity.usb.hardware_label();
-        let revision = identity.revision_label_for(container);
-        let target = identity.target(container, &hardware, &revision);
+        let mut revision = identity.revision_label_for(container);
         // Both immutable requirements are observed before propagating any error.
         // A failed integrity/target/config parse is never optional absence.
-        let firmware = provider.load(Requirement {
+        let mut firmware = provider.load(Requirement {
             name,
-            target,
+            target: identity.target(container, &hardware, &revision),
             minimum_bytes: container.minimum_bytes(),
         });
+        // btrtl.c:1196-1209: the next image only when this one did not
+        // load. Here only when it is absent: a present image whose integrity
+        // or target is refused is never replaced by another.
+        for &next in &images[1..] {
+            match &firmware {
+                Err(error) if error.kind == ResourceErrorKind::Missing => {
+                    self.attempt.fallback = Some(error.clone());
+                }
+                _ => break,
+            }
+            (name, container) = next;
+            revision = identity.revision_label_for(container);
+            firmware = provider.load(Requirement {
+                name,
+                target: identity.target(container, &hardware, &revision),
+                minimum_bytes: container.minimum_bytes(),
+            });
+        }
+        // The configuration is asked under the target of the image taken.
+        let target = identity.target(container, &hardware, &revision);
         let configuration = provider.load(Requirement {
             name: identity.configuration_name(),
             target,
@@ -283,6 +303,7 @@ impl<B: Io> Engine<'_, B> {
             before: identity,
             after,
             address,
+            fallback: self.attempt.fallback.take().map(Box::new),
             firmware: Box::new(firmware.into()),
             configuration,
             container_version,

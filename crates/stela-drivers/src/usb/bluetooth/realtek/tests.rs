@@ -137,6 +137,10 @@ fn firmware(project: Project) -> Vec<u8> {
         b.extend_from_slice(&[0xff, 2, 1, 1, project.id(), 1, 0, 0x51, 4, 0xfd, 0x77]);
         return b;
     }
+    v1_image(project)
+}
+/// A Realtech (EPATCH v1) container for `project`: one ROM 0 patch.
+fn v1_image(project: Project) -> Vec<u8> {
     let mut b = vec![0; 36];
     b[..8].copy_from_slice(b"Realtech");
     b[8..12].copy_from_slice(&0x12345678u32.to_le_bytes());
@@ -854,4 +858,193 @@ fn rtl8852cu_boots_its_v2_image_with_the_linked_empty_config() {
     drop(requests);
     assert!(hci.io.steps.is_empty());
     assert_eq!(trace.borrow().closed, 0);
+}
+/// The RTL8852CU's stock-ROM label for its second image, `.bin`.
+const RTL8852CU_V1: &str =
+    "epatch-v1:hci-0c-000c:lmp-0c-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00";
+fn rtl8852cu_v1_target() -> Target<'static> {
+    Target {
+        driver: "realtek-bluetooth-usb-epatch-v1",
+        hardware: "usb:13d3:3612:0100",
+        revision: RTL8852CU_V1,
+        board: None,
+    }
+}
+/// A catalog resource from the original stateful fixture.
+fn resource(
+    name: &'static str,
+    bytes: Vec<u8>,
+    target: Target<'static>,
+    member: &'static str,
+) -> Resource<'static> {
+    Resource {
+        name,
+        target,
+        provenance: Provenance {
+            source: "original stateful fixture",
+            revision: "model-v1",
+            member,
+            license: "MIT",
+        },
+        expected_length: bytes.len(),
+        expected_sha256: Sha256::digest(&bytes).into(),
+        bytes,
+    }
+}
+#[test]
+fn rtl8852cu_falls_back_to_its_v1_image_only_when_its_v2_image_is_missing() {
+    let (mut hci, _, _) = fixture(Project::Rtl8852Cu, true);
+    let cfg = vec![0x55, 0xab, 0x23, 0x87, 0, 0];
+    let catalog = Catalog::from_handoff(vec![
+        resource(
+            "rtl_bt/rtl8852cu_fw.bin",
+            v1_image(Project::Rtl8852Cu),
+            rtl8852cu_v1_target(),
+            "rtl_bt/rtl8852cu_fw.bin",
+        ),
+        resource(
+            "rtl_bt/rtl8852cu_config.bin",
+            cfg.clone(),
+            rtl8852cu_v1_target(),
+            "rtl_bt/rtl8761bu_config.bin",
+        ),
+    ])
+    .unwrap();
+    // The v1 patch ends in its container version, then the config follows.
+    let mut data = vec![0x80, 0x78, 0x56, 0x34, 0x12];
+    data.extend_from_slice(&cfg);
+    hci.io.steps[4].parameters = command(0xfc20, &data);
+    let provider = Recording {
+        catalog: &catalog,
+        requests: RefCell::new(vec![]),
+    };
+    let r = initialize(&mut hci, &provider).unwrap();
+    assert_eq!(r.firmware.name, "rtl_bt/rtl8852cu_fw.bin");
+    assert_eq!(r.firmware.target_driver, "realtek-bluetooth-usb-epatch-v1");
+    assert_eq!(r.firmware.target_revision, RTL8852CU_V1);
+    assert_eq!(r.before.revision_label_for(Container::V1), RTL8852CU_V1);
+    assert_eq!(r.container_version, ContainerVersion::V1(0x12345678));
+    assert!(r.v2.is_none());
+    let fallback = r.fallback.as_ref().unwrap();
+    assert_eq!(fallback.name, "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(fallback.kind, crate::firmware::ErrorKind::Missing);
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.2.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                RTL8852CU_V2,
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            (
+                "rtl_bt/rtl8852cu_fw.bin",
+                RTL8852CU_V1,
+                "realtek-bluetooth-usb-epatch-v1"
+            ),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                RTL8852CU_V1,
+                "realtek-bluetooth-usb-epatch-v1"
+            )
+        ]
+    );
+    drop(requests);
+    assert!(hci.io.steps.is_empty());
+}
+#[test]
+fn a_present_but_refused_rtl8852cu_v2_image_is_never_replaced_by_its_v1_image() {
+    struct Refuse<'a> {
+        catalog: &'a Catalog,
+        kind: crate::firmware::ErrorKind,
+        requests: RefCell<Vec<String>>,
+    }
+    impl Provider for Refuse<'_> {
+        fn load(
+            &self,
+            r: Requirement<'_>,
+        ) -> core::result::Result<Image<'_>, crate::firmware::Error> {
+            self.requests.borrow_mut().push(r.name.into());
+            if r.name == "rtl_bt/rtl8852cu_fw_v2.bin" {
+                return Err(crate::firmware::Error {
+                    name: r.name.into(),
+                    kind: self.kind.clone(),
+                });
+            }
+            self.catalog.load(r)
+        }
+    }
+    for kind in [
+        crate::firmware::ErrorKind::WrongTarget,
+        crate::firmware::ErrorKind::DigestMismatch {
+            expected: [1; 32],
+            actual: [2; 32],
+        },
+    ] {
+        let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+        let provider = Refuse {
+            catalog: &catalog,
+            kind: kind.clone(),
+            requests: RefCell::new(vec![]),
+        };
+        let e = initialize(&mut hci, &provider).unwrap_err();
+        let (cause, a) = attempt(&e);
+        assert!(
+            matches!(cause, Error::Resource(e) if e.name == "rtl_bt/rtl8852cu_fw_v2.bin" && e.kind == kind)
+        );
+        assert!(a.fallback.is_none());
+        assert!(a.download.is_empty());
+        assert_eq!(
+            *provider.requests.borrow(),
+            ["rtl_bt/rtl8852cu_fw_v2.bin", "rtl_bt/rtl8852cu_config.bin"]
+        );
+        assert_eq!(trace.borrow().commands, 4);
+        assert_eq!(hci.state(), State::Closed);
+    }
+}
+#[test]
+fn both_missing_rtl8852cu_images_fail_on_the_v1_name_with_the_v2_absence_kept() {
+    let (mut hci, _, trace) = fixture(Project::Rtl8852Cu, true);
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    let provider = Recording {
+        catalog: &empty,
+        requests: RefCell::new(vec![]),
+    };
+    let e = initialize(&mut hci, &provider).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(
+        cause,
+        Error::Resource(e)
+            if e.name == "rtl_bt/rtl8852cu_fw.bin" && e.kind == crate::firmware::ErrorKind::Missing
+    ));
+    assert!(
+        a.fallback
+            .as_ref()
+            .is_some_and(|e| e.name == "rtl_bt/rtl8852cu_fw_v2.bin")
+    );
+    assert!(a.download.is_empty() && a.v2.is_none());
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            ("rtl_bt/rtl8852cu_fw.bin", "realtek-bluetooth-usb-epatch-v1"),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                "realtek-bluetooth-usb-epatch-v1"
+            )
+        ]
+    );
+    drop(requests);
+    assert_eq!(trace.borrow().commands, 4);
+    assert_eq!(hci.state(), State::Closed);
 }
