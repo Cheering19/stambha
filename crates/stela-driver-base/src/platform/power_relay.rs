@@ -20,6 +20,23 @@ pub const REFRESH_MILLIS: u64 = 30_000;
 /// read its key table, early in its boot.
 pub const WAITING_REFRESH_MILLIS: u64 = 1_000;
 pub const WAIT_MILLIS: u64 = 60_000;
+/// A reading that fails, or takes this long, doubles the period, up to
+/// [`MAX_REFRESH_MILLIS`].
+pub const SLOW_REFRESH_MILLIS: u64 = 100;
+pub const MAX_REFRESH_MILLIS: u64 = 300_000;
+
+/// What a timed reading's outcome means for the log and the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Polled {
+    /// It failed, the first since one succeeded: say so.
+    pub failed: bool,
+    /// It took [`SLOW_REFRESH_MILLIS`] or more, the first that did: say so.
+    pub slow: bool,
+    /// It succeeded after a failure: say so.
+    pub recovered: bool,
+    /// The period until the next.
+    pub period_ms: u64,
+}
 
 /// Where the host's battery is on its way to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +158,12 @@ pub struct Relay {
     mode: AtomicU8,
     /// When a wait for a complete reading ends, in milliseconds.
     until: AtomicU64,
+    /// The period a failed or slow reading set; 0 for the mode's own.
+    period: AtomicU64,
+    /// The last timed reading failed.
+    failing: AtomicBool,
+    /// A slow timed reading was said.
+    slow_said: AtomicBool,
 }
 
 const NEVER: u64 = u64::MAX;
@@ -158,6 +181,9 @@ impl Relay {
             logged: AtomicU32::new(0),
             mode: AtomicU8::new(OFF),
             until: AtomicU64::new(0),
+            period: AtomicU64::new(0),
+            failing: AtomicBool::new(false),
+            slow_said: AtomicBool::new(false),
         }
     }
 
@@ -210,10 +236,7 @@ impl Relay {
                 expired: true,
             };
         }
-        let period = match self.mode() {
-            Mode::Waiting => WAITING_REFRESH_MILLIS,
-            Mode::Off | Mode::Attached => REFRESH_MILLIS,
-        };
+        let period = self.period.load(Ordering::Relaxed).max(self.base_period());
         let refreshed = self.refreshed.load(Ordering::Relaxed);
         let refresh = refreshed == NEVER || now_ms.wrapping_sub(refreshed) >= period;
         if refresh {
@@ -226,6 +249,36 @@ impl Relay {
             reading,
             flush: reading.is_none() && due != 0 && now_ms >= due,
             expired: false,
+        }
+    }
+
+    /// A timed reading the turns asked for ended, `failed` or not, after
+    /// `took_ms` of the firmware's AML.
+    pub fn polled(&self, failed: bool, took_ms: u64) -> Polled {
+        let slow = took_ms >= SLOW_REFRESH_MILLIS;
+        let base = self.base_period();
+        let period = if failed || slow {
+            let before = self.period.load(Ordering::Relaxed).max(base);
+            before.saturating_mul(2).min(MAX_REFRESH_MILLIS)
+        } else {
+            base
+        };
+        self.period
+            .store(if period == base { 0 } else { period }, Ordering::Relaxed);
+        let was_failing = self.failing.swap(failed, Ordering::Relaxed);
+        Polled {
+            failed: failed && !was_failing,
+            slow: slow && !self.slow_said.swap(true, Ordering::Relaxed),
+            recovered: !failed && was_failing,
+            period_ms: period,
+        }
+    }
+
+    /// The period between timed readings with none failing.
+    fn base_period(&self) -> u64 {
+        match self.mode() {
+            Mode::Waiting => WAITING_REFRESH_MILLIS,
+            Mode::Off | Mode::Attached => REFRESH_MILLIS,
         }
     }
 

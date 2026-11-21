@@ -124,6 +124,55 @@ fn a_wait_with_no_complete_reading_ends_once() {
 }
 
 #[test]
+fn a_failed_or_slow_reading_doubles_the_period_up_to_5_minutes_and_says_so_once() {
+    let relay = Relay::new();
+    relay.attached();
+    assert!(relay.turn(0).refresh);
+    // Failing: the period doubles each time, from 30 s to 5 min at most,
+    // and only the first failure is said.
+    let first = relay.polled(true, 2);
+    assert_eq!(
+        first,
+        Polled {
+            failed: true,
+            slow: false,
+            recovered: false,
+            period_ms: 2 * REFRESH_MILLIS
+        }
+    );
+    let mut period = 2 * REFRESH_MILLIS;
+    for _ in 0..6 {
+        let again = relay.polled(true, 2);
+        period = (period * 2).min(MAX_REFRESH_MILLIS);
+        assert_eq!(again.period_ms, period);
+        assert!(!again.failed);
+    }
+    assert_eq!(period, MAX_REFRESH_MILLIS);
+    // The turns follow the longer period.
+    assert!(!relay.turn(MAX_REFRESH_MILLIS - 1).refresh);
+    assert!(relay.turn(MAX_REFRESH_MILLIS).refresh);
+    // A success says it recovered and goes back to 30 s.
+    let back = relay.polled(false, 2);
+    assert!(back.recovered && !back.failed);
+    assert_eq!(back.period_ms, REFRESH_MILLIS);
+    assert!(!relay.polled(false, 2).recovered);
+    // A reading that took past the bound backs off as a failure does, and
+    // is said once.
+    let slow = relay.polled(false, SLOW_REFRESH_MILLIS);
+    assert!(slow.slow && !slow.failed);
+    assert_eq!(slow.period_ms, 2 * REFRESH_MILLIS);
+    assert!(!relay.polled(false, SLOW_REFRESH_MILLIS).slow);
+    assert_eq!(relay.polled(false, 1).period_ms, REFRESH_MILLIS);
+    // Waiting, the period starts from a second.
+    let waiting = Relay::new();
+    waiting.wait(0);
+    assert_eq!(
+        waiting.polled(true, 1).period_ms,
+        2 * WAITING_REFRESH_MILLIS
+    );
+}
+
+#[test]
 fn the_reading_at_attach_counts_as_the_guests() {
     let relay = Relay::new();
     assert_eq!(relay.take(), None);

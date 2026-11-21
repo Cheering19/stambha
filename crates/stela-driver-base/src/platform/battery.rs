@@ -184,17 +184,10 @@ impl<'a> Battery<'a> {
         } else {
             parse_information(self.evaluate(Method::Information)?, false)?
         };
-        let mut state = parse_state(self.evaluate(Method::State)?)?;
-        if information.unit == Unit::Charge {
-            // Linux's generic signed-16-bit DSDT rate correction, excluding
-            // the unknown sentinel. Preserve all other rates verbatim.
-            if let Some(rate) = state.rate {
-                let signed = rate as i16;
-                if signed < 0 {
-                    state.rate = Some(u32::from(signed.unsigned_abs()));
-                }
-            }
-        }
+        let state = corrected(
+            parse_state(self.evaluate(Method::State)?)?,
+            information.unit,
+        );
         let after = self.status()?;
         if after != status {
             return Err(Error::PresenceChanged);
@@ -204,6 +197,22 @@ impl<'a> Battery<'a> {
             information,
             state,
         });
+        Ok(self.snapshot.as_ref())
+    }
+
+    /// Linux's `acpi_battery_get_state`: `_BST` alone, keeping what the last
+    /// full [`Self::refresh`] read from `_STA` and `_BIX`/`_BIF`, which
+    /// notification 0x81 and resume refresh. A battery with no snapshot yet
+    /// takes the full refresh. No stale state survives a failure.
+    pub fn refresh_state(&mut self) -> Result<Option<&Snapshot>, Error> {
+        let Some(snapshot) = self.snapshot.take() else {
+            return self.refresh();
+        };
+        let state = corrected(
+            parse_state(self.evaluate(Method::State)?)?,
+            snapshot.information.unit,
+        );
+        self.snapshot = Some(Snapshot { state, ..snapshot });
         Ok(self.snapshot.as_ref())
     }
 
@@ -303,6 +312,19 @@ fn text(value: Value<'_>, method: Method) -> Result<Vec<u8>, Error> {
             .min(31),
     );
     Ok(bytes)
+}
+/// Linux's generic signed-16-bit DSDT rate correction for an mA firmware,
+/// excluding the unknown sentinel; every other rate is kept verbatim.
+fn corrected(mut state: State, unit: Unit) -> State {
+    if unit == Unit::Charge
+        && let Some(rate) = state.rate
+    {
+        let signed = rate as i16;
+        if signed < 0 {
+            state.rate = Some(u32::from(signed.unsigned_abs()));
+        }
+    }
+    state
 }
 fn parse_state(value: Value<'_>) -> Result<State, Error> {
     let method = Method::State;

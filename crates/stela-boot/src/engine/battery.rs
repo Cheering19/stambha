@@ -44,6 +44,33 @@ pub(super) fn publish(power: &stela_drivers::probe::Power) {
     RELAY.publish(PowerSnapshot { ac_online, battery });
 }
 
+/// The AML host's timed reading, which a turn asked for, ended: `failure`
+/// names what failed, and it ran `took_ms` of AML. A failure or a slow
+/// reading lengthens the period (`Relay::polled`); the first of each is
+/// said, and a reading that succeeds again.
+pub(super) fn polled(failure: Option<&str>, took_ms: u64) {
+    let polled = RELAY.polled(failure.is_some(), took_ms);
+    if let Some(failure) = failure.filter(|_| polled.failed) {
+        output::arguments(format_args!(
+            "POWER battery: reading the host's battery failed ({failure}); the next reading is \
+             in {} s, longer each failure up to {} s, and this is not said again until one \
+             succeeds\n",
+            polled.period_ms / 1000,
+            power_relay::MAX_REFRESH_MILLIS / 1000
+        ));
+    }
+    if polled.slow {
+        output::arguments(format_args!(
+            "POWER battery: reading the host's battery took {took_ms} ms on the boot processor; \
+             the next is in {} s\n",
+            polled.period_ms / 1000
+        ));
+    }
+    if polled.recovered {
+        output::arguments(format_args!("POWER battery: the host's battery reads again\n"));
+    }
+}
+
 /// Give the guest's SMC the battery `choice` names, before the guest starts:
 /// the synthetic battery, or the host's latest reading. A host reading
 /// without a percentage, a remaining or a full capacity would read as an
