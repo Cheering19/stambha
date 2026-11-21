@@ -277,6 +277,53 @@ impl fmt::Display for Failures {
     }
 }
 
+/// What an address that may name the owner's network beyond the LAN reads
+/// as.
+const PUBLIC: &str = "<public>";
+
+/// An IPv4 address as the line prints it: itself when it names no network
+/// beyond the owner's own, a private (RFC 1918), link-local (RFC 3927) or
+/// shared (RFC 6598, 100.64.0.0/10) one, else `<public>`.
+pub struct Shown(pub Ipv4Addr);
+
+impl fmt::Display for Shown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [first, second, ..] = self.0.octets();
+        let shared = first == 100 && second & 0xc0 == 0x40;
+        match self.0.is_private() || self.0.is_link_local() || shared {
+            true => write!(f, "{}", self.0),
+            false => f.write_str(PUBLIC),
+        }
+    }
+}
+
+/// `account`, the network stack's DHCP account (`Stack::dhcp_summary`),
+/// with the address after each `server=` and `router=` (the lease's) as
+/// [`Shown`] writes it; anything else, a word that is no address among it,
+/// as it was.
+pub fn hide_public(account: &str) -> String {
+    let mut shown = String::with_capacity(account.len());
+    let mut rest = account;
+    while let Some(at) = ["server=", "router="]
+        .iter()
+        .filter_map(|name| rest.find(name).map(|at| at + name.len()))
+        .min()
+    {
+        shown.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        match rest[..end].parse::<Ipv4Addr>() {
+            Ok(address) => shown.push_str(&alloc::format!("{}", Shown(address))),
+            Err(_) => shown.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    shown.push_str(rest);
+    shown
+}
+
 /// A DHCPv4 lease, `after_us` after the station began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
@@ -299,16 +346,18 @@ pub enum Outcome {
 /// The station check's verdict and the line's ending after the progress
 /// (M3 spec "Done means", M3b): a pass is a lease with
 /// [`Progress::keyed`], `; DHCP lease <a.b.c.d>/<p> router <r|-> after <s>
-/// s`; anything else fails and says which way.
+/// s`, each address as [`Shown`] writes it; anything else fails and says
+/// which way.
 pub fn ending(outcome: &Outcome, progress: &Progress) -> (bool, String) {
     match outcome {
         Outcome::Leased(lease) => {
-            let router = lease
-                .router
-                .map_or_else(|| String::from("-"), |router| alloc::format!("{router}"));
+            let router = lease.router.map_or_else(
+                || String::from("-"),
+                |router| alloc::format!("{}", Shown(router)),
+            );
             let line = alloc::format!(
                 "; DHCP lease {}/{} router {router} after {} s",
-                lease.address,
+                Shown(lease.address),
                 lease.prefix,
                 lease.after_us / 1_000_000
             );

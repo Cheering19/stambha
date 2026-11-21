@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::ToString;
 use core::net::Ipv4Addr;
 
 /// What an rtw89 radio prints once M3b's handshake ran (M3 spec S14.6): its
@@ -244,6 +245,89 @@ fn every_other_ending_fails_and_says_why() {
             String::from("; no DHCP lease: invalid request: interface address capacity")
         )
     );
+}
+
+/// The line prints an address only when it names no network beyond the
+/// owner's own: a private, link-local or shared (100.64.0.0/10) one.
+#[test]
+fn only_local_addresses_are_shown() {
+    for (octets, local) in [
+        ([10, 1, 2, 3], true),
+        ([172, 16, 0, 1], true),
+        ([172, 31, 255, 254], true),
+        ([172, 32, 0, 1], false),
+        ([192, 168, 29, 1], true),
+        ([192, 169, 0, 1], false),
+        ([169, 254, 3, 4], true),
+        ([100, 64, 0, 1], true),
+        ([100, 127, 255, 254], true),
+        ([100, 63, 255, 255], false),
+        ([100, 128, 0, 1], false),
+        ([203, 0, 113, 5], false),
+        ([8, 8, 8, 8], false),
+    ] {
+        let address = Ipv4Addr::from(octets);
+        let shown = match local {
+            true => address.to_string(),
+            false => String::from("<public>"),
+        };
+        assert_eq!(Shown(address).to_string(), shown, "{address}");
+    }
+}
+
+#[test]
+fn a_public_lease_and_router_read_as_public() {
+    let keyed = Progress::read(KEYED);
+    let leased = |address: [u8; 4], prefix, router: [u8; 4]| {
+        Outcome::Leased(Lease {
+            address: Ipv4Addr::from(address),
+            prefix,
+            router: Some(Ipv4Addr::from(router)),
+            after_us: 7_900_000,
+        })
+    };
+    assert_eq!(
+        ending(&leased([203, 0, 113, 5], 24, [203, 0, 113, 1]), &keyed),
+        (
+            true,
+            String::from("; DHCP lease <public>/24 router <public> after 7 s")
+        )
+    );
+    assert_eq!(
+        ending(&leased([100, 64, 12, 34], 10, [100, 64, 0, 1]), &keyed).1,
+        "; DHCP lease 100.64.12.34/10 router 100.64.0.1 after 7 s"
+    );
+    assert_eq!(
+        ending(&leased([10, 0, 0, 9], 8, [8, 8, 4, 4]), &keyed).1,
+        "; DHCP lease 10.0.0.9/8 router <public> after 7 s"
+    );
+}
+
+/// The network stack's DHCP account (`Stack::dhcp_summary`) names the
+/// lease's server and router: each reads as [`Shown`].
+#[test]
+fn the_dhcp_account_shows_only_a_local_server_and_router() {
+    let account = "sent discover=1 request=1; replies offer=1 ack=1 nak=0 other=0 (broadcast=2 \
+                   unicast=0) for_other_clients=0; not taken: checksum=0 xid=0 no_server_id=0 \
+                   your_ip=0 no_mask=0; broadcast_frames=2 vlan_tagged=0; lease=3600s \
+                   server=203.0.113.1 mask=255.255.255.0 router=192.168.1.1";
+    assert_eq!(
+        hide_public(account),
+        account.replace("server=203.0.113.1", "server=<public>")
+    );
+    assert_eq!(
+        hide_public("lease=3600s server=10.0.0.1 mask=255.0.0.0 router=8.8.8.8"),
+        "lease=3600s server=10.0.0.1 mask=255.0.0.0 router=<public>"
+    );
+    for kept in [
+        "lease=unseen",
+        "lease=none server=none mask=none router=none",
+        "server=<public> router=<public>",
+        "server=",
+        "router=1.2.3",
+    ] {
+        assert_eq!(hide_public(kept), kept);
+    }
 }
 
 #[test]

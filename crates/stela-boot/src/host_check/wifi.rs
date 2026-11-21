@@ -34,9 +34,11 @@
 //! TX pools are kept. A PASS is the lease with the station's keys and its
 //! port open. The network's name is hidden wherever the line would print it
 //! (the keeper's failures name it), then every address is masked; the
-//! lease's private LAN addresses are printed (spec "Done means"); the
-//! secret is never printed: it lives in the keeper's network, which clears
-//! it when the keeper goes.
+//! lease's address and router, and the DHCP account's server and router,
+//! are printed only when private, link-local or shared (100.64.0.0/10),
+//! else as `<public>` (spec "Done means", `host_wifi::Shown`); the secret
+//! is never printed: it lives in the keeper's network, which clears it
+//! when the keeper goes.
 //!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
@@ -59,7 +61,8 @@ use core::{
 use stela_boot_core::{
     heap::Heap,
     host_wifi::{
-        Cut, FLUSH_US, Failures, Lease, Outcome, Progress, ending, hide_ssid, mask_addresses,
+        Cut, FLUSH_US, Failures, Lease, Outcome, Progress, ending, hide_public, hide_ssid,
+        mask_addresses,
     },
     native_memory::NativeMemory,
     options::{DEFAULT_WIFI_KEY, HostCheck},
@@ -695,7 +698,7 @@ fn keep(
     let (passed, ended) = ending(&outcome, &Progress::read(&progress));
     let mut detail = format!("{running}; station {progress}{ended}");
     if let Some(summary) = summary {
-        detail.push_str(&format!("; dhcp {summary}"));
+        detail.push_str(&format!("; dhcp {}", hide_public(&summary)));
     }
     if !failures.is_empty() {
         detail.push_str(&format!("; {failures}"));
