@@ -6,7 +6,8 @@
 //! presence inversion and headset CTIA/OMTP policies are not inferred.
 //! An ALC256's bind runs the same init before any route, on the headphone
 //! and speaker pins auto_parser.c::snd_hda_parse_pin_defcfg assigns, with
-//! realtek.c::{alc_get_hp_pin,alc_auto_init_amp}.
+//! realtek.c::{alc_get_hp_pin,alc_auto_init_amp} and alc269.c::alc269_probe,
+//! read at cc9de5d4b5ab6459f5774946aa3195ad51236fa8 (Linux 7.2.12).
 use super::{CoefficientChange, RealtekCommonReport};
 use crate::{
     Direction, Error, Timer,
