@@ -74,7 +74,9 @@ impl BlockRing {
         }
         self.tail
             .store(tail.wrapping_add(count as u64), Ordering::Release);
-        if count < into.len() {
+        // A locked swap only when there is an overflow to take: the engine
+        // takes after every native run.
+        if count < into.len() && self.overflow.load(Ordering::Relaxed) != 0 {
             let cycles = self.overflow.swap(0, Ordering::Relaxed);
             if cycles != 0 {
                 into[count] = BlockSample {
