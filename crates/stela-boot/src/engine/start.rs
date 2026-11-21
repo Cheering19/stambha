@@ -3367,15 +3367,10 @@ fn start_devices(
             // is not lent: the guest's function would carry the host's
             // vendor commands and replies, which BlueTool's chip boot and
             // bluetoothd's bring-up do not take. It is released in the
-            // loader's root by its drop. The log says so once.
-            if let Some(line) = stela_boot_core::guest_bluetooth::model_line(
-                host_controller.is_some(),
-                options.input,
-            ) {
-                output::arguments(format_args!("{line}"));
-                host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
-            }
-            drop(host_controller);
+            // loader's root by its drop (`bluetooth::HostBluetooth::guest`).
+            // The log says so once.
+            host_bluetooth =
+                bluetooth::HostBluetooth::guest(host_controller, options, handoff.root);
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {

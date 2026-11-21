@@ -47,6 +47,7 @@ pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
 pub const USB4_APPROVE: &str = "--usb4-approve";
+pub const BLUETOOTH_TRACE: &str = "--bluetooth-trace";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
 /// IEEE 802.11 SSIDs are 1 to 32 octets.
@@ -274,6 +275,10 @@ pub struct System {
     /// Cable the native USB keyboard and pointer to the last USB-C
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
+    /// Log every packet of the guest's Bluetooth controller, 1024 per
+    /// configuration (`--bluetooth-trace`). The packets name nearby devices'
+    /// addresses and names.
+    pub bluetooth_trace: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -394,6 +399,7 @@ impl Default for System {
             survey: false,
             idle_skip: false,
             input: false,
+            bluetooth_trace: false,
             native_cores: None,
             guest_pes: None,
             display_size: None,
@@ -841,6 +847,7 @@ impl fmt::Display for System {
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
+        line.flag(BLUETOOTH_TRACE, self.bluetooth_trace)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

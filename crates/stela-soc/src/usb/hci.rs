@@ -73,6 +73,7 @@ use alloc::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
 use stela_contracts::refuse;
 use stela_drivers::usb::bluetooth::MAX_ACL_PAYLOAD;
 
+pub mod capture;
 pub mod model;
 
 const EVENTS: u8 = 0x81;
@@ -135,6 +136,8 @@ pub enum Traced {
     /// [`TRACED_COMMANDS`] commands were traced; an HCI Reset or the next
     /// configuration starts again.
     Ended,
+    /// The capture (`capture`) took its packets for this configuration.
+    CaptureEnded,
 }
 
 /// The event that answered a traced command.
@@ -186,6 +189,11 @@ impl core::fmt::Display for Traced {
             Self::Ended => write!(
                 f,
                 "trace ends after {TRACED_COMMANDS} commands until the next HCI Reset or configuration"
+            ),
+            Self::CaptureEnded => write!(
+                f,
+                "capture ends after {} packets until the next configuration",
+                capture::CAPTURED_PACKETS
             ),
         }
     }
@@ -278,6 +286,8 @@ struct State {
     configured: u8,
     /// HCI Resets that may still start the trace again.
     bring_ups: u8,
+    /// Every packet, once the owner asks (`--bluetooth-trace`).
+    capture: capture::Capture,
 }
 
 /// The function: its pipes and queues.
@@ -425,6 +435,7 @@ impl Hci {
                 tracing: 0,
                 configured: 0,
                 bring_ups: 0,
+                capture: capture::Capture::default(),
             },
         }
     }
@@ -465,6 +476,18 @@ impl Hci {
         core::mem::take(&mut self.state.trace)
     }
 
+    /// Capture every packet from now on, [`capture::CAPTURED_PACKETS`] per
+    /// configuration (`--bluetooth-trace`).
+    pub fn capture(&mut self) {
+        let configured = self.up();
+        self.state.capture.enable(configured);
+    }
+
+    /// The packets captured since they were last taken.
+    pub fn take_captured(&mut self) -> Vec<capture::Captured> {
+        self.state.capture.take()
+    }
+
     /// The next packet the guest sent for the host's controller.
     pub fn take(&mut self) -> Option<Outbound> {
         self.state.outbound.pop_front()
@@ -491,6 +514,7 @@ impl Hci {
             return;
         }
         state.counters.acl_to_guest += 1;
+        state.captured(capture::Direction::ToGuest, capture::Kind::Acl, packet);
         state.acl.queue.push_back(packet.to_vec());
     }
 }
@@ -514,7 +538,14 @@ impl State {
             return;
         }
         self.counters.events_to_guest += 1;
+        self.captured(capture::Direction::ToGuest, capture::Kind::Event, &packet);
         self.events.queue.push_back(packet);
+    }
+
+    fn captured(&mut self, direction: capture::Direction, kind: capture::Kind, packet: &[u8]) {
+        if self.capture.record(direction, kind, packet) {
+            self.trace(Traced::CaptureEnded);
+        }
     }
 
     fn modeled_command(&mut self, packet: &[u8]) {
@@ -594,6 +625,11 @@ impl State {
             self.counters.malformed += 1;
             return Err(Stall);
         }
+        self.captured(
+            capture::Direction::FromGuest,
+            capture::Kind::Command,
+            packet,
+        );
         let opcode = u16::from_le_bytes([low, high]);
         let vendor = opcode >> 10 == VENDOR_GROUP;
         if self.model.is_some() {
@@ -630,6 +666,7 @@ impl State {
             self.assembling.clear();
         } else if self.assembling.len() == ACL_HEADER + data {
             let packet = core::mem::take(&mut self.assembling);
+            self.captured(capture::Direction::FromGuest, capture::Kind::Acl, &packet);
             if self.model.is_some() {
                 self.modeled_acl(&packet);
             } else {
@@ -655,6 +692,7 @@ impl Requests for State {
         } else {
             (TRACED_COMMANDS, TRACED_BRING_UPS)
         };
+        self.capture.configured(value);
         self.halted = [false; 3];
         self.sco_setting = 0;
         self.outbound.clear();
@@ -1185,6 +1223,106 @@ mod tests {
         assert_eq!(traced[0], Traced::Configured(1));
         assert_eq!(traced.len(), 2);
         assert_eq!(Traced::Reset.to_string(), "bus reset");
+    }
+
+    /// `--bluetooth-trace`: once the owner asks, every packet after each
+    /// configuration, both ways, then one end line until the next
+    /// configuration; nothing before it asks.
+    #[test]
+    fn the_capture_holds_every_packet_after_each_configuration() {
+        use capture::{CAPTURED_PACKETS, Captured, Direction, Kind};
+        let mut hci = modeled();
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert!(hci.take_captured().is_empty(), "nothing until asked");
+        hci.capture();
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        let answer = read(&mut hci, EVENTS, EVENT_PACKET).concat();
+        assert_eq!(
+            hci.take_captured(),
+            [
+                Captured::new(Direction::FromGuest, Kind::Command, &[0x09, 0x10, 0]),
+                Captured::new(Direction::ToGuest, Kind::Event, &answer),
+            ]
+        );
+        // ACL data from the guest, and the model's return of its buffer.
+        hci.packet(ACL_OUT, Token::Out, &mut [1, 0, 1, 0, 7])
+            .unwrap();
+        let completed = read(&mut hci, EVENTS, EVENT_PACKET).concat();
+        assert_eq!(
+            hci.take_captured(),
+            [
+                Captured::new(Direction::FromGuest, Kind::Acl, &[1, 0, 1, 0, 7]),
+                Captured::new(Direction::ToGuest, Kind::Event, &completed),
+            ]
+        );
+        hci.take_trace();
+        // The bound counts every packet of the configuration.
+        let left = usize::from(CAPTURED_PACKETS) - 4;
+        for _ in 0..left / 2 {
+            command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+            read(&mut hci, EVENTS, EVENT_PACKET);
+        }
+        assert_eq!(hci.take_captured().len(), left);
+        assert_eq!(hci.take_trace().last(), Some(&Traced::CaptureEnded));
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert!(hci.take_captured().is_empty());
+        assert_eq!(
+            Traced::CaptureEnded.to_string(),
+            "capture ends after 1024 packets until the next configuration"
+        );
+        // A new configuration starts it again; a bus reset stops it.
+        transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert_eq!(hci.take_captured().len(), 2);
+        hci.reset().unwrap();
+        let mut hci = configured(hci);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert_eq!(hci.take_captured().len(), 2, "still asked for");
+    }
+
+    /// A packet longer than the capture shows keeps its first bytes and
+    /// counts the rest; a host controller's packets are captured as they
+    /// reach the guest.
+    #[test]
+    fn a_captured_packet_keeps_its_first_bytes_and_counts_the_rest() {
+        use capture::{CAPTURED_BYTES, Captured, Direction, Kind};
+        let mut hci = controller();
+        hci.capture();
+        let mut long = vec![1, 0, 0, 2];
+        long.resize(ACL_HEADER + 512, 7);
+        let (first, rest) = long.split_at(512);
+        hci.packet(ACL_OUT, Token::Out, &mut first.to_vec())
+            .unwrap();
+        hci.packet(ACL_OUT, Token::Out, &mut rest.to_vec()).unwrap();
+        hci.deliver_acl(&long);
+        hci.deliver_event(&[0x0e, 4, 1, 0x03, 0x0c, 0]);
+        let shown = long[..CAPTURED_BYTES].to_vec();
+        let cut = long.len() - CAPTURED_BYTES;
+        assert_eq!(
+            hci.take_captured(),
+            [
+                Captured {
+                    direction: Direction::FromGuest,
+                    kind: Kind::Acl,
+                    bytes: shown.clone(),
+                    cut,
+                },
+                Captured {
+                    direction: Direction::ToGuest,
+                    kind: Kind::Acl,
+                    bytes: shown,
+                    cut,
+                },
+                Captured::new(
+                    Direction::ToGuest,
+                    Kind::Event,
+                    &[0x0e, 4, 1, 0x03, 0x0c, 0]
+                ),
+            ]
+        );
     }
 
     #[test]

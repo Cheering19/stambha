@@ -30,7 +30,10 @@ use crate::usb::{
 };
 pub use crate::usb::{
     ecm::Counters as UsbNetworkCounters,
-    hci::{Counters as UsbBluetoothCounters, Outbound, Traced as UsbBluetoothTrace},
+    hci::{
+        Counters as UsbBluetoothCounters, Outbound, Traced as UsbBluetoothTrace,
+        capture::Captured as UsbBluetoothCaptured,
+    },
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
     mux::{
         Backpressure as MuxBackpressure, State as MuxState, StreamId as MuxStream,

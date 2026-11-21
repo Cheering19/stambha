@@ -10,7 +10,9 @@
 //! reports the model's unknown commands, each once, how many commands the
 //! guest sent, at each doubling, and the function's trace: each
 //! configuration and reset, and the first commands after each
-//! configuration with their answers.
+//! configuration with their answers. With `--bluetooth-trace` it also logs
+//! every packet the function captures (`GUEST BLUETOOTH RAW`, at most
+//! `stela_soc::usb::hci::capture::CAPTURED_PACKETS` per configuration).
 //!
 //! One controller serves the guest; others are reported and left idle. A
 //! controller that fails is reported once, and the guest's commands then get
@@ -24,13 +26,15 @@
 //! controller, for the next service turn.
 use super::{output, storage::RestoreRoot};
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
+use stela_boot_core::options::System;
 use stela_drivers::{
     bluetooth::{bcm4377, intel_pcie},
     probe::native::{Bcm4377, IntelBluetooth, PcieController, PcieHci},
     usb::bluetooth::{Packet, UsbHci},
 };
 use stela_soc::machine::{
-    AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCounters, UsbBluetoothTrace,
+    AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCaptured, UsbBluetoothCounters,
+    UsbBluetoothTrace,
 };
 
 enum Controller {
@@ -61,6 +65,10 @@ pub struct HostBluetooth {
     reported_commands: u64,
     /// The guest function's trace, to report.
     trace: Vec<UsbBluetoothTrace>,
+    /// Whether the function is still to be asked for its capture.
+    capture: bool,
+    /// The packets it captured, to report.
+    captured: Vec<UsbBluetoothCaptured>,
 }
 
 /// The controller is dropped in the loader's root. An install runs without
@@ -109,6 +117,8 @@ impl HostBluetooth {
             unknown: Vec::new(),
             reported_commands: 0,
             trace: Vec::new(),
+            capture: false,
+            captured: Vec::new(),
         })
     }
 
@@ -125,7 +135,24 @@ impl HostBluetooth {
             unknown: Vec::new(),
             reported_commands: 0,
             trace: Vec::new(),
+            capture: false,
+            captured: Vec::new(),
         }
+    }
+
+    /// The guest's controller for a boot with `options`, said once in the
+    /// log: the model of Apple's internal USB module for every boot with
+    /// host input. The host's `controller` is not lent: the guest's
+    /// function would carry the host's vendor commands and replies, which
+    /// BlueTool's chip boot and bluetoothd's bring-up do not take. One not
+    /// kept is released in the loader's root by its drop.
+    pub fn guest(controller: Option<Self>, options: &System, root: u64) -> Option<Self> {
+        let line =
+            stela_boot_core::guest_bluetooth::model_line(controller.is_some(), options.input)?;
+        output::arguments(format_args!("{line}"));
+        let mut guest = Self::modeled(root);
+        guest.capture = options.bluetooth_trace;
+        Some(guest)
     }
 
     /// The guest's USB function for this controller.
@@ -145,7 +172,13 @@ impl HostBluetooth {
         if matches!(self.controller, Controller::Modeled) {
             self.unknown.extend(devices.bluetooth_unknown());
         }
+        // Asked at the first service turn, before the guest's USB stack
+        // can configure the function.
+        if core::mem::take(&mut self.capture) {
+            devices.bluetooth_capture();
+        }
         self.trace.extend(devices.bluetooth_trace());
+        self.captured.extend(devices.bluetooth_captured());
         let packets = core::iter::from_fn(|| devices.bluetooth_take()).collect();
         (
             packets,
@@ -169,6 +202,9 @@ impl HostBluetooth {
         // configuration, and its resets.
         for entry in self.trace.drain(..) {
             output::arguments(format_args!("GUEST BLUETOOTH {entry}\n"));
+        }
+        for packet in self.captured.drain(..) {
+            output::arguments(format_args!("GUEST BLUETOOTH RAW {packet}\n"));
         }
         for opcode in self.unknown.drain(..) {
             output::arguments(format_args!(

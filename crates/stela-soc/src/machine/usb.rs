@@ -263,6 +263,21 @@ impl AppleDevices {
             .unwrap_or_default()
     }
 
+    /// Capture every packet of the guest's Bluetooth controller from now on
+    /// (`--bluetooth-trace`).
+    pub fn bluetooth_capture(&mut self) {
+        if let Some(hci) = self.usb_bluetooth() {
+            hci.capture();
+        }
+    }
+
+    /// The Bluetooth packets captured since they were last taken.
+    pub fn bluetooth_captured(&mut self) -> Vec<UsbBluetoothCaptured> {
+        self.usb_bluetooth()
+            .map(|hci| hci.take_captured())
+            .unwrap_or_default()
+    }
+
     /// Whether the guest configured its Bluetooth controller, and the
     /// controller's counters; `None` without one.
     pub fn bluetooth_status(&mut self) -> Option<(bool, UsbBluetoothCounters)> {
