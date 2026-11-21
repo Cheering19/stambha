@@ -1006,10 +1006,11 @@ fn an_ap_without_wmm_leaves_its_edca_to_the_chip() {
 
 #[test]
 fn the_slot_is_the_association_responses_not_the_beacons() {
+    // At association the slot is the response's, not the scan beacon's:
     // mac80211 keeps the response's capability as `assoc_capability`
     // (`mlme.c:6339`) and takes the slot from it
-    // (`ieee80211_handle_bss_capability`, `mlme.c:4344`): a 2.4 GHz
-    // beacon without the short slot does not undo the response's.
+    // (`ieee80211_handle_bss_capability`, `mlme.c:4344`). mac80211 then
+    // follows changed beacons (`mlme.c:8395`), which this radio does not.
     let (mut wifi, model) = wifi_with(|air| air.short_slot_response = true);
     assert!(run(&mut wifi, &model, |wifi, _| {
         wifi.radio().station().phase() == Peering::Associated
@@ -2020,7 +2021,9 @@ fn under_pmf_a_deauthentication_without_its_ptk_never_leaves_in_the_clear() {
     // the station layer still holds the port authorized under PMF. The
     // deauthentication that follows is robust and protected, with no PTK
     // left to seal it: it is dropped and reported to the keeper once, never
-    // sent with the Protected bit over a plain body.
+    // sent with the Protected bit over a plain body. Only "never in the
+    // clear" is the property; the drop itself is a known gap (mac80211
+    // would send it protected under a software key).
     let (mut wifi, model) = connected_with_pmf();
     model.0.borrow_mut().refuse_keys = true;
     let got = wifi
@@ -2120,7 +2123,8 @@ fn the_keepers_group_key_handshake_installs_the_new_gtk_under_the_ptk() {
     // The new GTK's frame is delivered and its replay refused. So is the
     // old GTK's: the shared station layer authorizes the port on the GTK
     // last installed alone, where mac80211 takes either index until the
-    // AP's switch (the shared-layer gap of ruling R4, outside this radio).
+    // AP's switch. That is a known gap in the shared station layer, outside
+    // this radio, pinned here so a fix there shows up as this test failing.
     assert_eq!(delivered(&mut wifi), [0x5a]);
     let line = progress(&mut wifi);
     assert!(

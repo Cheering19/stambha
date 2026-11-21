@@ -675,7 +675,11 @@ pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError>
 /// are marked stopped, and once every index clear succeeded the RXQ and RPQ
 /// host indices restart at 0: only another `pre_init` starts the rings
 /// again. A clear that fails stops the ones after it, the RX clear last, so
-/// the RX host indices stay with the hardware's they still match.
+/// the RX host indices stay with the hardware's they still match. This
+/// relies on a failed clear never reaching the device: on the real MMIO
+/// window the range check runs before any access and every ring register is
+/// in range, so `clr_idx_all` fails only in a test model, never after a
+/// write has landed.
 pub fn deinit<I: AxIo + ?Sized>(io: &mut I, rings: &Rings, ltr: bool) -> Result<(), AxError> {
     rings.ch12_ready.set(false);
     rings.data_ready.set(false);
