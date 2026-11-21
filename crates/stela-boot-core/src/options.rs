@@ -920,6 +920,10 @@ pub struct HostCheck {
     pub wifi_key: Option<String>,
     /// The network's country, upper case (`--wifi-country XX`).
     pub wifi_country: Option<String>,
+    /// POST once to this `http://` or `https://` URL over the `--wifi`
+    /// network once it gives a DHCP lease, and report the reply, as a
+    /// normal boot's `--network-check URL` does over its network.
+    pub network_check: Option<String>,
     /// Keep the newest lines, the summary among them, in the firmware's
     /// stop-record variables once the checks end (`--keep-lines`).
     pub keep_lines: bool,
@@ -935,6 +939,7 @@ impl Default for HostCheck {
             ssid: None,
             wifi_key: None,
             wifi_country: None,
+            network_check: None,
             keep_lines: false,
         }
     }
@@ -991,6 +996,14 @@ impl HostCheck {
                         return Err(Error::DuplicateWifiCountry);
                     }
                 }
+                // The normal boot's URL rules (`parse::system`).
+                "--network-check" => {
+                    let url = words.next().ok_or(Error::MissingNetworkUrl)?;
+                    parse_url(url)?;
+                    if options.network_check.replace(String::from(url)).is_some() {
+                        return Err(Error::DuplicateNetworkCheck);
+                    }
+                }
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -1022,6 +1035,7 @@ impl fmt::Display for HostCheck {
                 .filter(|&path| path != DEFAULT_WIFI_KEY),
         )?;
         line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
+        line.value("--network-check", self.network_check.as_deref())?;
         line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }

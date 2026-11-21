@@ -40,6 +40,18 @@
 //! is never printed: it lives in the keeper's network, which clears it
 //! when the keeper goes.
 //!
+//! With `--network-check URL` (roadmap step 4, in place of a normal
+//! `--wifi` boot's) the station, once leased, POSTs to `URL` over the same
+//! stack as a normal boot's `--network-check` does (`Stack::post_url`, no
+//! headers, `text/plain`, no body), under the same cut, before the
+//! deauthentication; an `https://` hop takes a TLS configuration made as a
+//! normal boot makes its own (`engine::network::security`), from the
+//! firmware's RTC read before ExitBootServices and the station's stream.
+//! Its result is `CHECK network` ([`network`], `host_wifi::network_check`):
+//! any HTTP answer passes, a transport failure fails; the network's name
+//! is hidden, every MAC address masked and every public IPv4 address, the
+//! server's among them, printed as `<public>`.
+//!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
 //! firmware. If the firmware left an IOMMU translating that does not map the
@@ -61,8 +73,8 @@ use core::{
 use stela_boot_core::{
     heap::Heap,
     host_wifi::{
-        Cut, FLUSH_US, Failures, Lease, Outcome, Progress, ending, hide_public, hide_ssid,
-        mask_addresses,
+        Cut, FLUSH_US, Failures, Lease, Outcome, Post, Progress, ending, hide_public, hide_ssid,
+        mask_addresses, network_check,
     },
     native_memory::NativeMemory,
     options::{DEFAULT_WIFI_KEY, HostCheck},
@@ -100,7 +112,7 @@ use stela_drivers::{
         native::{Rtw89Device, rtw89_attach, rtw89_attach_with},
     },
 };
-use stela_runtime::net::{ClockError, NetError, Stack};
+use stela_runtime::net::{ClockError, NetError, Stack, TlsUnavailable};
 use uefi::boot::{self, AllocateType, MemoryType};
 
 /// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
@@ -178,17 +190,32 @@ impl Drop for Key {
 
 /// What `--wifi` keeps the chip connected to: the network, with the key
 /// file's secret, the handshake nonces' source, and the network stack's
-/// seed (its TCP sequence numbers, ports and DHCP transaction IDs).
+/// seed (its TCP sequence numbers, ports and DHCP transaction IDs); and
+/// with `--network-check`, what the station POSTs once leased.
 struct Station {
     network: Network,
     entropy: Arc<dyn Entropy>,
     seed: u64,
+    check: Option<NetworkCheck>,
+}
+
+/// `--network-check`: the URL, and the TLS configuration an `https://` hop
+/// takes, made as a normal boot makes its own
+/// (`engine::network::security::client_config`): the firmware's RTC, read
+/// before ExitBootServices, carried forward on the invariant TSC, with the
+/// station's stream as its randomness. Without a usable RTC or an
+/// invariant TSC it is unavailable, and an `https://` hop fails, never
+/// falling back to `http://`.
+struct NetworkCheck {
+    url: String,
+    security: Result<Arc<stela_tls::ClientConfig>, TlsUnavailable>,
 }
 
 /// The network `options` names, with `key`'s secret: a key file that is
 /// missing, empty or unusable fails as `key: …`, without its contents; and
 /// a stream seeded before ExitBootServices for the handshake's nonces,
-/// which gives the network stack's seed first.
+/// which gives the network stack's seed first, then with `--network-check`
+/// the TLS configuration's randomness.
 fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, String> {
     let path = options.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
     if key.0.is_empty() {
@@ -206,14 +233,25 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, St
     source
         .fill(&mut seed)
         .map_err(|error| format!("entropy: {error:?}"))?;
+    let entropy: Arc<dyn Entropy> = Arc::new(source);
+    let check = options.network_check.clone().map(|url| NetworkCheck {
+        url,
+        security: crate::engine::network::security::client_config(
+            crate::system::read_rtc(),
+            crate::firmware::tsc_hz(),
+            crate::firmware::tsc_tolerance_ppm(),
+            || Ok(Arc::clone(&entropy)),
+        ),
+    });
     Ok(Box::new(Station {
         network: Network {
             ssid: ssid.as_bytes().to_vec(),
             secret,
             country,
         },
-        entropy: Arc::new(source),
+        entropy,
         seed: u64::from_le_bytes(seed),
+        check,
     }))
 }
 
@@ -326,13 +364,20 @@ pub(super) fn prepare(
 }
 
 /// After ExitBootServices: the bring-up, recorded as `CHECK wifi`, then
-/// RF 0x18 per path and the networks the scan heard, one per line.
+/// RF 0x18 per path and the networks the scan heard, one per line; then
+/// the station's `--network-check` POST, recorded as `CHECK network`.
 pub(super) fn check(machine: &mut Machine) {
     let mut lines = Vec::new();
+    let mut posted = None;
     let (verdict, detail) = match core::mem::replace(&mut machine.wifi, Plan::Off) {
         Plan::Off => (Verdict::Skip, String::from("no --wifi-check")),
         Plan::Decided(verdict, detail) => (verdict, detail),
-        Plan::Ready(prepared) => match run(prepared, &mut machine.kept, &mut machine.timing) {
+        Plan::Ready(prepared) => match run(
+            prepared,
+            &mut machine.kept,
+            &mut machine.timing,
+            &mut posted,
+        ) {
             Ok((detail, found)) => {
                 lines = found;
                 (Verdict::Pass, detail)
@@ -347,6 +392,29 @@ pub(super) fn check(machine: &mut Machine) {
     if !lines.is_empty() {
         crate::output::flush_log();
     }
+    network(machine, verdict, posted.as_ref());
+}
+
+/// `CHECK network`: the `--network-check` POST the station made once
+/// leased, judged and printed as `host_wifi::network_check` does; skipped
+/// without the option or without a station (`CHECK wifi` skipped), failed
+/// when the station got no lease.
+fn network(machine: &mut Machine, wifi: Verdict, posted: Option<&Post>) {
+    let (verdict, detail) = match machine.options.network_check.as_deref() {
+        None => (Verdict::Skip, String::from("no --network-check")),
+        Some(_) if posted.is_none() && wifi == Verdict::Skip => (
+            Verdict::Skip,
+            String::from("no Wi-Fi station (see CHECK wifi)"),
+        ),
+        Some(url) => {
+            let ssid = machine.options.ssid.as_deref().unwrap_or_default();
+            match network_check(url, posted, ssid.as_bytes()) {
+                (true, detail) => (Verdict::Pass, detail),
+                (false, detail) => (Verdict::Fail, detail),
+            }
+        }
+    };
+    machine.record("network", verdict, detail);
 }
 
 /// One RTL8852CE through `rtw89_attach`: its parked function, the window
@@ -386,11 +454,13 @@ impl Rtw89Device for Chip<'_> {
 
 /// The bring-up of `prepared`'s function. Whatever happens past the park,
 /// Bus Master ends clear and memory decode as the firmware left it; what
-/// DMA could still reach (the rings) is kept in `kept`.
+/// DMA could still reach (the rings) is kept in `kept`, and the station's
+/// `--network-check` POST, made before it was stopped, in `posted`.
 fn run(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
     timing: &mut Timing,
+    posted: &mut Option<Post>,
 ) -> Result<(String, Vec<String>), String> {
     let address = prepared.address;
     // SAFETY: one CPU after ExitBootServices; the storage probe is done
@@ -414,7 +484,7 @@ fn run(
         .config()
         .read16(regs::COMMAND)
         .map_err(|error| format!("pci={address} COMMAND: {error}"))?;
-    let result = attach(&mut function, prepared, kept, timing);
+    let result = attach(&mut function, prepared, kept, timing, posted);
     // Bus Master off, and memory decode as found; the rest of the park
     // (MSI, MSI-X, No Snoop, ATS off, INTx disabled) stays.
     let restored = function.set_bus_master(false).and_then(|()| {
@@ -443,6 +513,7 @@ fn attach(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
     timing: &mut Timing,
+    posted: &mut Option<Post>,
 ) -> Result<(String, Vec<String>), String> {
     let Prepared {
         address,
@@ -570,8 +641,10 @@ fn attach(
                     result,
                     rings,
                     pools,
+                    post,
                 } = ran;
                 kept.push(Box::new((rings, pools)));
+                *posted = post;
                 match result {
                     Ok((detail, lines)) => Ok((format!("{detail}{}", left_on(was_on)), lines)),
                     Err(detail) => Err(format!("{detail}{}", left_on(was_on))),
@@ -603,20 +676,24 @@ fn attach(
 }
 
 /// What the station check ran to: its line and the `WIFI RF18` lines, or
-/// its failure; and what DMA could still reach, which is kept.
+/// its failure; what DMA could still reach, which is kept; and with
+/// `--network-check` and a lease, the POST.
 struct Kept {
     result: Result<(String, Vec<String>), String>,
     rings: Option<ax::Rings>,
     pools: Option<TxPools>,
+    post: Option<Post>,
 }
 
 /// The station check (M3 spec S17.3-S17.5) on a chip `rtw89_attach_with`
 /// took over: `ax::attach` with `station`, `database` and `clock`; then
 /// Stela's network stack over the keeper, seeded with the station's seed,
 /// its `dhcp` driven again past each failure of its own ([`lease`]) until
-/// the lease or [`HostClock`]'s cut; the keeper's last failure taken with
-/// one `receive()` (`into_radio` drops one not yet reported); then the
-/// deauthentication, [`FLUSH_US`] of service and the stop. The line is the
+/// the lease or [`HostClock`]'s cut, and with `--network-check` and a
+/// lease, the POST under that same cut ([`post`]); the keeper's last
+/// failure taken with one `receive()` (`into_radio` drops one not yet
+/// reported); then the deauthentication, [`FLUSH_US`] of service and the
+/// stop, after the POST as without one. The line is the
 /// bring-up's report, the station's progress and how the wait ended
 /// ([`ending`]), then on no lease the DHCP exchange's counts, the stack's
 /// failures and the keeper's, the network's name hidden and then every
@@ -650,6 +727,7 @@ fn keep(
     // The keeper owns the network once attached, and its failures name it.
     let ssid = station.network.ssid.clone();
     let seed = station.seed;
+    let check = station.check;
     let inputs = Inputs {
         clock,
         database,
@@ -670,10 +748,12 @@ fn keep(
                 result: Err(mask_addresses(&hide_ssid(&error.to_string(), &ssid))),
                 rings: returned.and_then(|(_, rings)| rings),
                 pools: None,
+                post: None,
             };
         }
     };
-    let (mut wifi, outcome, summary, failures) = lease(wifi, clock, timing, seed);
+    let (mut wifi, outcome, summary, failures, post) =
+        lease(wifi, clock, timing, seed, check.as_ref());
     let failure = match wifi.receive() {
         Err(LinkError::Adapter(failure)) => Some(failure),
         Err(error) => Some(format!("{error:?}")),
@@ -716,6 +796,7 @@ fn keep(
         },
         rings: Some(rings),
         pools: Some(pools),
+        post,
     }
 }
 
@@ -724,15 +805,17 @@ fn keep(
 /// `Stack::dhcp` waits for the keeper's carrier, then for the lease; a
 /// failure it may get past (the keeper's failures reach it as the link's,
 /// carrier that did not come or went) is noted and `dhcp` driven again,
-/// until [`HostClock`]'s cut ends the wait. Gives back the station, how the
-/// wait ended, without a lease what the DHCP exchange did, and the
-/// failures driven past.
+/// until [`HostClock`]'s cut ends the wait. With `check` and a lease, the
+/// POST follows under the same cut ([`post`]). Gives back the station, how
+/// the wait ended, without a lease what the DHCP exchange did, the
+/// failures driven past, and the POST.
 fn lease<L: Link>(
     wifi: L,
     clock: Clock,
     timing: &mut Timing,
     seed: u64,
-) -> (L, Outcome, Option<String>, Failures) {
+    check: Option<&NetworkCheck>,
+) -> (L, Outcome, Option<String>, Failures, Option<Post>) {
     let mut failures = Failures::default();
     // The stack's every time comes after this one, which it takes as its
     // start (smoltcp's `Instant` is an i64 of microseconds).
@@ -742,7 +825,7 @@ fn lease<L: Link>(
         // would drop the station with a failure of its clock, is not made.
         other => {
             let why = format!("the TSC cannot time the network stack: {other:?}");
-            return (wifi, Outcome::Failed(why), None, failures);
+            return (wifi, Outcome::Failed(why), None, failures, None);
         }
     };
     let deadline = timing
@@ -786,7 +869,35 @@ fn lease<L: Link>(
         Outcome::Leased(_) => None,
         _ => stack.dhcp_summary(),
     };
-    (stack.into_link(), outcome, summary, failures)
+    let posted = match (&outcome, check) {
+        (Outcome::Leased(_), Some(check)) => Some(post(&mut stack, check, clock, &cut, stop)),
+        _ => None,
+    };
+    (stack.into_link(), outcome, summary, failures, posted)
+}
+
+/// The network check's POST over the leased `stack`, as a normal boot's
+/// `--network-check` makes it (`HostNetwork::post_url`): `post_url` to
+/// `check`'s URL with no headers, `text/plain` and no body, once, waiting
+/// for the answer; the stack's own bounds (DNS, the connection's idle time,
+/// the POST's) apply, and before them the lease's cut, which `cut` tells
+/// ended it.
+fn post<L: Link, C: stela_runtime::net::Clock>(
+    stack: &mut Stack<L, C>,
+    check: &NetworkCheck,
+    clock: Clock,
+    cut: &Cell<bool>,
+    stop: Cut,
+) -> Post {
+    let begun = clock.now_us();
+    let result = stack.post_url(&check.url, &[], "text/plain", b"", check.security.clone());
+    match result {
+        Err(NetError::Clock(_)) if cut.get() => Post::Cut(stop.end()),
+        result => Post::Ended {
+            result,
+            after_us: clock.now_us().saturating_sub(begun),
+        },
+    }
 }
 
 /// The network stack's clock (M3 plan Task 20): the TSC, as the radio's

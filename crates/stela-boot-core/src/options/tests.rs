@@ -227,6 +227,90 @@ fn wifi_key_without_wifi_is_refused() {
     }
 }
 
+#[test]
+fn host_check_network_check_posts_over_the_wifi_network() {
+    let options = HostCheck::parse(
+        "--host-check --network-check http://example.com/ --wifi-check --keep-lines --wifi home \
+         --deadline 600 --wifi-country IN",
+    )
+    .unwrap();
+    assert_eq!(
+        options.network_check.as_deref(),
+        Some("http://example.com/")
+    );
+    assert_eq!(
+        options.to_string(),
+        "--host-check --deadline 600 --wifi-check --wifi home --wifi-country IN \
+         --network-check http://example.com/ --keep-lines"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // https too, with the normal boot's URL rules: the value is kept raw.
+    let raw = "https://H:443/a/../p%2f?sig=%2B%3d";
+    let options = HostCheck::parse(&format!(
+        "--host-check --wifi-check --wifi a --network-check {raw}"
+    ))
+    .unwrap();
+    assert_eq!(options.network_check.as_deref(), Some(raw));
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // Without it nothing is posted, and the line prints as before.
+    let options = HostCheck::parse("--host-check --wifi-check --wifi a").unwrap();
+    assert_eq!(options.network_check, None);
+    assert_eq!(options.to_string(), "--host-check --wifi-check --wifi a");
+    for (text, error) in [
+        (
+            "--host-check --wifi-check --wifi a --network-check",
+            Error::MissingNetworkUrl,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --network-check ftp://h/p",
+            Error::UrlScheme,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --network-check http://h",
+            Error::UrlPath,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --network-check http:///p",
+            Error::UrlHost,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --network-check http://u:p@h/p",
+            Error::Url(stela_runtime::net::http::UrlError::Credentials),
+        ),
+        (
+            "--host-check --wifi-check --wifi a --network-check http://h/p \
+             --network-check https://h/p",
+            Error::DuplicateNetworkCheck,
+        ),
+    ] {
+        assert_eq!(HostCheck::parse(text), Err(error), "{text}");
+    }
+}
+
+#[test]
+fn network_check_without_wifi_is_refused() {
+    for text in [
+        "--host-check --network-check http://h/p",
+        "--host-check --wifi-check --network-check http://h/p",
+        "--host-check --wifi-check --keep-lines --network-check https://h/p --deadline 600",
+    ] {
+        assert_eq!(
+            HostCheck::parse(text),
+            Err(Error::Constraint(Constraint::HostNetworkCheckDependency)),
+            "{text}"
+        );
+    }
+    // --wifi without --wifi-check is refused as before, first.
+    assert_eq!(
+        HostCheck::parse("--host-check --wifi a --network-check http://h/p"),
+        Err(Error::Constraint(Constraint::HostWifiDependency))
+    );
+    assert_eq!(
+        Constraint::HostNetworkCheckDependency.message(),
+        "host check: --network-check posts over the network of --wifi"
+    );
+}
+
 const DISK: &str = "74EXN0LI:11111111-2222-3333-4444-555555555555";
 
 fn round_trip(text: &str) -> System {

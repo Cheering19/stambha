@@ -3,8 +3,8 @@
 //!
 //! `stela.cfg`: `--host-check [--nor-file GUID:/PATH] [--deadline SECONDS]
 //! [--key-seconds SECONDS] [--wifi-check [--wifi SSID [--wifi-key PATH]
-//! [--wifi-country CC]]] [--keep-lines]`. The line is printed with the
-//! network's name left out.
+//! [--wifi-country CC] [--network-check URL]]] [--keep-lines]`. The line
+//! is printed with the network's name left out.
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
@@ -32,6 +32,13 @@
 //!   network's name hidden, before it deauthenticates and the chip is
 //!   powered off. It waits for the handshake until 10 s before
 //!   `--deadline` at most, so the chip is stopped before the deadline.
+//! - `network`: with `--network-check URL`, the leased station's POST to
+//!   `URL` (`http://`, or `https://` with the firmware's RTC as the
+//!   certificate time), as a normal boot's `--network-check`: any HTTP
+//!   answer passes, a 2xx body given by its length and SHA-256, and only a
+//!   transport failure fails. It is made before the station leaves, within
+//!   the same wait, and a public server address is printed as `<public>`.
+//!   Without the option it is skipped.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.

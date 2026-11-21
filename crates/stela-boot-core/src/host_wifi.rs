@@ -3,7 +3,8 @@
 //! line (spec S14.6), when the network stack's wait for a DHCP lease is
 //! cut, the stack's failures, the line's ending (M3b's "Done means"),
 //! every MAC address in text it prints masked (S17.5), and its `stela.cfg`
-//! line and its own line with the network's name left out.
+//! line and its own line with the network's name left out; then the
+//! `--network-check` POST's verdict and line ([`network_check`]).
 /// The network's name hidden as a normal boot hides it in what a Wi-Fi
 /// adapter's link says.
 pub use crate::network_link::hide_ssid;
@@ -11,6 +12,7 @@ use crate::options::WIFI;
 use alloc::string::String;
 use core::{fmt, net::Ipv4Addr};
 use stela_drivers::net::wifi::realtek::ax::WIFI_CARRIER_WAIT_US;
+use stela_runtime::net::NetError;
 /// How long the network stack's `dhcp` waits for a lease once the link has
 /// carrier: the stack's own.
 pub use stela_runtime::net::stack::DHCP_WAIT_US;
@@ -119,7 +121,8 @@ impl Progress {
 /// spec S17.3): its wait for the radio's carrier ([`WIFI_CARRIER_WAIT_US`],
 /// the scan, authentication and 4-way handshake) and then for the lease
 /// ([`DHCP_WAIT_US`]). The stack is driven again past a failure of its own
-/// (the keeper's failures reach it as the link's) until this passes.
+/// (the keeper's failures reach it as the link's) until this passes. The
+/// `--network-check` POST that follows a lease gets what is left of it.
 pub const STATION_BUDGET_US: u64 = WIFI_CARRIER_WAIT_US + DHCP_WAIT_US;
 
 /// How long before `--deadline` the station check stops without a lease,
@@ -273,6 +276,34 @@ pub fn hide_public(account: &str) -> String {
     shown
 }
 
+/// `text` with every IPv4 address in it, a run of digits and dots that
+/// reads as one once the dots at its ends are left aside, as [`Shown`]
+/// writes it; anything else as it was.
+pub fn hide_public_addresses(text: &str) -> String {
+    let part = |c: char| c.is_ascii_digit() || c == '.';
+    let mut shown = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(part) {
+        shown.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(|c: char| !part(c)).unwrap_or(rest.len());
+        let run = &rest[..end];
+        let word = run.trim_matches('.');
+        let lead = run.len() - run.trim_start_matches('.').len();
+        match word.parse::<Ipv4Addr>() {
+            Ok(address) => {
+                shown.push_str(&run[..lead]);
+                shown.push_str(&alloc::format!("{}", Shown(address)));
+                shown.push_str(&run[lead + word.len()..]);
+            }
+            Err(_) => shown.push_str(run),
+        }
+        rest = &rest[end..];
+    }
+    shown.push_str(rest);
+    shown
+}
+
 /// A DHCPv4 lease, `after_us` after the station began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
@@ -332,6 +363,79 @@ pub fn ending(outcome: &Outcome, progress: &Progress) -> (bool, String) {
         ),
         Outcome::Failed(why) => (false, alloc::format!("; no DHCP lease: {why}")),
     }
+}
+
+/// How the network check's POST (`--network-check`), made over the station
+/// once it has its lease, ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Post {
+    /// The network stack's `post_url`: the 2xx answer's body, or how it
+    /// failed, `after_us` after the POST began.
+    Ended {
+        result: Result<alloc::vec::Vec<u8>, NetError>,
+        after_us: u64,
+    },
+    /// The station check's cut ([`Cut`]) came first.
+    Cut(End),
+}
+
+/// The network check's verdict and its `CHECK network` line for a POST to
+/// `url` (`post`; none when the station check got no lease), judged as a
+/// normal boot judges its `--network-check`: any HTTP answer proves the
+/// path end to end and passes, a 2xx body given by its length and SHA-256
+/// as the normal boot prints it (`NETWORK CHECK body bytes=… sha256=…`);
+/// only a transport failure (the link, DNS, the connection, TLS, a reply
+/// malformed or asking for a login) fails, in the stack's words, as does
+/// the station check's cut. The network's name `ssid` is hidden, then
+/// every MAC address masked and every public IPv4 address written
+/// `<public>` ([`hide_public_addresses`]): the server's, and the network
+/// and AP a keeper failure reaching the POST as the link's names.
+pub fn network_check(url: &str, post: Option<&Post>, ssid: &[u8]) -> (bool, String) {
+    let (passed, line) = match post {
+        None => (
+            false,
+            String::from("not run: the station check got no DHCP lease (see CHECK wifi)"),
+        ),
+        Some(Post::Ended { result, after_us }) => {
+            let ms = after_us / 1_000;
+            match result {
+                Ok(body) => (
+                    true,
+                    alloc::format!(
+                        "POST {url} answered 2xx in {ms} ms: body bytes={} sha256={}",
+                        body.len(),
+                        stela_formats::sha256(body)
+                    ),
+                ),
+                Err(NetError::Status(status)) => (
+                    true,
+                    alloc::format!(
+                        "POST {url} answered HTTP {status} in {ms} ms, which proves the path"
+                    ),
+                ),
+                Err(error) => (
+                    false,
+                    alloc::format!("POST {url} failed after {ms} ms: {error}"),
+                ),
+            }
+        }
+        Some(Post::Cut(End::Budget)) => (
+            false,
+            alloc::format!(
+                "POST {url}: no answer within the station check's {} s",
+                STATION_BUDGET_US / 1_000_000
+            ),
+        ),
+        Some(Post::Cut(End::Deadline)) => (
+            false,
+            alloc::format!(
+                "POST {url}: stopped {} s before --deadline without an answer",
+                DEADLINE_MARGIN_US / 1_000_000
+            ),
+        ),
+    };
+    let line = hide_public_addresses(&mask_addresses(&hide_ssid(&line, ssid)));
+    (passed, line)
 }
 
 /// `eapol rx <r> tx <t> acked <k>` in `line`.

@@ -49,14 +49,17 @@ fn wifi(options: &System) -> Result<(), Error> {
     Ok(())
 }
 
-/// A host check's `--wifi` runs on the `--wifi-check` bring-up, and its key
-/// and country configure that network.
+/// A host check's `--wifi` runs on the `--wifi-check` bring-up, its key and
+/// country configure that network, and `--network-check` posts over it.
 pub(super) fn host_check(options: &HostCheck) -> Result<(), Error> {
     if options.ssid.is_none() && (options.wifi_key.is_some() || options.wifi_country.is_some()) {
         return Err(Error::Constraint(Constraint::WifiDependency));
     }
     if options.ssid.is_some() && !options.wifi_check {
         return Err(Error::Constraint(Constraint::HostWifiDependency));
+    }
+    if options.network_check.is_some() && options.ssid.is_none() {
+        return Err(Error::Constraint(Constraint::HostNetworkCheckDependency));
     }
     Ok(())
 }

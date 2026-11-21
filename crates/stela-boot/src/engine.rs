@@ -33,7 +33,7 @@ pub(crate) mod interrupts;
 mod kernel_work;
 mod large_blocks;
 pub(crate) use kernel_work::FirmwareContext;
-mod network;
+pub(crate) mod network;
 pub(crate) mod nor;
 mod parallel;
 mod pci_power;

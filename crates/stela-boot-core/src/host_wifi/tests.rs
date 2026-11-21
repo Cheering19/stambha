@@ -330,6 +330,192 @@ fn the_dhcp_account_shows_only_a_local_server_and_router() {
     }
 }
 
+/// Every IPv4 address in free text reads as [`Shown`] writes it: a public
+/// one, the network check's server among them, as `<public>`.
+#[test]
+fn public_addresses_in_text_read_as_public() {
+    assert_eq!(
+        hide_public_addresses(
+            "http://93.184.215.14/ via 192.168.29.1:80, 10.0.0.2 and 8.8.8.8. (100.64.0.9)"
+        ),
+        "http://<public>/ via 192.168.29.1:80, 10.0.0.2 and <public>. (100.64.0.9)"
+    );
+    // At either end, after a letter, and back to back with other text.
+    assert_eq!(
+        hide_public_addresses("203.0.113.5v1.2.3.4x169.254.1.1"),
+        "<public>v<public>x169.254.1.1"
+    );
+    // No address: too few or too many parts, an octet past 255, a lone
+    // number, nothing; and text around it is kept, multi-byte included.
+    for text in [
+        "after 7 s",
+        "1.2.3",
+        "1.2.3.4.5",
+        "1.2.3.256",
+        "...",
+        "",
+        "é \"x\" 12",
+    ] {
+        assert_eq!(hide_public_addresses(text), text);
+    }
+    assert_eq!(hide_public_addresses("é8.8.4.4ü"), "é<public>ü");
+}
+
+const URL: &str = "http://example.com/";
+
+fn ended(result: Result<Vec<u8>, NetError>, after_us: u64) -> Post {
+    Post::Ended { result, after_us }
+}
+
+/// Any HTTP answer proves the path end to end, as the normal boot's
+/// `--network-check` takes it: a 2xx body, by its length and SHA-256 as the
+/// normal boot prints it, or any other status.
+#[test]
+fn any_answer_passes_the_network_check() {
+    use sha2::Digest;
+    let body = b"<!doctype html><title>Example Domain</title>".to_vec();
+    let digest = alloc::format!("{:x}", sha2::Sha256::digest(&body));
+    assert_eq!(
+        network_check(URL, Some(&ended(Ok(body.clone()), 412_900)), b"test"),
+        (
+            true,
+            alloc::format!(
+                "POST http://example.com/ answered 2xx in 412 ms: body bytes={} sha256={digest}",
+                body.len()
+            )
+        )
+    );
+    assert_eq!(
+        network_check(URL, Some(&ended(Ok(Vec::new()), 0)), b"test").1,
+        "POST http://example.com/ answered 2xx in 0 ms: body bytes=0 \
+         sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    for status in [100, 404, 405, 500, 503] {
+        assert_eq!(
+            network_check(
+                URL,
+                Some(&ended(Err(NetError::Status(status)), 380_000)),
+                b"test"
+            ),
+            (
+                true,
+                alloc::format!(
+                    "POST http://example.com/ answered HTTP {status} in 380 ms, which proves the \
+                     path"
+                )
+            )
+        );
+    }
+}
+
+/// Only a transport failure fails it: the stack's own words, which say
+/// where it ended (DNS, the connection, TLS, the reply).
+#[test]
+fn only_a_transport_failure_fails_the_network_check() {
+    use stela_runtime::net::TlsUnavailable;
+    for error in [
+        NetError::Dns(String::from("example.com: no address")),
+        NetError::Dns(String::from(
+            "no DNS server from DHCPv4 or IPv6 router advertisements",
+        )),
+        NetError::Timeout("DNS"),
+        NetError::Reset,
+        NetError::Timeout("TCP transfer"),
+        NetError::Timeout("HTTP request"),
+        NetError::Http(String::from("response header too large")),
+        NetError::Truncated("HTTP response body"),
+        NetError::Tls(String::from("InvalidCertificate(Expired)")),
+        NetError::TlsUnavailable(TlsUnavailable::CorrelatedClock),
+        NetError::ProxyAuthentication,
+        NetError::NetworkAuthentication,
+        NetError::NoCarrier,
+    ] {
+        let words = error.to_string();
+        assert_eq!(
+            network_check(URL, Some(&ended(Err(error), 15_000_999)), b"test"),
+            (
+                false,
+                alloc::format!("POST http://example.com/ failed after 15000 ms: {words}")
+            ),
+            "{words}"
+        );
+    }
+}
+
+/// The station check's cut ends the POST as it ends the wait for a lease,
+/// and without a lease nothing is posted.
+#[test]
+fn a_cut_or_no_lease_fails_the_network_check() {
+    assert_eq!(
+        network_check(URL, Some(&Post::Cut(End::Budget)), b"test"),
+        (
+            false,
+            String::from("POST http://example.com/: no answer within the station check's 90 s")
+        )
+    );
+    assert_eq!(
+        network_check(URL, Some(&Post::Cut(End::Deadline)), b"test"),
+        (
+            false,
+            String::from(
+                "POST http://example.com/: stopped 10 s before --deadline without an answer"
+            )
+        )
+    );
+    assert_eq!(
+        network_check(URL, None, b"test"),
+        (
+            false,
+            String::from("not run: the station check got no DHCP lease (see CHECK wifi)")
+        )
+    );
+}
+
+/// The line names no network, no station and no public address: a keeper
+/// failure that reaches the POST as the link's names the network and the
+/// AP, and the server's address may be public.
+#[test]
+fn the_network_check_names_no_network_station_or_public_address() {
+    let error = NetError::Link(String::from(
+        "rtw89: test is gone: deauthenticated by 02:03:04:05:06:07 (reason 3)",
+    ));
+    assert_eq!(
+        network_check(
+            "http://203.0.113.7/p",
+            Some(&ended(Err(error), 2_000)),
+            b"test"
+        )
+        .1,
+        "POST http://<public>/p failed after 2 ms: network link: rtw89: <ssid> is gone: \
+         deauthenticated by xx:xx:xx:xx:xx:xx (reason 3)"
+    );
+    // A server in the owner's own network is shown.
+    assert_eq!(
+        network_check(
+            "http://192.168.1.10:8080/",
+            Some(&ended(Err(NetError::Status(404)), 3_000)),
+            b"test"
+        )
+        .1,
+        "POST http://192.168.1.10:8080/ answered HTTP 404 in 3 ms, which proves the path"
+    );
+    // A redirect's or a header's words are the server's, hidden the same.
+    assert_eq!(
+        network_check(
+            URL,
+            Some(&ended(
+                Err(NetError::Http(String::from(
+                    "transfer coding \"x 198.51.100.4\""
+                ))),
+                1_000
+            )),
+            b"test"
+        )
+        .1,
+        "POST http://example.com/ failed after 1 ms: HTTP: transfer coding \"x <public>\""
+    );
+}
+
 #[test]
 fn hide_network_names_no_ssid() {
     assert_eq!(

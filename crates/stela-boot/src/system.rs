@@ -1217,8 +1217,9 @@ pub(crate) fn host_power() -> Option<pc::power::HostPower> {
 
 /// The firmware's real-time clock, read between two TSC values. An
 /// unspecified time zone is read as UTC, as Linux reads the RTC and as QEMU
-/// and Macs keep it; a time the firmware cannot give is reported.
-fn read_rtc() -> Option<crate::handoff::RtcReading> {
+/// and Macs keep it; a time the firmware cannot give is reported. Also the
+/// host check's, for its `--network-check` certificate time.
+pub(crate) fn read_rtc() -> Option<crate::handoff::RtcReading> {
     use stela_boot_core::firmware_time::{self, UnspecifiedZone};
     let tsc_before = rdtsc();
     let read = uefi::runtime::get_time_and_caps();
