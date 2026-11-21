@@ -124,6 +124,16 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateInstallSource);
                 }
             }
+            INSTALL_READ_AHEAD => {
+                let chunks = number(value().ok_or(Error::InstallReadAhead)?)?;
+                let chunks = usize::try_from(chunks)
+                    .ok()
+                    .filter(|&chunks| chunks <= MAX_INSTALL_READ_AHEAD)
+                    .ok_or(Error::InstallReadAhead)?;
+                if options.install_read_ahead.replace(chunks).is_some() {
+                    return Err(Error::DuplicateInstallReadAhead);
+                }
+            }
             "--restore-identity" => {
                 let index = number(value().ok_or(Error::MissingRestoreIdentity)?)?;
                 let index = usize::try_from(index).map_err(|_| Error::RestoreIdentityCapacity)?;

@@ -17,9 +17,10 @@ const SHA1_BYTES: usize = 20;
 const PACKET_BYTES: u64 = 1450;
 const FEC_STRIDE: u64 = 40;
 const PACKETS_PER_FEC: u64 = 25;
-/// Payload chunks [`Sender::prefetch`] keeps read ahead, 4 MiB: a host
-/// that reads on while the guest's window is shut has them ready once it
-/// opens.
+/// Payload chunks [`Sender::prefetch`] keeps read ahead at most, 4 MiB: two
+/// prefetches' worth, so a host that reads on while the guest's window is
+/// shut has them ready once it opens. A caller that reads 8 chunks a turn
+/// keeps 16, as all callers did before, and the 2 MiB it held.
 const AHEAD_CHUNKS: usize = 32;
 /// Payload chunks one read of the source holds at most, the store's
 /// largest read.
@@ -90,6 +91,9 @@ pub struct Sender {
     recycled: Vec<Vec<u8>>,
     ahead_at: u64,
     reads_ahead: bool,
+    /// The most chunks read ahead and buffers kept for reuse: two of the
+    /// last prefetch's, [`AHEAD_CHUNKS`] at most.
+    kept: usize,
     /// Polls that ended with the guest's window open and no chunk read
     /// ahead (the host was behind), or with its window full.
     pub starved: u64,
@@ -114,6 +118,7 @@ impl Sender {
             recycled: Vec::new(),
             ahead_at: 0,
             reads_ahead: false,
+            kept: AHEAD_CHUNKS,
             starved: 0,
             full: 0,
         })
@@ -126,16 +131,17 @@ impl Sender {
         (self.offset, self.size)
     }
     /// Read up to `chunks` payload chunks ahead, in reads of the source of
-    /// [`READ_CHUNKS`] at most, while fewer than [`AHEAD_CHUNKS`] wait: a
-    /// caller that must not hold the stream's owner while it reads the
-    /// source does so here, between polls. A read that fails keeps the
-    /// chunks of those before it.
+    /// [`READ_CHUNKS`] at most, while fewer than twice `chunks`, and than
+    /// [`AHEAD_CHUNKS`], wait: a caller that must not hold the stream's
+    /// owner while it reads the source does so here, between polls. A read
+    /// that fails keeps the chunks of those before it.
     pub fn prefetch(&mut self, source: &mut impl ImageSource, chunks: usize) -> Result<()> {
         self.reads_ahead = true;
+        self.kept = AHEAD_CHUNKS.min(2 * chunks);
         if self.phase != Phase::Payload {
             return Ok(());
         }
-        let mut room = AHEAD_CHUNKS.saturating_sub(self.ahead.len()).min(chunks);
+        let mut room = self.kept.saturating_sub(self.ahead.len()).min(chunks);
         while room != 0 && self.ahead_at != self.size {
             let most = (room.min(READ_CHUNKS) * CHUNK_BYTES) as u64;
             let n = (self.size - self.ahead_at).min(most) as usize;
@@ -252,7 +258,7 @@ impl Sender {
                     if self.phase == Phase::Payload && self.reads_ahead {
                         let buffer = self.output.take_completed_buffer();
                         if buffer.capacity() == CHUNK_BYTES + SHA1_BYTES
-                            && self.recycled.len() < AHEAD_CHUNKS
+                            && self.recycled.len() < self.kept
                         {
                             self.recycled.push(buffer);
                         }
@@ -576,6 +582,31 @@ mod tests {
         assert_eq!(ends.len(), 1, "one reply");
         assert!(output[ends[0] + 9..] == data[..], "the image whole, once");
         assert_eq!(source.reads.len(), 4, "the payload is read once");
+    }
+    /// A sender keeps at most two prefetches' worth read ahead, however long
+    /// the guest's window stays shut: a caller that reads 8 chunks a turn
+    /// keeps 16, as before it read more, and one that reads 16 keeps 32.
+    #[test]
+    fn a_sender_keeps_two_prefetches_worth_read_ahead() {
+        let data = vec![5; (2 * AHEAD_CHUNKS + 1) * CHUNK_BYTES];
+        for (chunks, kept) in [(8, 16), (16, AHEAD_CHUNKS)] {
+            let mut source = fixture(&data, false);
+            let mut input = xml(Value::dict([("Command", Value::from("Initiate"))]));
+            input.extend(xml(Value::dict([("Command", Value::from("Payload"))])));
+            let mut stream = Ready {
+                input,
+                output: Vec::new(),
+            };
+            let mut sender = Sender::new("os.dmg".into(), &source).unwrap();
+            sender.prefetch(&mut source, chunks).unwrap();
+            while sender.phase() != Phase::Payload {
+                assert!(sender.poll(&mut stream, &mut source).is_pending());
+            }
+            for _ in 0..8 {
+                sender.prefetch(&mut source, chunks).unwrap();
+            }
+            assert_eq!(sender.ahead.len(), kept, "{chunks} chunks a prefetch");
+        }
     }
     /// A source whose every other read runs out of the time it may wait, as
     /// a network source's does.
