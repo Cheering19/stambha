@@ -64,10 +64,18 @@ fn segment(
 }
 
 /// The `__TEXT` and `__LINKEDIT` bytes of the image at `base`, whose
-/// segments lie at `text_offset` and `linkedit_offset` of their file and
-/// whose code bytes `seed` picks.
-fn image(base: u64, text_offset: u32, linkedit_offset: u32, seed: u8) -> (Vec<u8>, Vec<u8>) {
-    let strings = b"\0_alpha\0_beta\0";
+/// segments lie at `text_offset` and `linkedit_offset` of their file,
+/// whose code bytes `seed` picks and whose symbols at [`ALPHA`] and
+/// [`BETA`] are `names`.
+fn image(
+    base: u64,
+    text_offset: u32,
+    linkedit_offset: u32,
+    seed: u8,
+    names: [&str; 2],
+) -> (Vec<u8>, Vec<u8>) {
+    let strings = format!("\0{}\0{}\0", names[0], names[1]);
+    let strings = strings.as_bytes();
     let mut commands = Vec::new();
     commands.extend(segment(
         b"__TEXT",
@@ -126,7 +134,8 @@ fn image(base: u64, text_offset: u32, linkedit_offset: u32, seed: u8) -> (Vec<u8
         *byte = ((index * 7 + 3) as u8 ^ (index >> 9) as u8).wrapping_add(seed);
     }
     let mut linkedit = Vec::new();
-    for (name, value) in [(1u32, base + ALPHA), (8, base + BETA)] {
+    let second = 2 + names[0].len() as u32;
+    for (name, value) in [(1u32, base + ALPHA), (second, base + BETA)] {
         u32s(&mut linkedit, &[name]);
         // N_SECT | N_EXT, section 1.
         linkedit.extend_from_slice(&[0x0f, 1, 0, 0]);
@@ -141,9 +150,16 @@ fn image(base: u64, text_offset: u32, linkedit_offset: u32, seed: u8) -> (Vec<u8
     (text, linkedit)
 }
 
-/// A standalone Mach-O of [`image`] at `base`: at any base, the same code.
+/// A standalone Mach-O of [`image`] at `base`: at any base, the same code,
+/// `_alpha` and `_beta`.
 pub(super) fn macho(base: u64) -> Vec<u8> {
-    let (mut file, linkedit) = image(base, 0, TEXT as u32, 0);
+    macho_named(base, 0, ["_alpha", "_beta"])
+}
+
+/// A standalone Mach-O of [`image`] at `base`, its code picked by `seed`
+/// and its symbols `names`.
+pub(super) fn macho_named(base: u64, seed: u8, names: [&str; 2]) -> Vec<u8> {
+    let (mut file, linkedit) = image(base, 0, TEXT as u32, seed, names);
     file.extend(linkedit);
     file
 }
@@ -153,7 +169,13 @@ pub(super) fn macho(base: u64) -> Vec<u8> {
 /// [`macho`]'s.
 pub(super) fn cache() -> Vec<u8> {
     let header = PAGE;
-    let (text, linkedit) = image(CACHE_BASE, header as u32, (header + TEXT) as u32, 1);
+    let (text, linkedit) = image(
+        CACHE_BASE,
+        header as u32,
+        (header + TEXT) as u32,
+        1,
+        ["_alpha", "_beta"],
+    );
     let mut file = Vec::new();
     file.extend_from_slice(b"dyld_v1  arm64e\0");
     // Mappings at 0x100, two; images at 0x200, one.

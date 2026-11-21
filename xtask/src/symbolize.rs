@@ -149,8 +149,8 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
                 "?".into(),
                 format!("{} (ambiguous {page:016x}+{:x})", entry.pc, entry.offset),
             ),
-            Some(Place::Found(address)) => {
-                let named = code.name(address);
+            Some(Place::Found { file, address }) => {
+                let named = code.name(file, address);
                 (named.image.unwrap_or("?").to_owned(), named.function)
             }
         };

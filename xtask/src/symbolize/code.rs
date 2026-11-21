@@ -3,8 +3,10 @@
 //! the pages it runs (SHA-256 of the page's bytes, as `model.rs` in the
 //! engine's `ahead` maps a pack's pages to a cache), and the images'
 //! symbols and function starts, which name an address. Only the pages a
-//! log names are kept; a page whose bytes more than one address holds is
-//! ambiguous.
+//! log names are kept; a page whose bytes more than one place holds is
+//! ambiguous. A page found names its function from the file it was found
+//! in: kernels of one KDK, kexts linked at 0 and two caches' images share
+//! addresses.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use object::macho::{self, LinkeditDataCommand};
 use object::read::macho::{DyldCache, MachOFile64};
@@ -20,12 +22,27 @@ const DEPTH: usize = 6;
 /// Where a page key and offset are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Place {
-    /// At this unslid address.
-    Found(u64),
-    /// In a page whose bytes more than one address holds.
+    /// At this unslid address of the `file`th file read.
+    Found { file: usize, address: u64 },
+    /// In a page whose bytes more than one place holds.
     Ambiguous,
     /// In no page given.
     Missing,
+}
+
+/// Where a wanted page's bytes are: one place, or more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageAt {
+    One { file: usize, address: u64 },
+    Many,
+}
+
+/// One file read: its name and its images' executable ranges `(start,
+/// end, image)`, ascending.
+#[derive(Debug, Default)]
+struct File {
+    name: String,
+    ranges: Vec<(u64, u64, usize)>,
 }
 
 /// The function an address is in: its image's path, if an image holds it,
@@ -49,11 +66,10 @@ pub(super) struct Image {
 
 #[derive(Debug, Default)]
 pub(super) struct Code {
-    /// The wanted pages, by key: the page's address, or `None` where more
-    /// than one address holds its bytes.
-    pages: HashMap<u64, Option<u64>>,
-    /// Executable ranges `(start, end, image)`, ascending.
-    ranges: Vec<(u64, u64, usize)>,
+    /// The wanted pages, by key.
+    pages: HashMap<u64, PageAt>,
+    /// The files read, in order.
+    files: Vec<File>,
     pub images: Vec<Image>,
     /// What was read: each cache and image, for the report.
     pub loaded: Vec<String>,
@@ -142,15 +158,22 @@ impl Code {
         wanted: &HashSet<u64>,
     ) -> Result<()> {
         let file = MachOFile64::<Endianness>::parse(data).map_err(|e| anyhow!("{name}: {e}"))?;
+        // A dSYM's segments hold no code, only the names its image has.
+        if file.macho_header().filetype.get(file.endian()) == macho::MH_DSYM {
+            return Ok(());
+        }
+        let Some(index) = self.start_file(name) else {
+            return Ok(());
+        };
         let before = self.pages.len();
         for segment in file.segments() {
             if executable(segment.flags()) {
                 let bytes = segment.data().map_err(|e| anyhow!("{name}: {e}"))?;
-                self.hash(segment.address(), bytes, wanted);
+                self.hash(index, segment.address(), bytes, wanted);
             }
         }
         let starts = function_starts(&file, |offset, size| data.get(offset..offset + size));
-        self.add_image(&file, name, starts);
+        self.add_image(index, &file, name, starts);
         self.loaded.push(format!(
             "{name}: 1 image, {} of {} wanted pages",
             self.pages.len() - before,
@@ -170,11 +193,14 @@ impl Code {
     ) -> Result<()> {
         let cache =
             DyldCache::<Endianness>::parse(main, subcaches).map_err(|e| anyhow!("{name}: {e}"))?;
+        let Some(index) = self.start_file(name) else {
+            return Ok(());
+        };
         let before = self.pages.len();
         for mapping in cache.mappings() {
             if mapping.init_prot() & macho::VM_PROT_EXECUTE != 0 {
                 let bytes = mapping.data().map_err(|e| anyhow!("{name}: {e}"))?;
-                self.hash(mapping.address(), bytes, wanted);
+                self.hash(index, mapping.address(), bytes, wanted);
             }
         }
         let mut images = 0;
@@ -193,7 +219,7 @@ impl Code {
             let starts = function_starts(&file, |offset, size| {
                 linkedit.and_then(|data| data.get(offset..offset + size))
             });
-            self.add_image(&file, path, starts);
+            self.add_image(index, &file, path, starts);
             images += 1;
         }
         self.loaded.push(format!(
@@ -205,9 +231,22 @@ impl Code {
         Ok(())
     }
 
-    /// Keep the address of each page of `bytes`, at `address`, whose key
-    /// `wanted` names.
-    fn hash(&mut self, address: u64, bytes: &[u8], wanted: &HashSet<u64>) {
+    /// The index of a new file read as `name`, or `None` for a name read
+    /// before: the same file twice is one place.
+    fn start_file(&mut self, name: &str) -> Option<usize> {
+        if self.files.iter().any(|file| file.name == name) {
+            return None;
+        }
+        self.files.push(File {
+            name: name.to_owned(),
+            ranges: Vec::new(),
+        });
+        Some(self.files.len() - 1)
+    }
+
+    /// Keep the place of each page of `bytes`, at `address` in the `file`th
+    /// file, whose key `wanted` names.
+    fn hash(&mut self, file: usize, address: u64, bytes: &[u8], wanted: &HashSet<u64>) {
         if wanted.is_empty() && !self.keeps(0, wanted) {
             return;
         }
@@ -215,33 +254,39 @@ impl Code {
             if !self.keeps(key, wanted) {
                 continue;
             }
-            let at = address + (index * PAGE) as u64;
+            let at = PageAt::One {
+                file,
+                address: address + (index * PAGE) as u64,
+            };
             self.pages
                 .entry(key)
                 .and_modify(|held| {
-                    if *held != Some(at) {
-                        *held = None;
+                    if *held != at {
+                        *held = PageAt::Many;
                     }
                 })
-                .or_insert(Some(at));
+                .or_insert(at);
         }
     }
 
-    /// Add an image's executable ranges, code symbols and function starts.
+    /// Add an image of the `file`th file: its executable ranges, code
+    /// symbols and function starts.
     fn add_image<'data, R: object::ReadRef<'data>>(
         &mut self,
+        file_index: usize,
         file: &MachOFile64<'data, Endianness, R>,
         path: &str,
         mut starts: Vec<u64>,
     ) {
         let index = self.images.len();
+        let ranges = &mut self.files[file_index].ranges;
         for segment in file.segments() {
             if executable(segment.flags()) && segment.size() != 0 {
                 let start = segment.address();
-                self.ranges.push((start, start + segment.size(), index));
+                ranges.push((start, start + segment.size(), index));
             }
         }
-        self.ranges.sort_unstable();
+        ranges.sort_unstable();
         let mut symbols: Vec<(u64, String)> = file
             .symbols()
             .filter(|symbol| symbol.kind() == SymbolKind::Text && symbol.is_definition())
@@ -262,26 +307,35 @@ impl Code {
     /// Where `offset` in the page `key` is.
     pub(super) fn place(&self, key: u64, offset: u16) -> Place {
         match self.pages.get(&key) {
-            Some(Some(address)) => Place::Found(address + u64::from(offset)),
-            Some(None) => Place::Ambiguous,
+            Some(&PageAt::One { file, address }) => Place::Found {
+                file,
+                address: address + u64::from(offset),
+            },
+            Some(PageAt::Many) => Place::Ambiguous,
             None => Place::Missing,
         }
     }
 
-    /// The function at `address`.
-    pub(super) fn name(&self, address: u64) -> Named<'_> {
-        let range = self
-            .ranges
-            .partition_point(|range| range.0 <= address)
-            .checked_sub(1)
-            .map(|index| self.ranges[index])
-            .filter(|range| address < range.1);
-        let Some((_, _, index)) = range else {
-            return Named {
-                image: None,
-                function: format!("{address:#x}"),
-                start: address,
-            };
+    /// The function at `address` of the `file`th file read: only that
+    /// file's images name it.
+    pub(super) fn name(&self, file: usize, address: u64) -> Named<'_> {
+        let unnamed = Named {
+            image: None,
+            function: format!("{address:#x}"),
+            start: address,
+        };
+        let Some(file) = self.files.get(file) else {
+            return unnamed;
+        };
+        // The innermost range that holds the address, the last to start
+        // at or below it: ranges may nest.
+        let below = file.ranges.partition_point(|range| range.0 <= address);
+        let range = file.ranges[..below]
+            .iter()
+            .rev()
+            .find(|range| address < range.1);
+        let Some(&(_, _, index)) = range else {
+            return unnamed;
         };
         let image = &self.images[index];
         let symbol = image
@@ -512,6 +566,14 @@ mod tests {
         ]
     }
 
+    /// The address a place names, wherever it was found.
+    fn address(place: Place) -> Option<u64> {
+        match place {
+            Place::Found { address, .. } => Some(address),
+            _ => None,
+        }
+    }
+
     #[test]
     fn a_macho_names_its_pages_and_functions() {
         let file = fixtures::macho(BASE);
@@ -523,14 +585,20 @@ mod tests {
             &HashSet::from([first, second, 42]),
         )
         .unwrap();
-        assert_eq!(code.place(first, 0x10), Place::Found(BASE + ALPHA + 0x10));
-        assert_eq!(code.place(second, 0x20), Place::Found(BASE + 0x2020));
+        assert_eq!(
+            code.place(first, 0x10),
+            Place::Found {
+                file: 0,
+                address: BASE + ALPHA + 0x10
+            }
+        );
+        assert_eq!(address(code.place(second, 0x20)), Some(BASE + 0x2020));
         assert_eq!(code.place(42, 0), Place::Missing);
         // The header's page was not wanted.
         assert_eq!(code.place(fixtures::key(&file[..PAGE]), 0), Place::Missing);
         let image = Some("libfixture.dylib");
         assert_eq!(
-            code.name(BASE + ALPHA + 0x10),
+            code.name(0, BASE + ALPHA + 0x10),
             Named {
                 image,
                 function: "_alpha".into(),
@@ -540,17 +608,17 @@ mod tests {
         // A function start past the symbol before it: a function no
         // symbol names.
         assert_eq!(
-            code.name(BASE + UNNAMED + 0x100),
+            code.name(0, BASE + UNNAMED + 0x100),
             Named {
                 image,
                 function: format!("sub_{:x}", BASE + UNNAMED),
                 start: BASE + UNNAMED
             }
         );
-        assert_eq!(code.name(BASE + 0x2020).function, "_beta");
-        assert_eq!(code.name(BASE + 0x2020).start, BASE + BETA);
+        assert_eq!(code.name(0, BASE + 0x2020).function, "_beta");
+        assert_eq!(code.name(0, BASE + 0x2020).start, BASE + BETA);
         // Outside every image.
-        assert_eq!(code.name(0x10).image, None);
+        assert_eq!(code.name(0, 0x10).image, None);
         assert_eq!(
             code.loaded,
             ["libfixture.dylib: 1 image, 2 of 3 wanted pages"]
@@ -570,12 +638,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            code.place(first, 0x10),
-            Place::Found(CACHE_BASE + ALPHA + 0x10)
+            address(code.place(first, 0x10)),
+            Some(CACHE_BASE + ALPHA + 0x10)
         );
-        assert_eq!(code.place(second, 0x20), Place::Found(CACHE_BASE + 0x2020));
+        assert_eq!(address(code.place(second, 0x20)), Some(CACHE_BASE + 0x2020));
         assert_eq!(
-            code.name(CACHE_BASE + ALPHA + 0x10),
+            code.name(0, CACHE_BASE + ALPHA + 0x10),
             Named {
                 image: Some(CACHE_PATH),
                 function: "_alpha".into(),
@@ -583,10 +651,10 @@ mod tests {
             }
         );
         assert_eq!(
-            code.name(CACHE_BASE + UNNAMED).function,
+            code.name(0, CACHE_BASE + UNNAMED).function,
             format!("sub_{:x}", CACHE_BASE + UNNAMED)
         );
-        assert_eq!(code.name(CACHE_BASE + 0x2ffc).function, "_beta");
+        assert_eq!(code.name(0, CACHE_BASE + 0x2ffc).function, "_beta");
         assert_eq!(
             code.loaded,
             ["dyld_shared_cache_arm64e: 1 image, 2 of 2 wanted pages"]
@@ -605,11 +673,55 @@ mod tests {
         code.add_macho(&one, "one", &wanted).unwrap();
         code.add_macho(&other, "other", &wanted).unwrap();
         assert_eq!(code.place(first, 0), Place::Ambiguous);
-        // The same image read twice is one address.
+        // The same file read twice is one place.
         let mut again = Code::default();
         again.add_macho(&one, "one", &wanted).unwrap();
         again.add_macho(&one, "one", &wanted).unwrap();
-        assert_eq!(again.place(first, 0), Place::Found(BASE + ALPHA));
+        assert_eq!(
+            again.place(first, 0),
+            Place::Found {
+                file: 0,
+                address: BASE + ALPHA
+            }
+        );
+        assert_eq!(again.loaded.len(), 1);
+    }
+
+    /// Images at overlapping addresses in different files (the kernels of
+    /// one KDK, kexts linked at 0, two caches): a page names its function
+    /// from the file its bytes were found in. A dSYM, which holds names but
+    /// no code, is not read.
+    #[test]
+    fn overlapping_images_name_functions_from_their_own_file() {
+        let one = fixtures::macho_named(BASE, 0, ["_alpha", "_beta"]);
+        let other = fixtures::macho_named(BASE, 2, ["_gamma", "_delta"]);
+        let shifted = fixtures::macho_named(BASE + 0x1000, 4, ["_epsilon", "_zeta"]);
+        let [one_first, one_second] = keys(&one, 0);
+        let [other_first, _] = keys(&other, 0);
+        let [shifted_first, _] = keys(&shifted, 0);
+        let wanted = HashSet::from([one_first, one_second, other_first, shifted_first]);
+        let mut dsym = fixtures::macho_named(BASE, 6, ["_dsym", "_names"]);
+        dsym[12] = macho::MH_DSYM as u8;
+        let mut code = Code::default();
+        code.add_macho(&dsym, "kernel.dSYM", &wanted).unwrap();
+        code.add_macho(&one, "kernel.release.t6000", &wanted)
+            .unwrap();
+        code.add_macho(&other, "kernel.release.t8112", &wanted)
+            .unwrap();
+        code.add_macho(&shifted, "kext", &wanted).unwrap();
+        assert_eq!(code.loaded.len(), 3, "{:?}", code.loaded);
+        let named = |key, offset| match code.place(key, offset) {
+            Place::Found { file, address } => code.name(file, address),
+            place => panic!("{place:?}"),
+        };
+        assert_eq!(named(one_first, 0x10).function, "_alpha");
+        assert_eq!(named(one_first, 0x10).image, Some("kernel.release.t6000"));
+        assert_eq!(named(other_first, 0x10).function, "_gamma");
+        assert_eq!(named(other_first, 0x10).image, Some("kernel.release.t8112"));
+        assert_eq!(named(one_second, 0x20).function, "_beta");
+        // The shifted image's first code page is the others' second.
+        assert_eq!(named(shifted_first, 0x10).function, "_epsilon");
+        assert_eq!(named(shifted_first, 0x10).image, Some("kext"));
     }
 
     /// Paths load by content: a directory's main cache and its subcaches
@@ -635,8 +747,8 @@ mod tests {
             &HashSet::from([cached, kernel]),
         )
         .unwrap();
-        assert_eq!(code.place(cached, 4), Place::Found(CACHE_BASE + ALPHA + 4));
-        assert_eq!(code.place(kernel, 4), Place::Found(BASE + ALPHA + 4));
+        assert_eq!(address(code.place(cached, 4)), Some(CACHE_BASE + ALPHA + 4));
+        assert_eq!(address(code.place(kernel, 4)), Some(BASE + ALPHA + 4));
         assert_eq!(code.loaded.len(), 2, "{:?}", code.loaded);
         // A missing path is refused.
         let missing = directory.path().join("absent");
@@ -661,7 +773,11 @@ mod tests {
         code.read(&[path], &HashSet::new()).unwrap();
         println!("{:?}", code.loaded);
         assert!(code.images.len() > 1000, "{} images", code.images.len());
-        let unique = code.pages.values().filter(|at| at.is_some()).count();
+        let unique = code
+            .pages
+            .values()
+            .filter(|at| **at != PageAt::Many)
+            .count();
         assert!(
             unique * 10 > code.pages.len() * 9,
             "{unique} of {} code pages unique",
@@ -670,7 +786,10 @@ mod tests {
         let by_address: HashMap<u64, u64> = code
             .pages
             .iter()
-            .filter_map(|(&key, &at)| Some((at?, key)))
+            .filter_map(|(&key, &at)| match at {
+                PageAt::One { address, .. } => Some((address, key)),
+                PageAt::Many => None,
+            })
             .collect();
         for wanted in ["_objc_msgSend", "_platform_memmove"] {
             let (image, address) = code
@@ -689,8 +808,11 @@ mod tests {
                 .get(&page)
                 .unwrap_or_else(|| panic!("{wanted}'s page {page:#x} is ambiguous or not code"));
             let offset = (address - page) as u16;
-            assert_eq!(code.place(key, offset), Place::Found(address), "{wanted}");
-            let named = code.name(address);
+            let Place::Found { file, address: at } = code.place(key, offset) else {
+                panic!("{wanted} not found");
+            };
+            assert_eq!(at, address, "{wanted}");
+            let named = code.name(file, address);
             assert!(named.function.ends_with(wanted), "{wanted}: {named:?}");
             assert_eq!(named.image, Some(image.as_str()), "{wanted}");
             println!("{wanted}: {address:#x} in {image}, page {key:016x}+{offset:x}");
