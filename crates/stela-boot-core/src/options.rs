@@ -896,6 +896,11 @@ impl fmt::Display for System {
 
 pub const HOST_CHECK: &str = "--host-check";
 const DEFAULT_KEY_SECONDS: u64 = 60;
+/// What `--throughput-check` GETs without `--throughput-bytes`: 50 MiB (M4
+/// spec S3.6).
+pub const DEFAULT_THROUGHPUT_BYTES: u64 = 52_428_800;
+/// The largest `--throughput-bytes`: 2^32.
+const MAX_THROUGHPUT_BYTES: u64 = 1 << 32;
 
 /// The options of a `--host-check` line: the standalone report on the PC
 /// and its diagnostics.
@@ -924,6 +929,16 @@ pub struct HostCheck {
     /// network once it gives a DHCP lease, and report the reply, as a
     /// normal boot's `--network-check URL` does over its network.
     pub network_check: Option<String>,
+    /// GET this `http://` or `https://` URL over the `--wifi` network once
+    /// leased (and posted to), and time it (`--throughput-check URL`, M4 spec
+    /// S3.6), [`HostCheck::throughput_bytes`] of it.
+    pub throughput_check: Option<String>,
+    /// How many bytes the throughput check GETs, and its upload POSTs
+    /// (`--throughput-bytes N`, 1 to 2^32; [`DEFAULT_THROUGHPUT_BYTES`]).
+    pub throughput_bytes: u64,
+    /// POST that many zero bytes to this URL after the GET, and time it
+    /// (`--upload-check URL`).
+    pub upload_check: Option<String>,
     /// Keep the newest lines, the summary among them, in the firmware's
     /// stop-record variables once the checks end (`--keep-lines`).
     pub keep_lines: bool,
@@ -940,6 +955,9 @@ impl Default for HostCheck {
             wifi_key: None,
             wifi_country: None,
             network_check: None,
+            throughput_check: None,
+            throughput_bytes: DEFAULT_THROUGHPUT_BYTES,
+            upload_check: None,
             keep_lines: false,
         }
     }
@@ -959,6 +977,7 @@ impl HostCheck {
             return Err(Error::HostPrefix);
         }
         let mut options = Self::default();
+        let mut sized = false;
         while let Some(word) = words.next() {
             match word {
                 "--nor-file" => {
@@ -1004,6 +1023,36 @@ impl HostCheck {
                         return Err(Error::DuplicateNetworkCheck);
                     }
                 }
+                // The same URL rules, for the throughput check's GET and POST.
+                "--throughput-check" => {
+                    let url = words.next().ok_or(Error::MissingThroughputUrl)?;
+                    parse_url(url)?;
+                    if options
+                        .throughput_check
+                        .replace(String::from(url))
+                        .is_some()
+                    {
+                        return Err(Error::DuplicateThroughputCheck);
+                    }
+                }
+                "--throughput-bytes" => {
+                    let bytes = words
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .filter(|bytes| (1..=MAX_THROUGHPUT_BYTES).contains(bytes))
+                        .ok_or(Error::ThroughputBytes)?;
+                    if core::mem::replace(&mut sized, true) {
+                        return Err(Error::DuplicateThroughputBytes);
+                    }
+                    options.throughput_bytes = bytes;
+                }
+                "--upload-check" => {
+                    let url = words.next().ok_or(Error::MissingUploadUrl)?;
+                    parse_url(url)?;
+                    if options.upload_check.replace(String::from(url)).is_some() {
+                        return Err(Error::DuplicateUploadCheck);
+                    }
+                }
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -1036,6 +1085,11 @@ impl fmt::Display for HostCheck {
         )?;
         line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
         line.value("--network-check", self.network_check.as_deref())?;
+        line.value("--throughput-check", self.throughput_check.as_deref())?;
+        if self.throughput_bytes != DEFAULT_THROUGHPUT_BYTES {
+            line.value("--throughput-bytes", Some(self.throughput_bytes))?;
+        }
+        line.value("--upload-check", self.upload_check.as_deref())?;
         line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }

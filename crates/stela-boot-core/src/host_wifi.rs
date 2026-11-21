@@ -438,6 +438,85 @@ pub fn network_check(url: &str, post: Option<&Post>, ssid: &[u8]) -> (bool, Stri
     (passed, line)
 }
 
+/// How one of the throughput check's transfers (`--throughput-check`'s GET,
+/// `--upload-check`'s POST, M4 spec S3.6) ended, `after_us` microseconds on
+/// the TSC after it was opened: all its bytes moved (`Ended`, the GET's
+/// `--throughput-bytes` received, the POST's sent and answered), or not
+/// (`Failed`), with the bytes moved by then and why, in the network
+/// stack's words or the station check's cut's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Transfer {
+    Ended {
+        bytes: u64,
+        after_us: u64,
+    },
+    Failed {
+        bytes: u64,
+        after_us: u64,
+        why: String,
+    },
+}
+
+impl Transfer {
+    /// `<method> <url> <n> bytes in <ms> ms = <x.y> Mb/s`, or for a failure
+    /// `<method> <url> failed after <n> bytes in <ms> ms = <x.y> Mb/s: <why>`;
+    /// the rate is `-` for a transfer under a microsecond.
+    fn describe(&self, method: &str, url: &str) -> String {
+        let (bytes, after_us, why) = match self {
+            Self::Ended { bytes, after_us } => (*bytes, *after_us, None),
+            Self::Failed {
+                bytes,
+                after_us,
+                why,
+            } => (*bytes, *after_us, Some(why)),
+        };
+        // Bits per microsecond are Mb/s; tenths of one, rounded.
+        let rate = match after_us {
+            0 => String::from("-"),
+            us => {
+                let tenths = (u128::from(bytes) * 80 + u128::from(us) / 2) / u128::from(us);
+                alloc::format!("{}.{}", tenths / 10, tenths % 10)
+            }
+        };
+        let ms = after_us / 1_000;
+        match why {
+            None => alloc::format!("{method} {url} {bytes} bytes in {ms} ms = {rate} Mb/s"),
+            Some(why) => alloc::format!(
+                "{method} {url} failed after {bytes} bytes in {ms} ms = {rate} Mb/s: {why}"
+            ),
+        }
+    }
+
+    fn ended(&self) -> bool {
+        matches!(self, Self::Ended { .. })
+    }
+}
+
+/// The throughput check's verdict and its `CHECK throughput` line (M4 spec
+/// S3.6): the GET of `url` (`get`), then the upload's POST when there was
+/// one (`post`, its URL and how it ended), then the radio's `progress` line
+/// as the transfers left it. It passes when every transfer moved all its
+/// bytes. Every MAC address is masked and every public IPv4 address, a
+/// server's in a URL among them, written `<public>`
+/// ([`hide_public_addresses`]); the radio's line names no network.
+pub fn throughput_line(
+    url: &str,
+    get: &Transfer,
+    post: Option<(&str, &Transfer)>,
+    progress: &str,
+) -> (bool, String) {
+    let mut line = get.describe("GET", url);
+    let mut passed = get.ended();
+    if let Some((url, post)) = post {
+        line.push_str("; ");
+        line.push_str(&post.describe("POST", url));
+        passed &= post.ended();
+    }
+    line.push_str("; ");
+    line.push_str(progress);
+    (passed, hide_public_addresses(&mask_addresses(&line)))
+}
+
 /// `eapol rx <r> tx <t> acked <k>` in `line`.
 fn eapol(line: &str) -> Option<Eapol> {
     let (_, rest) = line.split_once("eapol rx ")?;

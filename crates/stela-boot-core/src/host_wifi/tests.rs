@@ -548,3 +548,90 @@ fn the_check_hides_the_name_and_waits_as_a_normal_boot() {
     assert_eq!(DHCP_WAIT_US, 60_000_000);
     assert_eq!(STATION_BUDGET_US, WIFI_CARRIER_WAIT_US + DHCP_WAIT_US);
 }
+
+/// A radio's progress line past its M3 fields (M4 spec S3.4).
+const MEASURED: &str = "keys 2, port open, ap vht80 ch 157 (c 155), regd IN ETSI, \
+     rx ht20 2ss mcs15 sgi 91% (40000), ampdu 99%, rxq full 0; tx sent 9";
+
+#[test]
+fn throughput_counts_exact_bytes_and_tsc_time() {
+    // M4 spec S3.6: N bytes over the TSC's microseconds, as Mb/s to one
+    // decimal: 52428800 * 8 / 4321000 = 97.07.
+    let get = Transfer::Ended {
+        bytes: 52_428_800,
+        after_us: 4_321_000,
+    };
+    assert_eq!(
+        throughput_line("http://x/f", &get, None, MEASURED),
+        (
+            true,
+            alloc::format!("GET http://x/f 52428800 bytes in 4321 ms = 97.1 Mb/s; {MEASURED}")
+        )
+    );
+    // With the upload: both pass.
+    let post = Transfer::Ended {
+        bytes: 1_048_576,
+        after_us: 1_000_000,
+    };
+    let (passed, line) = throughput_line("http://x/f", &get, Some(("http://u/up", &post)), "p");
+    assert!(passed);
+    assert_eq!(
+        line,
+        "GET http://x/f 52428800 bytes in 4321 ms = 97.1 Mb/s; \
+         POST http://u/up 1048576 bytes in 1000 ms = 8.4 Mb/s; p"
+    );
+    // A transfer no microsecond long has no rate.
+    let instant = Transfer::Ended {
+        bytes: 10,
+        after_us: 0,
+    };
+    let (_, line) = throughput_line("http://x/f", &instant, None, "p");
+    assert_eq!(line, "GET http://x/f 10 bytes in 0 ms = - Mb/s; p");
+}
+
+#[test]
+fn throughput_failure_names_bytes() {
+    let failed = Transfer::Failed {
+        bytes: 1000,
+        after_us: 30_000_000,
+        why: String::from("idle"),
+    };
+    assert_eq!(
+        throughput_line("http://x/f", &failed, None, "p"),
+        (
+            false,
+            String::from("GET http://x/f failed after 1000 bytes in 30000 ms = 0.0 Mb/s: idle; p")
+        )
+    );
+    // A failed upload fails the check, the GET's rate still printed.
+    let get = Transfer::Ended {
+        bytes: 2_000_000,
+        after_us: 1_000_000,
+    };
+    let (passed, line) = throughput_line("http://x/f", &get, Some(("http://u/up", &failed)), "p");
+    assert!(!passed);
+    assert_eq!(
+        line,
+        "GET http://x/f 2000000 bytes in 1000 ms = 16.0 Mb/s; \
+         POST http://u/up failed after 1000 bytes in 30000 ms = 0.0 Mb/s: idle; p"
+    );
+}
+
+#[test]
+fn throughput_masks_public_addresses() {
+    let get = Transfer::Ended {
+        bytes: 1,
+        after_us: 8,
+    };
+    let (_, line) = throughput_line(
+        "http://93.184.215.14/f",
+        &get,
+        None,
+        "deauth from 02:03:04:05:06:07, dns 8.8.8.8, router 192.168.29.1",
+    );
+    assert_eq!(
+        line,
+        "GET http://<public>/f 1 bytes in 0 ms = 1.0 Mb/s; deauth from xx:xx:xx:xx:xx:xx, \
+         dns <public>, router 192.168.29.1"
+    );
+}

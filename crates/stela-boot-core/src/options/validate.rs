@@ -61,6 +61,15 @@ pub(super) fn host_check(options: &HostCheck) -> Result<(), Error> {
     if options.network_check.is_some() && options.ssid.is_none() {
         return Err(Error::Constraint(Constraint::HostNetworkCheckDependency));
     }
+    // The throughput check GETs over the --wifi network; its size and its
+    // upload measure that GET's network (M4 spec S3.6).
+    let measured =
+        options.throughput_bytes != DEFAULT_THROUGHPUT_BYTES || options.upload_check.is_some();
+    if (options.throughput_check.is_some() && options.ssid.is_none())
+        || (measured && options.throughput_check.is_none())
+    {
+        return Err(Error::Constraint(Constraint::HostThroughputDependency));
+    }
     Ok(())
 }
 

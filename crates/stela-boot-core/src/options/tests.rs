@@ -660,3 +660,122 @@ fn numbers_take_decimal_and_separated_hex() {
 
 mod constraints;
 mod grammar;
+
+#[test]
+fn host_check_parses_throughput() {
+    // M4 spec S3.6: a GET of --throughput-bytes over the --wifi network,
+    // optionally a POST of as many to --upload-check.
+    let options = HostCheck::parse(
+        "--host-check --wifi-check --wifi home --throughput-check http://x/f \
+         --throughput-bytes 1048576",
+    )
+    .unwrap();
+    assert_eq!(options.throughput_check.as_deref(), Some("http://x/f"));
+    assert_eq!(options.throughput_bytes, 1_048_576);
+    assert_eq!(options.upload_check, None);
+    assert_eq!(
+        options.to_string(),
+        "--host-check --wifi-check --wifi home --throughput-check http://x/f \
+         --throughput-bytes 1048576"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // 50 MiB by default, which the line leaves out; an upload URL, in any
+    // order, with the normal boot's URL rules.
+    let options = HostCheck::parse(
+        "--host-check --upload-check https://u/up --wifi-check --throughput-check \
+         https://d/down --wifi a --keep-lines",
+    )
+    .unwrap();
+    assert_eq!(options.throughput_bytes, DEFAULT_THROUGHPUT_BYTES);
+    assert_eq!(DEFAULT_THROUGHPUT_BYTES, 52_428_800);
+    assert_eq!(options.upload_check.as_deref(), Some("https://u/up"));
+    assert_eq!(
+        options.to_string(),
+        "--host-check --wifi-check --wifi a --throughput-check https://d/down \
+         --upload-check https://u/up --keep-lines"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // The largest size is 2^32 bytes.
+    let options = HostCheck::parse(
+        "--host-check --wifi-check --wifi a --throughput-check http://x/f \
+         --throughput-bytes 4294967296",
+    )
+    .unwrap();
+    assert_eq!(options.throughput_bytes, 1 << 32);
+    let base = "--host-check --wifi-check --wifi a --throughput-check http://x/f";
+    for (extra, error) in [
+        (
+            " --throughput-check http://y/g",
+            Error::DuplicateThroughputCheck,
+        ),
+        (
+            " --throughput-bytes 1 --throughput-bytes 2",
+            Error::DuplicateThroughputBytes,
+        ),
+        (
+            " --upload-check http://u/p --upload-check http://u/q",
+            Error::DuplicateUploadCheck,
+        ),
+        (" --throughput-bytes", Error::ThroughputBytes),
+        (" --throughput-bytes 4294967297", Error::ThroughputBytes),
+        (" --throughput-bytes -1", Error::ThroughputBytes),
+        (" --throughput-bytes 1k", Error::ThroughputBytes),
+        (" --upload-check", Error::MissingUploadUrl),
+        (" --upload-check ftp://u/p", Error::UrlScheme),
+    ] {
+        let text = format!("{base}{extra}");
+        assert_eq!(HostCheck::parse(&text), Err(error), "{text}");
+    }
+    assert_eq!(
+        HostCheck::parse("--host-check --wifi-check --wifi a --throughput-check"),
+        Err(Error::MissingThroughputUrl)
+    );
+    assert_eq!(
+        HostCheck::parse("--host-check --wifi-check --wifi a --throughput-check http://h"),
+        Err(Error::UrlPath)
+    );
+}
+
+#[test]
+fn throughput_without_wifi_is_refused() {
+    for text in [
+        "--host-check --throughput-check http://h/p",
+        "--host-check --wifi-check --throughput-check http://h/p",
+        "--host-check --wifi-check --throughput-check http://h/p --upload-check http://h/u",
+    ] {
+        assert_eq!(
+            HostCheck::parse(text),
+            Err(Error::Constraint(Constraint::HostThroughputDependency)),
+            "{text}"
+        );
+    }
+    // The size and the upload measure the --throughput-check GET's network.
+    for text in [
+        "--host-check --wifi-check --wifi a --throughput-bytes 10",
+        "--host-check --wifi-check --wifi a --upload-check http://h/u",
+    ] {
+        assert_eq!(
+            HostCheck::parse(text),
+            Err(Error::Constraint(Constraint::HostThroughputDependency)),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        Constraint::HostThroughputDependency.message(),
+        "host check: --throughput-check, its --throughput-bytes and --upload-check run over the network of --wifi"
+    );
+}
+
+#[test]
+fn throughput_bytes_zero_is_refused() {
+    assert_eq!(
+        HostCheck::parse(
+            "--host-check --wifi-check --wifi a --throughput-check http://x/f --throughput-bytes 0"
+        ),
+        Err(Error::ThroughputBytes)
+    );
+    assert_eq!(
+        Error::ThroughputBytes.message(),
+        "--throughput-bytes takes a size from 1 to 4294967296 bytes"
+    );
+}

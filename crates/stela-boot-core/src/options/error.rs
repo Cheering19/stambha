@@ -71,6 +71,12 @@ pub enum Error {
     MissingAudioMode,
     MissingNetworkUrl,
     DuplicateNetworkCheck,
+    MissingThroughputUrl,
+    DuplicateThroughputCheck,
+    ThroughputBytes,
+    DuplicateThroughputBytes,
+    MissingUploadUrl,
+    DuplicateUploadCheck,
     MissingEcid,
     Ecid,
     MissingStorage,
@@ -123,6 +129,7 @@ pub enum Constraint {
     WifiDependency,
     HostWifiDependency,
     HostNetworkCheckDependency,
+    HostThroughputDependency,
     Ipv4Gateway,
     InstallSourceDependency,
     InstallConfiguration,
@@ -193,6 +200,12 @@ impl Error {
             Self::MissingAudioMode => "missing audio check mode",
             Self::MissingNetworkUrl => "missing network check URL",
             Self::DuplicateNetworkCheck => "duplicate network check",
+            Self::MissingThroughputUrl => "missing throughput check URL",
+            Self::DuplicateThroughputCheck => "duplicate --throughput-check",
+            Self::ThroughputBytes => "--throughput-bytes takes a size from 1 to 4294967296 bytes",
+            Self::DuplicateThroughputBytes => "duplicate --throughput-bytes",
+            Self::MissingUploadUrl => "missing upload check URL",
+            Self::DuplicateUploadCheck => "duplicate --upload-check",
             Self::MissingEcid => "missing ECID",
             Self::Ecid => "--ecid takes one nonzero ECID",
             Self::MissingStorage => "missing ANS storage partition",
@@ -241,6 +254,9 @@ impl Constraint {
             Self::HostWifiDependency => "host check: --wifi joins the network of --wifi-check",
             Self::HostNetworkCheckDependency => {
                 "host check: --network-check posts over the network of --wifi"
+            }
+            Self::HostThroughputDependency => {
+                "host check: --throughput-check, its --throughput-bytes and --upload-check run over the network of --wifi"
             }
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",
             Self::InstallSourceDependency => {

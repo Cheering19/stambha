@@ -52,6 +52,16 @@
 //! is hidden, every MAC address masked and every public IPv4 address, the
 //! server's among them, printed as `<public>`.
 //!
+//! With `--throughput-check URL` (M4 spec S3.6) the station, once leased
+//! and past its POST, GETs `--throughput-bytes` of `URL` ([`download`]),
+//! then with `--upload-check` POSTs as many zero bytes ([`upload`]), each
+//! timed on the TSC under a cut of its own, before the deauthentication.
+//! The result is `CHECK throughput` ([`throughput`],
+//! `host_wifi::throughput_line`): each transfer's bytes, milliseconds and
+//! Mb/s, then the radio's progress line as they left it, which counts the
+//! rates, aggregates and TX releases the link ran at; it passes when every
+//! transfer moved all its bytes. The same hiding and masking apply.
+//!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
 //! firmware. If the firmware left an IOMMU translating that does not map the
@@ -59,9 +69,6 @@
 //! fails at the first step the chip reads memory in, the firmware download
 //! (`dma rings` only allocates and maps; CH12's descriptors or the
 //! firmware's ready status then time out).
-//!
-//! [`STATION_BUDGET_US`]: stela_boot_core::host_wifi::STATION_BUDGET_US
-//! [`DEADLINE_MARGIN_US`]: stela_boot_core::host_wifi::DEADLINE_MARGIN_US
 use super::{Machine, Timing, Verdict};
 use alloc::{boxed::Box, format, string::String, string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
@@ -73,8 +80,9 @@ use core::{
 use stela_boot_core::{
     heap::Heap,
     host_wifi::{
-        Cut, FLUSH_US, Failures, Lease, Outcome, Post, Progress, ending, hide_public, hide_ssid,
-        mask_addresses, network_check,
+        Cut, DEADLINE_MARGIN_US, End, FLUSH_US, Failures, Lease, Outcome, Post, Progress,
+        STATION_BUDGET_US, Transfer, ending, hide_public, hide_ssid, mask_addresses, network_check,
+        throughput_line,
     },
     native_memory::NativeMemory,
     options::{DEFAULT_WIFI_KEY, HostCheck},
@@ -112,7 +120,9 @@ use stela_drivers::{
         native::{Rtw89Device, rtw89_attach, rtw89_attach_with},
     },
 };
-use stela_runtime::net::{ClockError, NetError, Stack, TlsUnavailable};
+use stela_runtime::net::{
+    ClockError, HttpRequest, NetError, Stack, TlsUnavailable, stack::DOWNLOAD_BUFFER,
+};
 use uefi::boot::{self, AllocateType, MemoryType};
 
 /// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
@@ -197,6 +207,7 @@ struct Station {
     entropy: Arc<dyn Entropy>,
     seed: u64,
     check: Option<NetworkCheck>,
+    throughput: Option<Throughput>,
 }
 
 /// `--network-check`: the URL, and the TLS configuration an `https://` hop
@@ -209,6 +220,33 @@ struct Station {
 struct NetworkCheck {
     url: String,
     security: Result<Arc<stela_tls::ClientConfig>, TlsUnavailable>,
+}
+
+/// `--throughput-check` (M4 spec S3.6): the URL GET, the bytes it takes (and
+/// `--upload-check`'s POST sends), the upload's URL, and their TLS
+/// configuration, made as [`NetworkCheck`]'s is.
+struct Throughput {
+    url: String,
+    bytes: u64,
+    upload: Option<String>,
+    security: Result<Arc<stela_tls::ClientConfig>, TlsUnavailable>,
+}
+
+/// What the throughput check measured: the GET, the POST when
+/// `--upload-check` asked for one, and the radio's progress line as the
+/// transfers left it.
+struct Measured {
+    get: Transfer,
+    post: Option<Transfer>,
+    progress: String,
+}
+
+/// What the station did once leased, before it left: the `--network-check`
+/// POST and the `--throughput-check` transfers.
+#[derive(Default)]
+pub(super) struct After {
+    post: Option<Post>,
+    measured: Option<Measured>,
 }
 
 /// The network `options` names, with `key`'s secret: a key file that is
@@ -234,14 +272,23 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, St
         .fill(&mut seed)
         .map_err(|error| format!("entropy: {error:?}"))?;
     let entropy: Arc<dyn Entropy> = Arc::new(source);
-    let check = options.network_check.clone().map(|url| NetworkCheck {
-        url,
-        security: crate::engine::network::security::client_config(
+    let security = || {
+        crate::engine::network::security::client_config(
             crate::system::read_rtc(),
             crate::firmware::tsc_hz(),
             crate::firmware::tsc_tolerance_ppm(),
             || Ok(Arc::clone(&entropy)),
-        ),
+        )
+    };
+    let check = options.network_check.clone().map(|url| NetworkCheck {
+        url,
+        security: security(),
+    });
+    let throughput = options.throughput_check.clone().map(|url| Throughput {
+        url,
+        bytes: options.throughput_bytes,
+        upload: options.upload_check.clone(),
+        security: security(),
     });
     Ok(Box::new(Station {
         network: Network {
@@ -252,6 +299,7 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, St
         entropy,
         seed: u64::from_le_bytes(seed),
         check,
+        throughput,
     }))
 }
 
@@ -365,10 +413,11 @@ pub(super) fn prepare(
 
 /// After ExitBootServices: the bring-up, recorded as `CHECK wifi`, then
 /// RF 0x18 per path and the networks the scan heard, one per line; then
-/// the station's `--network-check` POST, recorded as `CHECK network`.
+/// the station's `--network-check` POST, recorded as `CHECK network`; then
+/// its `--throughput-check` transfers, recorded as `CHECK throughput`.
 pub(super) fn check(machine: &mut Machine) {
     let mut lines = Vec::new();
-    let mut posted = None;
+    let mut after = After::default();
     let (verdict, detail) = match core::mem::replace(&mut machine.wifi, Plan::Off) {
         Plan::Off => (Verdict::Skip, String::from("no --wifi-check")),
         Plan::Decided(verdict, detail) => (verdict, detail),
@@ -376,7 +425,7 @@ pub(super) fn check(machine: &mut Machine) {
             prepared,
             &mut machine.kept,
             &mut machine.timing,
-            &mut posted,
+            &mut after,
         ) {
             Ok((detail, found)) => {
                 lines = found;
@@ -392,7 +441,39 @@ pub(super) fn check(machine: &mut Machine) {
     if !lines.is_empty() {
         crate::output::flush_log();
     }
-    network(machine, verdict, posted.as_ref());
+    network(machine, verdict, after.post.as_ref());
+    throughput(machine, verdict, after.measured.as_ref());
+}
+
+/// `CHECK throughput` (M4 spec S3.6): the `--throughput-check` GET, and the
+/// `--upload-check` POST, the station made once leased, judged and printed
+/// as `host_wifi::throughput_line` does, with the radio's progress line as
+/// the transfers left it; skipped without the option or without a station,
+/// failed when the station got no lease (or the `--network-check` POST
+/// before it ended the wait).
+fn throughput(machine: &mut Machine, wifi: Verdict, measured: Option<&Measured>) {
+    let (verdict, detail) = match (machine.options.throughput_check.as_deref(), measured) {
+        (None, _) => (Verdict::Skip, String::from("no --throughput-check")),
+        (Some(_), None) if wifi == Verdict::Skip => (
+            Verdict::Skip,
+            String::from("no Wi-Fi station (see CHECK wifi)"),
+        ),
+        (Some(_), None) => (
+            Verdict::Fail,
+            String::from("not run: the station check got no DHCP lease (see CHECK wifi)"),
+        ),
+        (Some(url), Some(measured)) => {
+            let upload = machine.options.upload_check.as_deref();
+            let post = upload.zip(measured.post.as_ref());
+            let ssid = machine.options.ssid.as_deref().unwrap_or_default();
+            let progress = hide_ssid(&measured.progress, ssid.as_bytes());
+            match throughput_line(url, &measured.get, post, &progress) {
+                (true, detail) => (Verdict::Pass, detail),
+                (false, detail) => (Verdict::Fail, detail),
+            }
+        }
+    };
+    machine.record("throughput", verdict, detail);
 }
 
 /// `CHECK network`: the `--network-check` POST the station made once
@@ -455,12 +536,13 @@ impl Rtw89Device for Chip<'_> {
 /// The bring-up of `prepared`'s function. Whatever happens past the park,
 /// Bus Master ends clear and memory decode as the firmware left it; what
 /// DMA could still reach (the rings) is kept in `kept`, and the station's
-/// `--network-check` POST, made before it was stopped, in `posted`.
+/// `--network-check` POST and `--throughput-check` transfers, made before
+/// it was stopped, in `after`.
 fn run(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
     timing: &mut Timing,
-    posted: &mut Option<Post>,
+    after: &mut After,
 ) -> Result<(String, Vec<String>), String> {
     let address = prepared.address;
     // SAFETY: one CPU after ExitBootServices; the storage probe is done
@@ -484,7 +566,7 @@ fn run(
         .config()
         .read16(regs::COMMAND)
         .map_err(|error| format!("pci={address} COMMAND: {error}"))?;
-    let result = attach(&mut function, prepared, kept, timing, posted);
+    let result = attach(&mut function, prepared, kept, timing, after);
     // Bus Master off, and memory decode as found; the rest of the park
     // (MSI, MSI-X, No Snoop, ATS off, INTx disabled) stays.
     let restored = function.set_bus_master(false).and_then(|()| {
@@ -513,7 +595,7 @@ fn attach(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
     timing: &mut Timing,
-    posted: &mut Option<Post>,
+    after: &mut After,
 ) -> Result<(String, Vec<String>), String> {
     let Prepared {
         address,
@@ -642,9 +724,10 @@ fn attach(
                     rings,
                     pools,
                     post,
+                    measured,
                 } = ran;
                 kept.push(Box::new((rings, pools)));
-                *posted = post;
+                *after = After { post, measured };
                 match result {
                     Ok((detail, lines)) => Ok((format!("{detail}{}", left_on(was_on)), lines)),
                     Err(detail) => Err(format!("{detail}{}", left_on(was_on))),
@@ -683,6 +766,7 @@ struct Kept {
     rings: Option<ax::Rings>,
     pools: Option<TxPools>,
     post: Option<Post>,
+    measured: Option<Measured>,
 }
 
 /// The station check (M3 spec S17.3-S17.5) on a chip `rtw89_attach_with`
@@ -702,15 +786,9 @@ struct Kept {
 /// the cut comes [`DEADLINE_MARGIN_US`] short of `--deadline`, so the chip
 /// is stopped (and then Bus Master cleared) before the deadline can end
 /// the check.
-///
-/// [`DEADLINE_MARGIN_US`]: stela_boot_core::host_wifi::DEADLINE_MARGIN_US
 #[expect(
     clippy::too_many_arguments,
     reason = "rtw89_attach_with's step 5 inputs, then the station's own."
-)]
-#[expect(
-    clippy::boxed_local,
-    reason = "The box keeps the passphrase's inline bytes from being copied on every hand-on."
 )]
 fn keep(
     io: &mut NativeAxIo,
@@ -728,6 +806,7 @@ fn keep(
     let ssid = station.network.ssid.clone();
     let seed = station.seed;
     let check = station.check;
+    let throughput = station.throughput;
     let inputs = Inputs {
         clock,
         database,
@@ -749,11 +828,12 @@ fn keep(
                 rings: returned.and_then(|(_, rings)| rings),
                 pools: None,
                 post: None,
+                measured: None,
             };
         }
     };
-    let (mut wifi, outcome, summary, failures, post) =
-        lease(wifi, clock, timing, seed, check.as_ref());
+    let (mut wifi, outcome, summary, failures, after) =
+        lease(wifi, clock, timing, seed, check.as_ref(), throughput.as_ref());
     let failure = match wifi.receive() {
         Err(LinkError::Adapter(failure)) => Some(failure),
         Err(error) => Some(format!("{error:?}")),
@@ -796,7 +876,8 @@ fn keep(
         },
         rings: Some(rings),
         pools: Some(pools),
-        post,
+        post: after.post,
+        measured: after.measured,
     }
 }
 
@@ -806,16 +887,22 @@ fn keep(
 /// failure it may get past (the keeper's failures reach it as the link's,
 /// carrier that did not come or went) is noted and `dhcp` driven again,
 /// until [`HostClock`]'s cut ends the wait. With `check` and a lease, the
-/// POST follows under the same cut ([`post`]). Gives back the station, how
-/// the wait ended, without a lease what the DHCP exchange did, the
-/// failures driven past, and the POST.
+/// POST follows under the same cut ([`post`]); then with `throughput` the
+/// GET and the upload ([`download`], [`upload`]), each under a cut of its
+/// own, the station check's budget again from its start or the margin
+/// before `--deadline`, whichever comes first, unless an earlier cut
+/// already ended the stack's wait; and the radio's progress line as they
+/// left it. Gives back the station, how the wait ended, without a lease
+/// what the DHCP exchange did, the failures driven past, and what the
+/// station did once leased.
 fn lease<L: Link>(
     wifi: L,
     clock: Clock,
     timing: &mut Timing,
     seed: u64,
     check: Option<&NetworkCheck>,
-) -> (L, Outcome, Option<String>, Failures, Option<Post>) {
+    throughput: Option<&Throughput>,
+) -> (L, Outcome, Option<String>, Failures, After) {
     let mut failures = Failures::default();
     // The stack's every time comes after this one, which it takes as its
     // start (smoltcp's `Instant` is an i64 of microseconds).
@@ -825,13 +912,13 @@ fn lease<L: Link>(
         // would drop the station with a failure of its clock, is not made.
         other => {
             let why = format!("the TSC cannot time the network stack: {other:?}");
-            return (wifi, Outcome::Failed(why), None, failures, None);
+            return (wifi, Outcome::Failed(why), None, failures, After::default());
         }
     };
     let deadline = timing
         .until_deadline_us()
         .map(|left| start.saturating_add(left));
-    let stop = Cut::new(start, deadline);
+    let stop = Cell::new(Cut::new(start, deadline));
     let timing = RefCell::new(timing);
     let armed = Cell::new(false);
     let cut = Cell::new(false);
@@ -839,7 +926,7 @@ fn lease<L: Link>(
         clock,
         start,
         timing: &timing,
-        stop,
+        stop: &stop,
         armed: &armed,
         cut: &cut,
     };
@@ -860,7 +947,7 @@ fn lease<L: Link>(
                     after_us: clock.now_us().saturating_sub(start),
                 });
             }
-            Err(NetError::Clock(_)) if cut.get() => break Outcome::Cut(stop.end()),
+            Err(NetError::Clock(_)) if cut.get() => break Outcome::Cut(stop.get().end()),
             Err(error) if error.retryable() => failures.note(error.to_string()),
             Err(error) => break Outcome::Failed(error.to_string()),
         }
@@ -870,10 +957,38 @@ fn lease<L: Link>(
         _ => stack.dhcp_summary(),
     };
     let posted = match (&outcome, check) {
-        (Outcome::Leased(_), Some(check)) => Some(post(&mut stack, check, clock, &cut, stop)),
+        (Outcome::Leased(_), Some(check)) => Some(post(&mut stack, check, clock, &cut, stop.get())),
         _ => None,
     };
-    (stack.into_link(), outcome, summary, failures, posted)
+    let measured = match (&outcome, throughput) {
+        (Outcome::Leased(_), Some(throughput)) if !cut.get() => {
+            stop.set(Cut::new(clock.now_us(), deadline));
+            let get = download(&mut stack, throughput, clock, &cut, stop.get());
+            let post = throughput.upload.as_deref().map(|url| {
+                if cut.get() {
+                    return Transfer::Failed {
+                        bytes: 0,
+                        after_us: 0,
+                        why: String::from("not run: the GET's cut ended the stack's wait"),
+                    };
+                }
+                stop.set(Cut::new(clock.now_us(), deadline));
+                upload(&mut stack, url, throughput, clock, &cut, stop.get())
+            });
+            let progress = stack.link_mut().diagnostic().unwrap_or_default();
+            Some(Measured {
+                get,
+                post,
+                progress,
+            })
+        }
+        _ => None,
+    };
+    let after = After {
+        post: posted,
+        measured,
+    };
+    (stack.into_link(), outcome, summary, failures, after)
 }
 
 /// The network check's POST over the leased `stack`, as a normal boot's
@@ -900,17 +1015,142 @@ fn post<L: Link, C: stela_runtime::net::Clock>(
     }
 }
 
+/// How long the throughput check lets the stack wait between two reads of
+/// a transfer; a polled radio's `wait` returns at once
+/// (`Stack::wait_until`), so the transfer polls the radio as fast as it
+/// can.
+const TRANSFER_WAIT_US: u64 = 1_000;
+
+/// The throughput check's GET over the leased `stack` (M4 spec S3.6), as a
+/// normal boot's download opens one (`engine::network::download`):
+/// `open_http` of `throughput`'s URL for bytes 0 to N - 1
+/// (`HttpRequest::range`, without an ETag) on a `DOWNLOAD_BUFFER` socket,
+/// then `read_http` until N bytes of a 2xx answer came, which ends it there
+/// whatever more the server sends, or until it fails. Timed on the TSC from
+/// before `open_http` to the N-th byte. A response that ends short of N
+/// bytes fails, with what it gave.
+fn download<L: Link, C: stela_runtime::net::Clock>(
+    stack: &mut Stack<L, C>,
+    throughput: &Throughput,
+    clock: Clock,
+    cut: &Cell<bool>,
+    stop: Cut,
+) -> Transfer {
+    let wanted = throughput.bytes;
+    let begun = clock.now_us();
+    let mut moved = 0u64;
+    let request = HttpRequest::range(0, wanted.saturating_sub(1), None);
+    let opened = stack.open_http(
+        &throughput.url,
+        request,
+        DOWNLOAD_BUFFER,
+        throughput.security.clone(),
+    );
+    let result = opened.and_then(|mut transfer| {
+        let result = loop {
+            let read = stack.read_http(&mut transfer, |bytes, closed| {
+                moved = moved.saturating_add(bytes.len() as u64).min(wanted);
+                Ok(moved >= wanted || closed)
+            });
+            match read {
+                Ok(true) => break Ok(moved >= wanted),
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
+            if let Err(error) = stack.wait(TRANSFER_WAIT_US) {
+                break Err(error);
+            }
+        };
+        stack.close_http(transfer);
+        result
+    });
+    let after_us = clock.now_us().saturating_sub(begun);
+    finished(result, moved, after_us, cut, stop, "the answer ended early")
+}
+
+/// The throughput check's upload over the leased `stack` (M4 spec S3.6):
+/// `post_url` of `throughput`'s N zero bytes to `url`, as
+/// `application/octet-stream` without other headers, waiting for the
+/// answer, timed on the TSC from before the POST to its 2xx answer. The
+/// stack holds the body and its request while it sends them, so the heap
+/// holds about three times N at once. A failure counts no byte: the stack
+/// does not say how many left.
+fn upload<L: Link, C: stela_runtime::net::Clock>(
+    stack: &mut Stack<L, C>,
+    url: &str,
+    throughput: &Throughput,
+    clock: Clock,
+    cut: &Cell<bool>,
+    stop: Cut,
+) -> Transfer {
+    let Ok(length) = usize::try_from(throughput.bytes) else {
+        return Transfer::Failed {
+            bytes: 0,
+            after_us: 0,
+            why: String::from("the upload is larger than this machine's address space"),
+        };
+    };
+    let begun = clock.now_us();
+    let body = vec![0u8; length];
+    let result = stack.post_url(
+        url,
+        &[],
+        "application/octet-stream",
+        &body,
+        throughput.security.clone(),
+    );
+    drop(body);
+    let after_us = clock.now_us().saturating_sub(begun);
+    let answered = result.map(|_| true);
+    let bytes = if answered.is_ok() { throughput.bytes } else { 0 };
+    finished(answered, bytes, after_us, cut, stop, "")
+}
+
+/// A transfer's end: all its bytes (`Ok(true)`), short of them
+/// (`Ok(false)`, `short` saying how), cut by `stop`, or failed in the
+/// stack's words.
+fn finished(
+    result: Result<bool, NetError>,
+    bytes: u64,
+    after_us: u64,
+    cut: &Cell<bool>,
+    stop: Cut,
+    short: &str,
+) -> Transfer {
+    let why = match result {
+        Ok(true) => return Transfer::Ended { bytes, after_us },
+        Ok(false) => String::from(short),
+        Err(NetError::Clock(_)) if cut.get() => match stop.end() {
+            End::Budget => format!(
+                "no end within the station check's {} s",
+                STATION_BUDGET_US / 1_000_000
+            ),
+            End::Deadline => format!(
+                "stopped {} s before --deadline",
+                DEADLINE_MARGIN_US / 1_000_000
+            ),
+        },
+        Err(error) => error.to_string(),
+    };
+    Transfer::Failed {
+        bytes,
+        after_us,
+        why,
+    }
+}
+
 /// The network stack's clock (M3 plan Task 20): the TSC, as the radio's
 /// own, beating `timing` on every read as the host check's other waits do,
 /// so `BEAT` keeps printing while the stack waits. Until `armed` it gives
 /// `start`, the stack's own start. Armed, a read at or past `stop` fails
 /// and sets `cut`, which ends the stack's wait (the stack then refuses
-/// every operation, and the station check asks it none).
+/// every operation, and the station check asks it none). `stop` is moved
+/// on for each throughput transfer.
 struct HostClock<'a, 't> {
     clock: Clock,
     start: u64,
     timing: &'a RefCell<&'t mut Timing>,
-    stop: Cut,
+    stop: &'a Cell<Cut>,
     armed: &'a Cell<bool>,
     cut: &'a Cell<bool>,
 }
@@ -922,7 +1162,7 @@ impl stela_runtime::net::Clock for HostClock<'_, '_> {
             return Ok(self.start);
         }
         let now = self.clock.try_now_us().map_err(ClockError::Calibration)?;
-        if self.stop.reached(now) {
+        if self.stop.get().reached(now) {
             self.cut.set(true);
             return Err(ClockError::Unavailable);
         }
