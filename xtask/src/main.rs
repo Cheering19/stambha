@@ -14,6 +14,7 @@ mod oracles;
 mod pages;
 mod preflight;
 mod restore_dry_run;
+mod symbolize;
 mod sysregs;
 mod tools;
 
@@ -68,6 +69,9 @@ enum Task {
     RestoreDryRun(restore_dry_run::RestoreDryRun),
     /// Generate the System register accessors from Arm's AARCHMRS.
     Sysregs(sysregs::Sysregs),
+    /// Name the functions a `--profile` boot log's `PES PC` lines sampled,
+    /// from the guest's dyld shared cache or Mach-O images.
+    Symbolize(symbolize::Symbolize),
 }
 
 fn main() -> ExitCode {
@@ -88,6 +92,7 @@ fn main() -> ExitCode {
         Task::CpuReference(task) => task.run().map(|()| ExitCode::SUCCESS),
         Task::RestoreDryRun(task) => task.run(),
         Task::Sysregs(task) => task.run().map(|()| ExitCode::SUCCESS),
+        Task::Symbolize(task) => task.run().map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");
