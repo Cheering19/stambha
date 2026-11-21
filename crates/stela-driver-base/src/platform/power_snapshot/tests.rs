@@ -313,6 +313,9 @@ fn names_keep_31_bytes_up_to_the_first_nul() {
     let mut padded = [0u8; 32];
     padded[..4].copy_from_slice(b"Pack");
     assert_eq!(Name::new(b"Pack").padded(), &padded);
+    // Bytes no printable ASCII character is are '?'; a NUL still ends it.
+    assert_eq!(Name::new(b"A\x01B\x7fC\xffD ~\0E").text(), b"A?B?C?D ~");
+    assert_eq!(Name::new(&[0x80; 40]).text(), &[b'?'; 31]);
 }
 
 #[test]

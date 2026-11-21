@@ -48,7 +48,8 @@ pub enum Unit {
 }
 
 /// A battery identity string as Linux keeps it: at most 31 bytes, ended
-/// by the first NUL, held NUL-padded in 32.
+/// by the first NUL, held NUL-padded in 32. Firmware strings are raw bytes;
+/// each that is not printable ASCII (0x20 to 0x7e) is held as `?`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Name([u8; Name::BYTES]);
 
@@ -62,7 +63,13 @@ impl Name {
             .unwrap_or(text.len())
             .min(Self::BYTES - 1);
         let mut bytes = [0; Self::BYTES];
-        bytes[..length].copy_from_slice(&text[..length]);
+        for (to, &from) in bytes.iter_mut().zip(&text[..length]) {
+            *to = if (0x20..=0x7e).contains(&from) {
+                from
+            } else {
+                b'?'
+            };
+        }
         Self(bytes)
     }
 
