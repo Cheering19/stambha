@@ -141,7 +141,7 @@ use super::assoc::{self, AddrCam, AssocInputs, Features, RaPeer};
 use super::ba::{self, BaCam, RxStats};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
-use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, SCAN_END};
+use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, RaReport, SCAN_END};
 use super::chan::{Chan, frequency};
 use super::channel::{self, ChannelError, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
@@ -154,9 +154,10 @@ use super::keys::{self, KeyCam};
 use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
 use super::regd::Regds;
+use super::rx::decode_rate;
 use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
 use super::station::chip::{
-    self, Association, Chip, Data, HardwareKey, Incoming, Management, Token,
+    self, Association, Chip, Data, HardwareKey, Incoming, LinkCounts, Management, Token, TxCounts,
 };
 use super::txd::{self, RateCaps, TxSec};
 use super::txpwr_tables::TxPowerTables;
@@ -224,9 +225,9 @@ const TX_CHANNELS: [TxChannel; 5] = [
 /// What the TX side did, saturating, for [`Chip::diagnostic`]: frames
 /// queued, refused for no room, reported, reported acknowledged; release
 /// reports skipped (`Releases::invalid`) and stale (for a page not in
-/// flight or already reported).
+/// flight or already reported). [`Live::tx_counts`] counts by channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TxCounts {
+struct TxTally {
     sent: u32,
     full: u32,
     reported: u32,
@@ -293,7 +294,9 @@ pub struct Live<I: AxIo> {
     ba: BaCam,
     /// The AP's station's `tid_rx_stats`, for the PN check.
     rx_stats: RxStats,
-    tx: TxCounts,
+    tx: TxTally,
+    /// [`Live::tx_counts`].
+    counts: TxCounts,
     ba_counts: BaCounts,
     /// A failure powered the chip off.
     off: bool,
@@ -327,21 +330,23 @@ impl LiveScan {
     }
 }
 
-/// What [`Held`] keeps: a frame, or a beacon filter report.
+/// What [`Held`] keeps: a frame, a beacon filter report, or an RA report.
 enum Kept {
     Frame(Received),
     Report(BcnFltr),
+    Rate(RaReport),
 }
 
-/// Frames and beacon filter reports drained outside [`Live::drain`] and
-/// [`Live::expire_scan`], oldest first, for the next [`Live::drain`] to hand
-/// out, at most [`MAX_HELD`] of each; past it they are dropped and counted.
-/// Other C2Hs are not held: the ledger counts them.
+/// Frames, beacon filter reports and RA reports drained outside
+/// [`Live::drain`] and [`Live::expire_scan`], oldest first, for the next
+/// [`Live::drain`] to hand out, at most [`MAX_HELD`] of each; past it they are
+/// dropped and counted. Other C2Hs are not held: the ledger counts them.
 #[derive(Default)]
 struct Held {
     kept: VecDeque<Kept>,
     frames: usize,
     reports: usize,
+    rates: usize,
     dropped: u16,
 }
 
@@ -350,6 +355,7 @@ impl Held {
         let (kept, count) = match event {
             Event::Frame(frame) => (Kept::Frame(frame), &mut self.frames),
             Event::C2h(C2h::BeaconFilter(report)) => (Kept::Report(report), &mut self.reports),
+            Event::C2h(C2h::RaReport(report)) => (Kept::Rate(report), &mut self.rates),
             Event::C2h(_) => return,
         };
         if *count < MAX_HELD {
@@ -370,6 +376,10 @@ impl Held {
             Kept::Report(report) => {
                 self.reports -= 1;
                 Event::C2h(C2h::BeaconFilter(report))
+            }
+            Kept::Rate(report) => {
+                self.rates -= 1;
+                Event::C2h(C2h::RaReport(report))
             }
         })
     }
@@ -556,7 +566,8 @@ pub unsafe fn start<I: AxIo>(
         keys: KeyCam::default(),
         ba: BaCam::default(),
         rx_stats: RxStats::default(),
-        tx: TxCounts::default(),
+        tx: TxTally::default(),
+        counts: TxCounts::default(),
         ba_counts: BaCounts::default(),
         off: false,
     })
@@ -583,7 +594,8 @@ fn token(ch: TxChannel, page: u8) -> Token {
 }
 
 /// A received frame as the station hears it: the tag as a channel at its
-/// cfg80211 frequency, the free-running counter as its TSF.
+/// cfg80211 frequency, the free-running counter as its TSF, the
+/// descriptor's rate decoded ([`decode_rate`]) with its A-MPDU bit.
 fn heard(frame: Received) -> chip::Received {
     let Tag { band, channel } = frame.tag;
     chip::Received {
@@ -598,6 +610,8 @@ fn heard(frame: Received) -> chip::Received {
         decrypted: frame.decrypted,
         icv_error: frame.icv_error,
         fcs_error: frame.fcs_error,
+        rate: Some(decode_rate(frame.data_rate, frame.bw, frame.gi_ltf)),
+        ampdu: frame.ampdu,
     }
 }
 
@@ -617,6 +631,13 @@ fn chan_of(channel: Channel) -> Result<Chan, AxError> {
 /// A failure of `step` as [`Chip`] reports it.
 fn failed(step: &str, error: AxError) -> String {
     format!("{step}: {error}")
+}
+
+/// Whether an RA report goes to the station: for its MAC ID
+/// (`__rtw89_phy_c2h_ra_rpt_iter` matches `rtwsta_link->mac_id`,
+/// `phy.c:3247-3249`), and kept as Linux keeps one ([`RaReport::valid`]).
+fn station_rate(report: &RaReport) -> bool {
+    report.macid == u16::from(vif::MAC_ID) && report.valid()
 }
 
 /// Whether `event` goes on from the drain that brought it: a frame only
@@ -647,6 +668,17 @@ impl<I: AxIo> Live<I> {
     /// (`00` for the world's).
     pub fn regds(&self) -> (Regds, [u8; 2]) {
         self.regds
+    }
+
+    /// What the TX side did by channel (M4 spec S3.2): each frame a submit
+    /// took, each write of a ring's index, each release report and those
+    /// not `RTW89_TX_DONE`, and the RPQ polls that found RPQ full
+    /// ([`super::pci::Rings::rpq_full_batches`]).
+    pub fn tx_counts(&self) -> TxCounts {
+        TxCounts {
+            rpq_full: u32::from(self.rings.rpq_full_batches()),
+            ..self.counts
+        }
     }
 
     /// The channel the last switch set: [`start`]'s 2.4 GHz channel 1, then
@@ -1533,6 +1565,9 @@ impl<I: AxIo> Live<I> {
         match queued {
             Some(page) => {
                 bump(&mut self.tx.sent);
+                // Txq::submit writes the ring index for each frame it takes.
+                bump(&mut self.counts.submitted[ch.slot()]);
+                bump(&mut self.counts.kicks[ch.slot()]);
                 Ok(Some(token(ch, page)))
             }
             None => {
@@ -1548,8 +1583,9 @@ impl<I: AxIo> Live<I> {
     /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
     /// outstanding; RXQ ([`Live::drain`]), its frames handed on, each past
     /// `rtw89_core_skb_pn_valid` as it was drained ([`RxStats::valid`], a
-    /// drop counted); the scan budget ([`Live::expire_scan`]); then each
-    /// beacon filter report
+    /// drop counted), with each RA report for the station's MAC ID as
+    /// [`Incoming::RaReport`] (`rtw89_phy_c2h_ra_rpt`, M4 spec S3.3); the
+    /// scan budget ([`Live::expire_scan`]); then each beacon filter report
     /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
     /// takes it (`Live::beacon_filter`); then, once,
     /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
@@ -1577,6 +1613,9 @@ impl<I: AxIo> Live<I> {
         let mut frames = |e: Event<'_>| match e {
             Event::Frame(frame) => sink(Incoming::Frame(heard(frame))),
             Event::C2h(C2h::BeaconFilter(report)) => filter.push(report),
+            Event::C2h(C2h::RaReport(report)) if station_rate(&report) => {
+                sink(Incoming::RaReport(report))
+            }
             Event::C2h(_) => {}
         };
         // SAFETY: as above, `drain`'s.
@@ -1610,6 +1649,7 @@ impl<I: AxIo> Live<I> {
             rings,
             pools,
             tx,
+            counts,
             ..
         } = self;
         let mut rpq = rings.rpq();
@@ -1633,8 +1673,11 @@ impl<I: AxIo> Live<I> {
                     }
                     let acknowledged = release.status == TX_DONE;
                     bump(&mut tx.reported);
+                    bump(&mut counts.released[ch.slot()]);
                     if acknowledged {
                         bump(&mut tx.acked);
+                    } else {
+                        bump(&mut counts.failed);
                     }
                     sink(Incoming::Transmitted {
                         token: token(ch, page),
@@ -1984,7 +2027,7 @@ impl<I: AxIo> Chip for Live<I> {
     /// Ack starts and stops and the frames the PN check dropped, naming no
     /// address.
     fn diagnostic(&self) -> String {
-        let TxCounts {
+        let TxTally {
             sent,
             full,
             reported,
@@ -2016,6 +2059,18 @@ impl<I: AxIo> Chip for Live<I> {
             line.push_str(", powered off");
         }
         line
+    }
+
+    /// The TX power's alpha2 and its index on the band tuned
+    /// ([`Regds::txpwr`]), the RXQ polls that found RXQ full and
+    /// [`Live::tx_counts`].
+    fn link_counts(&self) -> LinkCounts {
+        let (regds, alpha2) = self.regds;
+        LinkCounts {
+            regd: Some((alpha2, regds.txpwr(self.chan.band))),
+            rxq_full: u32::from(self.rings.rxq_full_batches()),
+            tx: self.tx_counts(),
+        }
     }
 }
 

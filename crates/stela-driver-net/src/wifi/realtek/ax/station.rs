@@ -151,6 +151,8 @@ pub mod chip;
 
 use self::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
 use super::assoc::HtPeer;
+use super::c2h::{RaReport, ra_rate};
+use super::rx::{Rate, RateMode};
 use super::txd;
 use crate::{
     Clock, Link, LinkError, Mac,
@@ -177,12 +179,20 @@ use crate::{
             external,
             fragments::Fragments,
             multi_link::Affiliation,
+            operations::Operations,
             phy::{Capabilities, McsMaps, Role},
             wire::six_ghz::Selection,
         },
     },
 };
-use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, VecDeque},
+    format,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::fmt;
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
@@ -371,6 +381,10 @@ struct Progress {
     data: Option<Traffic>,
     beacon_lost: Option<u32>,
     last: Option<&'static str>,
+    /// The ADDBA Requests the station sent, and those the AP answered with
+    /// success (M4 spec S3.4).
+    addba_sent: u32,
+    addba_ok: u32,
 }
 
 fn bump(counter: &mut u32) {
@@ -387,6 +401,159 @@ fn exchange(exchange: Option<Exchange>) -> String {
         || String::from("-"),
         |e| format!("{}/{} status {}", e.sent, e.acked, or_dash(e.status)),
     )
+}
+
+/// The rates of the data frames the chip handed on addressed to the
+/// station, each with the A-MPDU bit of its RX descriptor (M4 spec S3.1):
+/// `counts` by rate, `ampdu` those that came in an A-MPDU, `total` all,
+/// each saturating. The key space is the descriptor's, so the map stays
+/// bounded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RateHistogram {
+    pub counts: BTreeMap<Rate, u32>,
+    pub ampdu: u32,
+    pub total: u32,
+}
+
+impl RateHistogram {
+    pub fn record(&mut self, rate: Rate, ampdu: bool) {
+        bump(self.counts.entry(rate).or_default());
+        if ampdu {
+            bump(&mut self.ampdu);
+        }
+        bump(&mut self.total);
+    }
+
+    /// The rate most frames came at, the highest of a tie, and its count.
+    pub fn top(&self) -> Option<(Rate, u32)> {
+        self.counts
+            .iter()
+            .max_by_key(|&(_, &count)| count)
+            .map(|(&rate, &count)| (rate, count))
+    }
+}
+
+/// `rate` as the progress line prints it: mode and width, streams, MCS (a
+/// legacy rate's index) and a short GI.
+fn rate_text(rate: &Rate) -> String {
+    let mode = match rate.mode {
+        RateMode::Legacy => "legacy",
+        RateMode::Ht => "ht",
+        RateMode::Vht => "vht",
+        RateMode::He => "he",
+    };
+    let sgi = if rate.sgi { " sgi" } else { "" };
+    format!(
+        "{mode}{} {}ss mcs{}{sgi}",
+        width_text(rate.bw),
+        rate.nss,
+        rate.mcs
+    )
+}
+
+/// `enum rtw89_bandwidth`'s 20 to 160 MHz.
+fn width_text(bw: u8) -> &'static str {
+    match bw {
+        0 => "20",
+        1 => "40",
+        2 => "80",
+        3 => "160",
+        _ => "?",
+    }
+}
+
+/// `part` of `whole` in whole percent, rounded down.
+fn percent(part: u32, whole: u32) -> u64 {
+    u64::from(part) * 100 / u64::from(whole.max(1))
+}
+
+/// The joined AP's operation as its beacon states it (M4 spec S3.4): its
+/// mode (`he` with an HE operation, else `vht` with a VHT operation on 5
+/// GHz, else `ht` with an HT operation, else `legacy`), its width and
+/// centre channel from the HT operation's secondary channel offset and the
+/// VHT operation's width and centre segments (`ieee80211_chandef_vht_oper`,
+/// read as the AP states it, not as the station joined), its primary
+/// channel, and the extended NSS bandwidth support of its VHT capability
+/// (bits 31:30) when it has one (M4 spec S7.2, SL-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApOperation {
+    mode: &'static str,
+    width: &'static str,
+    primary: u16,
+    centre: u16,
+    ext_nss_bw: Option<u8>,
+}
+
+impl ApOperation {
+    fn of(bss: &Bss) -> Self {
+        let primary = bss.channel.number;
+        let operations = Operations::parse(&bss.elements).ok();
+        let ht = operations.as_ref().and_then(|o| o.ht.as_ref());
+        let vht = operations
+            .as_ref()
+            .and_then(|o| o.vht.as_ref())
+            .filter(|_| bss.channel.band == Band::Ghz5);
+        let he = operations.as_ref().is_some_and(|o| o.he.is_some());
+        let mode = match (he, vht.is_some(), ht.is_some()) {
+            (true, _, _) => "he",
+            (false, true, _) => "vht",
+            (false, false, true) => "ht",
+            _ => "legacy",
+        };
+        let (mut width, mut centre) = ("20", primary);
+        match ht.map(|ht| ht.parameter & 3) {
+            Some(1) => (width, centre) = ("40", primary + 2),
+            Some(3) => (width, centre) = ("40", primary.saturating_sub(2)),
+            _ => {}
+        }
+        if let Some(vht) = vht {
+            let (c0, c1) = (u16::from(vht.center0), u16::from(vht.center1));
+            match vht.width {
+                1 if c1 != 0 && c0.abs_diff(c1) == 8 => (width, centre) = ("160", c1),
+                1 if c1 != 0 && c0.abs_diff(c1) > 8 => (width, centre) = ("80p80", c0),
+                1 => (width, centre) = ("80", c0),
+                2 => (width, centre) = ("160", c0),
+                3 => (width, centre) = ("80p80", c0),
+                _ => {}
+            }
+        }
+        // The VHT Capabilities element (191) and its capability's bits
+        // 31:30.
+        let mut ext_nss_bw = None;
+        let mut rest = &bss.elements[..];
+        while let [id, len, tail @ ..] = rest {
+            let Some(body) = tail.get(..usize::from(*len)) else {
+                break;
+            };
+            if *id == 191
+                && let Some(cap) = body.get(..4)
+            {
+                ext_nss_bw = Some(cap[3] >> 6);
+            }
+            rest = &tail[usize::from(*len)..];
+        }
+        Self {
+            mode,
+            width,
+            primary,
+            centre,
+            ext_nss_bw,
+        }
+    }
+}
+
+impl fmt::Display for ApOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{} ch {} (c {})",
+            self.mode, self.width, self.primary, self.centre
+        )?;
+        if let Some(bits) = self.ext_nss_bw {
+            write!(f, " ext nss bw {bits}")?;
+        }
+        Ok(())
+    }
 }
 
 /// The channels the country admits, which the real check gates at each frame.
@@ -562,6 +729,13 @@ pub struct Rtl8852c<C: Chip> {
     /// The configured network's name, compared and never printed.
     ssid: Vec<u8>,
     progress: Progress,
+    /// The rates the station's data came at, and the last RA report of the
+    /// firmware's for the AP, across every association (M4 spec S3.1,
+    /// S3.3).
+    rx_rates: RateHistogram,
+    tx_rate: Option<RaReport>,
+    /// The last BSS joined's operation.
+    ap_operation: Option<ApOperation>,
 }
 
 impl<C: Chip> Rtl8852c<C> {
@@ -605,6 +779,9 @@ impl<C: Chip> Rtl8852c<C> {
             reported: Vec::new(),
             ssid: Vec::new(),
             progress: Progress::default(),
+            rx_rates: RateHistogram::default(),
+            tx_rate: None,
+            ap_operation: None,
         })
     }
 
@@ -619,6 +796,12 @@ impl<C: Chip> Rtl8852c<C> {
     /// The chip, as the radio left it.
     pub fn into_chip(self) -> C {
         self.chip
+    }
+
+    /// The rates of the data the chip handed on addressed to the station
+    /// (M4 spec S3.1).
+    pub fn rx_rates(&self) -> &RateHistogram {
+        &self.rx_rates
     }
 
     fn chip<T>(result: Result<T, String>) -> Result<T, Error> {
@@ -953,7 +1136,7 @@ impl<C: Chip> Rtl8852c<C> {
                     token,
                     acknowledged,
                 } => self.transmitted(token, acknowledged, now),
-                Incoming::Frame(received) => match Self::mpdu(received) {
+                Incoming::Frame(received) => match self.count_rate(received) {
                     Some(mpdu) if self.admitted.is_some() => {
                         if self.deferred.len() < MAX_DEFERRED {
                             self.deferred.push_back(mpdu);
@@ -965,6 +1148,10 @@ impl<C: Chip> Rtl8852c<C> {
                 },
                 Incoming::ScanEnded { completed } => self.scan_ended(completed),
                 Incoming::BeaconLost => self.beacon_lost(),
+                Incoming::RaReport(report) => {
+                    self.tx_rate = Some(report);
+                    Ok(())
+                }
             };
             if first.is_ok() {
                 first = taken;
@@ -1083,6 +1270,21 @@ impl<C: Chip> Rtl8852c<C> {
         self.scanned = Some(ticket);
         bump(&mut self.progress.scans);
         recorded.and(restored)
+    }
+
+    /// [`Self::mpdu`], a data frame addressed to the station that passed
+    /// its FCS counted at its rate first (M4 spec S3.1).
+    fn count_rate(&mut self, received: Received) -> Option<Mpdu> {
+        let to_station = received.bytes.len() >= 10
+            && received.bytes[0] & 0x0c == 0x08
+            && received.bytes[4..10] == self.address.0;
+        if to_station
+            && !received.fcs_error
+            && let Some(rate) = received.rate
+        {
+            self.rx_rates.record(rate, received.ampdu);
+        }
+        Self::mpdu(received)
     }
 
     /// `received` as an MPDU on the channel the chip heard it on, its
@@ -1810,6 +2012,7 @@ impl<C: Chip> Rtl8852c<C> {
         } else {
             ", port closed"
         });
+        self.link_progress(&mut line);
         if let Some(d) = p.data {
             line.push_str(&format!(
                 ", rx data {} sealed {} nokey {} refused {}, tx data {}",
@@ -1825,6 +2028,63 @@ impl<C: Chip> Rtl8852c<C> {
         line.push_str("; ");
         line.push_str(&self.chip.diagnostic());
         line
+    }
+
+    /// The progress line's link fields (M4 spec S3.4), each `-` until known:
+    /// the joined AP's operation; the TX power's map entry and regulatory
+    /// index; the rate most of the station's data came at, its share and
+    /// the data counted, and the share in A-MPDUs; RXQ's full polls; the
+    /// firmware's last RA report (the AX report has no retry ratio, which
+    /// Linux reads on BE only, `phy.c:3263`); ACH0's kicks and releases, and
+    /// the releases per kick; the ADDBA Requests answered with success and
+    /// sent; and the TIDs aggregating.
+    fn link_progress(&self, line: &mut String) {
+        let link = self.chip.link_counts();
+        line.push_str(&format!(", ap {}", or_dash(self.ap_operation)));
+        match link.regd {
+            Some((alpha2, regd)) => line.push_str(&format!(
+                ", regd {}{} {}",
+                char::from(alpha2[0]),
+                char::from(alpha2[1]),
+                regd.name()
+            )),
+            None => line.push_str(", regd -"),
+        }
+        let h = &self.rx_rates;
+        match h.top() {
+            Some((rate, count)) => line.push_str(&format!(
+                ", rx {} {}% ({}), ampdu {}%",
+                rate_text(&rate),
+                percent(count, h.total),
+                h.total,
+                percent(h.ampdu, h.total)
+            )),
+            None => line.push_str(", rx -, ampdu -"),
+        }
+        line.push_str(&format!(", rxq full {}", link.rxq_full));
+        match &self.tx_rate {
+            Some(report) => {
+                line.push_str(&format!(", tx ra {} retry -", rate_text(&ra_rate(report))))
+            }
+            None => line.push_str(", tx ra -"),
+        }
+        let (kicks, released) = (link.tx.kicks[0], link.tx.released[0]);
+        let mean = match kicks {
+            0 => String::from("-"),
+            kicks => {
+                let tenths = (u64::from(released) * 10 + u64::from(kicks) / 2) / u64::from(kicks);
+                format!("{}.{}", tenths / 10, tenths % 10)
+            }
+        };
+        line.push_str(&format!(", kicks {kicks} rel {released} ({mean}/kick)"));
+        let p = &self.progress;
+        line.push_str(&format!(", addba {}/{}", p.addba_ok, p.addba_sent));
+        line.push_str(&format!(", agg {}", self.aggregating_tids()));
+    }
+
+    /// The TIDs whose TX Block Ack agreement is operational, `-` for none.
+    fn aggregating_tids(&self) -> String {
+        String::from("-")
     }
 
     fn begin_scan_with(&mut self, request: scan::Request, budget_us: u64) -> Result<(), Error> {
@@ -1860,6 +2120,7 @@ impl<C: Chip> Rtl8852c<C> {
     /// the channel, then the BSSID; the BSS's profile kept, and the AP's
     /// station new (`sta_info_alloc`).
     fn approach(&mut self, bss: &Bss, peer: Peer) -> Result<(), Error> {
+        self.ap_operation = Some(ApOperation::of(bss));
         Self::chip(self.chip.tune(bss.channel))?;
         Self::chip(self.chip.set_bssid(bss.bssid))?;
         self.peer = Some(peer);

@@ -111,7 +111,8 @@ pub enum Mode {
 /// A received frame. `mpdu` has no FCS. `signal` is `None` when no PPDU
 /// status matched (`RX_FLAG_NO_SIGNAL_VAL`); `chains` are paths A and B,
 /// `Some` exactly when a status matched. The rate fields are the
-/// descriptor's raw `RX_DATARATE`, `RX_GI_LTF` and `BW`; `free_run` is
+/// descriptor's raw `RX_DATARATE`, `RX_GI_LTF` and `BW`, and `ampdu` its
+/// `AMPDU` bit (`RX_FLAG_AMPDU_DETAILS`, `core.c:4403-4406`); `free_run` is
 /// `FREERUN_CNT`. `fcs_error` is `CRC32_ERR || ICV_ERR`
 /// (`RX_FLAG_FAILED_FCS_CRC`, `core.c:4396-4397`); `decrypted` is
 /// `HW_DEC && !(SW_DEC || ICV_ERR)` (`RX_FLAG_DECRYPTED`, `core.c:4399-4401`)
@@ -132,6 +133,7 @@ pub struct Received {
     pub data_rate: u16,
     pub gi_ltf: u8,
     pub bw: u8,
+    pub ampdu: bool,
     pub free_run: u32,
     pub hw_dec: bool,
     pub a1_match: bool,
@@ -387,6 +389,7 @@ impl Receiver {
             data_rate: desc.data_rate,
             gi_ltf: desc.gi_ltf,
             bw: desc.bw,
+            ampdu: desc.ampdu,
             free_run: desc.free_run,
             hw_dec: desc.hw_dec,
             a1_match: desc.a1_match,

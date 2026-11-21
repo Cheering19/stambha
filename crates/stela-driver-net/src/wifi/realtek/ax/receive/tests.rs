@@ -166,6 +166,7 @@ fn feed(rx: &mut Receiver, buffers: &[Vec<u8>]) -> Vec<Seen> {
                 Event::C2h(C2h::Log(_)) => Seen::C2h(C2h::Log(&[])),
                 Event::C2h(C2h::FormattedLog) => Seen::C2h(C2h::FormattedLog),
                 Event::C2h(C2h::BeaconFilter(b)) => Seen::C2h(C2h::BeaconFilter(b)),
+                Event::C2h(C2h::RaReport(r)) => Seen::C2h(C2h::RaReport(r)),
                 Event::Frame(f) => Seen::Frame(f),
             })
         })
@@ -212,6 +213,7 @@ fn matched_beacon_gets_signal_and_chains() {
             data_rate: 4,
             gi_ltf: 0,
             bw: 0,
+            ampdu: false,
             free_run: 0x1234_5678,
             hw_dec: false,
             a1_match: false,
@@ -1057,6 +1059,7 @@ fn station_mode_delivers_auth_and_data_at_once() {
             data_rate: 4,
             gi_ltf: 0,
             bw: 0,
+            ampdu: false,
             free_run: 0x1234_5678,
             hw_dec: false,
             a1_match: false,

@@ -27,6 +27,9 @@
 use crate::Mac;
 use crate::wifi::Channel;
 use crate::wifi::realtek::ax::assoc::HtPeer;
+use crate::wifi::realtek::ax::c2h::RaReport;
+use crate::wifi::realtek::ax::regd::Regd;
+use crate::wifi::realtek::ax::rx::Rate;
 use crate::wifi::station::phy::AccessCategory;
 use alloc::{string::String, vec::Vec};
 
@@ -44,6 +47,8 @@ pub struct Token(pub u16);
 /// the chip's free-running counter at its reception. `fcs_error` is set only
 /// on a scan's frames, which the scanner refuses (M2c's scan); a station's
 /// frames failing their FCS or ICV are dropped beneath this interface.
+/// `rate` is its PPDU's rate as the chip decoded it, when it did, and
+/// `ampdu` whether it came in an A-MPDU (M4 spec S3.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub bytes: Vec<u8>,
@@ -55,6 +60,8 @@ pub struct Received {
     pub icv_error: bool,
     /// `RX_FLAG_FAILED_FCS_CRC`.
     pub fcs_error: bool,
+    pub rate: Option<Rate>,
+    pub ampdu: bool,
 }
 
 /// What [`Chip::poll`] hands its sink.
@@ -76,6 +83,9 @@ pub enum Incoming {
     /// The firmware reported the associated AP's beacons lost, while no
     /// scan ran (M3 spec S15).
     BeaconLost,
+    /// The firmware's rate adaptation reported the rate it sends the AP at
+    /// (`rtw89_phy_c2h_ra_rpt`, M4 spec S3.3), for the station's MAC ID.
+    RaReport(RaReport),
 }
 
 /// A management frame (or null data frame) to send: `bytes` from its MAC
@@ -126,6 +136,36 @@ pub struct HardwareKey<'a> {
     pub pairwise: bool,
     pub index: u8,
     pub material: &'a [u8; 16],
+}
+
+/// What an RTL8852C's TX side did (M4 spec S3.2), saturating, each array
+/// indexed by channel: ACH0 to ACH3 (BE, BK, VI, VO), then CH8, the
+/// management queue. `submitted` counts the frames each channel took,
+/// `kicks` the writes of its TX ring index (`__rtw89_pci_tx_kick_off`),
+/// `released` the RPQ release reports for it (`rtw89_pci_release_rpp`), and
+/// `failed` the releases of any channel whose TX status was not
+/// `RTW89_TX_DONE` (statuses 1 to 3: retry limit, lifetime, MACID drop).
+/// `rpq_full` counts the RPQ polls that found every BD filled. The mean
+/// releases per kick on ACH0 is the aggregation's proxy: the firmware does
+/// not report its aggregates' sizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxCounts {
+    pub submitted: [u32; 5],
+    pub kicks: [u32; 5],
+    pub released: [u32; 5],
+    pub failed: u32,
+    pub rpq_full: u32,
+}
+
+/// What the chip counts for the station's progress line (M4 spec S3.4):
+/// the alpha2 of the TX power's regulatory map entry (`00` for the
+/// world's) and its regulatory index on the band tuned, once known; the
+/// RXQ polls that found the ring full; and [`TxCounts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounts {
+    pub regd: Option<([u8; 2], Regd)>,
+    pub rxq_full: u32,
+    pub tx: TxCounts,
 }
 
 /// The hardware beneath an rtw89 station (module documentation).
@@ -180,4 +220,9 @@ pub trait Chip {
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String>;
     /// The chip's own counts, naming no address.
     fn diagnostic(&self) -> String;
+    /// The counts the station's progress line prints (M4 spec S3.4); none
+    /// for a chip that keeps none.
+    fn link_counts(&self) -> LinkCounts {
+        LinkCounts::default()
+    }
 }

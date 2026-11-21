@@ -226,3 +226,60 @@ fn long_descriptor_mac_id_is_d5_and_sec_type_d7() {
     };
     assert_eq!((f.desc.mac_id, f.desc.sec_type), (0x12, 6));
 }
+
+/// `rtw89_core_update_rx_status`'s decode (`core.c:4410-4438`) with the AX
+/// masks of `txrx.h:10-23`: MOD `[8:7]`; legacy index `[3:0]`; HT MCS
+/// `[4:0]`, NSS `[4:3]` + 1 (`rtw89_get_data_rate_nss`, `core.c:2016-2034`);
+/// VHT and HE NSS `[6:4]` + 1, MCS `[3:0]`.
+#[test]
+fn decode_rate_matches_rtw89() {
+    let rate = |mode, nss, mcs, bw, sgi| Rate {
+        mode,
+        nss,
+        mcs,
+        bw,
+        sgi,
+    };
+    assert_eq!(
+        decode_rate(0x08F, 0, 0),
+        rate(RateMode::Ht, 2, 15, 0, false)
+    );
+    assert_eq!(
+        decode_rate(0x119, 0, 0),
+        rate(RateMode::Vht, 2, 9, 0, false)
+    );
+    assert_eq!(
+        decode_rate(0x19B, 0, 0),
+        rate(RateMode::He, 2, 11, 0, false)
+    );
+    assert_eq!(
+        decode_rate(0x00B, 0, 0),
+        rate(RateMode::Legacy, 1, 11, 0, false)
+    );
+    // The width as read; a GI/LTF of 1 is HT and VHT short GI.
+    assert_eq!(decode_rate(0x119, 2, 1), rate(RateMode::Vht, 2, 9, 2, true));
+    assert_eq!(decode_rate(0x087, 1, 1), rate(RateMode::Ht, 1, 7, 1, true));
+    // A legacy rate keeps only its index: no short GI, one stream.
+    assert_eq!(
+        decode_rate(0x07B, 0, 1),
+        rate(RateMode::Legacy, 1, 11, 0, false)
+    );
+    // HE's short GI is a 0.8 us one (`rtw89_rxdesc_to_nl_he_gi`,
+    // `core.c:2375-2395`): SGI_4XHE08 1, 2XHE08 3 and 1XHE08 5.
+    for (gi_ltf, sgi) in [
+        (0, false),
+        (1, true),
+        (2, false),
+        (3, true),
+        (4, false),
+        (5, true),
+    ] {
+        assert_eq!(decode_rate(0x19B, 2, gi_ltf).sgi, sgi, "{gi_ltf}");
+    }
+    // HT MCS 31 is four streams; the VHT/HE NSS field is three bits.
+    assert_eq!(decode_rate(0x09F, 0, 0).nss, 4);
+    assert_eq!(
+        decode_rate(0x179, 0, 0),
+        rate(RateMode::Vht, 8, 9, 0, false)
+    );
+}

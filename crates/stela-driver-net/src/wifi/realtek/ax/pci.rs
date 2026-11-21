@@ -351,6 +351,9 @@ pub struct Rings {
     /// RXQ polls that found the ring full, saturating; see
     /// [`Rings::rxq_full_batches`].
     rxq_full: Cell<u16>,
+    /// RPQ polls that found the ring full, saturating; see
+    /// [`Rings::rpq_full_batches`].
+    rpq_full: Cell<u16>,
 }
 
 impl Rings {
@@ -412,6 +415,7 @@ impl Rings {
             data_hw: Default::default(),
             rx_host: Default::default(),
             rxq_full: Cell::new(0),
+            rpq_full: Cell::new(0),
         };
         zero(&rings.tx, TX_CHANNELS * TX_RING_BYTES)?;
         rings
@@ -510,6 +514,14 @@ impl Rings {
     /// may have had no free buffer before the poll. Saturates at `u16::MAX`.
     pub fn rxq_full_batches(&self) -> u16 {
         self.rxq_full.get()
+    }
+
+    /// How many `Rpq::poll` batches found RPQ full, as
+    /// [`Rings::rxq_full_batches`] counts RXQ's (M4 spec S9.2, S9.4): the
+    /// device may have had no buffer for its release reports. Saturates at
+    /// `u16::MAX`.
+    pub fn rpq_full_batches(&self) -> u16 {
+        self.rpq_full.get()
     }
 
     fn tx_ring(&self, channel: usize) -> Result<u32, AxError> {
@@ -1057,8 +1069,9 @@ impl TxChannel {
         }
     }
 
-    /// The channel's place among the pools and the data ring indices.
-    const fn slot(self) -> usize {
+    /// The channel's place among the pools and the data ring indices, and in
+    /// [`super::station::chip::TxCounts`]' arrays.
+    pub const fn slot(self) -> usize {
         match self {
             Self::Ach0 => 0,
             Self::Ach1 => 1,
@@ -1503,9 +1516,10 @@ impl Rpq<'_> {
     /// [`Rxq::poll`] delivers RXQ's, with RPQ's own IDX (0x121C) and host
     /// index, as `rtw89_pci_poll_rpq_dma` (`pci.c:720`) reads them with
     /// `rtw89_pci_rxbd_recalc` and writes them back after
-    /// `rtw89_pci_release_tx` (`pci.c:697-718`). A full RPQ is not counted
-    /// in [`Rings::rxq_full_batches`]. A hardware index past the ring is
-    /// `Tx("RPQ hardware index out of range")`, refused untouched.
+    /// `rtw89_pci_release_tx` (`pci.c:697-718`). A full RPQ is counted in
+    /// [`Rings::rpq_full_batches`], not [`Rings::rxq_full_batches`]. A
+    /// hardware index past the ring is `Tx("RPQ hardware index out of
+    /// range")`, refused untouched.
     ///
     /// Where Linux skips every remaining entry after a buffer it cannot
     /// read (`pci.c:704-711`), an error from `each` here ends the batch
@@ -1562,10 +1576,15 @@ unsafe fn poll_rx<I: AxIo + ?Sized>(
     if count == 0 {
         return Ok(0);
     }
-    if ring == RXQ && count == RX_ENTRIES - 1 {
+    if count == RX_ENTRIES - 1 {
         // Every entry the device can fill is filled: it may have had no
         // free buffer since the last poll.
-        rings.rxq_full.set(rings.rxq_full.get().saturating_add(1));
+        let full = if ring == RXQ {
+            &rings.rxq_full
+        } else {
+            &rings.rpq_full
+        };
+        full.set(full.get().saturating_add(1));
     }
     // No buffer read may move before the index read that proved it full.
     fence(Ordering::Acquire);

@@ -74,6 +74,29 @@ impl Regd {
             _ => Self::Na,
         }
     }
+
+    /// The index's name, its `RTW89_` enumerator without the prefix, as the
+    /// station's progress line prints it (M4 spec S3.4).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ww => "WW",
+            Self::Etsi => "ETSI",
+            Self::Fcc => "FCC",
+            Self::Mkk => "MKK",
+            Self::Na => "NA",
+            Self::Ic => "IC",
+            Self::Kcc => "KCC",
+            Self::Acma => "ACMA",
+            Self::Ncc => "NCC",
+            Self::Mexico => "MEXICO",
+            Self::Chile => "CHILE",
+            Self::Ukraine => "UKRAINE",
+            Self::Cn => "CN",
+            Self::Qatar => "QATAR",
+            Self::Uk => "UK",
+            Self::Thailand => "THAILAND",
+        }
+    }
 }
 
 /// `regd->txpwr_regd` for the bands Stela runs, as the map gives them

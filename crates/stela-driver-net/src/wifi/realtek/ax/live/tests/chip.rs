@@ -4,12 +4,15 @@
 use super::*;
 use crate::Mac;
 use crate::wifi::realtek::ax::assoc::{HtPeer, edca_param, qos_defaults};
+use crate::wifi::realtek::ax::c2h::RaReport;
 use crate::wifi::realtek::ax::pci::TxChannel;
 use crate::wifi::realtek::ax::pci::tests::rpp;
+use crate::wifi::realtek::ax::rx::{Rate, RateMode};
+use crate::wifi::realtek::ax::station::chip::TxCounts;
 use crate::wifi::realtek::ax::station::chip::{
     Association, Chip, Data, HardwareKey, Incoming, Management, Received as Heard, Token,
 };
-use crate::wifi::realtek::ax::tests::firmware::{Air, Sent, rx_buffer};
+use crate::wifi::realtek::ax::tests::firmware::{Air, Sent, c2h as c2h_buffer, rx_buffer};
 use crate::wifi::realtek::ax::txd::{self, RateCaps, TxSec};
 use crate::wifi::{Band, Channel};
 use alloc::string::{String, ToString};
@@ -770,6 +773,8 @@ fn poll_hands_on_a_station_frame_with_its_channel_and_status() {
         decrypted,
         icv_error,
         fcs_error,
+        rate,
+        ampdu,
     } = heard;
     assert_eq!(bytes[..2], [0x08, 0x42]);
     assert_eq!(bytes[16..22], AP);
@@ -778,6 +783,15 @@ fn poll_hands_on_a_station_frame_with_its_channel_and_status() {
         (*signal_dbm, *decrypted, *icv_error, *fcs_error),
         (None, true, false, false)
     );
+    // OFDM 6M (`RTW89_HW_RATE_OFDM6`, legacy index 4), not in an A-MPDU.
+    let ofdm6 = Rate {
+        mode: RateMode::Legacy,
+        nss: 1,
+        mcs: 4,
+        bw: 0,
+        sgi: false,
+    };
+    assert_eq!((*rate, *ampdu), (Some(ofdm6), false));
 }
 
 #[test]
@@ -1319,4 +1333,116 @@ fn a_failed_leave_powers_off_without_a_bssid() {
     assert_eq!(live.bssid(), None);
     assert!(!live.associated());
     assert_powered_off_for_good(live);
+}
+
+/// M4 spec S3.2: frames submitted, kicks and releases per channel, and the
+/// releases not `RTW89_TX_DONE`. M3's submit still kicks each frame (Task 5
+/// batches them).
+#[test]
+fn tx_counts_follow_submit_kick_release() {
+    let (mut live, _m, mut air) = on_air(&|_| {});
+    assert_eq!(live.tx_counts(), TxCounts::default());
+    for n in 0..2 {
+        let frame = qos_frame(n, 0, n as u8);
+        assert!(
+            Chip::transmit_data(&mut live, &data(&frame, 0))
+                .unwrap()
+                .is_some()
+        );
+    }
+    let counts = live.tx_counts();
+    assert_eq!(counts.submitted, [2, 0, 0, 0, 0]);
+    assert_eq!(counts.kicks, [2, 0, 0, 0, 0]);
+    assert_eq!(counts.released, [0; 5]);
+    // Two DONE releases on ACH0.
+    assert_eq!(poll(&mut live).len(), 2);
+    let counts = live.tx_counts();
+    assert_eq!(counts.released, [2, 0, 0, 0, 0]);
+    assert_eq!(counts.failed, 0);
+    // A management frame on CH8 the AP never acknowledged (RETRY_LIMIT).
+    air.drop_tx(1);
+    let frame = auth(1);
+    let mgmt = Management {
+        bytes: &frame,
+        basic_rates: 0,
+    };
+    Chip::transmit_management(&mut live, &mgmt).unwrap();
+    assert_eq!(poll(&mut live).len(), 1);
+    let counts = live.tx_counts();
+    assert_eq!(counts.submitted, [2, 0, 0, 0, 1]);
+    assert_eq!(counts.kicks, [2, 0, 0, 0, 1]);
+    assert_eq!(counts.released, [2, 0, 0, 0, 1]);
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.rpq_full, 0);
+    // The station sees them through the chip's link counts.
+    let link = Chip::link_counts(&live);
+    assert_eq!(link.tx, counts);
+    assert_eq!(link.rxq_full, 0);
+}
+
+/// An RA report (`rtw89_phy_c2h_ra_rpt`, M4 spec S3.3) for the station's
+/// MAC ID goes to the station; one for another MAC ID, or a legacy one past
+/// `rtw89_bitrates`, does not (`phy.c:3247-3249`, `:3266-3270`). One the
+/// set_bssid operation drained is held for the next poll.
+#[test]
+fn ra_reports_reach_the_station_for_its_mac_id() {
+    let report = |w2: u32, w3: u32| {
+        let mut body = w2.to_le_bytes().to_vec();
+        body.extend_from_slice(&w3.to_le_bytes());
+        c2h_buffer(2, 1, 0, &body)
+    };
+    let batch = vec![
+        report(0, 0x0000_4619),
+        report(5, 0x0000_4619),
+        report(0, 0x0000_000C),
+        report(0, 0x0000_010F),
+    ];
+    let (mut live, _m, _air) = on_air(&move |fw| fw.after(6, 0, batch.clone()));
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.extend(poll(&mut live));
+    }
+    let ra = |mode, rate, giltf, bw| {
+        Incoming::RaReport(RaReport {
+            macid: 0,
+            mode,
+            rate,
+            giltf,
+            bw,
+        })
+    };
+    assert_eq!(seen, [ra(2, 0x19, 1, 2), ra(1, 0x0F, 0, 0)]);
+}
+
+/// A station frame carries its descriptor's rate (`rtw89_core_update_rx_status`)
+/// and A-MPDU bit (`RX_FLAG_AMPDU_DETAILS`, `core.c:4403-4406`).
+#[test]
+fn a_station_frame_carries_its_rate_and_ampdu_bit() {
+    let mut body = mgnt_frame(0x08, MAC, AP, b"m1", None, 3);
+    // d1: DATA_RATE VHT 2SS MCS 9 [24:16], GI_LTF 1 [27:25], BW 2 [31:29].
+    let d1 = u32::from_le_bytes(body[8..12].try_into().unwrap()) & 0x0000_FFFF;
+    let d1 = d1 | 0x119 << 16 | 1 << 25 | 2 << 29;
+    body[8..12].copy_from_slice(&d1.to_le_bytes());
+    let frame = with_d3(body, 1 << 3);
+    let (mut live, _m, _air) = on_air(&move |fw| fw.after(6, 0, vec![frame.clone()]));
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.extend(poll(&mut live));
+    }
+    let [Incoming::Frame(heard)] = &seen[..] else {
+        panic!("{seen:?}");
+    };
+    assert_eq!(
+        heard.rate,
+        Some(Rate {
+            mode: RateMode::Vht,
+            nss: 2,
+            mcs: 9,
+            bw: 2,
+            sgi: true,
+        })
+    );
+    assert!(heard.ampdu);
 }
