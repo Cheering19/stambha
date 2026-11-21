@@ -60,7 +60,8 @@
 //! critical, the one occasion Asahi saw it from real SMC firmware; status
 //! and percentage changes send nothing, and macOS's battery driver polls
 //! them (`pollBatteryState`). Their data bytes are those Asahi saw
-//! (`0x710101xx`, `0x71020000`, inferred: no 26B123 reader of either was
+//! (`0x710101xx`, with the AC adapter's new state as `xx`, and
+//! `0x71020000`; inferred: no 26B123 reader of either was
 //! traced, and no `AppleSmartBattery` object registers a 0x71 callback by
 //! name). Each kind goes out at most once a
 //! [`SPACING_MILLIS`] apart, a change in between waiting for the spacing to
@@ -145,6 +146,8 @@ const NO_TIME: u16 = 0xffff;
 const POWER_STATE: u8 = 0x71;
 const EXTERNAL_POWER: usize = 0;
 const BATTERY_STATE: usize = 1;
+/// `pow.ExternalPowerChange`'s last byte is the AC adapter's new state, 1
+/// online, filled in as it goes out.
 const EVENTS: [u32; 2] = [
     event(POWER_STATE, 0x01, 0x01, 0x00),
     event(POWER_STATE, 0x02, 0x00, 0x00),
@@ -330,7 +333,11 @@ impl Battery {
                 None => now,
             };
             if !asleep && now >= at {
-                events.push(EVENTS[kind]);
+                let ac = u32::from(self.shown.ac_online == Some(true));
+                events.push(match kind {
+                    EXTERNAL_POWER => EVENTS[kind] | ac,
+                    _ => EVENTS[kind],
+                });
                 self.sent[kind] = Some(now);
                 self.pending[kind] = false;
             } else {

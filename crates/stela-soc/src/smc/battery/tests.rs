@@ -525,7 +525,9 @@ fn latches_keep_writes_at_their_confirmed_sizes_only() {
 #[test]
 fn ac_changes_and_a_battery_turning_critical_notify_once_enabled_and_no_closer_than_their_spacing()
 {
+    // The last byte is the AC adapter's new state.
     const EXTERNAL_POWER: u64 = 0x18 | 0x7101_0100 << 32;
+    const PLUGGED: u64 = 0x18 | 0x7101_0101 << 32;
     const BATTERY_STATE: u64 = 0x18 | 0x7102_0000 << 32;
     let critical = |critical| PowerSnapshot {
         battery: Some(BatteryState {
@@ -581,12 +583,15 @@ fn ac_changes_and_a_battery_turning_critical_notify_once_enabled_and_no_closer_t
     let (mut smc, sram) = with_battery();
     enable_notifications(&mut smc, &sram);
     assert_eq!(smc.power(&charging(), 20_000), None);
-    assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
+    assert_eq!(notifications(&mut smc), [PLUGGED]);
     let ac_due = 20_000 + SPACING_MILLIS[0];
     assert_eq!(smc.power(&on_battery(), 20_500), Some(ac_due));
     assert_eq!(smc.power(&charging(), 20_700), Some(ac_due));
     assert!(notifications(&mut smc).is_empty());
+    // The one notice carries the state when it goes out.
     assert_eq!(smc.power_due(ac_due), None);
+    assert_eq!(notifications(&mut smc), [PLUGGED]);
+    assert_eq!(smc.power(&on_battery(), 30_000), None);
     assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
 }
 
@@ -610,7 +615,7 @@ fn a_change_while_the_soc_sleeps_waits_for_its_wake() {
     assert!(notifications(&mut smc).is_empty());
     smc.wake(WakeSource::PowerButton);
     assert_eq!(smc.power_due(32_000), None);
-    assert_eq!(notifications(&mut smc), [0x18 | 0x7101_0100 << 32]);
+    assert_eq!(notifications(&mut smc), [0x18 | 0x7101_0101 << 32]);
 }
 
 #[test]
