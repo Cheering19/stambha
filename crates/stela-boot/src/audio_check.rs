@@ -184,19 +184,18 @@ pub unsafe fn run(
         // SAFETY: mapped and exclusively owned as required by the caller.
         let all = unsafe { Function::enumerate(window) }
             .map_err(|error| refuse!("audio PCI inventory: {error}", ?error))?;
-        // A GPU's display-audio function (Linux `get_bound_vga`: function 0
-        // of the same device is a display controller) has no analog route.
-        let display = |function: &Function| {
-            all.iter().any(|other| {
-                other.address.function == 0
-                    && other.address.segment == function.address.segment
-                    && other.address.bus == function.address.bus
-                    && other.address.device == function.address.device
-                    && other.class[0] == DISPLAY_CLASS
-            })
-        };
+        // A GPU's display-audio function has no analog route; an AMD APU's
+        // analog controller beside its iGPU has.
+        let displays: Vec<_> = all
+            .iter()
+            .filter(|other| other.address.function == 0 && other.class[0] == DISPLAY_CLASS)
+            .map(|other| other.address)
+            .collect();
         let analog: Vec<usize> = (0..all.len())
-            .filter(|&index| pci::identify(&all[index]).is_ok() && !display(&all[index]))
+            .filter(|&index| {
+                pci::identify(&all[index]).is_ok()
+                    && !stela_drivers::probe::display_audio(&all[index].identity(), &displays)
+            })
             .collect();
         functions.extend(
             all.into_iter()

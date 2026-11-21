@@ -642,7 +642,7 @@ pub fn plan(
     if class[0] == 0x03 {
         return Cow::Borrowed("GPU");
     }
-    if display_audio(class, function.address, displays) {
+    if display_audio(function, displays) {
         return Cow::Owned(alloc::format!("unsupported: {DISPLAY_AUDIO}"));
     }
     #[cfg(feature = "native-acpi")]
@@ -694,7 +694,7 @@ pub fn plan(
         "AHCI SATA"
     } else if class[..2] == [6, 4] {
         "PCI bridge"
-    } else if let Some(why) = unclaimed(class, function.address, displays) {
+    } else if let Some(why) = unclaimed(function, displays) {
         return Cow::Owned(alloc::format!("unsupported: {why}"));
     } else {
         "not driven"
@@ -702,35 +702,48 @@ pub fn plan(
     Cow::Borrowed(driver)
 }
 
-/// An HD Audio function beside a display controller's function 0 is that
-/// GPU's HDMI/DP audio, as Linux `get_bound_vga` finds it. No HDMI/DP codec
-/// profile here serves one, whatever its identity.
+/// An ATI, AMD or NVIDIA HD Audio function 1 beside a display controller's
+/// function 0 is that GPU's HDMI/DP audio ([`display_audio`]). No HDMI/DP
+/// codec profile here serves one, whatever its identity.
 const DISPLAY_AUDIO: &str = "HDMI/DP audio controller of a GPU: not driven, left parked for the GPU's start (its outputs carry no audio)";
 
-/// Whether the function of `class` at `address` is the HDMI/DP audio of a
-/// GPU, given the slots whose function 0 is a display controller.
+/// The vendors whose HD Audio function 1 Linux's `quirk_gpu_hda` ties to a
+/// display function 0: `PCI_VENDOR_ID_ATI`, `_AMD` and `_NVIDIA`.
+const GPU_AUDIO_VENDORS: [u16; 3] = [0x1002, 0x1022, 0x10de];
+
+/// Whether `function` is the HDMI/DP audio of a GPU, given the slots whose
+/// function 0 is a display controller: an HD Audio function 1 of ATI, AMD
+/// or NVIDIA in such a slot, as Linux's `quirk_gpu_hda`
+/// (`drivers/pci/quirks.c`) links function 1 to the display function 0 of
+/// its slot. Its HD Audio driver's `get_bound_vga`
+/// (`sound/hda/controllers/intel.c`) pairs the same vendors' devfn 1 alone
+/// with a GPU. Any other HD Audio function there is a board controller
+/// Linux drives as such, as an AMD APU's analog controller, function 6 of
+/// its iGPU's device.
 ///
 /// The scan never claims one: no driver here serves GPU audio, and a claim
 /// takes the function out of the parked fabric, where the GPU's cold start
 /// needs it for a Secondary Bus Reset of the GPU's bus (a GPU without a
 /// function-local reset on a machine without DMA translation has no other
 /// reset). That reset contains the function and parks it again, quiesced.
-fn display_audio(class: [u8; 3], address: Address, displays: &[Address]) -> bool {
-    class[..2] == [0x04, 0x03]
-        && address.function != 0
+pub fn display_audio(function: &crate::bus::pci::Identity, displays: &[Address]) -> bool {
+    let address = function.address;
+    function.class[..2] == [0x04, 0x03]
+        && GPU_AUDIO_VENDORS.contains(&function.vendor)
+        && address.function == 1
         && displays.iter().any(|display| {
             (display.segment, display.bus, display.device)
                 == (address.segment, address.bus, address.device)
         })
 }
 
-/// Why no driver here takes `class` at `address`, given the slots whose
-/// function 0 is a display controller.
-fn unclaimed(class: [u8; 3], address: Address, displays: &[Address]) -> Option<&'static str> {
-    if display_audio(class, address, displays) {
+/// Why no driver here takes `function`, given the slots whose function 0
+/// is a display controller.
+fn unclaimed(function: &crate::bus::pci::Identity, displays: &[Address]) -> Option<&'static str> {
+    if display_audio(function, displays) {
         return Some(DISPLAY_AUDIO);
     }
-    unsupported(class)
+    unsupported(function.class)
 }
 
 /// Why no driver here takes a function of a device class the host needs,
@@ -2036,7 +2049,7 @@ pub unsafe fn probe_observed(
                 devices.gpus.push(adapter);
                 continue;
             }
-            if display_audio(function.class, address, &displays) {
+            if display_audio(&function.identity(), &displays) {
                 devices
                     .unsupported
                     .push((address, function.class, DISPLAY_AUDIO));
@@ -2437,7 +2450,7 @@ pub unsafe fn probe_observed(
                         .collect()
                 })
             } else {
-                if let Some(why) = unclaimed(function.class, address, &displays) {
+                if let Some(why) = unclaimed(&function.identity(), &displays) {
                     devices.unsupported.push((address, function.class, why));
                 }
                 continue;
@@ -3525,13 +3538,52 @@ mod tests {
             );
         }
         // The GPU's own HDMI audio function, beside its function 0.
-        let hdmi = identity(1, 1, 0x1234, 0x0001, 0x04_03_00);
+        let hdmi = identity(1, 1, 0x1002, 0xab38, 0x04_03_00);
         assert!(plan(&hdmi, &displays).starts_with("unsupported: HDMI/DP audio"));
         assert!(plan(&hdmi, &[]).starts_with("unsupported: HD Audio controller"));
         // An admitted HD Audio identity beside a GPU is left parked too.
         let nvidia = identity(1, 1, 0x10de, 0x22e9, 0x04_03_00);
         assert!(plan(&nvidia, &displays).starts_with("unsupported: HDMI/DP audio"));
         assert_eq!(plan(&nvidia, &[]), "HD Audio");
+    }
+
+    /// The ASUS TUF A16 FA608PP's census (a 2026-11-19 host check): an RTX
+    /// 5070 Laptop at 01:00.0 with its HDMI audio at 01:00.1, and a Radeon
+    /// 610M at 05:00.0 whose device also holds its HDMI audio (.1), xHCI
+    /// (.3, .4) and the analog HD Audio controller (.6) of the board's codec.
+    #[test]
+    fn an_amd_apus_analog_hd_audio_is_driven_beside_its_parked_hdmi_audio() {
+        let census = [
+            identity(0x01, 0, 0x10de, 0x2d58, 0x03_00_00),
+            identity(0x01, 1, 0x10de, 0x22eb, 0x04_03_00),
+            identity(0x05, 0, 0x1002, 0x164e, 0x03_00_00),
+            identity(0x05, 1, 0x1002, 0x1640, 0x04_03_00),
+            identity(0x05, 3, 0x1022, 0x15b6, 0x0c_03_30),
+            identity(0x05, 4, 0x1022, 0x15b7, 0x0c_03_30),
+            identity(0x05, 6, 0x1022, 0x15e3, 0x04_03_00),
+        ];
+        let displays: Vec<Address> = census
+            .iter()
+            .filter(|function| function.class[0] == 0x03 && function.address.function == 0)
+            .map(|function| function.address)
+            .collect();
+        let planned: Vec<_> = census
+            .iter()
+            .map(|function| plan(function, &displays))
+            .collect();
+        let parked = alloc::format!("unsupported: {DISPLAY_AUDIO}");
+        assert_eq!(
+            planned,
+            [
+                "GPU",
+                parked.as_str(),
+                "GPU",
+                parked.as_str(),
+                "xHCI USB",
+                "xHCI USB",
+                "HD Audio",
+            ]
+        );
     }
 
     #[test]
@@ -4168,24 +4220,50 @@ mod tests {
             device,
             function,
         };
-        let displays = [at(0x0d, 0, 0)];
-        let audio = [0x04, 0x03, 0x00];
-        assert_eq!(
-            unclaimed(audio, at(0x0d, 0, 1), &displays),
-            Some(DISPLAY_AUDIO)
-        );
-        // A chipset or board HD Audio controller keeps the general reason.
-        for address in [at(0x0d, 1, 1), at(0x0e, 0, 1), at(0x0d, 0, 0)] {
+        let audio = |vendor, address| crate::bus::pci::Identity {
+            address,
+            vendor,
+            device: 0x0001,
+            class: [0x04, 0x03, 0x00],
+        };
+        let displays = [at(0x0d, 0, 0), at(0x0f, 2, 0)];
+        // Function 1 of an ATI, AMD or NVIDIA device whose function 0 is a
+        // display controller, in any slot.
+        for vendor in [0x1002, 0x1022, 0x10de] {
+            for address in [at(0x0d, 0, 1), at(0x0f, 2, 1)] {
+                assert_eq!(
+                    unclaimed(&audio(vendor, address), &displays),
+                    Some(DISPLAY_AUDIO),
+                    "{vendor:04x} {address}"
+                );
+            }
+        }
+        // A chipset or board HD Audio controller keeps the general reason:
+        // another slot or bus, function 0, any other function of the GPU's
+        // device (an AMD APU's analog controller is function 6 of its iGPU)
+        // and any other vendor.
+        for function in [
+            audio(0x1002, at(0x0d, 1, 1)),
+            audio(0x1002, at(0x0e, 0, 1)),
+            audio(0x1002, at(0x0d, 0, 0)),
+            audio(0x1022, at(0x0d, 0, 6)),
+            audio(0x1002, at(0x0d, 0, 2)),
+            audio(0x10de, at(0x0d, 0, 7)),
+            audio(0x8086, at(0x0d, 0, 1)),
+            audio(0x1234, at(0x0d, 0, 1)),
+        ] {
             assert_eq!(
-                unclaimed(audio, address, &displays),
-                Some("HD Audio controller outside the supported identities")
+                unclaimed(&function, &displays),
+                Some("HD Audio controller outside the supported identities"),
+                "{function:?}"
             );
         }
         // Other classes beside a GPU are unaffected.
-        assert_eq!(
-            unclaimed([0x0c, 0x03, 0x10], at(0x0d, 0, 3), &displays),
-            unsupported([0x0c, 0x03, 0x10])
-        );
+        let xhci = crate::bus::pci::Identity {
+            class: [0x0c, 0x03, 0x10],
+            ..audio(0x1002, at(0x0d, 0, 1))
+        };
+        assert_eq!(unclaimed(&xhci, &displays), unsupported([0x0c, 0x03, 0x10]));
     }
 
     #[test]
