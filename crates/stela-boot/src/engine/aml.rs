@@ -1150,6 +1150,14 @@ pub struct HostAcpi {
             stela_drivers::platform::acpi::Notification<'static>,
         )>,
     >,
+    /// The ASUS WMI device, and the notify handler that counts its events
+    /// in [`ASUS_EVENTS`].
+    asus: RefCell<
+        Option<(
+            stela_drivers::platform::asus_wmi::AsusWmi<'static>,
+            Option<stela_drivers::platform::acpi::Notification<'static>>,
+        )>,
+    >,
     ec_pending: Cell<bool>,
     hardware: AtomicBool,
     ec_failed: AtomicBool,
@@ -1169,6 +1177,11 @@ const BACKLIGHTS: usize = 8;
 static BRIGHTNESS: [AtomicU32; BACKLIGHTS] = [const { AtomicU32::new(0) }; BACKLIGHTS];
 /// The last brightness notification of any device since the poll took it.
 static BRIGHTNESS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// The ASUS WMI event notifications since the poll took them, each one
+/// event its firmware queued ([`HostAcpi::service_asus_wmi`]).
+static ASUS_EVENTS: AtomicU32 = AtomicU32::new(0);
+/// The events the ASUS firmware's queue holds, at most.
+const ASUS_QUEUE: u32 = 16;
 
 impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
@@ -1340,6 +1353,7 @@ impl HostAcpi {
             notification: RefCell::new(None),
             buttons: RefCell::new(Vec::new()),
             backlights: RefCell::new(Vec::new()),
+            asus: RefCell::new(None),
             ec_pending: Cell::new(false),
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
@@ -1444,6 +1458,7 @@ impl HostAcpi {
                 }
                 self.attach_power_buttons();
                 self.attach_backlights();
+                self.attach_asus_wmi();
                 match self.session.notify_all(|_, value| {
                     POWER_CHANGED.store(true, Ordering::Release);
                     if stela_drivers::probe::backlight::switches(value) {
@@ -1709,6 +1724,104 @@ impl HostAcpi {
             output::fatal("ACPI deferred work completion failed");
         }
         self.service_brightness();
+        self.service_asus_wmi();
+    }
+
+    /// Linux's asus-wmi on an ASUS laptop's WMI device: a notify handler
+    /// on its event block first, then INIT, after which the firmware
+    /// reports its Fn hotkeys as events, and the keyboard backlight read
+    /// and set to that level, as asus-wmi registers its LED. Each event is
+    /// taken at the next poll ([`Self::service_asus_wmi`]). One line, where
+    /// the device exists.
+    fn attach_asus_wmi(&'static self) {
+        use stela_drivers::platform::asus_wmi::AsusWmi;
+        let mut wmi = match AsusWmi::find(&self.session) {
+            Ok(Some(wmi)) => wmi,
+            Ok(None) => return,
+            Err(error) => {
+                output::arguments(format_args!("HOST ASUS WMI search refused: {error:?}\n"));
+                return;
+            }
+        };
+        let notification = wmi.notify.and_then(|notify| {
+            match wmi.handle().notify(move |value| {
+                if value == notify {
+                    ASUS_EVENTS.fetch_add(1, Ordering::AcqRel);
+                }
+            }) {
+                Ok(notification) => Some(notification),
+                Err(error) => {
+                    output::arguments(format_args!(
+                        "HOST ASUS WMI {}: notify handler refused: {error:?}; its hotkeys are \
+                         not taken\n",
+                        wmi.path
+                    ));
+                    None
+                }
+            }
+        });
+        let init = match wmi.init() {
+            Ok(answer) => alloc::format!("INIT answered {answer:#x}"),
+            Err(error) => alloc::format!("INIT refused ({error:?})"),
+        };
+        let keyboard = match wmi.read_keyboard() {
+            Ok(Some(level)) => match wmi.set_keyboard(i32::from(level)) {
+                Ok(_) => alloc::format!(
+                    "keyboard backlight at {level} of {}, which its keys step",
+                    stela_drivers::platform::asus_wmi::KEYBOARD_MAX
+                ),
+                Err(error) => alloc::format!("keyboard backlight refused its level: {error:?}"),
+            },
+            Ok(None) => String::from("no keyboard backlight"),
+            Err(error) => alloc::format!("keyboard backlight unreadable: {error:?}"),
+        };
+        let events = if notification.is_some() {
+            "its hotkey events are taken"
+        } else {
+            "no hotkey events"
+        };
+        output::arguments(format_args!(
+            "HOST ASUS WMI {} ({}): {init}, {keyboard}, {events}\n",
+            wmi.path,
+            wmi.method()
+        ));
+        *self.asus.borrow_mut() = Some((wmi, notification));
+    }
+
+    /// Each ASUS WMI event since the last poll, read through `_WED` as
+    /// Linux reads one at every notification, so the firmware's queue
+    /// drains: a keyboard backlight key steps it, and any other code is
+    /// named.
+    fn service_asus_wmi(&self) {
+        let events = ASUS_EVENTS.swap(0, Ordering::AcqRel);
+        if events == 0 {
+            return;
+        }
+        let mut kept = self.asus.borrow_mut();
+        let Some((wmi, _)) = kept.as_mut() else {
+            return;
+        };
+        for _ in 0..events.min(ASUS_QUEUE) {
+            let code = match wmi.event() {
+                Ok(code) => code,
+                Err(error) => {
+                    output::arguments(format_args!("HOST ASUS WMI event unreadable: {error:?}\n"));
+                    return;
+                }
+            };
+            match wmi.keyboard_key(code) {
+                Ok(Some((from, to))) => output::arguments(format_args!(
+                    "HOST ASUS WMI keyboard backlight {from} -> {to} of {} (event {code:#x})\n",
+                    stela_drivers::platform::asus_wmi::KEYBOARD_MAX
+                )),
+                Ok(None) => {
+                    output::arguments(format_args!("HOST ASUS WMI event {code:#x}: not taken\n"))
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ASUS WMI keyboard backlight refused (event {code:#x}): {error:?}\n"
+                )),
+            }
+        }
     }
 
     /// Linux's ACPI video driver on each display output device with `_BCL`
