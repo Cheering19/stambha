@@ -3,7 +3,8 @@
 //! Linux's codec patch table selects its patch driver.
 use super::{
     Alc269CommonReport, CirrusReport, CodecGraph, ConexantHeadsetInitialization, ConexantReport,
-    Controller, RealtekReport, Registers, SigmatelReport, cirrus, conexant, realtek, sigmatel,
+    Controller, RealtekAlc256Report, RealtekReport, Registers, SigmatelReport, cirrus, conexant,
+    realtek, sigmatel,
 };
 use crate::{Error, Timer};
 
@@ -13,6 +14,8 @@ pub enum CodecSetup {
     /// Managed ALC882/ALC662-family setup, with any PCI-subsystem OEM procedure.
     Realtek(RealtekReport),
     Alc269(Alc269CommonReport),
+    /// Linux's ALC256 init, before any route.
+    Alc256(RealtekAlc256Report),
     Cirrus(CirrusReport),
     Conexant(ConexantReport),
     ConexantHeadset(ConexantHeadsetInitialization),
@@ -27,6 +30,30 @@ impl core::fmt::Display for CodecSetup {
         match self {
             Self::Realtek(report) => write!(f, "Realtek {:?} ({:?})", report.family, report.oem),
             Self::Alc269(report) => write!(f, "Realtek ALC269 {:?}", report.variant),
+            Self::Alc256(report) => {
+                let jack = match report.headphone_sense {
+                    Some(sense) if sense.present => "plugged in",
+                    Some(_) => "empty",
+                    None => "no jack sense",
+                };
+                write!(
+                    f,
+                    "Realtek ALC256, headphone pin {:#04x} ({jack}), ",
+                    report.headphone_pin
+                )?;
+                match report.speaker_pin {
+                    Some(pin) => write!(f, "speaker pin {pin:#04x}")?,
+                    None => f.write_str("no speaker pin")?,
+                }
+                f.write_str(", EAPD on")?;
+                if report.eapd_pins.is_empty() {
+                    f.write_str(" no pin")?;
+                }
+                for pin in &report.eapd_pins {
+                    write!(f, " {pin:#04x}")?;
+                }
+                Ok(())
+            }
             Self::Cirrus(report) => write!(f, "Cirrus {:?}", report.profile),
             Self::Conexant(_) => f.write_str("Conexant"),
             Self::ConexantHeadset(_) => f.write_str("Conexant headset"),
@@ -45,6 +72,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if id == 0x10ec_0269 {
             self.initialize_realtek_alc269_common(graph)
                 .map(CodecSetup::Alc269)
+        } else if id == 0x10ec_0256 {
+            self.initialize_realtek_alc256(graph)
+                .map(CodecSetup::Alc256)
         } else if realtek::managed(id, graph.revision_id) {
             let report = if self.realtek_oem_selected(graph)? {
                 self.initialize_realtek_oem_codec(graph)

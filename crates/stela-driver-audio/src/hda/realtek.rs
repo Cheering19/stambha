@@ -22,7 +22,7 @@ mod managed;
 pub(super) use managed::State;
 pub use managed::{AmplifierLevel, RealtekCaptureGain, RealtekReport};
 mod headphone;
-pub use headphone::RealtekHeadphoneReport;
+pub use headphone::{RealtekAlc256Report, RealtekHeadphoneReport};
 mod dual_headphone;
 pub use dual_headphone::{RealtekDualHeadphoneReport, RealtekHeadphoneRoute};
 
