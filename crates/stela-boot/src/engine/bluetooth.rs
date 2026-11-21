@@ -7,12 +7,16 @@
 //!
 //! The guest is given the controller model (`stela_soc::usb::hci::model`),
 //! presented as Apple's internal USB module, which answers inside the
-//! guest's function; a host controller is not lent yet (`start`). This
-//! reports the model's unknown commands, each once, how many commands the
-//! guest sent, at each doubling, and the function's trace: each
-//! configuration and reset, and the first commands after each
-//! configuration with their answers. With `--bluetooth-trace` it also logs
-//! every packet the function captures (`GUEST BLUETOOTH RAW`, at most
+//! guest's function. With `--bluetooth-lend` the host's controller is lent
+//! behind that module instead (`stela_soc::usb::hci::bridge`): the module's
+//! shadow model answers every vendor command and the controller the
+//! standard ones listed, until the controller fails or stalls and the model
+//! answers everything (`BLUETOOTH LEND FELL BACK`). This reports the
+//! model's unknown commands, each once, how many commands the guest sent,
+//! at each doubling, and the function's trace: each configuration and
+//! reset, and the first commands after each configuration with their
+//! answers. With `--bluetooth-trace` it also logs every packet the function
+//! captures (`GUEST BLUETOOTH RAW`, at most
 //! `stela_soc::usb::hci::capture::CAPTURED_PACKETS` per configuration).
 //!
 //! One controller serves the guest; others are reported and left idle. A
@@ -37,9 +41,12 @@ use stela_drivers::{
 use stela_soc::{
     machine::{
         AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCaptured, UsbBluetoothCounters,
-        UsbBluetoothTrace,
+        UsbBluetoothFallback, UsbBluetoothLendCounters, UsbBluetoothTrace,
     },
-    usb::hci::bridge::{HostController, Link},
+    usb::hci::{
+        bridge::{HostController, Link},
+        capture::LOG_PREFIX,
+    },
 };
 
 enum Controller {
@@ -145,6 +152,14 @@ pub struct HostBluetooth {
     capture: bool,
     /// The packets it captured, to report.
     captured: Vec<UsbBluetoothCaptured>,
+    /// Whether the controller is lent behind Apple's module.
+    lent: bool,
+    /// What its bridge reported last: the fallback, its counters, and
+    /// whether the guest wrote another address than the controller's.
+    lend: Option<(Option<UsbBluetoothFallback>, UsbBluetoothLendCounters, bool)>,
+    /// Whether the fallback and the address were reported.
+    fell_back: bool,
+    address_differs: bool,
 }
 
 /// The controller is dropped in the loader's root. An install runs without
@@ -196,6 +211,10 @@ impl HostBluetooth {
             trace: Vec::new(),
             capture: false,
             captured: Vec::new(),
+            lent: false,
+            lend: None,
+            fell_back: false,
+            address_differs: false,
         })
     }
 
@@ -215,20 +234,38 @@ impl HostBluetooth {
             trace: Vec::new(),
             capture: false,
             captured: Vec::new(),
+            lent: false,
+            lend: None,
+            fell_back: false,
+            address_differs: false,
         }
     }
 
     /// The guest's controller for a boot with `options`, said once in the
     /// log: the model of Apple's internal USB module for every boot with
-    /// host input. The host's `controller` is not lent: the guest's
+    /// host input. The host's `controller` is never lent raw: the guest's
     /// function would carry the host's vendor commands and replies, which
-    /// BlueTool's chip boot and bluetoothd's bring-up do not take. One not
-    /// kept is released in the loader's root by its drop.
+    /// BlueTool's chip boot and bluetoothd's bring-up do not take. With
+    /// `--bluetooth-lend` it is lent behind the module, which answers those
+    /// itself and falls back to the model on any failure. One not kept is
+    /// released in the loader's root by its drop.
     pub fn guest(controller: Option<Self>, options: &System, root: u64) -> Option<Self> {
-        let line =
-            stela_boot_core::guest_bluetooth::model_line(controller.is_some(), options.input)?;
-        output::arguments(format_args!("{line}"));
-        let mut guest = Self::modeled(root);
+        let mut guest = match controller {
+            Some(mut lent) if options.input && options.bluetooth_lend => {
+                let line = stela_boot_core::guest_bluetooth::lend_line(&lent.location);
+                output::arguments(format_args!("{line}"));
+                lent.lent = true;
+                lent
+            }
+            controller => {
+                let line = stela_boot_core::guest_bluetooth::model_line(
+                    controller.is_some(),
+                    options.input,
+                )?;
+                output::arguments(format_args!("{line}"));
+                Self::modeled(root)
+            }
+        };
         guest.capture = options.bluetooth_trace;
         Some(guest)
     }
@@ -236,6 +273,7 @@ impl HostBluetooth {
     /// The guest's USB function for this controller.
     pub fn kind(&self) -> UsbBluetooth {
         match self.controller {
+            _ if self.lent => UsbBluetooth::Bridged,
             Controller::Modeled => UsbBluetooth::Model,
             _ => UsbBluetooth::Host,
         }
@@ -247,8 +285,11 @@ impl HostBluetooth {
         &mut self,
         devices: &mut AppleDevices,
     ) -> (Vec<Outbound>, usize, Option<(bool, UsbBluetoothCounters)>) {
-        if matches!(self.controller, Controller::Modeled) {
+        if self.lent || matches!(self.controller, Controller::Modeled) {
             self.unknown.extend(devices.bluetooth_unknown());
+        }
+        if self.lent {
+            self.lend = devices.bluetooth_lend();
         }
         // Asked at the first service turn, before the guest's USB stack
         // can configure the function.
@@ -283,7 +324,19 @@ impl HostBluetooth {
             output::arguments(format_args!("GUEST BLUETOOTH {entry}\n"));
         }
         for packet in self.captured.drain(..) {
-            output::arguments(format_args!("GUEST BLUETOOTH RAW {packet}\n"));
+            output::arguments(format_args!("{LOG_PREFIX}{packet}\n"));
+        }
+        let (fallback, lend, differs) = self.lend.unwrap_or_default();
+        if let Some(fallback) = fallback.filter(|_| !self.fell_back) {
+            self.fell_back = true;
+            output::arguments(format_args!("BLUETOOTH LEND FELL BACK {fallback}\n"));
+        }
+        if differs && !self.address_differs {
+            self.address_differs = true;
+            output::arguments(format_args!(
+                "BLUETOOTH LEND the guest wrote a BD_ADDR its controller does not have, \
+                 which keeps its own\n"
+            ));
         }
         for opcode in self.unknown.drain(..) {
             output::arguments(format_args!(
@@ -294,7 +347,7 @@ impl HostBluetooth {
             ));
         }
         let (up, counters) = status.unwrap_or_default();
-        if matches!(self.controller, Controller::Modeled)
+        if (self.lent || matches!(self.controller, Controller::Modeled))
             && counters.commands > 0
             && counters.commands >= 2 * self.reported_commands
         {
@@ -303,6 +356,12 @@ impl HostBluetooth {
                 "GUEST BLUETOOTH commands={} unknown={}\n",
                 counters.commands, counters.unknown
             ));
+            if self.lent {
+                output::arguments(format_args!(
+                    "GUEST BLUETOOTH LEND forwarded={} local={} passed={} dropped={}\n",
+                    lend.forwarded, lend.local, lend.passed, lend.dropped
+                ));
+            }
         }
         if self.up != Some(up) {
             self.up = Some(up);

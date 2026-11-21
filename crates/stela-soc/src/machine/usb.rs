@@ -8,6 +8,17 @@ use stela_contracts::refuse;
 /// The reason of the power-off a held power button makes.
 pub const POWER_BUTTON_HELD: &str = "smc: power button held: system power-off";
 
+/// The guest's USB Bluetooth function of `kind` on the board whose ECID is
+/// `ecid`, which gives the model's address.
+fn bluetooth_function(kind: UsbBluetooth, ecid: u64) -> Hci {
+    let address = || crate::usb::hci::model::address(ecid);
+    match kind {
+        UsbBluetooth::Host => Hci::new(),
+        UsbBluetooth::Model => Hci::modeled(address()),
+        UsbBluetooth::Bridged => Hci::bridged(address()),
+    }
+}
+
 impl AppleDevices {
     /// The shared cable state of one Type-C connector.
     pub(super) fn typec_port(&mut self, number: u32) -> typec::Port {
@@ -178,10 +189,7 @@ impl AppleDevices {
         let attachments = Attachments {
             input: Peripheral::new(),
             network,
-            bluetooth: bluetooth.map(|kind| match kind {
-                UsbBluetooth::Host => Hci::new(),
-                UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
-            }),
+            bluetooth: bluetooth.map(|kind| bluetooth_function(kind, self.ecid)),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -253,6 +261,17 @@ impl AppleDevices {
         if let Some(hci) = self.usb_bluetooth() {
             hci.host_failed();
         }
+    }
+
+    /// What the bridge to a lent host controller reports: why it fell back
+    /// to the model, if it has, its counters, and whether the guest wrote a
+    /// BD_ADDR the controller does not have; `None` unless one is lent.
+    pub fn bluetooth_lend(
+        &mut self,
+    ) -> Option<(Option<UsbBluetoothFallback>, UsbBluetoothLendCounters, bool)> {
+        let hci = self.usb_bluetooth()?;
+        let counters = hci.bridge_counters()?;
+        Some((hci.fallback(), counters, hci.bridged_address_differs()))
     }
 
     /// The next packet the guest sent for the host's Bluetooth controller.
@@ -472,5 +491,27 @@ impl AppleDevices {
                 .and_then(Dwc3::take_host_trace)
                 .map(|line| (master.number, line))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--bluetooth-lend` gives the guest Apple's module with a bridge to
+    /// the host's controller behind it; the model and the raw function stay
+    /// as they were.
+    #[test]
+    fn each_kind_of_guest_bluetooth_is_its_function() {
+        let ecid = 0x1234;
+        let address = crate::usb::hci::model::address(ecid);
+        let bridged = bluetooth_function(UsbBluetooth::Bridged, ecid);
+        assert!(bridged.bridge_counters().is_some());
+        assert_eq!(bridged.model_address(), Some(address));
+        let modeled = bluetooth_function(UsbBluetooth::Model, ecid);
+        assert!(modeled.bridge_counters().is_none());
+        assert_eq!(modeled.model_address(), Some(address));
+        let host = bluetooth_function(UsbBluetooth::Host, ecid);
+        assert_eq!((host.model_address(), host.bridge_counters()), (None, None));
     }
 }

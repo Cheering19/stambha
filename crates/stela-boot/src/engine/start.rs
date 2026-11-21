@@ -3364,11 +3364,11 @@ fn start_devices(
             host_usb = Some(usb);
             // The guest's controller is the model of Apple's internal USB
             // module, for every boot with host input. The host's controller
-            // is not lent: the guest's function would carry the host's
+            // is not lent raw: the guest's function would carry the host's
             // vendor commands and replies, which BlueTool's chip boot and
             // bluetoothd's bring-up do not take. It is released in the
-            // loader's root by its drop (`bluetooth::HostBluetooth::guest`).
-            // The log says so once.
+            // loader's root by its drop (`bluetooth::HostBluetooth::guest`,
+            // which says so once, or lends it with `--bluetooth-lend`).
             host_bluetooth =
                 bluetooth::HostBluetooth::guest(host_controller, options, handoff.root);
             // With no adapter started, the screen names each one found and

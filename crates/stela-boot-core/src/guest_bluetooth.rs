@@ -8,7 +8,20 @@
 //! The model has no radio. It is powered, has a stable locally administered
 //! address, accepts scans and connection attempts and finds nothing, and has
 //! no paired devices. That is a degraded answer, not Bluetooth, and the line
-//! says so once. A host controller is not lent to the guest.
+//! says so once. A host controller is not lent to the guest unless the boot
+//! asks for it (`--bluetooth-lend`): it then sits behind the same module,
+//! which falls back to the model when the controller fails or stalls, and
+//! [`lend_line`] names it instead.
+use alloc::{format, string::String};
+
+/// The line for a boot that lends the host's controller at `location` to
+/// the guest behind Apple's module.
+pub fn lend_line(location: &str) -> String {
+    format!(
+        "BLUETOOTH LEND the guest's controller is {location} behind Apple's module; \
+         it falls back to the model on failure\n"
+    )
+}
 
 /// The line for a boot that gives macOS host input, by whether the host
 /// has a Bluetooth controller; `None` for a boot without host input.
@@ -38,6 +51,19 @@ mod tests {
             assert!(line.contains("finds no devices and has none paired"));
             assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
         }
+    }
+
+    /// `--bluetooth-lend`: the line names the controller lent, the module it
+    /// sits behind, and the fallback.
+    #[test]
+    fn a_lent_controller_is_named_with_its_fallback() {
+        let line = lend_line("xhci 0000:05:00.4 port 2.3");
+        assert_eq!(
+            line,
+            "BLUETOOTH LEND the guest's controller is xhci 0000:05:00.4 port 2.3 behind \
+             Apple's module; it falls back to the model on failure\n"
+        );
+        assert_eq!(line.matches('\n').count(), 1);
     }
 
     #[test]
