@@ -353,8 +353,8 @@ impl BlockDevice for Runs {
 /// [`ReadAhead::pump`] keeps `depth` chunks after the last read in memory
 /// or in flight, never waiting, and a read finds them in memory. A read
 /// that catches up with a chunk in flight waits for that chunk, within the
-/// bound of a bounded device ([`ReadAhead::bounded`]), rather than read its
-/// blocks again. A read that nothing read ahead holds reads the device
+/// bound of a bounded device once one is set ([`ReadAhead::bounded`]),
+/// rather than read its blocks again. A read that nothing read ahead holds reads the device
 /// directly and starts the read-ahead over after it; one that jumped there
 /// is read ahead again once its reader reads on from it, so a reader that
 /// moves between two places reads nothing for nothing.
@@ -384,8 +384,10 @@ pub struct ReadAhead {
 
 impl ReadAhead {
     /// Read `device` ahead in requests of `chunk_bytes`, keeping `depth`. A
-    /// read that waits for a chunk in flight waits until it arrives; over a
-    /// [`Bounded`] device take [`Self::bounded`].
+    /// read that catches up with a chunk in flight takes it if it has
+    /// arrived and else reads the device directly; over a [`Bounded`]
+    /// device take [`Self::bounded`], whose reads wait for it within the
+    /// bound.
     pub fn new(device: Box<dyn BlockDevice>, chunk_bytes: usize, depth: usize) -> Self {
         let block = u64::from(device.identity().block_size.max(1));
         Self {
@@ -484,6 +486,9 @@ impl ReadAhead {
     /// whether it arrived. One that failed is read again directly. Within a
     /// bound ([`Self::bounded`]), as a [`Bounded`] read: past it, only a
     /// result the device has by then is taken, else the read is blocked.
+    /// With no bound set, nothing limits a wait, so only a result the device
+    /// has already is taken, and else the read reads directly, as one of a
+    /// [`Bounded`] device does then.
     fn wait(&mut self, index: usize) -> Result<bool, BlockError> {
         loop {
             if let Some(finished) = self.running[index].1.poll(&mut *self.device) {
@@ -496,9 +501,10 @@ impl ReadAhead {
                     _ => false,
                 });
             }
-            if let Some(bound) = &self.bound
-                && bound.passed()
-            {
+            let Some(bound) = self.bound.as_ref().filter(|bound| bound.is_set()) else {
+                return Ok(false);
+            };
+            if bound.passed() {
                 bound.block();
                 return Err(BlockError::Timeout);
             }

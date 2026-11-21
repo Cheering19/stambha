@@ -53,6 +53,71 @@ fn a_reader_that_catches_up_waits_for_the_chunk_in_flight() {
     );
 }
 
+/// A disk whose queued commands complete only once looked at `after`
+/// times: one a reader with no bound to wait within must not wait for.
+struct Slow {
+    inner: Delayed,
+    released: Rc<Cell<usize>>,
+    looks: Rc<Cell<usize>>,
+    after: usize,
+}
+
+impl BlockDevice for Slow {
+    fn identity(&self) -> &Identity {
+        self.inner.identity()
+    }
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.inner.read(lba, buffer)
+    }
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.inner.write(lba, data)
+    }
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+    fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.inner.start(command)
+    }
+    fn finish(&mut self, tag: u32) -> Option<Finished> {
+        self.looks.set(self.looks.get() + 1);
+        if self.looks.get() >= self.after {
+            self.released.set(usize::MAX);
+        }
+        self.inner.finish(tag)
+    }
+}
+
+/// With no bound set, as before a turn bounds it, a read that catches up
+/// with a chunk in flight takes it only if it has arrived and otherwise
+/// reads directly, as an unbounded read does, rather than wait for it
+/// without any limit.
+#[test]
+fn a_reader_with_no_bound_reads_directly_rather_than_wait_for_a_chunk() {
+    let (delayed, (released, reads, _)) = Delayed::new(numbered(16), 4);
+    released.set(usize::MAX);
+    let looks = Rc::new(Cell::new(0));
+    let slow = Slow {
+        inner: delayed,
+        released: released.clone(),
+        looks: looks.clone(),
+        after: 1_000,
+    };
+    let ahead = Ahead::new(ReadAhead::bounded(Bounded::new(Box::new(slow)), 1024, 2));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    reader.read(0, &mut block).unwrap();
+    released.set(0);
+    ahead.pump();
+    let mut two = [0; 1024];
+    reader.read(1, &mut two).unwrap();
+    assert_eq!((two[0], two[512]), (1, 2));
+    assert_eq!(reads.get(), 2, "read directly");
+    assert_eq!(looks.get(), 1, "the chunk in flight was looked at once");
+}
+
 /// A caller whose reads in one turn ran past their bound reads them again
 /// from the first: the chunks its last read took stay for it.
 #[test]

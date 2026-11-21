@@ -36,6 +36,11 @@ impl ReadBound {
         self.0.blocked.replace(false)
     }
 
+    /// Whether a bound was set: until then reads wait for their device.
+    pub(super) fn is_set(&self) -> bool {
+        self.0.ticks.get().is_some()
+    }
+
     /// Whether the bound set last has passed; never before one is set.
     pub(super) fn passed(&self) -> bool {
         self.0
