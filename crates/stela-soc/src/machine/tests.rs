@@ -2222,6 +2222,42 @@ fn smc_places_a_running_wrapper_its_shared_page_and_watchdog() {
 }
 
 #[test]
+fn the_host_battery_reaches_the_smc_once_and_only_on_a_board_with_one() {
+    use stela_drivers::platform::power_snapshot::{PowerSnapshot, TestState};
+    use stela_soc_data::board::SmcController;
+    let charging = PowerSnapshot::synthetic(80, TestState::Charging);
+    let mut devices = AppleDevices::new();
+    assert!(devices.add_battery(&charging).is_err());
+    assert!(devices.power_update(&charging, 0).is_err());
+    let placement = SmcController {
+        wrapper: (0x2_3e40_0000, 0x6c000),
+        interrupts: [0x1f4, 0x1f3, 0x1f6, 0x1f5],
+        watchdog: None,
+        region: (0x2_3fe0_0000, 0x10_0000),
+        gpio_keys: alloc::vec![],
+        quiesced: true,
+        wake_bits: stela_soc_data::smc::WakeBits::default(),
+    };
+    devices
+        .add_aic(0x2_3b0c_0000, 1152, AicLayout::aic2(0x8000, 0))
+        .unwrap();
+    devices
+        .add_smc(&placement, stela_formats::builds::DEFAULT)
+        .unwrap();
+    // Without a battery the readings reach nothing.
+    assert_eq!(devices.power_update(&charging, 0), Ok(None));
+    devices.add_battery(&charging).unwrap();
+    assert!(devices.add_battery(&charging).is_err());
+    let unplugged = PowerSnapshot::synthetic(79, TestState::Discharging);
+    assert_eq!(devices.power_update(&unplugged, 1_000), Ok(None));
+    assert_eq!(devices.power_due(2_000), Ok(None));
+    assert_eq!(
+        devices.smc().unwrap().value(smc::code(b"BUIC")),
+        Some(&[79][..])
+    );
+}
+
+#[test]
 fn the_kept_rtc_anchor_is_the_pmu_upcount_at_the_latest_board_entry() {
     let hz = crate::counter::FREQUENCY_HZ;
     let wall = stela_soc_data::pmu::WallClock {

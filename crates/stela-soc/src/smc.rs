@@ -69,8 +69,9 @@
 //!   T6050 kernel's `_shutdownGated` writes it on its other path (mac17j
 //!   `.cold.3`, 0xfffffe0009ad9c88, after the RTC wake alarm is cleared)
 //!   and panics "SMCFW failed to handle shutdown request" a second later.
-//!   `lpem` (low-power emergency mode, on battery systems) refuses: the
-//!   board has no battery.
+//!   `lpem` (low-power emergency mode, on battery systems) powers off an
+//!   SMC given the host's battery ([`Smc::add_battery`]), as `susp` does;
+//!   any other refuses: the board has no battery.
 //! - `slpa` puts the SoC to sleep and `hiba` into hibernation: the key
 //!   endpoint writes one itself when its power state drops to 0
 //!   (`AppleSMCKeysEndpoint::_powerStateActionGated` file 0x2da492c,
@@ -155,17 +156,20 @@
 //! `NESN`, `MBSW`, `MESS`, `D1Vn`, `aDC#`, `aDC?` and `TP<n>d` are inferred
 //! from their sizes and uses; no client reads them. Every key the 26A434
 //! J473AP kernel's SMC clients and the restore ramdisk use was censused; a key
-//! absent here is one none of them needs.
+//! absent here is one none of them needs. The battery's keys ([`battery`])
+//! join them only when the SMC is given the host's battery.
 //!
 //! A source-declared primary RTC helper can additionally bind CLKM to the
 //! PMU oscillator. Its recovered six-byte hex_ / attributes0x94 key
 //! profile follows the original firmware.
 //! Missing counter publication refuses before SRAM/reply effects; this path
 //! owns no second calendar offset and makes no Apple reset-epoch assumption.
+mod battery;
 mod rtc;
 use crate::Result;
 use rtc::RtcBinding;
 use stela_contracts::refuse;
+use stela_drivers::platform::power_snapshot::PowerSnapshot;
 use stela_soc_data::smc::RtcKeyProfile;
 
 use super::asc::TransitionRequest;
@@ -422,6 +426,8 @@ pub struct Smc {
     waking_press: bool,
     write_log: VecDeque<WriteLog>,
     dropped_writes: usize,
+    /// The host's battery, when the SMC was given it.
+    battery: Option<battery::Battery>,
 }
 
 impl Smc {
@@ -462,6 +468,7 @@ impl Smc {
             waking_press: false,
             write_log: VecDeque::new(),
             dropped_writes: 0,
+            battery: None,
         })
     }
 
@@ -508,6 +515,61 @@ impl Smc {
         }
         u32::try_from(self.keys.len() + 1).map_err(|_| refuse!("too many SMC keys"))?;
         Ok(())
+    }
+
+    /// Give the SMC the host's battery, as `snapshot` read it: the battery's
+    /// keys ([`battery`]) join the table, before the AP first reads it.
+    /// Refused without a reading of a battery, or a second time.
+    pub fn add_battery(&mut self, snapshot: &PowerSnapshot) -> Result<()> {
+        if self.battery.is_some() {
+            return Err(refuse!("the SMC already has the host's battery"));
+        }
+        if snapshot.battery.is_none() {
+            return Err(refuse!(
+                "an SMC battery needs a reading of the host's battery"
+            ));
+        }
+        let keys = battery::keys(snapshot);
+        if keys
+            .iter()
+            .any(|(name, _)| self.keys.contains_key(name) || *name == rtc::KEY)
+        {
+            return Err(refuse!("an SMC battery key duplicates a board key"));
+        }
+        let count = u32::try_from(self.keys.len() + keys.len() + usize::from(self.rtc.is_some()))
+            .map_err(|_| refuse!("too many SMC keys"))?;
+        self.keys.extend(keys);
+        self.keys
+            .get_mut(&KEY_COUNT)
+            .expect("key count owner")
+            .value = count.to_be_bytes().to_vec();
+        self.battery = Some(battery::Battery::new(snapshot));
+        Ok(())
+    }
+
+    /// The host's battery and AC adapter read anew, at `now_ms` on the
+    /// host's clock in milliseconds: the battery's keys take the reading, and
+    /// a change macOS acts on queues its notification ([`battery`]). Returns
+    /// when a notification that waits is due ([`Self::power_due`]). An SMC
+    /// with no battery takes nothing.
+    pub fn power(&mut self, snapshot: &PowerSnapshot, now_ms: u64) -> Option<u64> {
+        let battery = self.battery.as_mut()?;
+        for (name, value) in battery.update(snapshot) {
+            self.keys
+                .get_mut(&name)
+                .expect("the battery's keys are in the table")
+                .value = value;
+        }
+        self.power_due(now_ms)
+    }
+
+    /// Queue the battery's notifications due at `now_ms`; when the next
+    /// that waits is due.
+    pub fn power_due(&mut self, now_ms: u64) -> Option<u64> {
+        let (enabled, asleep) = (self.notifications_enabled(), self.asleep());
+        let (events, next) = self.battery.as_mut()?.due(now_ms, enabled, asleep);
+        self.events.extend(events);
+        next
     }
 
     fn key_info(&self, name: u32) -> Option<(usize, u32, u8)> {
@@ -716,6 +778,12 @@ impl Smc {
                 self.transition = Some(transition(
                     Transition::PowerOff,
                     "MBSE shutdown command: system power-off",
+                ));
+            }
+            LOW_POWER_EMERGENCY if self.battery.is_some() => {
+                self.transition = Some(transition(
+                    Transition::PowerOff,
+                    "MBSE low-power emergency command: system power-off",
                 ));
             }
             LOW_POWER_EMERGENCY => {
