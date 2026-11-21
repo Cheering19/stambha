@@ -5,12 +5,17 @@
 //!
 //! This module holds the parts that need no machine: the routine ids
 //! ([`Id`]), the masked function signatures and the phase-1 eligibility of a
-//! function ([`Signature`], [`eligible`]). None of it feeds the translation
-//! store's translator id (`build.rs` hashes neither this module nor the
-//! engine glue), so building it in leaves every stored translation valid.
+//! function ([`Signature`], [`eligible`]), and a boot's configuration
+//! ([`Config`]), off unless the boot passes `--hle`. None of it feeds the
+//! translation store's translator id (`build.rs` hashes neither this module
+//! nor the engine glue), so building it in leaves every stored translation
+//! valid.
+mod config;
 mod routine;
 mod signature;
+mod signatures;
 
+pub use config::Config;
 pub use routine::Routine as Id;
 pub use signature::{Ineligible, PREFIX_BYTES, Signature, eligible, mask_word, prefix_hash};
 

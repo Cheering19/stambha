@@ -36,6 +36,14 @@ impl ParseState<'_> {
             "--parallel" => options.parallel = true,
             "--serialized" => options.parallel = false,
             "--profile" => options.profile = true,
+            "--hle" => flag(&mut options.hle, Error::DuplicateHle)?,
+            "--hle-off" => {
+                // A list is never empty, so an empty one is none yet.
+                if !options.hle_off.is_empty() {
+                    return Err(Error::DuplicateHle);
+                }
+                options.hle_off = hle_routines(value().ok_or(Error::HleId)?)?;
+            }
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,

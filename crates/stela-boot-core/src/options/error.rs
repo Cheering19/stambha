@@ -99,6 +99,8 @@ pub enum Error {
     WifiNetwork,
     DuplicateNativeShared,
     DuplicateNativeBootstrap,
+    DuplicateHle,
+    HleId,
     Constraint(Constraint),
     Target {
         argument: TargetArgument,
@@ -221,6 +223,10 @@ impl Error {
             Self::WifiNetwork => "--wifi needs a 1 to 32 byte network name, with %XX escapes",
             Self::DuplicateNativeShared => "duplicate native shared check",
             Self::DuplicateNativeBootstrap => "duplicate native bootstrap check",
+            Self::DuplicateHle => "--hle and --hle-off each occur once",
+            Self::HleId => {
+                "--hle-off needs distinct routines separated by commas: memmove, bzero, memset, memcmp or strlen"
+            }
             Self::Constraint(rule) => rule.message(),
             Self::Target { source, .. } | Self::Guid { source, .. } => source,
             Self::BootCommandOrigin { source, .. } => source,

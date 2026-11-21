@@ -275,3 +275,73 @@ fn names_round_trip() {
         });
     assert_eq!(bits, 0x7f);
 }
+
+/// A table of two functions: the leaf as memmove and another as bzero.
+fn two_routines() -> alloc::sync::Arc<[Signature]> {
+    alloc::sync::Arc::from([
+        Signature::of(Id::Memmove, &leaf(), EXIT).unwrap(),
+        Signature::of(Id::Bzero, &replaced(NOP), EXIT).unwrap(),
+    ])
+}
+
+#[test]
+fn an_off_config_enables_nothing() {
+    let off = Config::off();
+    assert_eq!(off.enabled, 0);
+    assert!(off.table.is_empty());
+    assert_eq!(off.max_bytes, Config::MAX_BYTES);
+    assert_eq!(Config::default(), off);
+    for routine in Id::PRODUCTION.into_iter().chain([Id::Bail, Id::Touch]) {
+        assert!(!off.enables(routine), "{routine:?}");
+    }
+    // Without --hle a boot is off whatever its table, and the generated
+    // table holds nothing yet.
+    assert_eq!(config::booted(false, &[], two_routines()), off);
+    assert_eq!(Config::boot(false, &[]), off);
+    assert_eq!(Config::boot(true, &[]).enabled, 0);
+    // A routine without a signature is never enabled.
+    assert_eq!(Config::with_table(two_routines(), &[Id::Strlen]).enabled, 0);
+}
+
+#[test]
+fn hle_off_clears_only_its_ids() {
+    let both = config::booted(true, &[], two_routines());
+    assert!(both.enables(Id::Memmove) && both.enables(Id::Bzero));
+    assert_eq!(both.enabled, Id::Memmove.bit() | Id::Bzero.bit());
+    let without_bzero = config::booted(true, &[Id::Bzero], two_routines());
+    assert_eq!(without_bzero.enabled, Id::Memmove.bit());
+    assert_eq!(without_bzero.table, two_routines());
+    // Naming a routine the table lacks clears nothing else.
+    let without_strlen = config::booted(true, &[Id::Strlen], two_routines());
+    assert_eq!(without_strlen.enabled, both.enabled);
+    assert_eq!(
+        Config::with_table(two_routines(), &[Id::Memmove, Id::Strlen]).enabled,
+        Id::Memmove.bit()
+    );
+}
+
+#[test]
+fn max_bytes_takes_its_bounds() {
+    for bytes in [256, 4096, 1 << 20] {
+        assert_eq!(Config::off().with_max_bytes(bytes).max_bytes, bytes);
+    }
+}
+
+#[test]
+#[should_panic(expected = "256 bytes to 1 MiB")]
+fn max_bytes_below_its_bounds_panics() {
+    Config::off().with_max_bytes(255);
+}
+
+#[test]
+#[should_panic(expected = "256 bytes to 1 MiB")]
+fn max_bytes_above_its_bounds_panics() {
+    Config::off().with_max_bytes((1 << 20) + 1);
+}
+
+#[test]
+#[should_panic(expected = "at most 64 signatures")]
+fn a_table_of_more_than_64_signatures_panics() {
+    let signature = Signature::of(Id::Memmove, &leaf(), EXIT).unwrap();
+    Config::with_table(alloc::sync::Arc::from(vec![signature; 65]), &[Id::Memmove]);
+}
