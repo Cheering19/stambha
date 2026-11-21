@@ -55,6 +55,8 @@ pub(super) struct Profile {
     pub other: [u64; 2],
     pub levels: [[u64; 2]; 3],
     pub entries: Vec<Entry>,
+    /// The `PES PC` lines skipped, each with its line number and why.
+    pub warnings: Vec<String>,
 }
 
 /// An entry's key while groups are summed: level, page, offset, PC.
@@ -64,7 +66,7 @@ impl Profile {
     /// The last total group of `text`, or with `beats` (or without a
     /// total) the sum of its beat groups.
     pub(super) fn parse(text: &str, beats: bool) -> Result<Self> {
-        let groups = groups(text)?;
+        let (groups, warnings) = groups(text);
         let totals: Vec<&Group> = groups.iter().filter(|group| group.total).collect();
         let beat_groups: Vec<&Group> = groups.iter().filter(|group| !group.total).collect();
         let (source, chosen) = match totals.last() {
@@ -94,6 +96,7 @@ impl Profile {
             other: [0; 2],
             levels: [[0; 2]; 3],
             entries: Vec::new(),
+            warnings,
         };
         let mut entries: BTreeMap<Key, (u64, u64)> = BTreeMap::new();
         for group in chosen {
@@ -148,10 +151,13 @@ pub(super) fn level_index(level: Level) -> usize {
     LEVELS.iter().position(|&l| l == level).unwrap_or(0)
 }
 
-/// The `PES PC` groups of `text`, in order.
-fn groups(text: &str) -> Result<Vec<Group>> {
+/// The `PES PC` groups of `text`, in order, and a warning for each line
+/// skipped: a level line without its group's header, as a log that starts
+/// or is cut mid-group has, or a broken line.
+fn groups(text: &str) -> (Vec<Group>, Vec<String>) {
     const PREFIX: &str = "PES PC ";
     let mut groups: Vec<Group> = Vec::new();
+    let mut warnings = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let Some(at) = line.find(PREFIX) else {
             continue;
@@ -161,10 +167,11 @@ fn groups(text: &str) -> Result<Vec<Group>> {
             Some(rest) => (true, rest),
             None => (false, rest),
         };
-        group_line(&mut groups, total, rest)
-            .with_context(|| format!("line {}: {}", number + 1, line.trim()))?;
+        if let Err(error) = group_line(&mut groups, total, rest) {
+            warnings.push(format!("line {}: skipped, {error:#}", number + 1));
+        }
     }
-    Ok(groups)
+    (groups, warnings)
 }
 
 /// Add one line's words, `rest` after its prefix, to `groups`: a header
@@ -198,19 +205,23 @@ fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
         .last_mut()
         .filter(|group| group.total == total)
         .context("a level line before its group's header")?;
-    let index = level_index(level);
+    // The whole line first: a broken one leaves its group as it was.
+    let mut counts = [0; 2];
+    let mut entries = Vec::new();
     for word in words {
         if word.contains('@') {
-            group.entries.push(entry(level, word)?);
+            entries.push(entry(level, word)?);
             continue;
         }
         let (name, value) = word.split_once('=').context("a `name=value` word")?;
         match name {
-            "samples" => group.levels[index][0] = number(value)?,
-            "cycles" => group.levels[index][1] = number(value)?,
+            "samples" => counts[0] = number(value)?,
+            "cycles" => counts[1] = number(value)?,
             _ => {}
         }
     }
+    group.levels[level_index(level)] = counts;
+    group.entries.extend(entries);
     Ok(())
 }
 
@@ -354,16 +365,52 @@ mod tests {
     }
 
     #[test]
-    fn a_log_without_lines_or_with_a_broken_entry_is_refused() {
+    fn a_log_without_lines_is_refused() {
         let none = Profile::parse("PES WHERE all: ins=1M\nPES HOT user samples=3\n", false);
         assert!(none.unwrap_err().to_string().contains("no `PES PC` lines"));
-        let broken = "PES PC samples=1 cycles=16000000 gone=0/0 other=0/0\n\
-                      PES PC user samples=1 cycles=16000000 blocks=1 0x100:1@?+100\n";
-        let error = Profile::parse(broken, false).unwrap_err();
-        assert!(format!("{error:#}").contains("line 2"), "{error:#}");
-        // A level line before any header.
+        // Nor does a log of level lines alone hold a group.
         let orphan = "PES PC user samples=1 cycles=16000000 blocks=1 0x100:1:16000000@?+100\n";
         assert!(Profile::parse(orphan, false).is_err());
+    }
+
+    /// A level line without its group's header (a log that starts
+    /// mid-group: a wrapped ring, a dropped line, a cut) and a broken line
+    /// are skipped with a warning naming them; the rest reads as before.
+    #[test]
+    fn an_orphan_or_broken_line_is_skipped_with_a_warning() {
+        let log = format!(
+            "PES PC user samples=1 cycles=7 blocks=1 0x200:1:7@?+200\n{LOG}\
+             PES PC TOTAL user samples=1 cycles=7 blocks=1 0x300:1:7@?+300\n\
+             PES PC samples=0 cycles=0 gone=0/0 other=0/0\n\
+             PES PC user samples=1 cycles=16000000 blocks=1 0x100:1@?+100\n"
+        );
+        let beats = Profile::parse(&log, true).unwrap();
+        assert_eq!(beats.source, Source::Beats { of: 4 });
+        let clean = Profile::parse(LOG, true).unwrap();
+        assert_eq!(beats.entries, clean.entries);
+        assert_eq!(beats.cycles, clean.cycles);
+        assert_eq!(beats.warnings.len(), 3, "{:?}", beats.warnings);
+        assert!(
+            beats.warnings[0].starts_with("line 1: "),
+            "{:?}",
+            beats.warnings
+        );
+        assert!(beats.warnings[0].contains("header"), "{:?}", beats.warnings);
+        // A total's level line after a beat's group is no part of it.
+        assert!(
+            beats.warnings[1].starts_with("line 13: "),
+            "{:?}",
+            beats.warnings
+        );
+        assert!(
+            beats.warnings[2].starts_with("line 15: "),
+            "{:?}",
+            beats.warnings
+        );
+        assert!(clean.warnings.is_empty());
+        // The total reads as before too.
+        let total = Profile::parse(&log, false).unwrap();
+        assert_eq!(total.entries, Profile::parse(LOG, false).unwrap().entries);
     }
 
     /// The lines the engine prints parse back into the blocks it held.

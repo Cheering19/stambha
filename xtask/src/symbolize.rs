@@ -91,6 +91,9 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
         })
         .collect();
     let _ = writeln!(out, "levels: {}", levels.join(", "));
+    for warning in &profile.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
     for loaded in &code.loaded {
         let _ = writeln!(out, "read: {loaded}");
     }
@@ -273,6 +276,18 @@ mod tests {
             short.contains("_alpha") && !short.contains("_beta"),
             "{short}"
         );
+    }
+
+    /// The lines the log's reading skipped are named.
+    #[test]
+    fn skipped_lines_are_reported() {
+        let text = "PES PC user samples=1 cycles=7 blocks=1 0x200:1:7@?+200\n\
+                    PES PC samples=1 cycles=7 gone=0/0 other=0/0\n\
+                    PES PC user samples=1 cycles=7 blocks=1 0x200:1:7@?+200\n";
+        let profile = log::Profile::parse(text, false).unwrap();
+        let table = report(&profile, &Code::default(), 10);
+        assert!(table.contains("warning: line 1: "), "{table}");
+        assert!(table.contains("0x200"), "{table}");
     }
 
     /// Without a cache, blocks are listed by page.
