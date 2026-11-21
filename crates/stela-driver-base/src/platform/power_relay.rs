@@ -10,11 +10,27 @@
 use super::power_snapshot::PowerSnapshot;
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
 /// How often the host's battery is read again with no notification.
 pub const REFRESH_MILLIS: u64 = 30_000;
+/// How often it is read while the guest waits for a complete reading, and
+/// how long the guest waits: the SMC takes a battery only until macOS has
+/// read its key table, early in its boot.
+pub const WAITING_REFRESH_MILLIS: u64 = 1_000;
+pub const WAIT_MILLIS: u64 = 60_000;
+
+/// Where the host's battery is on its way to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// No host battery goes to the guest.
+    Off,
+    /// The guest waits for a complete reading to attach.
+    Waiting,
+    /// The guest's SMC has the battery.
+    Attached,
+}
 
 /// The latest of a value one processor writes and another reads: a flag
 /// one processor at a time holds for one copy in or out, and a count of
@@ -104,6 +120,9 @@ pub struct Turn {
     pub reading: Option<PowerSnapshot>,
     /// No newer reading, but the guest's notifications are due.
     pub flush: bool,
+    /// The guest waited [`WAIT_MILLIS`] for a complete reading in vain: no
+    /// host battery goes to it now.
+    pub expired: bool,
 }
 
 /// Readings from the host's firmware to the guest's SMC.
@@ -118,9 +137,16 @@ pub struct Relay {
     refreshed: AtomicU64,
     /// The last reading logged's summary (`Summary::pack`); 0 none.
     logged: AtomicU32,
+    /// [`Mode`], as [`OFF`], [`WAITING`] or [`ATTACHED`].
+    mode: AtomicU8,
+    /// When a wait for a complete reading ends, in milliseconds.
+    until: AtomicU64,
 }
 
 const NEVER: u64 = u64::MAX;
+const OFF: u8 = 0;
+const WAITING: u8 = 1;
+const ATTACHED: u8 = 2;
 
 impl Relay {
     pub const fn new() -> Self {
@@ -130,7 +156,35 @@ impl Relay {
             due: AtomicU64::new(0),
             refreshed: AtomicU64::new(NEVER),
             logged: AtomicU32::new(0),
+            mode: AtomicU8::new(OFF),
+            until: AtomicU64::new(0),
         }
+    }
+
+    pub fn mode(&self) -> Mode {
+        match self.mode.load(Ordering::Acquire) {
+            WAITING => Mode::Waiting,
+            ATTACHED => Mode::Attached,
+            _ => Mode::Off,
+        }
+    }
+
+    /// The guest waits for a complete reading, from `now_ms` for at most
+    /// [`WAIT_MILLIS`].
+    pub fn wait(&self, now_ms: u64) {
+        self.until
+            .store(now_ms.saturating_add(WAIT_MILLIS), Ordering::Relaxed);
+        self.mode.store(WAITING, Ordering::Release);
+    }
+
+    /// The guest's SMC took the battery.
+    pub fn attached(&self) {
+        self.mode.store(ATTACHED, Ordering::Release);
+    }
+
+    /// No host battery goes to the guest any more.
+    pub fn give_up(&self) {
+        self.mode.store(OFF, Ordering::Release);
     }
 
     /// The firmware's newest reading.
@@ -147,8 +201,21 @@ impl Relay {
 
     /// One service turn at `now_ms`.
     pub fn turn(&self, now_ms: u64) -> Turn {
+        if self.mode() == Mode::Waiting && now_ms >= self.until.load(Ordering::Relaxed) {
+            self.give_up();
+            return Turn {
+                refresh: false,
+                reading: None,
+                flush: false,
+                expired: true,
+            };
+        }
+        let period = match self.mode() {
+            Mode::Waiting => WAITING_REFRESH_MILLIS,
+            Mode::Off | Mode::Attached => REFRESH_MILLIS,
+        };
         let refreshed = self.refreshed.load(Ordering::Relaxed);
-        let refresh = refreshed == NEVER || now_ms.wrapping_sub(refreshed) >= REFRESH_MILLIS;
+        let refresh = refreshed == NEVER || now_ms.wrapping_sub(refreshed) >= period;
         if refresh {
             self.refreshed.store(now_ms, Ordering::Relaxed);
         }
@@ -158,6 +225,7 @@ impl Relay {
             refresh,
             reading,
             flush: reading.is_none() && due != 0 && now_ms >= due,
+            expired: false,
         }
     }
 

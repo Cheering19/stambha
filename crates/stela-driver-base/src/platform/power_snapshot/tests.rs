@@ -304,6 +304,56 @@ fn critical_is_the_firmware_bit_or_the_low_capacity_while_discharging() {
 }
 
 #[test]
+fn the_full_capacity_falls_back_to_the_design_capacity_as_the_percentage_does() {
+    for full in [None, Some(0)] {
+        let readings = Readings {
+            full_charge_capacity: full,
+            ..energy()
+        };
+        let battery = BatteryState::from_readings(&readings, Some(false));
+        assert_eq!(battery.full_mah, battery.design_mah);
+        assert_eq!(battery.full_mah, Some(3_377));
+        assert_eq!(battery.percent, Some(69));
+    }
+}
+
+#[test]
+fn a_reading_is_complete_with_a_percentage_a_remaining_and_a_full_capacity() {
+    let missing = |readings: Readings| BatteryState::from_readings(&readings, Some(true)).missing();
+    assert_eq!(missing(energy()), None);
+    assert_eq!(missing(charge()), None);
+    // An EC not ready yet: _BST's remaining capacity unknown.
+    assert_eq!(
+        missing(Readings {
+            remaining_capacity: None,
+            ..charge()
+        }),
+        Some("percentage")
+    );
+    // No full charge and no design capacity.
+    for capacity in [None, Some(0)] {
+        assert_eq!(
+            missing(Readings {
+                full_charge_capacity: capacity,
+                design_capacity: capacity,
+                ..charge()
+            }),
+            Some("percentage")
+        );
+    }
+    // An mWh firmware with no voltage converts no capacity: the percentage
+    // alone would leave B0UC and B0CM 0.
+    assert_eq!(
+        missing(Readings {
+            design_voltage_mv: None,
+            voltage_mv: Some(0),
+            ..energy()
+        }),
+        Some("remaining capacity")
+    );
+}
+
+#[test]
 fn a_low_capacity_counts_only_below_a_tenth_of_the_full_one() {
     let with = |low, full, design| {
         let readings = Readings {

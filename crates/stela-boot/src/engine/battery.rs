@@ -17,13 +17,11 @@ use super::{aml::HostAcpi, host, output, parallel};
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use stela_boot_core::options::Battery;
 use stela_drivers::platform::{
-    power_relay::Relay,
+    power_relay::{self, Mode, Relay},
     power_snapshot::{BatteryState, PowerSnapshot, Readings},
 };
 
 static RELAY: Relay = Relay::new();
-/// The SMC has the host's battery: the service passes readings on.
-static HOST: AtomicBool = AtomicBool::new(false);
 /// The AML host, which reads the battery again on request.
 static ACPI: AtomicPtr<HostAcpi> = AtomicPtr::new(core::ptr::null_mut());
 /// A refused update was reported.
@@ -47,67 +45,119 @@ pub(super) fn publish(power: &stela_drivers::probe::Power) {
 }
 
 /// Give the guest's SMC the battery `choice` names, before the guest starts:
-/// the host's latest reading, or the synthetic battery. Without a reading of
-/// a host battery the SMC keeps the Mac mini's keys, and the line says why.
+/// the synthetic battery, or the host's latest reading. A host reading
+/// without a percentage, a remaining or a full capacity would read as an
+/// empty battery, so the SMC keeps the Mac mini's keys, the line says why,
+/// and the service tries each new reading ([`serve`]) until macOS has read
+/// the SMC's key table or [`power_relay::WAIT_MILLIS`] pass.
 pub(super) fn attach(
     devices: &parallel::Board,
     choice: Option<Battery>,
     acpi: Option<&'static HostAcpi>,
 ) {
-    let Some(choice) = choice else {
-        return;
-    };
-    let (snapshot, source) = match choice {
-        Battery::Host => {
-            let Some(reading) = RELAY.take().filter(|reading| reading.battery.is_some()) else {
+    match choice {
+        None => {}
+        Some(Battery::Test { percent, state }) => {
+            let snapshot = PowerSnapshot::synthetic(percent, state);
+            match devices.with(|devices| devices.add_battery(&snapshot)) {
+                Ok(()) => attached(&snapshot, "--test-battery"),
+                Err(error) => output::arguments(format_args!(
+                    "POWER battery refused: {error}; the SMC answers as the Mac mini's\n"
+                )),
+            }
+        }
+        Some(Battery::Host) => {
+            let Some(acpi) = acpi else {
                 output::arguments(format_args!(
-                    "POWER battery: --battery, but the host reported no ACPI battery reading{}; \
-                     the SMC answers as the Mac mini's\n",
-                    if acpi.is_none() {
-                        " (its ACPI namespace did not load)"
-                    } else {
-                        ""
-                    }
+                    "POWER battery: --battery, but the host's ACPI namespace did not load; \
+                     the SMC answers as the Mac mini's\n"
                 ));
                 return;
             };
-            (reading, "the host's ACPI battery")
+            ACPI.store(core::ptr::from_ref(acpi).cast_mut(), Ordering::Release);
+            let reading = RELAY.take();
+            if let Some(missing) = missing(reading.as_ref()) {
+                output::arguments(format_args!(
+                    "POWER battery: waiting up to {} s for a reading of the host's battery with \
+                     a percentage and a remaining and full capacity; this one has no {missing}; \
+                     until then the SMC answers as the Mac mini's\n",
+                    power_relay::WAIT_MILLIS / 1000
+                ));
+                RELAY.wait(now_ms());
+                return;
+            }
+            attach_host(devices, reading.as_ref().expect("a complete reading"));
         }
-        Battery::Test { percent, state } => (PowerSnapshot::synthetic(percent, state), "--test-battery"),
-    };
-    if let Err(error) = devices.with(|devices| devices.add_battery(&snapshot)) {
-        output::arguments(format_args!(
-            "POWER battery refused: {error}; the SMC answers as the Mac mini's\n"
-        ));
-        return;
     }
+}
+
+/// What a host reading lacks before the SMC may take it, if anything.
+fn missing(reading: Option<&PowerSnapshot>) -> Option<&'static str> {
+    match reading.and_then(|reading| reading.battery) {
+        None => Some("battery"),
+        Some(battery) => battery.missing(),
+    }
+}
+
+fn attach_host(devices: &parallel::Board, reading: &PowerSnapshot) {
+    match devices.with(|devices| devices.add_battery(reading)) {
+        Ok(()) => {
+            attached(reading, "the host's ACPI battery");
+            RELAY.attached();
+        }
+        Err(error) => {
+            RELAY.give_up();
+            output::arguments(format_args!(
+                "POWER battery refused: {error}; the SMC stays the Mac mini's for this boot\n"
+            ));
+        }
+    }
+}
+
+fn attached(snapshot: &PowerSnapshot, source: &str) {
     if let Some(battery) = &snapshot.battery {
         output::arguments(format_args!(
             "POWER {snapshot} {} (the SMC's battery, one pack, from {source})\n",
             battery.thresholds()
         ));
     }
-    RELAY.changed(&snapshot);
-    if choice == Battery::Host {
-        if let Some(acpi) = acpi {
-            ACPI.store(core::ptr::from_ref(acpi).cast_mut(), Ordering::Release);
-        }
-        HOST.store(true, Ordering::Release);
-    }
+    RELAY.changed(snapshot);
 }
 
-/// One service turn, as the relay says. Nothing without the host's battery.
+/// One service turn, as the relay says: while the guest waits for a
+/// complete reading, try each new one; once its SMC has the battery, pass
+/// each new reading on. Nothing without the host's battery.
 pub(super) fn serve(devices: &parallel::Board) {
-    if !HOST.load(Ordering::Acquire) {
+    let mode = RELAY.mode();
+    if mode == Mode::Off {
         return;
     }
     let now = now_ms();
     let turn = RELAY.turn(now);
+    if turn.expired {
+        output::arguments(format_args!(
+            "POWER battery: no complete reading of the host's battery within {} s; \
+             the SMC stays the Mac mini's for this boot\n",
+            power_relay::WAIT_MILLIS / 1000
+        ));
+        return;
+    }
     if turn.refresh {
         // SAFETY: the AML host is leaked for the whole program.
         if let Some(acpi) = unsafe { ACPI.load(Ordering::Acquire).as_ref() } {
             acpi.refresh_power();
         }
+    }
+    if mode == Mode::Waiting {
+        if let Some(reading) = turn.reading {
+            if RELAY.changed(&reading) {
+                output::arguments(format_args!("POWER {reading} (not attached)\n"));
+            }
+            if missing(Some(&reading)).is_none() {
+                attach_host(devices, &reading);
+            }
+        }
+        return;
     }
     if turn.reading.is_none() && !turn.flush {
         return;

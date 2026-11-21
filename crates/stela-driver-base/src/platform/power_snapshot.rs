@@ -277,7 +277,9 @@ impl BatteryState {
             status,
             percent,
             remaining_mah: charge(r.remaining_capacity),
-            full_mah: charge(r.full_charge_capacity),
+            // As the percentage's: the design capacity when the full charge
+            // capacity is not valid.
+            full_mah: charge(full_capacity),
             design_mah: charge(r.design_capacity),
             warning_mah: charge(r.warning_capacity),
             low_mah: charge(r.low_capacity),
@@ -292,6 +294,22 @@ impl BatteryState {
                 || (status == Status::Discharging && low),
             model: r.model,
             serial: r.serial,
+        }
+    }
+
+    /// What a reading needs before a guest may take it as its battery, the
+    /// first it lacks: a percentage, a remaining and a full capacity in
+    /// mAh. Without any of them the guest would read 0, and macOS shuts
+    /// down on a battery it reads as empty.
+    pub fn missing(&self) -> Option<&'static str> {
+        if self.percent.is_none() {
+            Some("percentage")
+        } else if self.remaining_mah.is_none() {
+            Some("remaining capacity")
+        } else if self.full_mah.is_none() {
+            Some("full charge capacity")
+        } else {
+            None
         }
     }
 

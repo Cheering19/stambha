@@ -425,6 +425,77 @@ fn a_reading_that_lost_a_value_keeps_the_last_known_one() {
 }
 
 #[test]
+fn an_incomplete_reading_or_a_table_the_ap_has_read_keeps_the_mac_minis_keys() {
+    for battery in [
+        BatteryState {
+            percent: None,
+            ..discharging()
+        },
+        BatteryState {
+            remaining_mah: None,
+            ..discharging()
+        },
+        BatteryState {
+            full_mah: None,
+            ..discharging()
+        },
+    ] {
+        let (mut smc, _) = mac_mini();
+        let reading = PowerSnapshot {
+            ac_online: Some(false),
+            battery: Some(battery),
+        };
+        assert!(smc.add_battery(&reading).is_err());
+        assert!(smc.battery.is_none());
+        assert_eq!(smc.keys.len() as u32, MAC_MINI_KEYS);
+    }
+    // Once the AP has read the key count or a key by its index, the table
+    // is the one it keeps: no battery joins it.
+    let (mut smc, _) = mac_mini();
+    send(&mut smc, request(READ, 0, 4, 0, KEY_COUNT));
+    assert!(smc.add_battery(&on_battery()).is_err());
+    assert_eq!(smc.keys.len() as u32, MAC_MINI_KEYS);
+    let (mut smc, _) = mac_mini();
+    send(&mut smc, request(KEY_BY_INDEX, 0, 0, 0, 3));
+    assert!(smc.add_battery(&on_battery()).is_err());
+    // One key's information does not.
+    let (mut smc, _) = mac_mini();
+    send(&mut smc, request(KEY_INFO, 0, 0, 0, code(b"MBSW")));
+    smc.add_battery(&on_battery()).unwrap();
+}
+
+#[test]
+fn the_first_reading_after_attach_that_lost_every_value_keeps_the_attached_ones() {
+    let (mut smc, sram) = with_battery();
+    let lost = PowerSnapshot {
+        ac_online: None,
+        battery: Some(BatteryState {
+            percent: None,
+            remaining_mah: None,
+            full_mah: None,
+            design_mah: None,
+            voltage_mv: None,
+            current_ma: None,
+            power_mw: None,
+            cycle_count: None,
+            time_to_empty_min: None,
+            ..discharging()
+        }),
+    };
+    smc.power(&lost, 0);
+    for (name, value) in [
+        (b"BUIC", vec![73]),
+        (b"B0UC", 3_650u16.to_le_bytes().to_vec()),
+        (b"B0CM", 5_000u16.to_le_bytes().to_vec()),
+        (b"B0DC", 5_200u16.to_le_bytes().to_vec()),
+        (b"B0AV", 15_800u16.to_le_bytes().to_vec()),
+        (b"CHCE", vec![0]),
+    ] {
+        assert_eq!(read(&mut smc, &sram, name), value);
+    }
+}
+
+#[test]
 fn latches_keep_writes_at_their_confirmed_sizes_only() {
     let (mut smc, sram) = with_battery();
     sram.put(&[1]);

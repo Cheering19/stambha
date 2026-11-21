@@ -428,6 +428,9 @@ pub struct Smc {
     dropped_writes: usize,
     /// The host's battery, when the SMC was given it.
     battery: Option<battery::Battery>,
+    /// The AP read the key count or a key by its index: the table it
+    /// caches (`_smcInitKeyTableCache`) is this one.
+    table_read: bool,
 }
 
 impl Smc {
@@ -469,6 +472,7 @@ impl Smc {
             write_log: VecDeque::new(),
             dropped_writes: 0,
             battery: None,
+            table_read: false,
         })
     }
 
@@ -519,14 +523,27 @@ impl Smc {
 
     /// Give the SMC the host's battery, as `snapshot` read it: the battery's
     /// keys ([`battery`]) join the table, before the AP first reads it.
-    /// Refused without a reading of a battery, or a second time.
+    /// Refused once the AP has read the table, which it keeps; without a
+    /// reading of a battery with a percentage and a remaining and full
+    /// capacity, which would read 0, empty, to macOS; or a second time.
     pub fn add_battery(&mut self, snapshot: &PowerSnapshot) -> Result<()> {
         if self.battery.is_some() {
             return Err(refuse!("the SMC already has the host's battery"));
         }
-        if snapshot.battery.is_none() {
+        if self.table_read {
+            return Err(refuse!(
+                "the AP already read the SMC's key table, which it keeps"
+            ));
+        }
+        let Some(reading) = snapshot.battery else {
             return Err(refuse!(
                 "an SMC battery needs a reading of the host's battery"
+            ));
+        };
+        if let Some(missing) = reading.missing() {
+            return Err(refuse!(
+                "the host's battery reading has no {missing}",
+                missing
             ));
         }
         let keys = battery::keys(snapshot);
@@ -820,6 +837,7 @@ impl Endpoint for Smc {
         let size = usize::from((payload >> 16) as u8);
         let write_size = usize::from((payload >> 24) as u8);
         let name = (payload >> 32) as u32;
+        self.table_read |= kind == KEY_BY_INDEX || (kind == READ && name == KEY_COUNT);
         let mut answers = Vec::new();
         let system_event = (name == SYSTEM_EVENT
             && matches!((kind, size, write_size), (WRITE, 4, _) | (READ_WRITE, _, 4)))

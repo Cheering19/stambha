@@ -70,7 +70,8 @@ fn a_turn_refreshes_every_30_s_passes_a_newer_reading_once_and_flushes_when_due(
         Turn {
             refresh: true,
             reading: None,
-            flush: false
+            flush: false,
+            expired: false,
         }
     );
     assert!(!relay.turn(1_000 + REFRESH_MILLIS - 1).refresh);
@@ -90,6 +91,36 @@ fn a_turn_refreshes_every_30_s_passes_a_newer_reading_once_and_flushes_when_due(
     relay.publish(reading(69));
     let turn = relay.turn(60_000);
     assert_eq!((turn.reading, turn.flush), (Some(reading(69)), false));
+}
+
+#[test]
+fn a_relay_waiting_for_a_complete_reading_asks_every_second_then_every_30_once_attached() {
+    let relay = Relay::new();
+    assert_eq!(relay.mode(), Mode::Off);
+    relay.wait(10_000);
+    assert_eq!(relay.mode(), Mode::Waiting);
+    assert!(relay.turn(10_000).refresh);
+    assert!(!relay.turn(10_000 + WAITING_REFRESH_MILLIS - 1).refresh);
+    assert!(relay.turn(10_000 + WAITING_REFRESH_MILLIS).refresh);
+    relay.attached();
+    assert_eq!(relay.mode(), Mode::Attached);
+    assert!(!relay.turn(12_000).refresh);
+    assert!(relay.turn(11_000 + REFRESH_MILLIS).refresh);
+    // Attached, the wait's end means nothing.
+    assert!(!relay.turn(10_000 + WAIT_MILLIS).expired);
+    relay.give_up();
+    assert_eq!(relay.mode(), Mode::Off);
+}
+
+#[test]
+fn a_wait_with_no_complete_reading_ends_once() {
+    let relay = Relay::new();
+    relay.wait(5_000);
+    assert!(!relay.turn(5_000 + WAIT_MILLIS - 1).expired);
+    let ended = relay.turn(5_000 + WAIT_MILLIS);
+    assert!(ended.expired && !ended.refresh);
+    assert_eq!(relay.mode(), Mode::Off);
+    assert!(!relay.turn(5_000 + WAIT_MILLIS + 1).expired);
 }
 
 #[test]
