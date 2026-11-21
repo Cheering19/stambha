@@ -180,3 +180,197 @@ fn a_refused_bcm_is_answered() {
     let levels = parsed(&[100, 40, 10, 100]);
     assert_eq!(initialize(&levels, &mut Refusing), Err(Error(5)));
 }
+
+/// The FA608PP's LCD levels: AC 90 and battery 60, then 2 to 100 by 2.
+fn every_second() -> Levels {
+    let mut listed = vec![90, 60];
+    listed.extend((1..=50).map(|step| step * 2));
+    parsed(&listed)
+}
+
+#[test]
+fn brightness_keys_step_as_linux_steps_them() {
+    let levels = every_second();
+    for (current, event, next) in [
+        (60, NOTIFY_INC, 62),
+        (60, NOTIFY_DEC, 58),
+        // The highest and lowest stay.
+        (100, NOTIFY_INC, 100),
+        (2, NOTIFY_DEC, 2),
+        // An unlisted level goes to the closest first (the lower of two).
+        (61, NOTIFY_INC, 62),
+        (61, NOTIFY_DEC, 58),
+        (0, NOTIFY_INC, 4),
+        (255, NOTIFY_DEC, 98),
+        // Cycling wraps after the highest.
+        (98, NOTIFY_CYCLE, 100),
+        (100, NOTIFY_CYCLE, 2),
+        (60, NOTIFY_ZERO, 0),
+        (60, NOTIFY_OFF, 0),
+        // Another event leaves the closest level.
+        (61, 0x80, 60),
+    ] {
+        assert_eq!(
+            next_level(&levels, current, event),
+            next,
+            "{current} {event:#x}"
+        );
+    }
+    assert!((NOTIFY_CYCLE..=NOTIFY_OFF).all(switches));
+    assert!(!switches(0x80) && !switches(0x8a) && !switches(0x84));
+}
+
+#[test]
+fn a_switch_starts_from_bqc_else_the_level_last_set() {
+    let levels = every_second();
+    // A listed level read back.
+    let mut panel = Fake::new(40);
+    assert_eq!(
+        switch(&levels, &mut panel, Some(70), NOTIFY_INC),
+        Ok(Switch {
+            from: 40,
+            to: 42,
+            max: 100,
+            read: true
+        })
+    );
+    assert_eq!(panel.sets, [42]);
+    // No _BQC, or one naming no level: the level last set, else the highest.
+    let mut unread = Fake::new(41);
+    unread.query = false;
+    let switched = switch(&levels, &mut unread, Some(70), NOTIFY_DEC).unwrap();
+    assert_eq!((switched.from, switched.to, switched.read), (70, 68, false));
+    let mut unlisted = Fake::new(41);
+    let switched = switch(&levels, &mut unlisted, None, NOTIFY_DEC).unwrap();
+    assert_eq!(
+        (switched.from, switched.to, switched.read),
+        (100, 98, false)
+    );
+}
+
+mod namespace {
+    extern crate std;
+    use super::*;
+    use crate::platform::acpi::{
+        Mode, Session,
+        test_support::{self, TEST_SERIAL, aml},
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    unsafe extern "C" {
+        fn acpi_os_wait_events_complete();
+    }
+
+    /// A panel with `_BCL`, `_BCM` and `_BQC`, one whose `_BCL` lists
+    /// nothing, and one without `_BCM`.
+    fn outputs() -> Vec<u8> {
+        let levels: Vec<Vec<u8>> = [100, 40, 10, 40, 70, 100]
+            .into_iter()
+            .map(aml::integer)
+            .collect();
+        let device = |name: &str, body: &[Vec<u8>]| aml::device(name, &body.concat());
+        aml::scope(
+            "\\_SB_",
+            &[
+                device(
+                    "LCD0",
+                    &[
+                        aml::named("_ADR", &aml::integer(0x110)),
+                        aml::named("BLVL", &aml::integer(40)),
+                        aml::named("_BCL", &aml::package_of(&levels)),
+                        aml::method("_BCM", 1, &aml::store(&[aml::ARG0], &aml::name("BLVL"))),
+                        aml::method("_BQC", 0, &aml::ret(&aml::name("BLVL"))),
+                    ],
+                ),
+                device(
+                    "LCD1",
+                    &[
+                        aml::named("_ADR", &aml::integer(0x111)),
+                        aml::named("_BCL", &aml::package_of(&[])),
+                        aml::method("_BCM", 1, &[]),
+                    ],
+                ),
+                device(
+                    "LCD2",
+                    &[
+                        aml::named("_ADR", &aml::integer(0x112)),
+                        aml::named("_BCL", &aml::package_of(&levels)),
+                    ],
+                ),
+            ]
+            .concat(),
+        )
+    }
+
+    #[test]
+    fn controls_are_the_outputs_with_bcl_levels_and_bcm() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+        let session = unsafe {
+            Session::start(
+                test_support::dsdt_fixture(&outputs()),
+                Mode::InterpreterOnly,
+            )
+        }
+        .unwrap();
+        let mut found = controls(&session).unwrap();
+        assert_eq!(found.unlisted, ["\\_SB_.LCD1"]);
+        let [control] = &mut found.controls[..] else {
+            panic!("{:?}", found.controls.len());
+        };
+        assert_eq!(control.path, "\\_SB_.LCD0");
+        assert_eq!((control.levels.max(), control.levels.count()), (100, 4));
+        let up = control.switch(NOTIFY_INC).unwrap();
+        assert_eq!((up.from, up.to, up.read), (40, 70, true));
+        let level = session
+            .handle("\\_SB.LCD0.BLVL")
+            .unwrap()
+            .evaluate(None, &[])
+            .unwrap();
+        assert_eq!(level, Some(Value::Integer(70)));
+        let down = control.switch(NOTIFY_DEC).unwrap();
+        assert_eq!((down.from, down.to), (70, 40));
+        drop(found);
+        session.shutdown().unwrap();
+    }
+
+    /// `STELA_TEST_DSDT` names the ASUS TUF A16 FA608PP's DSDT; skipped
+    /// without one. Fn+F8's EC query `_Q17` notifies the iGPU's panel
+    /// output `LCD` with 0x86 (`BRTN`), and `LCD` is its one output with
+    /// `_BCL` and `_BCM`; the dGPU's `EDP1` lives in an SSDT the test
+    /// lacks. `LCD`'s `_BCM` sets the level through the iGPU's ATIF
+    /// (`AFN7`), which another of those SSDTs holds, so here it ends
+    /// there.
+    #[test]
+    fn the_fa608pps_brightness_key_reaches_its_lcd_control() {
+        static NOTIFIED: AtomicU32 = AtomicU32::new(0);
+        let Some(services) = test_support::named_dsdt_fixture() else {
+            return;
+        };
+        let _serial = TEST_SERIAL.lock().unwrap();
+        // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+        let session = unsafe { Session::start(services, Mode::InterpreterOnly) }.unwrap();
+        let mut found = controls(&session).unwrap();
+        let paths: Vec<_> = found.controls.iter().map(|control| &control.path).collect();
+        assert_eq!(paths, ["\\_SB_.PCI0.GP17.VGA_.LCD_"]);
+        let control = &mut found.controls[0];
+        assert_eq!((control.levels.max(), control.levels.count()), (100, 50));
+        let notification = control
+            .handle()
+            .notify(|value| NOTIFIED.store(value, Ordering::Release))
+            .unwrap();
+        // BRTN notifies EDP1 next, which this namespace lacks.
+        let _ = session
+            .handle("\\_SB.PCI0.SBRG.EC0._Q17")
+            .unwrap()
+            .invoke(None, &[]);
+        // SAFETY: serialized test process context outside an AML frame.
+        unsafe { acpi_os_wait_events_complete() };
+        let event = NOTIFIED.load(Ordering::Acquire);
+        assert_eq!(event, NOTIFY_INC);
+        assert_eq!(control.switch(event), Err(crate::platform::acpi::NOT_FOUND));
+        drop(notification);
+        drop(found);
+        session.shutdown().unwrap();
+    }
+}

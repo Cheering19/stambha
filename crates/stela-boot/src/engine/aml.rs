@@ -1143,6 +1143,13 @@ pub struct HostAcpi {
     notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
     /// The control-method power buttons whose presses set [`BUTTON_NOTIFIED`].
     buttons: RefCell<Vec<stela_drivers::platform::button::PowerButton<'static>>>,
+    /// The display outputs whose brightness notifications set [`BRIGHTNESS`].
+    backlights: RefCell<
+        Vec<(
+            stela_drivers::probe::backlight::Control<'static>,
+            stela_drivers::platform::acpi::Notification<'static>,
+        )>,
+    >,
     ec_pending: Cell<bool>,
     hardware: AtomicBool,
     ec_failed: AtomicBool,
@@ -1154,6 +1161,14 @@ static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
 /// A control-method power button (PNP0C0C) was pressed: its firmware
 /// notified it, as a FADT with PWR_BUTTON set reports presses.
 static BUTTON_NOTIFIED: AtomicBool = AtomicBool::new(false);
+/// The display outputs with `_BCL` and `_BCM` whose brightness keys are
+/// followed, at most.
+const BACKLIGHTS: usize = 8;
+/// Each followed output's last brightness notification since the poll
+/// took it, 0 for none ([`HostAcpi::service_brightness`]).
+static BRIGHTNESS: [AtomicU32; BACKLIGHTS] = [const { AtomicU32::new(0) }; BACKLIGHTS];
+/// The last brightness notification of any device since the poll took it.
+static BRIGHTNESS_SEEN: AtomicU32 = AtomicU32::new(0);
 
 impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
@@ -1324,6 +1339,7 @@ impl HostAcpi {
             power: RefCell::new(Default::default()),
             notification: RefCell::new(None),
             buttons: RefCell::new(Vec::new()),
+            backlights: RefCell::new(Vec::new()),
             ec_pending: Cell::new(false),
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
@@ -1427,10 +1443,13 @@ impl HostAcpi {
                     output::arguments(format_args!("HOST ACPI power button refused: {error:?}\n"));
                 }
                 self.attach_power_buttons();
-                match self
-                    .session
-                    .notify_all(|_, _| POWER_CHANGED.store(true, Ordering::Release))
-                {
+                self.attach_backlights();
+                match self.session.notify_all(|_, value| {
+                    POWER_CHANGED.store(true, Ordering::Release);
+                    if stela_drivers::probe::backlight::switches(value) {
+                        BRIGHTNESS_SEEN.store(value, Ordering::Release);
+                    }
+                }) {
                     Ok(notification) => *self.notification.borrow_mut() = Some(notification),
                     Err(error) => {
                         output::arguments(format_args!("HOST ACPI notify refused: {error:?}\n"))
@@ -1688,6 +1707,116 @@ impl HostAcpi {
         // unrelated fixed events and GPEs to keep making SCI progress.
         if unsafe { drain_work(self.provider.cast_mut().cast()) } != AE_OK {
             output::fatal("ACPI deferred work completion failed");
+        }
+        self.service_brightness();
+    }
+
+    /// Linux's ACPI video driver on each display output device with `_BCL`
+    /// and `_BCM`: its brightness notifications, which a laptop's
+    /// brightness keys send, step it ([`Self::service_brightness`]). One
+    /// line for each device, or one saying none was found.
+    fn attach_backlights(&'static self) {
+        use stela_drivers::probe::backlight;
+        let found = match backlight::controls(&self.session) {
+            Ok(found) => found,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight search refused: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        for path in &found.unlisted {
+            output::arguments(format_args!(
+                "HOST ACPI backlight {path}: _BCL lists no levels, so the brightness keys leave it\n"
+            ));
+        }
+        if found.controls.is_empty() {
+            output::arguments(format_args!(
+                "HOST ACPI backlight: no display output has _BCL and _BCM, so the brightness keys \
+                 find no backlight control\n"
+            ));
+        }
+        let mut kept = self.backlights.borrow_mut();
+        for (index, control) in found.controls.into_iter().enumerate() {
+            let path = &control.path;
+            if index >= BACKLIGHTS {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: past the first {BACKLIGHTS} outputs, its brightness \
+                     keys are not followed\n"
+                ));
+                continue;
+            }
+            let notified = control.handle().notify(move |value| {
+                if backlight::switches(value) {
+                    BRIGHTNESS[index].store(value, Ordering::Release);
+                }
+            });
+            match notified {
+                Ok(notification) => {
+                    output::arguments(format_args!(
+                        "HOST ACPI backlight {path}: _BCL lists {} levels up to {}, and the \
+                         brightness keys step it through _BCM\n",
+                        control.levels.count(),
+                        control.levels.max()
+                    ));
+                    kept.push((control, notification));
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: notify handler refused: {error:?}\n"
+                )),
+            }
+        }
+    }
+
+    /// Each followed output's brightness notification since the last poll:
+    /// its next level set through its `_BCM`, with a line. A brightness
+    /// notification no followed output took is named too.
+    fn service_brightness(&self) {
+        use stela_drivers::probe::backlight;
+        let what = |event| match event {
+            backlight::NOTIFY_INC => "up",
+            backlight::NOTIFY_DEC => "down",
+            backlight::NOTIFY_CYCLE => "cycled",
+            backlight::NOTIFY_ZERO => "to zero",
+            _ => "off",
+        };
+        let seen = BRIGHTNESS_SEEN.swap(0, Ordering::AcqRel);
+        let mut taken = false;
+        for (index, (control, _)) in self.backlights.borrow_mut().iter_mut().enumerate() {
+            let event = BRIGHTNESS[index].swap(0, Ordering::AcqRel);
+            if event == 0 {
+                continue;
+            }
+            taken = true;
+            let switched = control.switch(event);
+            let path = &control.path;
+            match switched {
+                Ok(switched) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: brightness {} {} -> {} of {} through _BCM ({})\n",
+                    what(event),
+                    switched.from,
+                    switched.to,
+                    switched.max,
+                    if switched.read {
+                        "from the level _BQC read"
+                    } else {
+                        "from the level last set"
+                    }
+                )),
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: brightness {} refused by _BCM (status {:#x})\n",
+                    what(event),
+                    error.0
+                )),
+            }
+        }
+        if seen != 0 && !taken {
+            output::arguments(format_args!(
+                "HOST ACPI brightness {}: no display output with _BCL and _BCM took it, so no \
+                 backlight control found\n",
+                what(seen)
+            ));
         }
     }
 
