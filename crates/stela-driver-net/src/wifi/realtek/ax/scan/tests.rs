@@ -3,8 +3,8 @@ use super::*;
 use crate::wifi::realtek::ax::bb::BbGain;
 use crate::wifi::realtek::ax::bringup::FirmwareFile;
 use crate::wifi::realtek::ax::bringup::tests::{
-    BOTH, NO_LTR, chip_hearing, efuse_with_mac, never, same_access, tables_file, trace_sha256,
-    txpwr_window,
+    BOTH, NO_LTR, chip_hearing, depth_free, efuse_with_mac, never, same_access, tables_file,
+    trace_sha256, txpwr_window,
 };
 use crate::wifi::realtek::ax::chan::Chan;
 use crate::wifi::realtek::ax::channel::{ChannelInputs, TxPower};
@@ -13,7 +13,7 @@ use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::h2c::H2c;
 use crate::wifi::realtek::ax::live::{self, BOOT_CHANNEL, Live, StartError, leave_ips};
 use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read, running};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings, TX_ENTRIES_CTRL};
 use crate::wifi::realtek::ax::receive::{Mode, Tag};
 use crate::wifi::realtek::ax::regd::{Regd, Regds};
 use crate::wifi::realtek::ax::tests::firmware::{
@@ -172,7 +172,7 @@ fn time_at(trace: &[Op], at: usize) -> u64 {
 
 /// The first `len` bytes of the FWCMD slot that carried `seq`.
 fn slot(m: &Arc<Mutex<Model>>, seq: u8, len: usize) -> Vec<u8> {
-    let n = usize::from(seq - 3) % TX_ENTRIES;
+    let n = usize::from(seq - 3) % TX_ENTRIES_CTRL;
     let state = m.lock().unwrap();
     device_read(
         &state,
@@ -332,10 +332,10 @@ fn the_scan_steps_are_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
         t[window.end..window.end + 2],
         [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
     );
-    assert_eq!(
-        trace_sha256(t[..window.start].iter().chain(&t[window.end..])),
-        M2C_SCAN_TRACE
-    );
+    // Its view across M4's ring depths is the same trace: the scan writes no
+    // ring size or address, and RXQ's host index stays under 32.
+    let rest = depth_free(t[..window.start].iter().chain(&t[window.end..]));
+    assert_eq!(trace_sha256(&rest), M2C_SCAN_TRACE);
 }
 
 /// A data frame on channel 6 during the scan: M2c's scan receiver counts it
@@ -859,7 +859,7 @@ fn refused_vif_h2c_is_named_in_the_line() {
 
 #[test]
 fn rxq_full_is_reported() {
-    let r = scan(|fw| fw.burst(31)).report();
+    let r = scan(|fw| fw.burst(255)).report();
     assert_eq!((r.rxq_full, r.dropped, r.frames), (1, 0, 0));
     assert!(
         r.to_string().ends_with("(0 without RSSI), RXQ full 1"),

@@ -4,7 +4,7 @@ use crate::wifi::realtek::ax::c2h::{BcnFltr, SCAN_END, SCAN_ENTER_CH, ScanOfld};
 use crate::wifi::realtek::ax::chan::HwBand;
 use crate::wifi::realtek::ax::h2c::ScanChannel;
 use crate::wifi::realtek::ax::pci::{
-    encode_txbd,
+    TX_RING_AT, encode_txbd,
     tests::{FWCMD, TX_POOL, device_read, device_write, reclaim_at_once, running, rxq_buffer},
 };
 use crate::wifi::realtek::ax::receive::Received;
@@ -134,7 +134,7 @@ fn ofld_cfg_sends_the_exact_packet() {
         let state = r.m.lock().unwrap();
         (
             device_read(&state, u64::from(FWCMD), 32),
-            device_read(&state, u64::from(TX_POOL + 12 * 16 * 8), 8),
+            device_read(&state, u64::from(TX_POOL) + TX_RING_AT[12] as u64, 8),
         )
     };
     assert_eq!(packet, S8_PACKET);
@@ -751,9 +751,19 @@ fn scripted_scan_crosses_the_rxq_wrap_and_wait_ends_at_end_scan() {
         |io, m| {
             let mut fw = Firmware::new(m);
             fw.beacon(1, BSSID, b"Home", 0x70);
-            fw.install(io);
+            // RXQ's 256 entries: the scan's buffers start at entry 240, so
+            // they cross the wrap.
+            let answering = fw.answering();
+            answering.resume_at(0, 240);
+            let ch12 = answering.clone();
+            io.on_read(0x1080, Box::new(move |r: &mut RegisterModel| ch12.ch12(r)));
+            io.on_read(
+                0x1218,
+                Box::new(move |r: &mut RegisterModel| answering.rxq(r)),
+            );
         },
         &mut |s, io, sink| {
+            s.rings().rxq_resume_at(240);
             let list: Vec<ScanChannel> = (1..=13)
                 .map(|channel| ScanChannel {
                     band: HwBand::G2,
@@ -776,7 +786,7 @@ fn scripted_scan_crosses_the_rxq_wrap_and_wait_ends_at_end_scan() {
     );
     assert_eq!(r.got, (Ok(18), Ok(19), Ok(true)));
     // 13 ENTER_CH and LEAVE_CH, the beacon and its status, END_SCAN and the
-    // four acks: past RXQ's 32-entry wrap, in order.
+    // four acks: past RXQ's wrap at 256, in order.
     let entered: Vec<u8> = r
         .sunk
         .iter()
@@ -808,9 +818,17 @@ fn scripted_scan_crosses_the_rxq_wrap_and_wait_ends_at_end_scan() {
     assert_eq!((beacon.tag.channel, beacon.signal), (2, Some(-54)));
     assert!(!r.sunk.contains(&Sunk::OtherC2h));
     assert_eq!((r.ledger.rec_acks, r.ledger.done_acks), (2, 2));
+    let hosts: Vec<u16> =
+        r.io.trace
+            .iter()
+            .filter_map(|o| match o {
+                Op::W16(0x1218, v) => Some(*v),
+                _ => None,
+            })
+            .collect();
     assert!(
-        r.io.trace.contains(&Op::W16(0x1218, 0)),
-        "RXQ never wrapped"
+        hosts.windows(2).any(|w| w[1] < w[0]),
+        "RXQ never wrapped: {hosts:?}"
     );
 }
 
@@ -884,7 +902,7 @@ fn firmware_probe_response_goes_to_the_cam_mac_and_a_burst_fills_rxq() {
         |io, m| {
             let mut fw = Firmware::new(m);
             fw.probe_response(1, other, b"Lab", 0x50);
-            fw.burst(31);
+            fw.burst(255);
             fw.install(io);
         },
         &mut |s, io, sink| {
@@ -927,7 +945,7 @@ fn firmware_probe_response_goes_to_the_cam_mac_and_a_burst_fills_rxq() {
         }
     );
     assert_eq!(probe.signal, Some(-70));
-    // The 31 data frames filled every entry the device may fill, once.
+    // The 255 data frames filled every entry the device may fill, once.
     assert_eq!(full, 1);
 }
 

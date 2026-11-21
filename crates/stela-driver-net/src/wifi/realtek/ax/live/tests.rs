@@ -13,7 +13,7 @@ use crate::wifi::realtek::ax::command::H2cAck;
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::h2c::ScanChannel;
 use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, TX_ENTRIES_CTRL};
 use crate::wifi::realtek::ax::receive::{Event, Mode, Received, Tag};
 use crate::wifi::realtek::ax::regd::Regd;
 use crate::wifi::realtek::ax::scan::{STOP_WAIT_US, ScanEnd, run_once, scan_budget_us, scan_list};
@@ -172,12 +172,14 @@ fn start_leaves_a_station_receiver_on_its_channel_and_fresh_tx_pools() {
             channel: 1
         }
     );
-    // "tx rings": the pools' own allocation of 174 080 bytes in 43 pages,
+    // "tx rings": the pools' own allocation of 2 263 040 bytes in 553 pages,
     // the last this start mapped, after the rings'.
-    let model = m.lock().unwrap();
-    let sizes: Vec<usize> = model.mappings.values().map(|(p, _)| p.bytes()).collect();
-    assert_eq!(sizes.iter().filter(|&&b| b == 43 * 4096).count(), 1);
-    assert_eq!(sizes.last(), Some(&(43 * 4096)), "{sizes:?}");
+    let sizes: Vec<usize> = {
+        let model = m.lock().unwrap();
+        model.mappings.values().map(|(p, _)| p.bytes()).collect()
+    };
+    assert_eq!(sizes.iter().filter(|&&b| b == 553 * 4096).count(), 1);
+    assert_eq!(sizes.last(), Some(&(553 * 4096)), "{sizes:?}");
 }
 
 #[test]
@@ -445,7 +447,7 @@ fn h2c_bytes(m: &Arc<Mutex<Model>>, class: u8, func: u8, seq: u8) -> Vec<u8> {
     // alone and leaves the model's mutex unpoisoned.
     let found = {
         let state = m.lock().unwrap();
-        (0..TX_ENTRIES).find_map(|n| {
+        (0..TX_ENTRIES_CTRL).find_map(|n| {
             let at = u64::from(FWCMD) + (n * FWCMD_SLOT_BYTES) as u64;
             let head = device_read(&state, at, 24);
             let hdr0 = u32::from_le_bytes(head[16..20].try_into().unwrap());

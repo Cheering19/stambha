@@ -24,7 +24,8 @@ use crate::wifi::realtek::ax::pci::tests::{
     FWCMD, TX_POOL, device_read, device_write, rpp, rpq_buffer, rpq_buffer_iova, rxq_buffer,
 };
 use crate::wifi::realtek::ax::pci::{
-    FWCMD_SLOT_BYTES, RX_ENTRIES, TX_ENTRIES, TxChannel, WD_HEAD_BYTES,
+    FWCMD_SLOT_BYTES, RX_ENTRIES_RPQ, RX_ENTRIES_RXQ, TX_ENTRIES_CTRL, TX_RING_AT, TxChannel,
+    WD_HEAD_BYTES, tx_entries,
 };
 use crate::wifi::realtek::ax::tests::model::RegisterModel;
 use crate::wifi::realtek::beacon::tests::Model;
@@ -363,8 +364,8 @@ impl Answering {
     /// were someone else's.
     pub fn resume_at(&self, ch12: usize, hw: usize) {
         let mut state = self.0.borrow_mut();
-        state.ch12 = ch12 % TX_ENTRIES;
-        state.hw = hw % RX_ENTRIES;
+        state.ch12 = ch12 % TX_ENTRIES_CTRL;
+        state.hw = hw % RX_ENTRIES_RXQ;
     }
 }
 
@@ -383,7 +384,7 @@ struct State {
 
 impl State {
     fn ch12(&mut self, r: &mut RegisterModel) -> u32 {
-        let host = (r.get32(CH12_IDX) & 0xFFF) as usize % TX_ENTRIES;
+        let host = (r.get32(CH12_IDX) & 0xFFF) as usize % TX_ENTRIES_CTRL;
         while self.ch12 != host {
             let at = u64::from(FWCMD) + (self.ch12 * FWCMD_SLOT_BYTES) as u64;
             let packet = {
@@ -393,20 +394,20 @@ impl State {
                 device_read(&m, at, DESC_LEN + (hdr1 & H2C_LEN) as usize)
             };
             self.h2c(&packet[DESC_LEN..]);
-            self.ch12 = (self.ch12 + 1) % TX_ENTRIES;
+            self.ch12 = (self.ch12 + 1) % TX_ENTRIES_CTRL;
         }
         (host | host << 16) as u32
     }
 
     fn rxq(&mut self, r: &mut RegisterModel) -> u32 {
-        let host = (r.get32(RXQ_IDX) & 0xFFF) as usize % RX_ENTRIES;
-        let mut free = (host + RX_ENTRIES - self.hw - 1) % RX_ENTRIES;
+        let host = (r.get32(RXQ_IDX) & 0xFFF) as usize % RX_ENTRIES_RXQ;
+        let mut free = (host + RX_ENTRIES_RXQ - self.hw - 1) % RX_ENTRIES_RXQ;
         if let Some(mut batch) = self.batches.pop_front() {
             let m = self.fw.m.lock().unwrap();
             let mut written = 0;
             while written < batch.len() && free > 0 {
                 device_write(&m, rxq_buffer(self.hw), &batch[written]);
-                self.hw = (self.hw + 1) % RX_ENTRIES;
+                self.hw = (self.hw + 1) % RX_ENTRIES_RXQ;
                 written += 1;
                 free -= 1;
             }
@@ -653,12 +654,13 @@ impl AirState {
     /// Take every TXBD kicked on a served ring, oldest first per ring.
     fn take(&mut self, r: &RegisterModel) {
         for (n, &(ch, ring, idx)) in TX_RINGS.iter().enumerate() {
-            let host = (r.get32(idx) & 0xFFF) as usize % TX_ENTRIES;
+            let entries = tx_entries(ring);
+            let host = (r.get32(idx) & 0xFFF) as usize % entries;
             while self.hw[n] != host {
                 let entry = self.hw[n];
                 let frame = {
                     let m = self.m.lock().unwrap();
-                    let bd_at = u64::from(TX_POOL) + ((ring * TX_ENTRIES + entry) * 8) as u64;
+                    let bd_at = u64::from(TX_POOL) + (TX_RING_AT[ring] + entry * 8) as u64;
                     let bd = device_read(&m, bd_at, 8);
                     assert_eq!(u16::from_le_bytes([bd[0], bd[1]]), WD_BYTES as u16);
                     let wd_at = u64::from(u32::from_le_bytes(bd[4..8].try_into().unwrap()));
@@ -687,7 +689,7 @@ impl AirState {
                 self.reports
                     .push(rpp(u32::from(frame.page), status, (body2 >> 17) & 0x3F));
                 self.sent.push(frame);
-                self.hw[n] = (entry + 1) % TX_ENTRIES;
+                self.hw[n] = (entry + 1) % entries;
             }
         }
     }
@@ -695,8 +697,8 @@ impl AirState {
     /// An RPQ index read.
     fn rpq(&mut self, r: &mut RegisterModel) -> u32 {
         self.take(r);
-        let host = (r.get32(RPQ_IDX) & 0xFFF) as usize % RX_ENTRIES;
-        let free = (host + RX_ENTRIES - self.rpq_hw - 1) % RX_ENTRIES;
+        let host = (r.get32(RPQ_IDX) & 0xFFF) as usize % RX_ENTRIES_RPQ;
+        let free = (host + RX_ENTRIES_RPQ - self.rpq_hw - 1) % RX_ENTRIES_RPQ;
         if !self.silent && !self.reports.is_empty() && free > 0 {
             let buffer = rpq_buffer(0, &core::mem::take(&mut self.reports));
             device_write(
@@ -704,7 +706,7 @@ impl AirState {
                 rpq_buffer_iova(self.rpq_hw),
                 &buffer,
             );
-            self.rpq_hw = (self.rpq_hw + 1) % RX_ENTRIES;
+            self.rpq_hw = (self.rpq_hw + 1) % RX_ENTRIES_RPQ;
         }
         (host | self.rpq_hw << 16) as u32
     }

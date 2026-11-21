@@ -125,7 +125,7 @@ fn joined(ch: Channel, legacy: u16, ht: Option<HtPeer>) -> Association {
 /// descriptor included.
 fn h2c_of(m: &Arc<Mutex<Model>>, cat: u32, class: u8, func: u8, seq: u8) -> Vec<u8> {
     let state = m.lock().unwrap();
-    for n in 0..TX_ENTRIES {
+    for n in 0..TX_ENTRIES_CTRL {
         let at = u64::from(FWCMD) + (n * FWCMD_SLOT_BYTES) as u64;
         let head = device_read(&state, at, 24);
         let hdr0 = u32::from_le_bytes(head[16..20].try_into().unwrap());
@@ -836,21 +836,21 @@ fn a_failed_rpq_poll_still_drains_rxq_and_says_so() {
 fn silent_rpq_stalls_tx_without_loss() {
     let (mut live, _m, mut air) = on_air(&|_| {});
     air.silent_rpq();
-    let frames: Vec<Vec<u8>> = (0..30).map(|n| data_frame(n, n as u8)).collect();
+    let frames: Vec<Vec<u8>> = (0..510).map(|n| data_frame(n, n as u8)).collect();
     let mut tokens = Vec::new();
-    for frame in &frames[..15] {
+    for frame in &frames[..255] {
         let sent = send(&mut live, &data(frame, 0)).unwrap();
-        tokens.push(sent.expect("room for the first 15"));
+        tokens.push(sent.expect("room for the first 255"));
     }
-    // The 16th finds the ring full: no room, and nothing touched.
+    // The 256th finds the ring full: no room, and nothing touched.
     let before = live.io().trace.len();
-    assert_eq!(send(&mut live, &data(&frames[15], 0)), Ok(None));
+    assert_eq!(send(&mut live, &data(&frames[255], 0)), Ok(None));
     assert_eq!(live.io().trace.len(), before);
     // While RPQ is silent the device sends, but no page comes back.
     for _ in 0..3 {
         assert!(poll(&mut live).is_empty());
     }
-    assert_eq!(air.sent().len(), 15);
+    assert_eq!(air.sent().len(), 255);
     // RPQ speaks: every frame's report, once, each acknowledged.
     air.ack_all();
     let reported: Vec<Incoming> = poll(&mut live);
@@ -862,12 +862,12 @@ fn silent_rpq_stalls_tx_without_loss() {
         })
         .collect();
     assert_eq!(reported, want);
-    for frame in &frames[15..] {
+    for frame in &frames[255..] {
         let sent = send(&mut live, &data(frame, 0)).unwrap();
         assert!(sent.is_some());
     }
-    assert_eq!(poll(&mut live).len(), 15);
-    // All 30 reached the air, in order, each once.
+    assert_eq!(poll(&mut live).len(), 255);
+    // All 510 reached the air, in order, each once.
     let payloads: Vec<Vec<u8>> = air.sent().into_iter().map(|s| s.bytes).collect();
     assert_eq!(payloads, frames);
 }
@@ -877,38 +877,38 @@ fn silent_rpq_runs_the_pages_out_without_reusing_one() {
     let (mut live, _m, mut air) = on_air(&|_| {});
     air.silent_rpq();
     let mut tokens = Vec::new();
-    for n in 0..40u16 {
+    for n in 0..300u16 {
         let frame = qos_frame(n, 5, n as u8);
         if let Some(token) = send(&mut live, &data(&frame, 5)).unwrap() {
             tokens.push(token);
         }
         assert!(poll(&mut live).is_empty());
     }
-    // Every TXBD came back, but no page without its report: 16, each once.
-    assert_eq!(tokens.len(), 16);
+    // Every TXBD came back, but no page without its report: 256, each once.
+    assert_eq!(tokens.len(), 256);
     let mut pages: Vec<u16> = tokens.iter().map(|t| t.0).collect();
     pages.sort_unstable();
     pages.dedup();
-    assert_eq!(pages.len(), 16);
+    assert_eq!(pages.len(), 256);
     assert!(tokens.iter().all(|t| t.0 >> 8 == 2), "VI is ACH2");
     assert!(
-        Chip::diagnostic(&live).contains("tx sent 16 reported 0 acked 0 full 24"),
+        Chip::diagnostic(&live).contains("tx sent 256 reported 0 acked 0 full 44"),
         "{}",
         Chip::diagnostic(&live)
     );
     air.ack_all();
-    assert_eq!(poll(&mut live).len(), 16);
-    let frame = qos_frame(40, 5, 40);
+    assert_eq!(poll(&mut live).len(), 256);
+    let frame = qos_frame(300, 5, 44);
     assert!(send(&mut live, &data(&frame, 5)).unwrap().is_some());
-    assert_eq!(air.sent().len(), 16);
+    assert_eq!(air.sent().len(), 256);
 }
 
 #[test]
 fn skipped_and_stale_reports_are_counted_not_reported() {
     let (mut live, _m, mut air) = on_air(&|_| {});
-    // Seq 16 is past the pools, qsel 4 names no channel, and page 3 of CH8
+    // Seq 256 is past the pools, qsel 4 names no channel, and page 3 of CH8
     // was never sent.
-    air.report(rpp(16, 0, 0x00));
+    air.report(rpp(256, 0, 0x00));
     air.report(rpp(0, 0, 0x04));
     air.report(rpp(3, 0, 0x12));
     assert!(poll(&mut live).is_empty());
