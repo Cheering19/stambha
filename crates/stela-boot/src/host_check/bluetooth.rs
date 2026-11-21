@@ -320,8 +320,12 @@ fn bring_up(
     // SAFETY: one CPU after ExitBootServices; `dma` was reserved for the
     // host check, and no probe allocates from it in this mode.
     let mut dma = unsafe { RegionAllocator::new(handoff.dma.clone()) };
-    let found = xhci::attach_with_provider(&mut function, handoff, &mut dma, provider, minimum)
-        .map_err(|error| format!("its xHCI driver failed: {error}"))?;
+    // Its devices enumerated and their class drivers bound, the Bluetooth
+    // controller's among them; a Bulk-Only disk, the stick's, is left
+    // settling and never discovered, so it gets no SCSI command.
+    let found = xhci::begin_with_provider(&mut function, handoff, &mut dma, provider, minimum)
+        .map_err(|error| format!("its xHCI driver failed: {error}"))?
+        .finish_unsettled(&mut dma, provider);
     let mut devices = Devices::default();
     devices.absorb_usb(Some(address), found, provider);
     devices.owners.push(Box::new(function));
