@@ -130,17 +130,20 @@ const VENDOR: u16 = 0x10ec;
 const DEVICE: u16 = 0xc852;
 /// `rtw89_pci_setup_mapping` maps BAR2.
 const BAR: u8 = 2;
-/// The rings' pages: 13 TX BD rings, the RXQ and RPQ rings with 32
-/// 11498-byte buffers of three pages each, and sixteen CH12 slots take 211
-/// pages of payload, 278 with the heap's per-allocation page (a 16-byte
-/// block header before each page-aligned block); the TX pools of the data
-/// and management queues that every start now allocates (M3 spec S5.1)
-/// take 43 more in one allocation, 44 with its header page: 322. The rest
-/// is room. M3b adds none (spec S17.6, re-checked at Task 20): the chip
-/// takes these only in `live::start`, keys and Block Ack agreements go to
+/// The rings' pages (M4 spec S9.2): the 13 TX BD rings (ACH0-3 256 BDs
+/// each, the rest 16) in 3 pages, the RX BD rings in 2, RXQ's 256 and RPQ's
+/// 32 11498-byte buffers of three pages each in 864, and sixteen CH12 slots
+/// in 16 take 885 pages of payload, 1 176 with the heap's per-allocation
+/// page (a 16-byte block header before each page-aligned block); the TX
+/// pools of the data and management queues (a WD page and a 2048-byte slot
+/// per TXBD: 256 per data channel, 16 for CH8) take 553 more in one
+/// allocation, 554 with its header page: 1 730. The rest is room. The chip
+/// takes these only in `live::start`; keys and Block Ack agreements go to
 /// its CAMs by H2C over CH12, and the network stack and its DHCP client
 /// live on the host check's heap, their frames copied into the TX pools.
-const DMA_PAGES: usize = 384;
+/// Whether the firmware grants 2 048 pages below 4 GiB is checked by the
+/// `dma rings` step of the first boot (M4 spec S19.8).
+const DMA_PAGES: usize = 2048;
 /// `WLAN_REASON_DEAUTH_LEAVING`, the station check's departure (spec S17.4).
 const DEAUTH_LEAVING: u16 = 3;
 const PAGE: usize = crate::paging::PAGE;
