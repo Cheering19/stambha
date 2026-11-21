@@ -11,9 +11,9 @@ use super::numerical::{
     single_vector_arithmetic, test_control, vector_exponent_range, vector_normal_or_zero_range,
 };
 use super::numerical::{
-    commit_flush_status, commit_invalid_status, commit_rounded_status, exceptional_lane_mask,
-    flush_subnormal_lanes, minimum_normal_lanes, reject_exceptional_lanes, reject_invalid,
-    scalar_ordered_range,
+    Entry, commit_flush_status, commit_invalid_status, commit_rounded_status,
+    exceptional_lane_mask, flush_subnormal_lanes, minimum_normal_lanes, reject_exceptional_lanes,
+    reject_invalid, scalar_ordered_range, sticky_inexact,
 };
 use super::{Host, commit, encode::guest, packed, read_vector, vector_offset};
 use crate::x86_64::asm::FloatLanes;
@@ -81,6 +81,12 @@ const HALF_SUBNORMAL_SCALE: u32 = (Format::Single.exponent_bias() + 1
     - Format::Half.exponent_bias()
     - Format::Half.fraction_bits())
     << Format::Single.fraction_bits();
+/// A Single's magnitude bits.
+const SINGLE_MAGNITUDE: u32 = 0x7fff_ffff;
+/// One past the Single minimum normal's magnitude, and the infinity's:
+/// [`sticky_narrow`] completes the magnitudes between.
+const SINGLE_PAST_MINIMUM: u32 = 0x0080_0001;
+const SINGLE_INFINITY_MAGNITUDE: u32 = 0x7f80_0000;
 const DOUBLE_TO_SINGLE_DISCARDED_BITS: u8 = 29;
 const DOUBLE_TO_SINGLE_DISCARDED_MASK: u32 = (1 << DOUBLE_TO_SINGLE_DISCARDED_BITS) - 1;
 const COMPACT_QWORD_LOW_DWORDS: u8 = 0x88;
@@ -200,9 +206,11 @@ fn emit_scalar(
     destination: Format,
     rounding: PrecisionRounding,
     pc: GuestAddress,
+    target: TargetCpu,
 ) {
     let mut helper = Vec::new();
     let mut rounded = None;
+    let mut sticky = Vec::new();
     exception_guard(code, &mut helper);
     read_vector(code, operand.source, SOURCE_VECTOR);
     // Precision conversions merge old Vd, unlike binary arithmetic's Vn merge.
@@ -248,6 +256,9 @@ fn emit_scalar(
         ));
         code.asm().cvtss2sd(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
     } else {
+        if rounding == PrecisionRounding::Fpcr && !target.data_independent_timing() {
+            sticky = sticky_narrow(code);
+        }
         rounded = (rounding == PrecisionRounding::Fpcr).then(|| rounded_narrow(code, &mut helper));
         flush_inputs(code, source);
         // A zero converts to the zero of its sign, without status; a
@@ -286,11 +297,55 @@ fn emit_scalar(
     if source != Format::Half {
         commit_flush_status(code);
     }
-    if let Some(rounded) = rounded {
-        let tail = code.len();
-        resolve(code, rounded, tail);
+    let tail = code.len();
+    for patch in rounded.into_iter().chain(sticky) {
+        resolve(code, patch, tail);
     }
     scalar_commit(code, operand.destination, destination);
+}
+
+/// Scalar D→S on the sticky-inexact path ([`sticky_inexact`]): with FPCR at
+/// its defaults and FPSR.IXC already set, CVTSD2SS in the MXCSR native code
+/// is entered with (nearest, every exception masked, no DAZ or FTZ) is the
+/// guest's conversion, and a result whose magnitude lies past the Single
+/// minimum normal and below the infinity raised nothing IXC does not
+/// already hold: it is no NaN (so neither was the source, and no IOC), it
+/// is finite (no OFC), and it is not tiny before rounding either, which Arm
+/// tests and the host does not (no UFC: an exact value below the minimum
+/// normal rounds to it at most). A zero result is exact from a zero source.
+/// Every other result, control or status takes the full path, which
+/// converts RESULT_VECTOR's low lane again. Returns the jumps to the commit.
+fn sticky_narrow(code: &mut Code) -> Vec<usize> {
+    let full = sticky_inexact(code, Entry::UNKNOWN);
+    let mut asm = code.asm();
+    asm.cvtsd2ss(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
+    asm.movd_from_xmm(Rax, RESULT_VECTOR);
+    asm.alu_imm32(Alu::And, Size::Dword, Rax, SINGLE_MAGNITUDE as i32);
+    asm.alu_imm32(Alu::Sub, Size::Dword, Rax, SINGLE_PAST_MINIMUM as i32);
+    asm.alu_imm32(
+        Alu::Cmp,
+        Size::Dword,
+        Rax,
+        (SINGLE_INFINITY_MAGNITUDE - SINGLE_PAST_MINIMUM) as i32,
+    );
+    let normal = asm.jcc(Cond::B).offset();
+    // A zero magnitude, less the same.
+    asm.alu_imm32(
+        Alu::Cmp,
+        Size::Dword,
+        Rax,
+        0u32.wrapping_sub(SINGLE_PAST_MINIMUM) as i32,
+    );
+    let other = asm.jcc(Cond::Ne).offset();
+    asm.movq_from_xmm(Rax, SOURCE_VECTOR);
+    asm.shift_one(ShiftOp::Shl, Size::Qword, Rax);
+    let inexact = asm.jcc(Cond::Ne).offset();
+    let zero = jump(code);
+    let full_start = code.len();
+    for patch in full.into_iter().chain([other, inexact]) {
+        resolve(code, patch, full_start);
+    }
+    alloc::vec![normal, zero]
 }
 
 /// Clear R11D, then with FZ or FIZ and AH clear flush a subnormal S/D
@@ -1120,7 +1175,7 @@ pub(in crate::x86_64) fn emit(
             destination,
             rounding,
         } if destination != Format::Half => {
-            emit_scalar(code, operand, source, destination, rounding, pc);
+            emit_scalar(code, operand, source, destination, rounding, pc, target);
         }
         PrecisionMode::Widen {
             source: Format::Half,

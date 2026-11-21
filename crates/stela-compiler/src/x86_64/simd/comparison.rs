@@ -335,19 +335,21 @@ fn quick_flags_supported(right: CompareSource, target: TargetCpu) -> bool {
 
 /// With no trap enabled and FZ, FIZ and AH clear, UCOMIS orders every
 /// non-NaN pair (zeros of either sign, subnormals, infinities) as Arm does
-/// and Arm raises no flag: only an unordered pair (a NaN, whose
-/// IOC depends on FCMP or FCMPE and on signalling) needs the helper. UCOMIS
-/// may set MXCSR status bits (IE for an SNaN, DE for a subnormal), which
-/// nothing reads: every status reader installs a clean control first.
-/// Returns the branch, taken with UCOMIS's flags, to the flag mapping;
-/// every other control falls through to the full classification.
+/// and Arm raises no flag. An unordered pair (a NaN on either side) gives
+/// Arm's 0011 there too, with IOC for FCMPE (`signal_all_nans`) or a
+/// signalling NaN (Arm `FPCompare`): no input is flushed, so no IDC, and
+/// no trap is enabled. UCOMIS may set MXCSR status bits (IE for an SNaN,
+/// DE for a subnormal), which nothing reads: every status reader installs
+/// a clean control first. Returns the branch, taken with UCOMIS's flags,
+/// to the flag mapping, and the unordered pair's jump past it; every other
+/// control falls through to the full classification.
 fn quick_flags(
     code: &mut Code,
     format: Format,
     left: u8,
     right: u8,
-    helper: &mut Vec<usize>,
-) -> usize {
+    signal_all_nans: bool,
+) -> [usize; 2] {
     use crate::aarch64::floating::{FPCR_AH, FPCR_FIZ, FPCR_FZ};
     test_control(
         code,
@@ -361,11 +363,64 @@ fn quick_flags(
     } else {
         code.asm().ucomiss(LEFT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
     }
-    helper.push(code.asm().jcc(Cond::P).offset());
+    let nan = code.asm().jcc(Cond::P).offset();
     let ordered = jump(code);
+    let unordered_start = code.len();
+    resolve(code, nan, unordered_start);
+    if signal_all_nans {
+        raise_invalid(code);
+    } else {
+        for source in [LEFT_VECTOR, RIGHT_VECTOR] {
+            signalling_invalid(code, format, source);
+        }
+    }
+    let unordered = flag_word::constant(code, NZCV_C | NZCV_V);
+    flag_word::store_constant(&mut code.asm(), unordered);
+    let done = jump(code);
     let full = code.len();
     resolve(code, other, full);
-    ordered
+    [ordered, done]
+}
+
+/// FPSR.IOC.
+fn raise_invalid(code: &mut Code) {
+    code.asm().alu_imm8(
+        Alu::Or,
+        Size::Dword,
+        super::numerical::state(core::mem::offset_of!(crate::GuestState, fpsr)),
+        crate::aarch64::floating::INVALID as i8,
+    );
+}
+
+/// FPSR.IOC where the S or D value in `vector`'s low lane is a signalling
+/// NaN: its magnitude above the infinity's, its quiet bit clear. Clobbers
+/// RAX, RCX, RDX and flags.
+fn signalling_invalid(code: &mut Code, format: Format, vector: u8) {
+    let size = register_size(format);
+    let infinity = format.exponent_mask() << 1;
+    move_scalar(code, format, Gpr::Rax, vector);
+    let mut asm = code.asm();
+    asm.mov(size, Gpr::Rcx, Gpr::Rax);
+    // The magnitude, shifted past the sign.
+    asm.shift_one(ShiftOp::Shl, size, Gpr::Rcx);
+    if format == Format::Double {
+        asm.mov_imm64(Gpr::Rdx, infinity);
+        asm.alu(Alu::Cmp, Size::Qword, Gpr::Rcx, Gpr::Rdx);
+    } else {
+        asm.alu_imm32(Alu::Cmp, Size::Dword, Gpr::Rcx, infinity as u32 as i32);
+    }
+    let ordered = asm.jcc(Cond::Be).offset();
+    asm.bit_imm(
+        crate::x86_64::asm::BitTest::Bt,
+        size,
+        Gpr::Rax,
+        (format.fraction_bits() - 1) as u8,
+    );
+    let quiet = asm.jcc(Cond::B).offset();
+    raise_invalid(code);
+    let end = code.len();
+    resolve(code, ordered, end);
+    resolve(code, quiet, end);
 }
 
 /// Half FCMP and FCMPE, by register and with zero, for every input under
@@ -492,7 +547,7 @@ fn emit_flags(
     let mut helper = Vec::new();
     let quick = match right {
         CompareSource::Register(register) if quick_flags_supported(right, target) => {
-            Some(quick_flags(code, format, left, register, &mut helper))
+            Some(quick_flags(code, format, left, register, signal_all_nans))
         }
         _ => None,
     };
@@ -512,11 +567,15 @@ fn emit_flags(
         }
         // JMP and the unexecuted helper preserve the comparison flags.
         helper_section(code, &helper, pc);
-        if let Some(quick) = quick {
+        if let Some([quick, _]) = quick {
             let mapping = code.len();
             resolve(code, quick, mapping);
         }
         ordered_flags(code, false);
+        if let Some([_, unordered]) = quick {
+            let end = code.len();
+            resolve(code, unordered, end);
+        }
     } else {
         scalar_zero_guard(code, format, LEFT_VECTOR, &mut helper);
         helper_section(code, &helper, pc);

@@ -198,6 +198,121 @@ fn scalar_conversions_complete_subnormal_tiny_and_flushed_inputs_inline() {
     assert!(inline > runs * 2 / 5, "{inline} of {runs} inline");
 }
 
+/// The sticky-inexact D to S converts before the code installs any MXCSR:
+/// its CVTSD2SS (F2 0F 5A) comes before the full path's first LDMXCSR
+/// (0F AE /2), where every conversion took four MXCSR instructions.
+#[test]
+fn sticky_double_to_single_converts_before_any_mxcsr_load() {
+    let code = compile(word(Format::Double), TargetCpu::Baseline);
+    let convert = code
+        .windows(3)
+        .position(|bytes| bytes == [0xf2, 0x0f, 0x5a])
+        .expect("a CVTSD2SS");
+    let load = code
+        .windows(3)
+        .position(|bytes| bytes[..2] == [0x0f, 0xae] && bytes[2] >> 3 & 7 == 2)
+        .expect("an LDMXCSR");
+    assert!(convert < load, "CVTSD2SS at {convert}, LDMXCSR at {load}");
+    // FCVT with round to odd (FCVTXN) keeps its private rounding.
+    let odd = compile(0x7e61_6800 | N << 5 | D, TargetCpu::Baseline);
+    let convert = odd.windows(3).position(|bytes| bytes == [0xf2, 0x0f, 0x5a]);
+    let load = odd
+        .windows(3)
+        .position(|bytes| bytes[..2] == [0x0f, 0xae] && bytes[2] >> 3 & 7 == 2);
+    assert!(convert.is_none() || load < convert, "{convert:?} {load:?}");
+}
+
+/// Scalar D to S on the sticky-inexact path: with FPCR at its defaults and
+/// FPSR.IXC already set, CVTSD2SS runs in the MXCSR native code is entered
+/// with, and only a normal result other than the Single minimum normal, or
+/// a zero from a zero, completes there. Over every input class, every
+/// control and every tier, with IXC alone and every cumulative flag set
+/// beforehand, each run ends where the same input with IXC clear ends (the
+/// full path, which the sticky path leaves every such state to), with the
+/// same V registers and FPSR but IXC, and matches the Arm reference.
+#[test]
+fn sticky_double_to_single_matches_the_full_path_bit_for_bit() {
+    use crate::aarch64::floating::INEXACT;
+    const CUMULATIVE: u32 = 0x9f;
+    let (mut runs, mut inline) = (0, 0);
+    for target in targets() {
+        let code = compile(word(Format::Double), target);
+        for bits in floats(Format::Double) {
+            for fpcr in controls() {
+                for cumulative in [INEXACT, CUMULATIVE] {
+                    let state = |fpsr: u32| {
+                        let mut state = GuestState {
+                            fpcr,
+                            fpsr: 0x0800_0000 | fpsr,
+                            ..GuestState::default()
+                        };
+                        state.x[30] = RETURN;
+                        state.v[N as usize] = [bits, 0x0123_4567_89ab_cdef];
+                        state.v[D as usize] = [0xdead_beef_0bad_f00d, 0xfeed_face_cafe_d00d];
+                        state
+                    };
+                    let label = alloc::format!("{bits:#x} {fpcr:#x} {cumulative:#x} {target:?}");
+                    let (full_initial, sticky_initial) =
+                        (state(cumulative & !INEXACT), state(cumulative));
+                    let mut full = full_initial.clone();
+                    let full_exit = run(&code, &mut full);
+                    let mut sticky = sticky_initial.clone();
+                    let exit = run(&code, &mut sticky);
+                    runs += 1;
+                    assert_eq!(exit, full_exit, "{label}");
+                    // What completes inline at FPCR's defaults (DN aside)
+                    // outside the DIT profile: a non-NaN input whose result
+                    // is not the Single minimum normal (which Arm may find
+                    // tiny where the host does not).
+                    let magnitude = bits & !Format::Double.sign_mask();
+                    let minimum = precision::evaluate(
+                        Format::Double,
+                        Format::Single,
+                        PrecisionRounding::Fpcr,
+                        0,
+                        bits,
+                    )
+                    .is_ok_and(|outcome| {
+                        outcome.bits & !Format::Single.sign_mask()
+                            == 1 << Format::Single.fraction_bits()
+                    });
+                    let sticky_state = fpcr & !FPCR_DN == 0
+                        && !target.data_independent_timing()
+                        && magnitude <= Format::Double.exponent_mask()
+                        && !minimum;
+                    if exit == PC.0 {
+                        assert_eq!(sticky, sticky_initial, "{label}");
+                        assert!(!sticky_state, "exited: {label}");
+                        continue;
+                    }
+                    inline += 1;
+                    let mut expected = full;
+                    expected.fpsr |= INEXACT;
+                    assert_eq!(sticky, expected, "{label}");
+                    let outcome = precision::evaluate(
+                        Format::Double,
+                        Format::Single,
+                        PrecisionRounding::Fpcr,
+                        fpcr,
+                        bits,
+                    )
+                    .expect("completed with traps");
+                    assert_eq!(
+                        sticky.fpsr,
+                        sticky_initial.fpsr | outcome.exceptions,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        sticky.v[D as usize][0] as u32, outcome.bits as u32,
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(inline > runs * 2 / 5, "{inline} of {runs} inline");
+}
+
 /// FCVTL, FCVTL2, FCVTN and FCVTN2 between S and D lanes over every input
 /// class, two distinct classes per vector: with the trap enables and AH
 /// clear, widening completes every vector inline (zeros, subnormals,

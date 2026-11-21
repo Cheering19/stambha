@@ -293,6 +293,114 @@ fn environment_free_float_to_integer_matches_the_reference() {
     );
 }
 
+/// FCVTZS of S and D to W and X, to a general register and scalar SIMD,
+/// with no trap enabled: every input the reference converts with IOC (a NaN
+/// to 0, an infinity or a value past the integer's range to its bound)
+/// completes inline under every other control, with the reference's result
+/// and FPSR, as do the values next to the negative bound that are in range.
+#[test]
+fn signed_truncation_saturates_nans_infinities_and_out_of_range_values_inline() {
+    use crate::aarch64::floating::INVALID;
+    let mut saturated = 0;
+    for target in targets() {
+        for &(base, rounding, signed, general) in TO_INTEGER {
+            if rounding != IntegerRounding::TowardZero || !signed {
+                continue;
+            }
+            for format in [Format::Single, Format::Double] {
+                let double = format == Format::Double;
+                for wide in [false, true] {
+                    if !general && wide != double {
+                        continue;
+                    }
+                    let word = if general {
+                        base | u32::from(wide) << 31 | u32::from(double) << 22
+                    } else {
+                        base | u32::from(double) << 22
+                    } | (N as u32) << 5
+                        | D as u32;
+                    let integer = IntegerFormat {
+                        width: if wide {
+                            IntegerWidth::Bits64
+                        } else {
+                            IntegerWidth::Bits32
+                        },
+                        signed,
+                    };
+                    let code = compile(word, target);
+                    let mut values = floats(format);
+                    // Around the negative bound: -2^31 and -2^63, a half
+                    // below -2^31 (in range for D), and the next values out.
+                    values.extend(
+                        [
+                            -2147483648.0,
+                            -2147483648.5,
+                            -2147483649.0,
+                            -9.223372036854776e18,
+                        ]
+                        .map(|value: f64| {
+                            if double {
+                                value.to_bits()
+                            } else {
+                                u64::from((value as f32).to_bits())
+                            }
+                        }),
+                    );
+                    if double {
+                        values.extend([0xc1e0_0000_001f_ffff, 0xc1e0_0000_0020_0000]);
+                    }
+                    for &bits in &values {
+                        for fpcr in controls() {
+                            if fpcr & FPCR_EXCEPTION_ENABLE_MASK != 0 {
+                                continue;
+                            }
+                            let outcome = to_integer(format, integer, 0, rounding, fpcr, bits)
+                                .expect("no trap enabled");
+                            let exponent = if double {
+                                (bits >> 52) & 0x7ff
+                            } else {
+                                (bits >> 23) & 0xff
+                            };
+                            let bound =
+                                format.exponent_bias() as u64 + integer.width.bits() as u64 - 1;
+                            let negative = bits >> (format.bits() - 1) != 0;
+                            if outcome.exceptions & INVALID == 0 && !(negative && exponent == bound)
+                            {
+                                continue;
+                            }
+                            let mut initial = GuestState {
+                                fpcr,
+                                fpsr: 0,
+                                nzcv: 0x6000_0000,
+                                ..GuestState::default()
+                            };
+                            initial.x[30] = RETURN;
+                            initial.x[D] = 0xdead_beef_dead_beef;
+                            initial.v[N] = [bits | (UPPER[0] & !width_mask(format)), UPPER[1]];
+                            initial.v[D] = UPPER;
+                            let label = alloc::format!("{word:08x} {bits:#x} {fpcr:#x} {target:?}");
+                            let mut actual = initial.clone();
+                            let exit = run(&code, &mut actual);
+                            assert_eq!(exit, RETURN, "exited: {label}");
+                            let mut expected = initial.clone();
+                            expected.fpsr |= outcome.exceptions;
+                            if general {
+                                expected.x[D] = outcome.bits;
+                            } else {
+                                expected.v[D] =
+                                    scalar_vector(UPPER, outcome.bits, width_mask(format), fpcr);
+                            }
+                            assert_eq!(actual, expected, "{label}");
+                            saturated += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(saturated > 1000, "{saturated}");
+}
+
 #[test]
 fn environment_free_javascript_conversion_matches_the_reference() {
     for target in targets() {
