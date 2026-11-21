@@ -217,6 +217,10 @@ struct Air {
     beacon_extra: Vec<u8>,
     /// What the chip counts (M4 spec S3.2, S3.4).
     link: LinkCounts,
+    /// Data frames the chip took and has not kicked yet, and the kicks that
+    /// handed any over (M4 spec S9.1): only a kicked frame reaches the AP.
+    unkicked: Vec<(Token, Vec<u8>)>,
+    kicks: usize,
 }
 
 impl Air {
@@ -498,7 +502,7 @@ impl Chip for Model {
             key: frame.key,
         });
         let token = air.token();
-        air.unanswered.push_back((token, frame.bytes.to_vec()));
+        air.unkicked.push((token, frame.bytes.to_vec()));
         Ok(Some(token))
     }
     fn associate(&mut self, association: &Association) -> Result<(), String> {
@@ -550,7 +554,18 @@ impl Chip for Model {
         Ok(())
     }
     fn flush(&mut self, drop: bool) -> Result<(), String> {
+        // Live::flush kicks what was submitted first.
+        self.kick()?;
         self.0.borrow_mut().calls.push(Call::Flush(drop));
+        Ok(())
+    }
+    fn kick(&mut self) -> Result<(), String> {
+        let mut air = self.0.borrow_mut();
+        if !air.unkicked.is_empty() {
+            air.kicks += 1;
+            let kicked = core::mem::take(&mut air.unkicked);
+            air.unanswered.extend(kicked);
+        }
         Ok(())
     }
     /// Recorded, then refused when the BA CAM H2C cannot be sent.
@@ -3197,4 +3212,37 @@ fn in_keeps_149_to_165() {
         .collect();
     assert_eq!(upper, [149, 153, 157, 161, 165]);
     assert!(india.iter().all(|&(_, f)| f & NO_IR == 0));
+}
+
+#[test]
+fn kick_once_per_pass_covers_every_submitted_frame() {
+    // M4 spec S9.1: the frames the network hands over go to the chip as they
+    // come (`rtw89_pci_tx_write`), and the radio's service pass kicks once
+    // (`rtw89_core_txq_schedule`'s `rtw89_core_tx_kick_off`).
+    let (mut wifi, model) = connected();
+    let (before, kicks) = {
+        let air = model.0.borrow();
+        assert!(air.unkicked.is_empty());
+        (air.data().len(), air.kicks)
+    };
+    for fill in 0..5 {
+        wifi.transmit(&ip(fill)).unwrap();
+    }
+    {
+        let air = model.0.borrow();
+        assert_eq!(air.data().len(), before + 5);
+        assert_eq!(air.unkicked.len(), 5);
+        assert_eq!(air.kicks, kicks);
+    }
+    wifi.carrier();
+    let air = model.0.borrow();
+    assert_eq!(air.kicks, kicks + 1);
+    assert!(air.unkicked.is_empty());
+    // Every frame once, in order.
+    let fills: Vec<u8> = air.data()[before..]
+        .iter()
+        .map(|(bytes, _)| *bytes.last().unwrap())
+        .collect();
+    assert_eq!(fills, [0, 1, 2, 3, 4]);
+    assert_eq!(air.data().len(), before + 5);
 }

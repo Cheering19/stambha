@@ -196,8 +196,16 @@ pub trait Chip {
     fn authenticated(&mut self) -> Result<(), String>;
     /// Queue a management frame; `Ok(None)` when there is no room now.
     fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String>;
-    /// Queue a data frame; `Ok(None)` when there is no room now.
+    /// Queue a data frame; `Ok(None)` when there is no room now. It may wait
+    /// for the next [`Chip::kick`] to leave; a management frame does not.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String>;
+    /// Hand over every data frame queued since the last kick, the end of a
+    /// service pass (`rtw89_core_tx_kick_off` after
+    /// `rtw89_core_txq_schedule` pushed a TID's frames, M4 spec S9.1); none
+    /// for a chip whose frames leave as they are queued.
+    fn kick(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Program the association (M3 spec S10).
     fn associate(&mut self, association: &Association) -> Result<(), String>;
     /// Leave the BSS set, authenticated to or associated with (M3 spec

@@ -1408,15 +1408,21 @@ impl<I: AxIo> Live<I> {
     /// every 10 ms for up to 200 ms until `dle_is_txq_empty`'s queues are
     /// all empty (`mac.c:2388-2412`), a timeout passed over as Linux only
     /// logs it. Frames drained meanwhile are held for the next
-    /// [`Live::drain`]. Refused before any I/O on a chip off
-    /// ([`POWERED_OFF`]) and while a scan has not been ended
-    /// ([`SCAN_NOT_ENDED`]); a failed register read is returned, the chip
-    /// left on, as is the first PKT_DROP that could not be sent.
+    /// [`Live::drain`]. Before the wait, the data written and not yet
+    /// kicked is handed over ([`Live::kick`]): Linux's TX path kicks what it
+    /// pushed before a flush can run (`rtw89_core_txq_schedule`), and Stela
+    /// splits the write and the kick within one service pass (M4 spec
+    /// S9.1). Refused before any I/O on a chip off ([`POWERED_OFF`]) and
+    /// while a scan has not been ended ([`SCAN_NOT_ENDED`]); a failed
+    /// register read or kick is returned, the chip left on, as is the first
+    /// PKT_DROP that could not be sent.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     pub unsafe fn flush(&mut self, drop: bool) -> Result<(), AxError> {
         self.idle()?;
+        // SAFETY: the caller's contract is `kick`'s, word for word.
+        unsafe { self.kick() }?;
         self.rings.flush_tx(&mut self.io)?;
         if !drop {
             return match poll32(
@@ -1497,7 +1503,10 @@ impl<I: AxIo> Live<I> {
         }
         let (ch, head) = txd::management(bytes, self.chan.band, basic)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
-        unsafe { self.submit(ch, &head, bytes) }
+        let queued = unsafe { self.submit(ch, &head, bytes) }?;
+        // SAFETY: as above, `kick_channel`'s.
+        unsafe { self.kick_channel(ch) }?;
+        Ok(queued)
     }
 
     /// Queue a data frame, as [`Live::queue_management`] queues a
@@ -1557,17 +1566,11 @@ impl<I: AxIo> Live<I> {
     ) -> Result<Option<Token>, AxError> {
         // SAFETY: the caller's contract; `start` installed the pools for
         // these rings' own requester.
-        let queued = unsafe {
-            self.rings
-                .txq(&mut self.pools, ch)
-                .submit(&mut self.io, head, bytes)
-        }?;
+        let queued = unsafe { self.rings.txq(&mut self.pools, ch).submit(head, bytes) }?;
         match queued {
             Some(page) => {
                 bump(&mut self.tx.sent);
-                // Txq::submit writes the ring index for each frame it takes.
                 bump(&mut self.counts.submitted[ch.slot()]);
-                bump(&mut self.counts.kicks[ch.slot()]);
                 Ok(Some(token(ch, page)))
             }
             None => {
@@ -1575,6 +1578,44 @@ impl<I: AxIo> Live<I> {
                 Ok(None)
             }
         }
+    }
+
+    /// `rtw89_core_tx_kick_off` (`core.c:1337-1344`) of every data and
+    /// management channel a frame was written to since its last kick
+    /// ([`super::pci::Txq::kick`]), in ring order, each kick counted
+    /// ([`Live::tx_counts`]): the end of the radio's service pass, as
+    /// `rtw89_core_txq_schedule` kicks each TID's channel once after pushing
+    /// its frames (`core.c:4854-4858`, M4 spec S9.1). A channel with nothing
+    /// new is not written. Every channel is tried; the first failed write is
+    /// returned, its frames still pending for the next kick. Refused with
+    /// [`POWERED_OFF`] on a chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn kick(&mut self) -> Result<(), AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        let mut first = Ok(());
+        for ch in TX_CHANNELS {
+            // SAFETY: the caller's contract is `kick_channel`'s.
+            keep(&mut first, unsafe { self.kick_channel(ch) });
+        }
+        first
+    }
+
+    /// One channel's kick, counted when it wrote.
+    ///
+    /// # Safety
+    /// [`start`]'s contract: [`super::pci::Txq::kick`]'s for the live
+    /// chip's own window, rings and pools.
+    unsafe fn kick_channel(&mut self, ch: TxChannel) -> Result<(), AxError> {
+        // SAFETY: the caller's contract.
+        let kicked = unsafe { self.rings.txq(&mut self.pools, ch).kick(&mut self.io) }?;
+        if kicked {
+            bump(&mut self.counts.kicks[ch.slot()]);
+        }
+        Ok(())
     }
 
     /// The radio's poll (M3 spec S1.4), `rtw89_pci_napi_poll`'s order: RPQ,
@@ -2002,6 +2043,12 @@ impl<I: AxIo> Chip for Live<I> {
     fn remove_key(&mut self, cam: u8) -> Result<(), String> {
         // SAFETY: `start`'s contract holds for the live chip's every use.
         unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::kick`].
+    fn kick(&mut self) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::kick(self) }.map_err(|e| e.to_string())
     }
 
     /// [`Live::flush`].

@@ -341,6 +341,9 @@ pub struct Rings {
     data_ready: Cell<bool>,
     /// `bd_ring->wp` of each [`TxChannel`]: the next entry the host fills.
     data_host: [Cell<u16>; DATA_CHANNELS],
+    /// The host index each [`TxChannel`]'s last kick wrote: entries from it up
+    /// to `data_host` are written and not yet handed over.
+    data_kicked: [Cell<u16>; DATA_CHANNELS],
     /// `bd_ring->rp` of each [`TxChannel`]: the hardware index last read.
     /// Entries from it up to the host index are the device's.
     data_hw: [Cell<u16>; DATA_CHANNELS],
@@ -412,6 +415,7 @@ impl Rings {
             ch12_ready: Cell::new(false),
             data_ready: Cell::new(false),
             data_host: Default::default(),
+            data_kicked: Default::default(),
             data_hw: Default::default(),
             rx_host: Default::default(),
             rxq_full: Cell::new(0),
@@ -863,9 +867,15 @@ fn restart_host_indices(rings: &Rings) {
     // Every TX `bd_ring->wp` and `rp` restarts at 0 (`pci.c:1804-1805`). A
     // WD page still in flight stays out of its pool: no BD names it now, so
     // it is never handed out again.
-    for (host, hw) in rings.data_host.iter().zip(&rings.data_hw) {
+    for ((host, hw), kicked) in rings
+        .data_host
+        .iter()
+        .zip(&rings.data_hw)
+        .zip(&rings.data_kicked)
+    {
         host.set(0);
         hw.set(0);
+        kicked.set(0);
     }
     // RX `bd_ring->wp` restarts at 0, unwritten (`rx_ring_eq_is_full`
     // false), as `clr_idx_all` restarted the hardware's.
@@ -1263,33 +1273,61 @@ impl Txq<'_> {
         Ok(())
     }
 
-    /// Queue one frame as `rtw89_pci_txbd_submit` / `rtw89_pci_txwd_submit`
-    /// (`pci.c:1494-1636`) and `__rtw89_pci_tx_kick_off` (`pci.c:1332`) do:
-    /// take the lowest free page, zero it, write `head` (the WD body and
-    /// info), wp_info (`seq0 = page | VALID`, `seq1..3 = 0`) and one
+    /// Whether entries were written since the last [`Txq::kick`]: the host
+    /// index moved past what the device was last told.
+    pub fn pending_kick(&self) -> bool {
+        let slot = self.ch.slot();
+        self.rings.data_host[slot].get() != self.rings.data_kicked[slot].get()
+    }
+
+    /// `__rtw89_pci_tx_kick_off` (`pci.c:1332-1345`): after a fence, write
+    /// the host index (W16 `IDX`), handing over every entry [`Txq::submit`]
+    /// wrote since the last kick. Nothing is written when none was (`Ok(false)`;
+    /// Linux kicks a channel only after pushing frames to it,
+    /// `rtw89_core_txq_schedule`, `core.c:4854-4858`). A failed write keeps
+    /// the entries pending, and the next kick writes the same index again:
+    /// the device may have seen it, so their pages return only by their
+    /// TXBDs and reports, like any other.
+    ///
+    /// # Safety
+    /// [`Txq::submit`]'s contract.
+    pub unsafe fn kick<I: AxIo + ?Sized>(&mut self, io: &mut I) -> Result<bool, AxError> {
+        if !self.pending_kick() {
+            return Ok(false);
+        }
+        let slot = self.ch.slot();
+        let host = self.rings.data_host[slot].get();
+        // Every TXBD and page write is visible before the index that names
+        // them.
+        fence(Ordering::Release);
+        io.write16(TX_TABLE[self.ch.ring()].idx, host)?;
+        self.rings.data_kicked[slot].set(host);
+        Ok(true)
+    }
+
+    /// Write one frame as `rtw89_pci_tx_write` (`pci.c:1637-1678`) with
+    /// `rtw89_pci_txbd_submit` / `rtw89_pci_txwd_submit` (`pci.c:1494-1636`)
+    /// does: take the lowest free page, zero it, write `head` (the WD body
+    /// and info), wp_info (`seq0 = page | VALID`, `seq1..3 = 0`) and one
     /// addr_info v1 (`LEN | LS`, the slot's address below 4 GiB) into it and
     /// `payload` into its slot, and make both visible; then write the TXBD
-    /// (length 70, the page's address) and make it visible; then, after a
-    /// fence, write the new host index (W16 `IDX`). Returns the page's seq.
+    /// (length 70, the page's address), make it visible, and advance the
+    /// host index (`rtw89_pci_tx_bd_ring_update`). Nothing is written to the
+    /// device: [`Txq::kick`] hands the frames over. Returns the page's seq.
     ///
     /// A full queue ([`Txq::free`] 0) returns `Ok(None)` without touching
     /// the device. A frame that is empty or longer than [`MAX_TX_FRAME`] is
     /// refused, as is a head without WD_INFO_EN (b22 of body dword 0; see
     /// [`WD_HEAD_BYTES`]) and any frame before `pre_init` or after `deinit`.
-    ///
-    /// A failure before the kick hands nothing over: the page stays free
-    /// and the host index unmoved. A failed kick write keeps the page in
-    /// flight and the host index advanced, as the device may have seen it
-    /// (and a later kick hands it over anyway), so the page returns only by
-    /// its TXBD and its report like any other.
+    /// A failure before the host index advances hands nothing over: the
+    /// page stays free and the host index unmoved.
     ///
     /// # Safety
     /// [`Ch12::submit`]'s contract, for this queue, and `pools` were
     /// installed under [`TxPools::install`]'s contract for the same
     /// requester.
-    pub unsafe fn submit<I: AxIo + ?Sized>(
+    pub unsafe fn submit(
         &mut self,
-        io: &mut I,
         head: &[u8; WD_HEAD_BYTES],
         payload: &[u8],
     ) -> Result<Option<u8>, AxError> {
@@ -1361,8 +1399,6 @@ impl Txq<'_> {
         // rtw89_pci_tx_bd_ring_update: advance and wrap the host index.
         let host = ((entry + 1) % TX_ENTRIES) as u16;
         rings.data_host[slot].set(host);
-        fence(Ordering::Release);
-        io.write16(TX_TABLE[ch.ring()].idx, host)?;
         Ok(Some(page as u8))
     }
 }

@@ -1011,6 +1011,7 @@ fn head(fill: u8) -> [u8; WD_HEAD_BYTES] {
     head
 }
 
+/// [`submit`], then the kick: M3's submit, which kicked each frame.
 fn transmit(
     rings: &mut Rings,
     pools: &mut TxPools,
@@ -1019,9 +1020,34 @@ fn transmit(
     head: &[u8; WD_HEAD_BYTES],
     payload: &[u8],
 ) -> Result<Option<u8>, AxError> {
+    let page = submit(rings, pools, io, ch, head, payload)?;
+    kick(rings, pools, io, ch)?;
+    Ok(page)
+}
+
+fn submit(
+    rings: &mut Rings,
+    pools: &mut TxPools,
+    io: &mut RegisterModel,
+    ch: TxChannel,
+    head: &[u8; WD_HEAD_BYTES],
+    payload: &[u8],
+) -> Result<Option<u8>, AxError> {
+    // The submit writes no register: `io` is the window the kick will use.
+    let _ = io;
     // SAFETY: every test submits on the same `RegisterModel` that `start`
     // programmed with these rings, under the same model-only contract.
-    unsafe { rings.txq(pools, ch).submit(io, head, payload) }
+    unsafe { rings.txq(pools, ch).submit(head, payload) }
+}
+
+fn kick(
+    rings: &mut Rings,
+    pools: &mut TxPools,
+    io: &mut RegisterModel,
+    ch: TxChannel,
+) -> Result<bool, AxError> {
+    // SAFETY: as `submit`.
+    unsafe { rings.txq(pools, ch).kick(io) }
 }
 
 fn reclaim(
@@ -1120,12 +1146,12 @@ fn pools_take_one_to_device_allocation_of_43_pages() {
 }
 
 #[test]
-fn submit_writes_wd_tail_bd_and_kicks() {
+fn submit_writes_wd_tail_bd() {
     let (m, mut rings, mut pools, mut io) = running_with_pools();
     let payload: Vec<u8> = (0..30).map(|i| 0xA0 ^ i as u8).collect();
     let (before, cpu_before) = syncs(&m);
     assert_eq!(
-        transmit(
+        submit(
             &mut rings,
             &mut pools,
             &mut io,
@@ -1135,7 +1161,9 @@ fn submit_writes_wd_tail_bd_and_kicks() {
         ),
         Ok(Some(0))
     );
-    assert_eq!(io.trace, [Op::W16(0x1058, 1)]);
+    // Written, not kicked: no register access (`rtw89_pci_tx_write`).
+    assert!(io.trace.is_empty());
+    assert!(rings.txq(&mut pools, TxChannel::Ach0).pending_kick());
     let (wd, bd, slot) = {
         let state = m.lock().unwrap();
         (
@@ -1160,6 +1188,12 @@ fn submit_writes_wd_tail_bd_and_kicks() {
     // WD page and payload slot, then the TXBD, made visible before the kick.
     assert_eq!(syncs(&m), (before + 3, cpu_before));
     assert!(page(&pools, TxChannel::Ach0, 0).in_flight);
+    // The kick writes the host index.
+    assert_eq!(
+        kick(&mut rings, &mut pools, &mut io, TxChannel::Ach0),
+        Ok(true)
+    );
+    assert_eq!(io.trace, [Op::W16(0x1058, 1)]);
     // The device may now read the pool: it is never unmapped.
     drop(pools);
     assert_eq!(m.lock().unwrap().mappings.len(), MAPPINGS + 1);
@@ -1915,4 +1949,66 @@ fn pre_init_and_deinit_restart_rpq_at_entry_0() {
     io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 1 << 16));
     assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(1));
     assert_eq!(io.writes(), [Op::W16(0x121C, 1)]);
+}
+
+#[test]
+fn kick_writes_the_index_once() {
+    // `rtw89_pci_tx_write` advances `bd_ring->wp` per frame and
+    // `__rtw89_pci_tx_kick_off` writes it once (pci.c:1332-1345,
+    // :1637-1678).
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    assert!(!rings.txq(&mut pools, ch).pending_kick());
+    for seq in 0..3u8 {
+        assert_eq!(
+            submit(&mut rings, &mut pools, &mut io, ch, &head(seq), &[seq; 4]),
+            Ok(Some(seq))
+        );
+    }
+    assert!(io.trace.is_empty());
+    assert!(rings.txq(&mut pools, ch).pending_kick());
+    assert_eq!(kick(&mut rings, &mut pools, &mut io, ch), Ok(true));
+    assert_eq!(io.trace, [Op::W16(0x1058, 3)]);
+    // Nothing moved since: no write.
+    assert!(!rings.txq(&mut pools, ch).pending_kick());
+    assert_eq!(kick(&mut rings, &mut pools, &mut io, ch), Ok(false));
+    assert_eq!(io.trace, [Op::W16(0x1058, 3)]);
+    // Another channel's kick writes only its own index.
+    assert_eq!(
+        kick(&mut rings, &mut pools, &mut io, TxChannel::Ach1),
+        Ok(false)
+    );
+    submit(&mut rings, &mut pools, &mut io, ch, &head(3), &[3]).unwrap();
+    assert_eq!(kick(&mut rings, &mut pools, &mut io, ch), Ok(true));
+    assert_eq!(io.trace, [Op::W16(0x1058, 3), Op::W16(0x1058, 4)]);
+}
+
+#[test]
+fn a_failed_kick_is_written_again_by_the_next() {
+    // The host index advanced and the device may have seen the write, so
+    // the pages stay in flight; the next kick writes the same index again.
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach2;
+    submit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    io.fail_writes_of(0x1060);
+    assert!(kick(&mut rings, &mut pools, &mut io, ch).is_err());
+    assert!(page(&pools, ch, 0).in_flight);
+    assert!(rings.txq(&mut pools, ch).pending_kick());
+    io.allow_writes_of(0x1060);
+    io.trace.clear();
+    assert_eq!(kick(&mut rings, &mut pools, &mut io, ch), Ok(true));
+    assert_eq!(io.trace, [Op::W16(0x1060, 1)]);
+}
+
+#[test]
+fn pre_init_restarts_the_kick_with_the_ring() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    submit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    start(&mut io, 2, &rings).unwrap();
+    // The ring and its last kick both restart at entry 0.
+    assert!(!rings.txq(&mut pools, ch).pending_kick());
+    io.trace.clear();
+    assert_eq!(kick(&mut rings, &mut pools, &mut io, ch), Ok(false));
+    assert!(io.trace.is_empty());
 }

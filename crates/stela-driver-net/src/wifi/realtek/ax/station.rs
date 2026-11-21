@@ -998,7 +998,9 @@ impl<C: Chip> Rtl8852c<C> {
     }
 
     /// rtw88's `send_data` (`station.rs:943`): `held`, oldest first, while
-    /// the chip has room. Each EAPOL frame's token is kept for its report.
+    /// the chip has room, each written to the chip and left for the service
+    /// pass's kick (M4 spec S9.1). Each EAPOL frame's token is kept for its
+    /// report.
     fn send_data(&mut self) -> Result<(), Error> {
         while let Some(held) = self.held.front() {
             let frame = Data {
@@ -1061,8 +1063,9 @@ impl<C: Chip> Rtl8852c<C> {
     /// rtw88's `send` (`station.rs:1121`, spec S13.1) without A-MSDU or TX
     /// Block Ack: the MSDU as the station prepares it under the keys held,
     /// a `HostIv` frame's CCMP header checked against its reservation and
-    /// removed (spec S5.4), held, then sent while the chip has room, as
-    /// mac80211 hands a frame to the driver at once. A frame the strip
+    /// removed (spec S5.4), held, then written to the chip while it has
+    /// room, as mac80211 hands a frame to the driver at once; the service
+    /// pass's kick sends it. A frame the strip
     /// refuses is dropped, its PN spent.
     fn send(&mut self, ethernet: &[u8], class: TxClass) -> Result<(), Error> {
         let epoch = self
@@ -1967,6 +1970,14 @@ impl<C: Chip> Rtl8852c<C> {
         let sent = self.send_data();
         if first.is_ok() {
             first = sent;
+        }
+        // The pass's kick hands over every data frame queued since the last
+        // (`rtw89_core_txq_schedule`'s `rtw89_core_tx_kick_off`, M4 spec
+        // S9.1): the network's frames and the station's own, written to the
+        // chip as they came.
+        let kicked = Self::chip(self.chip.kick());
+        if first.is_ok() {
+            first = kicked;
         }
         first
     }

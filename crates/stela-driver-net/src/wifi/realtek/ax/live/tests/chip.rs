@@ -37,6 +37,14 @@ fn channel(band: HwBand, number: u8) -> Channel {
     }
 }
 
+/// [`Chip::transmit_data`], then the pass's [`Chip::kick`], as the radio hands
+/// a data frame over (M4 spec S9.1).
+fn send(live: &mut Live<RegisterModel>, frame: &Data<'_>) -> Result<Option<Token>, String> {
+    let sent = Chip::transmit_data(live, frame);
+    Chip::kick(live).unwrap();
+    sent
+}
+
 /// Every event one [`Chip::poll`] hands on.
 fn poll(live: &mut Live<RegisterModel>) -> Vec<Incoming> {
     let mut seen = Vec::new();
@@ -208,6 +216,9 @@ fn transmit_data_maps_tid_to_its_channel() {
         let before = live.io().trace.len();
         let sent = Chip::transmit_data(&mut live, &data(&frame, tid));
         assert_eq!(sent, Ok(Some(token(ch, 0))));
+        // Written, then kicked by the pass's Chip::kick (M4 spec S9.1).
+        assert_eq!(tx_kicks(&live.io().trace[before..], idx), 0);
+        Chip::kick(&mut live).unwrap();
         assert_eq!(tx_kicks(&live.io().trace[before..], idx), 1);
     }
     // EAPOL goes with BK on the queue of its TID, the unassociated peer
@@ -221,6 +232,7 @@ fn transmit_data_maps_tid_to_its_channel() {
         Chip::transmit_data(&mut live, &frame),
         Ok(Some(token(TxChannel::Ach3, 1)))
     );
+    Chip::kick(&mut live).unwrap();
     poll(&mut live);
     let sent = air.sent();
     let chs: Vec<TxChannel> = sent.iter().map(|s| s.ch).collect();
@@ -355,7 +367,7 @@ fn associate_takes_the_negotiated_ht() {
     // Data now carries the peer's STBC.
     let frame = data_frame(1, 1);
     let air = Air::install(live.io_mut(), &m);
-    Chip::transmit_data(&mut live, &data(&frame, 0)).unwrap();
+    send(&mut live, &data(&frame, 0)).unwrap();
     poll(&mut live);
     let info0 = u32::from_le_bytes(air.sent()[0].head[32..36].try_into().unwrap());
     assert_eq!(info0 & (1 << 12 | 1 << 11), 1 << 12);
@@ -827,15 +839,12 @@ fn silent_rpq_stalls_tx_without_loss() {
     let frames: Vec<Vec<u8>> = (0..30).map(|n| data_frame(n, n as u8)).collect();
     let mut tokens = Vec::new();
     for frame in &frames[..15] {
-        let sent = Chip::transmit_data(&mut live, &data(frame, 0)).unwrap();
+        let sent = send(&mut live, &data(frame, 0)).unwrap();
         tokens.push(sent.expect("room for the first 15"));
     }
     // The 16th finds the ring full: no room, and nothing touched.
     let before = live.io().trace.len();
-    assert_eq!(
-        Chip::transmit_data(&mut live, &data(&frames[15], 0)),
-        Ok(None)
-    );
+    assert_eq!(send(&mut live, &data(&frames[15], 0)), Ok(None));
     assert_eq!(live.io().trace.len(), before);
     // While RPQ is silent the device sends, but no page comes back.
     for _ in 0..3 {
@@ -854,7 +863,7 @@ fn silent_rpq_stalls_tx_without_loss() {
         .collect();
     assert_eq!(reported, want);
     for frame in &frames[15..] {
-        let sent = Chip::transmit_data(&mut live, &data(frame, 0)).unwrap();
+        let sent = send(&mut live, &data(frame, 0)).unwrap();
         assert!(sent.is_some());
     }
     assert_eq!(poll(&mut live).len(), 15);
@@ -870,7 +879,7 @@ fn silent_rpq_runs_the_pages_out_without_reusing_one() {
     let mut tokens = Vec::new();
     for n in 0..40u16 {
         let frame = qos_frame(n, 5, n as u8);
-        if let Some(token) = Chip::transmit_data(&mut live, &data(&frame, 5)).unwrap() {
+        if let Some(token) = send(&mut live, &data(&frame, 5)).unwrap() {
             tokens.push(token);
         }
         assert!(poll(&mut live).is_empty());
@@ -890,11 +899,7 @@ fn silent_rpq_runs_the_pages_out_without_reusing_one() {
     air.ack_all();
     assert_eq!(poll(&mut live).len(), 16);
     let frame = qos_frame(40, 5, 40);
-    assert!(
-        Chip::transmit_data(&mut live, &data(&frame, 5))
-            .unwrap()
-            .is_some()
-    );
+    assert!(send(&mut live, &data(&frame, 5)).unwrap().is_some());
     assert_eq!(air.sent().len(), 16);
 }
 
@@ -981,10 +986,7 @@ fn keyed_data_goes_under_its_cam_entry_and_pn() {
         key: Some((0, 0, 0x0605_0403_0201)),
         ..data(&frame, 0)
     };
-    assert_eq!(
-        Chip::transmit_data(&mut live, &keyed),
-        Ok(Some(token(TxChannel::Ach0, 0)))
-    );
+    assert_eq!(send(&mut live, &keyed), Ok(Some(token(TxChannel::Ach0, 0))));
     poll(&mut live);
     let sent = air.sent();
     let caps = RateCaps {
@@ -1336,8 +1338,8 @@ fn a_failed_leave_powers_off_without_a_bssid() {
 }
 
 /// M4 spec S3.2: frames submitted, kicks and releases per channel, and the
-/// releases not `RTW89_TX_DONE`. M3's submit still kicks each frame (Task 5
-/// batches them).
+/// releases not `RTW89_TX_DONE`. Data is kicked once per pass, management
+/// at once (M4 spec S9.1).
 #[test]
 fn tx_counts_follow_submit_kick_release() {
     let (mut live, _m, mut air) = on_air(&|_| {});
@@ -1352,7 +1354,12 @@ fn tx_counts_follow_submit_kick_release() {
     }
     let counts = live.tx_counts();
     assert_eq!(counts.submitted, [2, 0, 0, 0, 0]);
-    assert_eq!(counts.kicks, [2, 0, 0, 0, 0]);
+    assert_eq!(counts.kicks, [0; 5]);
+    Chip::kick(&mut live).unwrap();
+    // A second kick finds nothing new: no write, no count.
+    Chip::kick(&mut live).unwrap();
+    let counts = live.tx_counts();
+    assert_eq!(counts.kicks, [1, 0, 0, 0, 0]);
     assert_eq!(counts.released, [0; 5]);
     // Two DONE releases on ACH0.
     assert_eq!(poll(&mut live).len(), 2);
@@ -1370,7 +1377,7 @@ fn tx_counts_follow_submit_kick_release() {
     assert_eq!(poll(&mut live).len(), 1);
     let counts = live.tx_counts();
     assert_eq!(counts.submitted, [2, 0, 0, 0, 1]);
-    assert_eq!(counts.kicks, [2, 0, 0, 0, 1]);
+    assert_eq!(counts.kicks, [1, 0, 0, 0, 1]);
     assert_eq!(counts.released, [2, 0, 0, 0, 1]);
     assert_eq!(counts.failed, 1);
     assert_eq!(counts.rpq_full, 0);
@@ -1445,4 +1452,77 @@ fn a_station_frame_carries_its_rate_and_ampdu_bit() {
         })
     );
     assert!(heard.ampdu);
+}
+
+/// `rtw89_core_txq_schedule` pushes a TID's frames, then kicks its channel
+/// once (`core.c:4854-4858`): five data frames on BE and VO, then one kick
+/// each, every frame on the air once, in order.
+#[test]
+fn kick_once_per_pass_covers_every_submitted_frame() {
+    let (mut live, _m, air) = on_air(&|_| {});
+    let frames: Vec<(Vec<u8>, u8)> = [0u8, 0, 6, 0, 6]
+        .iter()
+        .enumerate()
+        .map(|(n, &tid)| (qos_frame(n as u16, tid, n as u8), tid))
+        .collect();
+    let before = live.io().trace.len();
+    for (frame, tid) in &frames {
+        assert!(
+            Chip::transmit_data(&mut live, &data(frame, *tid))
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert_eq!(tx_kicks(&live.io().trace[before..], 0x1058), 0);
+    assert_eq!(tx_kicks(&live.io().trace[before..], 0x1064), 0);
+    Chip::kick(&mut live).unwrap();
+    let t = &live.io().trace[before..];
+    assert_eq!(tx_kicks(t, 0x1058), 1);
+    assert_eq!(tx_kicks(t, 0x1064), 1);
+    assert!(t.contains(&Op::W16(0x1058, 3)) && t.contains(&Op::W16(0x1064, 2)));
+    for idx in [0x105C, 0x1060, 0x1078] {
+        assert_eq!(tx_kicks(t, idx), 0, "{idx:#x}");
+    }
+    assert_eq!(poll(&mut live).len(), 5);
+    let mut sent: Vec<Vec<u8>> = air.sent().into_iter().map(|s| s.bytes).collect();
+    let mut want: Vec<Vec<u8>> = frames.into_iter().map(|(f, _)| f).collect();
+    sent.sort();
+    want.sort();
+    assert_eq!(sent, want);
+}
+
+/// `rtw89_ops_tx` kicks a management frame at once (`mac80211.c:40-46`),
+/// without handing over data waiting for its pass's kick.
+#[test]
+fn management_kicks_at_once() {
+    let (mut live, _m, _air) = on_air(&|_| {});
+    let queued = qos_frame(0, 0, 1);
+    Chip::transmit_data(&mut live, &data(&queued, 0)).unwrap();
+    let frame = auth(1);
+    let before = live.io().trace.len();
+    let sent = Chip::transmit_management(
+        &mut live,
+        &Management {
+            bytes: &frame,
+            basic_rates: 0,
+        },
+    );
+    assert!(matches!(sent, Ok(Some(_))));
+    let t = &live.io().trace[before..];
+    assert_eq!(t.last(), Some(&Op::W16(0x1078, 1)));
+    assert_eq!(tx_kicks(t, 0x1058), 0);
+}
+
+/// A flush first hands over what the pass submitted and has not kicked yet,
+/// as Linux's TX path kicks what it pushed before a flush can run.
+#[test]
+fn a_flush_kicks_what_was_submitted_first() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    live.io_mut().set32(0x8430, 0x07FF_079F);
+    Chip::transmit_data(&mut live, &data(&qos_frame(1, 0, 1), 0)).unwrap();
+    let before = live.io().trace.len();
+    Chip::flush(&mut live, false).unwrap();
+    let t = &live.io().trace[before..];
+    assert_eq!(t.first(), Some(&Op::W16(0x1058, 1)));
+    assert_eq!(tx_kicks(t, 0x1058), 1);
 }
