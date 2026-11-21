@@ -833,6 +833,17 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
         self.ptp.is_some()
     }
 
+    /// Set a precision touchpad's frames mode ([`ptp::Ptp::set_frames`]);
+    /// whether the device is one.
+    pub fn set_touch_frames(&mut self, on: bool) -> bool {
+        self.ptp.as_mut().map(|ptp| ptp.set_frames(on)).is_some()
+    }
+
+    /// The surface a precision touchpad's frames span.
+    pub fn touch_surface(&self) -> Option<super::multitouch::Surface> {
+        self.ptp.as_ref().map(ptp::Ptp::surface)
+    }
+
     pub fn device(&self) -> &Device<B, I, T> {
         &self.device
     }

@@ -843,6 +843,10 @@ crates/stela-drivers/src/input/: Native input timer admission
 crates/stela-drivers/src/input/: Standard HID-over-I2C
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     drivers/hid/hid-ids.h, drivers/hid/i2c-hid/i2c-hid-core.c
+crates/stela-drivers/src/input/: Precision touchpad whole frames, their palms
+  and scan-time clock
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/hid/hid-multitouch.c
 crates/stela-drivers/src/input/: RMI4 transport and F01 control substrate
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     drivers/input/rmi4/rmi_bus.h, drivers/input/rmi4/rmi_driver.c,

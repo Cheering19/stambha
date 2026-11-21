@@ -13,9 +13,13 @@
 //! A frame is one report, or a first report whose contact count says how
 //! many contacts follow and continuation reports with a count of 0, as
 //! `mt_touch_report` assembles hybrid frames. The pad lists every contact
-//! of a frame, so a contact left out of a frame is lifted.
+//! of a frame, so a contact left out of a frame is lifted. In frames mode
+//! ([`Ptp::set_frames`]) each frame goes out whole instead
+//! ([`super::ptp_frames`]).
 use super::{
     Input,
+    multitouch::Surface,
+    ptp_frames,
     touchpad::{Axis, Geometry, Touch, Translator},
 };
 use crate::usb::hid::{
@@ -31,6 +35,7 @@ const FINGER: u32 = 0x000d_0022;
 const INPUT_MODE: u32 = 0x000d_0052;
 const SURFACE_SWITCH: u32 = 0x000d_0057;
 const BUTTON_SWITCH: u32 = 0x000d_0058;
+const SCAN_TIME: u32 = 0x000d_0056;
 const X: u32 = 0x0001_0030;
 const Y: u32 = 0x0001_0031;
 const BUTTON_1: u32 = 0x0009_0001;
@@ -118,6 +123,8 @@ pub struct Profile {
     application: usize,
     geometry: Geometry,
     modes: Vec<Mode>,
+    /// The fields' ranges and size as frames mode reads them.
+    scale: ptp_frames::Scale,
 }
 
 impl Profile {
@@ -142,6 +149,13 @@ impl Profile {
                 })
         };
         let (x, y) = (field(X)?, field(Y)?);
+        let scan = descriptor
+            .reports
+            .iter()
+            .filter(|report| report.kind == ReportType::Input)
+            .flat_map(|report| report.fields.iter())
+            .find(|field| field.usages.contains(&SCAN_TIME) && is(field.collection, TOUCH_PAD));
+        let scale = ptp_frames::Scale::of(x, y, scan);
         let application = application(descriptor, x.collection)?;
         let (x_range, x_axis) = axis(x);
         let (y_range, y_axis) = axis(y);
@@ -193,6 +207,7 @@ impl Profile {
             application,
             geometry: Geometry::new((x_range, y_range), x_axis, y_axis),
             modes,
+            scale,
         })
     }
 
@@ -220,6 +235,11 @@ impl Profile {
     pub fn geometry(&self) -> Geometry {
         self.geometry
     }
+
+    /// The surface the pad states, to the micrometre.
+    pub fn surface(&self) -> Option<Surface> {
+        self.scale.stated()
+    }
 }
 
 /// A precision touchpad in touchpad mode.
@@ -229,6 +249,8 @@ pub struct Ptp {
     /// The contacts the frame being assembled expects, and those it has.
     expected: usize,
     received: Vec<Contact>,
+    /// In frames mode, the pad's scan clock.
+    frames: Option<ptp_frames::Clock>,
 }
 
 impl Ptp {
@@ -238,7 +260,19 @@ impl Ptp {
             profile,
             expected: 0,
             received: Vec::new(),
+            frames: None,
         }
+    }
+
+    /// Frames mode: each frame goes out whole as [`Input::Touch`], in
+    /// place of the translator's motion, scrolling and taps, never both.
+    pub fn set_frames(&mut self, on: bool) {
+        self.frames = on.then(ptp_frames::Clock::default);
+    }
+
+    /// The surface the frames' positions span.
+    pub fn surface(&self) -> Surface {
+        self.profile.scale.surface()
     }
 
     /// One input report: `frame` as decoded, and the descriptor events the
@@ -293,6 +327,15 @@ impl Ptp {
         }
         // A complete frame, or a count of 0 with no frame pending: a
         // report of buttons alone, with no finger on the pad.
+        if let Some(clock) = &mut self.frames {
+            let scale = &self.profile.scale;
+            let time_us = clock.time_us(packet.scan_time, scale.scan_max(), now_us);
+            let frame = ptp_frames::frame(&self.received, buttons, time_us, scale);
+            inputs.push(Input::Touch(frame));
+            self.received.clear();
+            self.expected = 0;
+            return;
+        }
         let mut fingers: Vec<_> = self
             .received
             .drain(..)
@@ -315,4 +358,4 @@ impl Ptp {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

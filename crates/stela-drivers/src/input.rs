@@ -13,6 +13,7 @@ pub mod multitouch;
 pub mod observation;
 pub mod ps2;
 pub mod ptp;
+pub mod ptp_frames;
 pub mod rmi;
 pub mod sfh;
 pub mod touchpad;
