@@ -1195,3 +1195,111 @@ fn an_event_no_command_awaits_fails_an_undropped_identification_closed() {
     assert_eq!(trace.borrow().commands, 3);
     assert_eq!(hci.state(), State::Closed);
 }
+/// An LE Advertising Report event (Core v5.4 Vol 4 Part E 7.7.65.2) of
+/// `reports`, each (address type, address, data length, RSSI).
+fn advertising(reports: &[(u8, [u8; 6], usize, i8)]) -> Vec<u8> {
+    let mut b = vec![0x3e, 0, 0x02, reports.len() as u8];
+    for &(kind, address, length, rssi) in reports {
+        b.extend_from_slice(&[0, kind]);
+        b.extend_from_slice(&address);
+        b.push(length as u8);
+        b.extend(core::iter::repeat_n(0x11, length));
+        b.push(rssi as u8);
+    }
+    b[1] = (b.len() - 2) as u8;
+    b
+}
+/// The scan's commands after an initialized fixture's, in order, with the
+/// scan-enable completion followed by `heard`.
+fn scan_steps(hci: &mut Hci<Model>, heard: &[Vec<u8>]) {
+    let mut add = |op: u16, p: &[u8], tail: &[Vec<u8>]| {
+        let mut response = cc(op, &[0]);
+        response.extend(tail.concat());
+        hci.io.steps.push_back(Step {
+            parameters: command(op, p),
+            response,
+        });
+    };
+    add(0x0c03, &[], &[]);
+    add(0x0c01, &[0xff, 0xff, 0xfb, 0xff, 0x01, 0, 0, 0x20], &[]);
+    add(0x2001, &[0x02, 0, 0, 0, 0, 0, 0, 0], &[]);
+    add(0x200b, &[0, 0x60, 0, 0x30, 0, 0, 0], &[]);
+    add(0x200c, &[1, 0], heard);
+    add(0x200c, &[0, 0], &[]);
+    add(0x0c03, &[], &[]);
+}
+const A: [u8; 6] = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6];
+const B: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+const C: [u8; 6] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+#[test]
+fn a_passive_le_scan_counts_advertisers_and_their_best_rssi_then_resets_and_closes() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    let commands = trace.borrow().commands;
+    let heard = [
+        advertising(&[(0, A, 3, -60), (1, B, 0, -45)]),
+        // A again, louder; C without an RSSI (127); A as a random address
+        // is another advertiser.
+        advertising(&[(0, A, 31, -40), (0, C, 5, 127), (1, A, 1, -90)]),
+        // Too long for legacy advertising data: dropped, as Linux drops it.
+        advertising(&[(0, C, 32, -20)]),
+        // Another event, counted alone.
+        vec![0x13, 1, 0],
+    ];
+    scan_steps(&mut hci, &heard);
+    let report = scan(&mut hci, 1_000_000).unwrap();
+    assert!(hci.io.steps.is_empty(), "every command in order");
+    assert_eq!(trace.borrow().commands, commands + 7);
+    assert_eq!(report.reports, 5);
+    assert_eq!(report.devices, 4);
+    assert!(!report.saturated);
+    assert_eq!(report.best_rssi, Some(-40));
+    assert_eq!(report.malformed, 1);
+    assert_eq!(report.other_events, 1);
+    assert_eq!(report.window_us, 1_000_000);
+    assert_eq!(hci.state(), State::Closed);
+    assert_eq!(trace.borrow().closed, 1);
+}
+#[test]
+fn a_scan_needs_the_retained_realtek_initialization_and_sends_nothing_else() {
+    let (mut hci, _, trace) = fixture(Project::Rtl8852Cu, true);
+    assert!(matches!(
+        scan(&mut hci, 1_000_000),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(trace.borrow().commands, 0);
+    // A failed initialization keeps nothing to scan with either.
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    assert!(
+        hci.initialize_with_provider(&empty, PlatformInputs::default())
+            .is_err()
+    );
+    let commands = trace.borrow().commands;
+    assert!(matches!(
+        scan(&mut hci, 1_000_000),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(trace.borrow().commands, commands);
+}
+#[test]
+fn a_refused_scan_command_fails_the_scan_and_closes_the_transport() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    scan_steps(&mut hci, &[]);
+    // LE Set Scan Parameters answered Command Disallowed.
+    hci.io.steps[3].response = cc(0x200b, &[0x0c]);
+    let e = scan(&mut hci, 1_000_000).unwrap_err();
+    assert!(matches!(
+        e,
+        Error::Controller {
+            opcode: 0x200b,
+            status: 0x0c,
+            ..
+        }
+    ));
+    assert_eq!(hci.io.steps.len(), 3);
+    assert_eq!(hci.state(), State::Closed);
+    assert_eq!(trace.borrow().closed, 1);
+}

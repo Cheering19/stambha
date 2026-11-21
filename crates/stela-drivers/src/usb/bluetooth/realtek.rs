@@ -10,9 +10,11 @@ mod firmware;
 mod identity;
 mod initialize;
 pub mod media;
+mod scan;
 mod v2;
 pub use firmware::{Configuration, Fragment, Patch, Project, Staged};
 pub use identity::{Container, Identity, LocalVersion, UsbIdentity};
+pub use scan::{MAX_ADVERTISERS, ScanReport, scan};
 pub use v2::{ExtensionRecord, SectionObservation, SubsectionObservation, V2Metadata, V2Patch};
 
 /// Malformed or explicitly unsupported Realtek input. Parsing never emits a
@@ -120,6 +122,9 @@ pub struct OwnedReport {
     /// Validated v2 hierarchy/control observations, absent for a v1 container.
     pub v2: Option<V2Metadata>,
     pub download: Vec<DownloadResponse>,
+    /// The commands the controller's last completion let the host send,
+    /// which a later exchange ([`scan`]) starts from.
+    pub credits: u8,
 }
 #[derive(Debug)]
 pub enum Error {

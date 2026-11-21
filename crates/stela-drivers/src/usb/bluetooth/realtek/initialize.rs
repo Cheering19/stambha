@@ -41,14 +41,7 @@ pub(super) fn run<B: Io>(hci: &mut Hci<B>, provider: &dyn Provider) -> Result<Ow
     }
     hci.open()?;
     let deadline = hci.io.now_us().saturating_add(ATTEMPT_US);
-    let mut engine = Engine {
-        hci,
-        pending: VecDeque::new(),
-        deadline,
-        attempt: Attempt::default(),
-        credits: 1,
-        outside: None,
-    };
+    let mut engine = Engine::new(hci, deadline, 1);
     match engine.run(usb, provider) {
         Ok(r) => Ok(r),
         Err(cause) => {
@@ -68,8 +61,9 @@ pub(super) fn run<B: Io>(hci: &mut Hci<B>, provider: &dyn Provider) -> Result<Ow
         }
     }
 }
-struct Engine<'a, B: Io> {
-    hci: &'a mut Hci<B>,
+/// The HCI exchange of one initialization, or of a scan after it.
+pub(super) struct Engine<'a, B: Io> {
+    pub(super) hci: &'a mut Hci<B>,
     pending: VecDeque<Vec<u8>>,
     deadline: u64,
     attempt: Attempt,
@@ -78,6 +72,20 @@ struct Engine<'a, B: Io> {
     /// A command sent outside the command flow (0xfc66) whose completion
     /// or status has not come: one may still come, during any later wait.
     outside: Option<u16>,
+}
+impl<'a, B: Io> Engine<'a, B> {
+    /// An exchange over `hci` until `deadline`, which the controller will
+    /// take `credits` commands of now.
+    pub(super) fn new(hci: &'a mut Hci<B>, deadline: u64, credits: u8) -> Self {
+        Self {
+            hci,
+            pending: VecDeque::new(),
+            deadline,
+            attempt: Attempt::default(),
+            credits,
+            outside: None,
+        }
+    }
 }
 impl<B: Io> Engine<'_, B> {
     /// Whether `e` is the completion or status of the command sent outside
@@ -153,7 +161,7 @@ impl<B: Io> Engine<'_, B> {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    fn exchange(
+    pub(super) fn exchange(
         &mut self,
         opcode: u16,
         parameters: &[u8],
@@ -233,7 +241,11 @@ impl<B: Io> Engine<'_, B> {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    fn idle(&mut self, until: u64, other: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub(super) fn idle(
+        &mut self,
+        until: u64,
+        other: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let until = until.min(self.deadline);
         loop {
             self.receive()?;
@@ -479,6 +491,7 @@ impl<B: Io> Engine<'_, B> {
             container_version,
             v2: self.attempt.v2.take(),
             download: core::mem::take(&mut self.attempt.download),
+            credits: self.credits,
         })
     }
 }
