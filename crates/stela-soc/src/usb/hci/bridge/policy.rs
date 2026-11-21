@@ -10,8 +10,9 @@
 //!
 //! The list is milestone 1's, which lists nearby classic devices: the
 //! controller resets and takes the guest's configuration (event masks,
-//! inquiry mode, page timeout, names, class), and runs inquiries and remote
-//! name requests. It keeps local:
+//! inquiry mode, page timeout, names, class), runs inquiries and remote
+//! name requests, and gives its address, and its buffers and capabilities
+//! merged with the model's ([`Merge`]). It keeps local:
 //!
 //! - the identity the module gives (Read Local Version Information and the
 //!   Broadcom vendor commands), so bluetoothd stays on its BCM20702B0 path;
@@ -24,6 +25,7 @@
 //!   milestones list them.
 use super::{Cause, Completion};
 use alloc::vec::Vec;
+use stela_drivers::usb::bluetooth::MAX_ACL_PAYLOAD;
 
 const VENDOR_GROUP: u16 = 0x3f;
 const SUCCESS: u8 = 0x00;
@@ -38,6 +40,67 @@ pub enum Forward {
     /// A radio procedure, whose error is the radio's outcome: the
     /// controller's answer whatever its status.
     Procedure,
+    /// A capability: as [`Self::Strict`], its returns merged with the
+    /// model's.
+    Merge(Merge),
+}
+
+/// How a capability the guest reads merges the controller's answer with
+/// the model's, so bluetoothd stays on the path it was traced on with the
+/// module (Core 4.0, BCM20702B0): it is never shown more than the model
+/// claims, and never a forwarded command or a feature the controller
+/// lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merge {
+    /// Read Local Supported Commands: the model's bitmap, less each
+    /// forwarded command the controller lacks. A command the shadow answers
+    /// keeps its bit whatever the controller has.
+    Commands,
+    /// Read Local Supported Features: the model's features the controller
+    /// has too.
+    Features,
+    /// Read Local Extended Features, pages 0 and 1: likewise, under the
+    /// model's page number and maximum page, 1. Later pages are the
+    /// model's, empty, never asked of the controller: the module is a Core
+    /// 4.0 part, so BR/EDR Secure Connections stays hidden.
+    ExtendedFeatures,
+    /// Read Buffer Size: the controller's ACL buffers, no longer than the
+    /// transport carries, and no synchronous ones, as the function carries
+    /// no SCO data.
+    Buffers,
+    /// LE Read Local Supported Features: the controller's that
+    /// [`LE_FEATURES`] admits.
+    LeFeatures,
+}
+
+/// The LE features milestone 1 shows: none, as the module has none. Any
+/// feature bit bluetoothd reads as selecting LE Read Buffer Size v2 (0x2060)
+/// or Read Local Supported Features v2 (0x2087) would send it a command the
+/// model does not list.
+pub const LE_FEATURES: [u8; 8] = [0; 8];
+
+impl Merge {
+    /// The merged return parameters, of the model's length, which the
+    /// controller's has.
+    fn returns(self, shadow: &[u8], chip: &[u8]) -> Vec<u8> {
+        let both = |from: usize| shadow[from..].iter().zip(&chip[from..]).map(|(s, c)| s & c);
+        match self {
+            Self::Commands => shadow
+                .iter()
+                .zip(chip)
+                .zip(FORWARD_MASK)
+                .map(|((s, c), forwarded)| s & (!forwarded | c))
+                .collect(),
+            Self::Features => both(0).collect(),
+            Self::ExtendedFeatures => shadow[..2].iter().copied().chain(both(2)).collect(),
+            Self::Buffers => {
+                let acl = u16::from_le_bytes([chip[0], chip[1]]).min(MAX_ACL_PAYLOAD as u16);
+                let [low, high] = acl.to_le_bytes();
+                alloc::vec![low, high, 0, chip[3], chip[4], 0, 0]
+            }
+            Self::LeFeatures => chip.iter().zip(LE_FEATURES).map(|(c, a)| c & a).collect(),
+        }
+    }
 }
 
 /// The standard commands milestone 1 forwards (opcode, Supported Commands
@@ -87,11 +150,32 @@ pub const FORWARDED: &[(u16, u8, u8, Forward)] = &[
     (0x0c63, 22, 2, Forward::Strict), // Set Event Mask Page 2
     (0x0c6c, 24, 5, Forward::Strict), // Read LE Host Support
     (0x0c6d, 24, 6, Forward::Strict), // Write LE Host Support
-    // Informational: the controller's own address.
-    (0x1009, 15, 1, Forward::Strict), // Read BD_ADDR
-    // LE: the event mask only.
+    // Informational: the capabilities, merged, and the controller's own
+    // address.
+    (0x1002, 14, 4, Forward::Merge(Merge::Commands)), // Read Local Supported Commands
+    (0x1003, 14, 5, Forward::Merge(Merge::Features)), // Read Local Supported Features
+    (0x1004, 14, 6, Forward::Merge(Merge::ExtendedFeatures)), // Read Local Extended Features
+    (0x1005, 14, 7, Forward::Merge(Merge::Buffers)),  // Read Buffer Size
+    (0x1009, 15, 1, Forward::Strict),                 // Read BD_ADDR
+    // LE: the event mask and the features, merged.
     (0x2001, 25, 0, Forward::Strict), // LE Set Event Mask
+    (0x2003, 25, 2, Forward::Merge(Merge::LeFeatures)), // LE Read Local Supported Features
 ];
+
+/// The Supported Commands bits of [`FORWARDED`].
+const FORWARD_MASK: [u8; 64] = {
+    let mut mask = [0; 64];
+    let mut i = 0;
+    while i < FORWARDED.len() {
+        let (_, octet, bit, _) = FORWARDED[i];
+        mask[octet as usize] |= 1 << bit;
+        i += 1;
+    }
+    mask
+};
+
+/// Read Local Extended Features, whose pages past 1 are the model's.
+const READ_EXTENDED_FEATURES: u16 = 0x1004;
 
 // No vendor opcode is ever on the list.
 const _: () = {
@@ -134,6 +218,9 @@ pub fn forward(packet: &[u8]) -> Option<(ChipCommand, Forward)> {
         return None;
     }
     let &(_, _, _, kind) = FORWARDED.iter().find(|entry| entry.0 == opcode)?;
+    if opcode == READ_EXTENDED_FEATURES && packet.get(3).is_none_or(|&page| page > 1) {
+        return None;
+    }
     Some((ChipCommand(packet.to_vec()), kind))
 }
 
@@ -155,5 +242,10 @@ pub(super) fn answer(
     if refused && kind != Forward::Procedure {
         return Err(Cause::Refused(chip.status));
     }
-    Ok(chip.returns.to_vec())
+    Ok(match kind {
+        Forward::Merge(merge) if chip.status == SUCCESS => {
+            merge.returns(shadow.returns, chip.returns)
+        }
+        _ => chip.returns.to_vec(),
+    })
 }

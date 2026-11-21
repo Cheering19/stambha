@@ -347,4 +347,6 @@ impl Bridge {
 }
 
 #[cfg(test)]
+mod chip;
+#[cfg(test)]
 mod tests;

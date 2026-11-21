@@ -132,6 +132,26 @@ impl fmt::Display for Captured {
     }
 }
 
+/// What starts each captured packet's line in the boot log.
+pub const LOG_PREFIX: &str = "GUEST BLUETOOTH RAW ";
+
+/// The packets of a capture: each line [`Captured::parse`] reads, on its own
+/// or after [`LOG_PREFIX`] as the boot log writes it, blank lines and `#`
+/// comments skipped. `Err` names the first other line, counted from 1.
+pub fn read(text: &str) -> Result<Vec<Captured>, usize> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line
+                .find(LOG_PREFIX)
+                .map_or(line, |at| &line[at + LOG_PREFIX.len()..])
+                .trim();
+            (!line.is_empty() && !line.starts_with('#'))
+                .then(|| Captured::parse(line).ok_or(index + 1))
+        })
+        .collect()
+}
+
 /// What the function captures, and what it holds until the owner takes it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Capture {
@@ -239,6 +259,22 @@ mod tests {
         ] {
             assert_eq!(Captured::parse(bad), None, "{bad:?}");
         }
+    }
+
+    /// A fixture's lines, or the boot log's raw lines as grep gives them.
+    #[test]
+    fn a_capture_reads_from_its_own_lines_or_the_boot_logs() {
+        let text = "# a comment\n\n> cmd 03 0c 00\n\
+                    [  12.5] GUEST BLUETOOTH RAW < evt 0e 04 01 03 0c 00\n";
+        assert_eq!(
+            read(text),
+            Ok(vec![
+                Captured::new(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]),
+                Captured::new(Direction::ToGuest, Kind::Event, &[0x0e, 4, 1, 3, 0x0c, 0]),
+            ])
+        );
+        assert_eq!(read("> cmd 03 0c 00\nGUEST BLUETOOTH up\n"), Err(2));
+        assert_eq!(read(""), Ok(vec![]));
     }
 
     #[test]
