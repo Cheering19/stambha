@@ -531,3 +531,24 @@ fn a_refused_identification_keeps_the_rom_version_and_key_id_it_read() {
         )
     );
 }
+
+#[test]
+fn a_refused_target_fails_found_with_its_reason_and_starts_nothing_else() {
+    let got = refused("the firmware's USB devices could not all be read; nothing is started");
+    assert_eq!(
+        text(&got),
+        [
+            (
+                "bluetooth-found",
+                Verdict::Fail,
+                "the firmware's USB devices could not all be read; nothing is started"
+            ),
+            ("bluetooth-rom", Verdict::Skip, "nothing was started"),
+            ("bluetooth-firmware", Verdict::Skip, "nothing was started"),
+            ("bluetooth-download", Verdict::Skip, "nothing was started"),
+            ("bluetooth-version", Verdict::Skip, "nothing was started"),
+            ("bluetooth-scan", Verdict::Skip, "nothing was started"),
+            ("bluetooth", Verdict::Fail, "failed at bluetooth-found"),
+        ]
+    );
+}

@@ -18,6 +18,7 @@ pub mod audio_check_samples;
 pub mod beat_pace;
 pub mod bluetooth_check;
 pub mod bluetooth_dsbr;
+pub mod bluetooth_target;
 pub mod boot_exit;
 pub mod boot_ident;
 pub mod boot_progress;

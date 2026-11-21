@@ -170,6 +170,31 @@ pub fn lines(
     lines
 }
 
+/// The check's lines when no controller was started at all
+/// (`bluetooth_target::choose` refused, or its xHCI did not start), for
+/// `why`.
+pub fn refused(why: &str) -> Vec<Line> {
+    let mut lines = Vec::with_capacity(STEPS.len() + 1);
+    lines.push(Line {
+        name: STEPS[0],
+        verdict: Verdict::Fail,
+        detail: masked::mask_line(why).into_owned(),
+    });
+    for name in &STEPS[1..] {
+        lines.push(Line {
+            name,
+            verdict: Verdict::Skip,
+            detail: String::from("nothing was started"),
+        });
+    }
+    lines.push(Line {
+        name: "bluetooth",
+        verdict: Verdict::Fail,
+        detail: String::from("failed at bluetooth-found"),
+    });
+    lines
+}
+
 type Step = (Verdict, String);
 
 /// The four bring-up steps of a controller whose initialization never
