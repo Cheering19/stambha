@@ -23,13 +23,23 @@
 //!   Nothing goes to the host's controller again. So bluetoothd's bring-up,
 //!   and Setup's first screen, which waits for it, never wait on a stalled
 //!   controller.
+//! - The controller's events reach the guest as they are, but for its
+//!   vendor events, credits alone and answers to commands no longer in
+//!   flight, which are dropped. After a guest bus reset or a new
+//!   configuration, which reach the shadow but never the controller (a USB
+//!   reset would lose its patched firmware), its events stay out until the
+//!   guest's next HCI Reset is answered.
+//! - The owner carries packets to and from the controller through a
+//!   [`Link`] and the [`HostController`] trait.
 use super::model::Model;
 use crate::counter::FREQUENCY_HZ;
 use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::fmt;
 
+pub mod link;
 pub mod policy;
 
+pub use link::{HostController, Link};
 pub use policy::ChipCommand;
 
 /// System counts the host's controller has to answer a forwarded command:
@@ -101,8 +111,9 @@ pub struct Counters {
     pub local: u64,
     /// Events of the host's controller the guest got.
     pub passed: u64,
-    /// Events of the host's controller dropped: vendor events, credits
-    /// alone, stale answers, and every event after the fallback.
+    /// Packets of the host's controller dropped: vendor events, credits
+    /// alone, stale answers, what comes while it is kept out after a guest
+    /// reset, and everything after the fallback.
     pub dropped: u64,
 }
 
@@ -110,6 +121,7 @@ pub struct Counters {
 #[derive(Debug, Clone)]
 struct Pending {
     opcode: u16,
+    parameters: Vec<u8>,
     kind: policy::Forward,
     /// The shadow's answer, the first of its events, given on a fallback.
     shadow: Vec<Vec<u8>>,
@@ -123,8 +135,32 @@ pub struct Bridge {
     fallen: Option<Fallback>,
     pending: Option<Pending>,
     backlog: VecDeque<Vec<u8>>,
+    /// Whether the controller is kept out until the guest's next HCI Reset
+    /// is answered: the guest reset or configured the function again, and
+    /// the controller, which no USB reset reaches, may still send what the
+    /// old session asked for.
+    resync: bool,
+    /// The BD_ADDR the guest wrote with the module's vendor command.
+    written: Option<[u8; 6]>,
+    /// Whether the controller reported another address than that.
+    address_differs: bool,
     counters: Counters,
 }
+
+// Commands and events the shadow follows (Bluetooth Core v5.4 Vol 4 Part E
+// 7.1.1-7.1.2, 7.1.19-7.1.20, 7.3.2, 7.4.6, 7.7.1, 7.7.7).
+const INQUIRY: u16 = 0x0401;
+const INQUIRY_CANCEL: u16 = 0x0402;
+const REMOTE_NAME_REQUEST: u16 = 0x0419;
+const REMOTE_NAME_REQUEST_CANCEL: u16 = 0x041a;
+const RESET: u16 = 0x0c03;
+const READ_BD_ADDR: u16 = 0x1009;
+/// The module's Write BD_ADDR (Linux `btbcm_set_bdaddr`).
+const WRITE_BD_ADDR: u16 = 0xfc01;
+const INQUIRY_COMPLETE: u8 = 0x01;
+const REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
+/// A vendor's own event (7.7.65 leaves code 0xFF to vendors).
+const VENDOR_EVENT: u8 = 0xff;
 
 /// The parts of a Command Complete or Command Status event that answers a
 /// command, with its status.
@@ -193,8 +229,56 @@ impl Bridge {
             fallen: None,
             pending: None,
             backlog: VecDeque::new(),
+            resync: false,
+            written: None,
+            address_differs: false,
             counters: Counters::default(),
         }
+    }
+
+    /// Whether a forwarded command is in flight, so another waits.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Whether the guest wrote a BD_ADDR the controller does not have: the
+    /// controller keeps its own, which Read BD_ADDR gives.
+    pub fn address_differs(&self) -> bool {
+        self.address_differs
+    }
+
+    /// A guest USB bus reset: the shadow powers on again, as the model
+    /// does, and the controller is kept out until the next HCI Reset.
+    pub fn reset(&mut self) {
+        self.shadow.power_on();
+        self.written = None;
+        self.resync();
+    }
+
+    /// The guest configured the function again, which drops its queues: the
+    /// command in flight and those waiting are gone, and the controller is
+    /// kept out until the next HCI Reset.
+    pub fn resync(&mut self) {
+        self.pending = None;
+        self.backlog.clear();
+        self.resync = true;
+    }
+
+    /// ACL data from the guest. Milestone 1 forwards no connection, so the
+    /// shadow owns every one: it returns the buffer, as the model does.
+    pub fn acl(&mut self, packet: &[u8]) -> Vec<Step> {
+        guest(self.shadow.acl(packet))
+    }
+
+    /// Whether ACL data from the controller reaches the guest.
+    pub fn chip_acl(&mut self) -> bool {
+        let passes = self.fallen.is_none() && !self.resync;
+        if passes {
+            self.counters.passed += 1;
+        } else {
+            self.counters.dropped += 1;
+        }
+        passes
     }
 
     /// Why the bridge fell back to the model, once it has.
@@ -233,6 +317,9 @@ impl Bridge {
     }
 
     fn start(&mut self, packet: &[u8], now: u64) -> Vec<Step> {
+        if opcode(packet) == WRITE_BD_ADDR && packet.len() == 3 + 6 {
+            self.written = packet[3..].try_into().ok();
+        }
         let shadow = self.shadow.command(packet, now);
         if self.fallen.is_some() {
             return guest(shadow);
@@ -244,6 +331,7 @@ impl Bridge {
         self.counters.forwarded += 1;
         self.pending = Some(Pending {
             opcode: opcode(packet),
+            parameters: packet[3..].to_vec(),
             kind,
             shadow,
             deadline: now.saturating_add(DEADLINE),
@@ -275,9 +363,12 @@ impl Bridge {
         steps
     }
 
-    /// One event from the host's controller.
+    /// One event from the host's controller. The answer to the command in
+    /// flight becomes the guest's; a vendor event, credits alone or a stale
+    /// answer is dropped, as is everything while the controller is kept out
+    /// or after the fallback; every other event reaches the guest as it is.
     pub fn chip_event(&mut self, event: &[u8], now: u64) -> Vec<Step> {
-        if self.fallen.is_some() {
+        if self.fallen.is_some() || event.first() == Some(&VENDOR_EVENT) {
             self.counters.dropped += 1;
             return Vec::new();
         }
@@ -294,14 +385,67 @@ impl Bridge {
             };
             return self.answer(pending, &completion, now);
         }
+        if self.resync {
+            self.counters.dropped += 1;
+            return Vec::new();
+        }
+        self.follow(event, now);
         self.counters.passed += 1;
         vec![Step::Guest(event.to_vec())]
+    }
+
+    /// The shadow ends what the controller's event ends, so that after a
+    /// fallback it gives the guest no second end of it.
+    fn follow(&mut self, event: &[u8], now: u64) {
+        match *event {
+            [INQUIRY_COMPLETE, ..] => self.shadow_only(INQUIRY_CANCEL, &[], now),
+            [REMOTE_NAME_REQUEST_COMPLETE, _, _, ref peer @ ..] if peer.len() >= 6 => {
+                let peer = peer[..6].to_vec();
+                self.shadow_only(REMOTE_NAME_REQUEST_CANCEL, &peer, now);
+            }
+            _ => {}
+        }
+    }
+
+    /// Runs a command in the shadow alone, its events discarded.
+    fn shadow_only(&mut self, opcode: u16, parameters: &[u8], now: u64) {
+        let mut packet = opcode.to_le_bytes().to_vec();
+        packet.push(parameters.len() as u8);
+        packet.extend_from_slice(parameters);
+        self.shadow.command(&packet, now);
+    }
+
+    /// The shadow follows what the controller's answer to `pending` says:
+    /// the address it has, and a procedure it refused.
+    fn follow_answer(&mut self, pending: &Pending, chip: &Completion<'_>, now: u64) {
+        let shadow = pending.shadow.first().and_then(|e| Completion::of(e));
+        let shadow_succeeded = shadow.is_some_and(|s| s.status == 0);
+        match pending.opcode {
+            RESET if chip.status == 0 => self.resync = false,
+            READ_BD_ADDR if chip.status == 0 && chip.returns.len() == 6 => {
+                let address = &chip.returns[..6];
+                if self.written.is_some_and(|written| written != address) {
+                    self.address_differs = true;
+                }
+                self.shadow_only(WRITE_BD_ADDR, address, now);
+            }
+            INQUIRY if chip.status != 0 && shadow_succeeded => {
+                self.shadow_only(INQUIRY_CANCEL, &[], now);
+            }
+            REMOTE_NAME_REQUEST
+                if chip.status != 0 && shadow_succeeded && pending.parameters.len() >= 6 =>
+            {
+                self.shadow_only(REMOTE_NAME_REQUEST_CANCEL, &pending.parameters[..6], now);
+            }
+            _ => {}
+        }
     }
 
     fn answer(&mut self, pending: Pending, chip: &Completion<'_>, now: u64) -> Vec<Step> {
         let shadow = pending.shadow.first().and_then(|e| Completion::of(e));
         match policy::answer(pending.kind, shadow.as_ref(), chip) {
             Ok(returns) => {
+                self.follow_answer(&pending, chip, now);
                 self.counters.passed += 1;
                 let mut steps = vec![Step::Guest(chip.event(&returns))];
                 steps.extend(self.next(now));

@@ -241,6 +241,20 @@ impl AppleDevices {
         self.usb_bluetooth().is_some_and(|hci| hci.has_room())
     }
 
+    /// How many packets from the host's Bluetooth controller the guest's
+    /// takes now; 0 without one.
+    pub fn bluetooth_room_left(&mut self) -> usize {
+        self.usb_bluetooth().map_or(0, |hci| hci.room_left())
+    }
+
+    /// The host's Bluetooth controller failed: a guest's controller it is
+    /// lent behind falls back to the model.
+    pub fn bluetooth_host_failed(&mut self) {
+        if let Some(hci) = self.usb_bluetooth() {
+            hci.host_failed();
+        }
+    }
+
     /// The next packet the guest sent for the host's Bluetooth controller.
     pub fn bluetooth_take(&mut self) -> Option<Outbound> {
         self.usb_bluetooth()?.take()

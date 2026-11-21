@@ -418,3 +418,142 @@ fn the_merge_keeps_the_modules_capabilities_less_what_the_controller_lacks() {
     assert_eq!(le, [0; 8]);
     assert_eq!(bridge.fallen(), None);
 }
+
+/// The event filter: vendor events and credits alone go nowhere; inquiry
+/// results of each kind, LE meta events, completed packets and the rest
+/// reach the guest as they are.
+#[test]
+fn vendor_events_are_dropped_and_the_radios_events_pass_as_they_are() {
+    let mut bridge = Bridge::new(ADDRESS);
+    assert!(bridge.chip_event(&[0xff, 3, 0x2a, 1, 2], 0).is_empty());
+    assert!(
+        bridge
+            .chip_event(&[COMMAND_COMPLETE, 3, 1, 0, 0], 0)
+            .is_empty()
+    );
+    let passed = [
+        // Inquiry Result, with RSSI, Extended; Inquiry Complete.
+        [&[0x02, 15, 1][..], &[7; 14]].concat(),
+        [&[0x22, 15, 1][..], &[7; 14]].concat(),
+        [&[0x2f, 255, 1][..], &[7; 254]].concat(),
+        vec![0x01, 1, 0],
+        // Number Of Completed Packets, an LE meta event.
+        vec![0x13, 5, 1, 0x40, 0, 1, 0],
+        vec![0x3e, 3, 0x0c, 0, 0],
+    ];
+    for event in &passed {
+        assert_eq!(
+            events(bridge.chip_event(event, 0)),
+            core::slice::from_ref(event)
+        );
+    }
+    assert_eq!(bridge.counters().dropped, 2);
+    assert_eq!(bridge.counters().passed, passed.len() as u64);
+}
+
+/// A guest bus reset drops the command in flight, and the controller's
+/// events stay out until the guest's next HCI Reset is answered: the real
+/// controller is never reset by USB, so it may still be busy with the old
+/// session.
+#[test]
+fn a_bus_reset_keeps_the_controllers_events_out_until_the_next_reset() {
+    let mut bridge = Bridge::new(ADDRESS);
+    events(bridge.command(&packet(0xfc01, &[9, 8, 7, 6, 5, 0x42]), 0));
+    chip(bridge.command(&packet(0x0c14, &[]), 0));
+    bridge.reset();
+    assert_eq!(bridge.address(), ADDRESS, "power-on, as the model");
+    let result = [&[0x2f, 255, 1][..], &[7; 254]].concat();
+    for stale in [complete(0x0c14, 1, 0, &[0; 248]), result.clone()] {
+        assert!(bridge.chip_event(&stale, 0).is_empty());
+    }
+    // A command before the reset is answered; the reset's answer ends it.
+    chip(bridge.command(&packet(0x1009, &[]), 0));
+    assert_eq!(
+        events(bridge.chip_event(&complete(0x1009, 1, 0, &CHIP_ADDRESS), 0)).len(),
+        1
+    );
+    chip(bridge.command(&packet(0x0c03, &[]), 0));
+    assert!(bridge.chip_event(&result, 0).is_empty());
+    assert_eq!(
+        events(bridge.chip_event(&complete(0x0c03, 1, 0, &[]), 0)).len(),
+        1
+    );
+    assert_eq!(
+        events(bridge.chip_event(&result, 0)),
+        core::slice::from_ref(&result)
+    );
+    // A new configuration does the same, keeping the shadow's state.
+    events(bridge.command(&packet(0xfc01, &[9, 8, 7, 6, 5, 0x42]), 0));
+    bridge.resync();
+    assert_eq!(bridge.address(), [9, 8, 7, 6, 5, 0x42]);
+    assert!(bridge.chip_event(&result, 0).is_empty());
+    assert_eq!(bridge.fallen(), None);
+}
+
+/// The shadow follows the controller: a procedure the controller ended or
+/// refused ends in the shadow too, so a later fallback gives the guest no
+/// second end of it; and the controller's address becomes the shadow's.
+#[test]
+fn the_shadow_follows_the_controllers_procedures_and_address() {
+    let inquiry = packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]);
+    let mut name = CHIP_ADDRESS.to_vec();
+    name.extend_from_slice(&[1, 0, 0, 0]);
+    let name = packet(0x0419, &name);
+    let mut ended = vec![0x07, 255, 0];
+    ended.extend_from_slice(&CHIP_ADDRESS);
+    ended.resize(257, b'x');
+    for (command, end) in [
+        (&inquiry, Some(vec![0x01, 1, 0])),
+        (&name, Some(ended)),
+        // Refused by the controller: Command Disallowed.
+        (&inquiry, None),
+        (&name, None),
+    ] {
+        let mut bridge = Bridge::new(ADDRESS);
+        chip(bridge.command(command, 0));
+        let op = opcode(command);
+        match end {
+            Some(end) => {
+                events(bridge.chip_event(&status(op, 1, 0), 0));
+                assert_eq!(events(bridge.chip_event(&end, 0)), [end]);
+            }
+            None => {
+                let refused = events(bridge.chip_event(&status(op, 1, 0x0c), 0));
+                assert_eq!(refused, [status(op, 1, 0x0c)]);
+            }
+        }
+        events(bridge.chip_failed(0));
+        assert!(events(bridge.advance(u64::MAX)).is_empty(), "{op:#06x}");
+    }
+    // The address.
+    let mut bridge = Bridge::new(ADDRESS);
+    events(bridge.command(&packet(0xfc01, &[9, 8, 7, 6, 5, 0x42]), 0));
+    chip(bridge.command(&packet(0x1009, &[]), 0));
+    events(bridge.chip_event(&complete(0x1009, 1, 0, &CHIP_ADDRESS), 0));
+    assert!(bridge.address_differs(), "the guest wrote another");
+    events(bridge.chip_failed(0));
+    let address = events(bridge.command(&packet(0x1009, &[]), 0));
+    assert_eq!(address, [complete(0x1009, 1, 0, &CHIP_ADDRESS)]);
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x1009, &[]), 0));
+    events(bridge.chip_event(&complete(0x1009, 1, 0, &CHIP_ADDRESS), 0));
+    assert!(!bridge.address_differs(), "the guest wrote none");
+}
+
+/// In milestone 1 every connection is the shadow's, so ACL data from the
+/// guest names none of the controller's: the shadow returns its buffer.
+/// The controller's ACL data reaches the guest while the bridge forwards.
+#[test]
+fn acl_from_the_guest_is_the_shadows_and_the_controllers_passes() {
+    let mut bridge = Bridge::new(ADDRESS);
+    assert_eq!(
+        events(bridge.acl(&[0x40, 0x20, 2, 0, 9, 9])),
+        [vec![0x13, 5, 1, 0x40, 0, 1, 0]]
+    );
+    assert!(bridge.chip_acl());
+    bridge.resync();
+    assert!(!bridge.chip_acl(), "until the next reset");
+    let mut bridge = Bridge::new(ADDRESS);
+    events(bridge.chip_failed(0));
+    assert!(!bridge.chip_acl());
+}
