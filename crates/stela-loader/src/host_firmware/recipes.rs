@@ -804,6 +804,31 @@ pub const REALTEK_WIFI: &[Recipe] = &[
     ),
 ];
 
+/// The Realtek USB Bluetooth driver's RTL8852CU files at linux-firmware
+/// 59f9fc2, under the rtlwifi notice: btrtl's `rtl8852cu_fw_v2.bin` and
+/// `rtl8852cu_fw.bin` (btrtl.c:1196-1209, :1563-1565) and the 8761BU's empty
+/// config, which WHENCE links `rtl_bt/rtl8852cu_config.bin` to.
+pub const REALTEK_BLUETOOTH: &[Recipe] = &[
+    wifi(
+        "rtl_bt/rtl8852cu_fw_v2.bin",
+        112953,
+        "d1314df53b8f4282f9db57a727ba77c180bc6fd05bf2c306e960326a4ef48660",
+        &REALTEK_WIFI_LICENSE,
+    ),
+    wifi(
+        "rtl_bt/rtl8852cu_fw.bin",
+        113336,
+        "9b8b27741a914c1cecc1ab9837194236890522101a57ba1898eb55f8d538dae0",
+        &REALTEK_WIFI_LICENSE,
+    ),
+    wifi(
+        "rtl_bt/rtl8761bu_config.bin",
+        6,
+        "6c28a3f07c6a30ed208c4b64862a23f02b7d93543ea980edd24df16bab45095f",
+        &REALTEK_WIFI_LICENSE,
+    ),
+];
+
 const REGULATORY_LICENSE: Artifact = Artifact {
     source: WIRELESS_REGDB,
     revision: WIRELESS_REGDB_REVISION,
@@ -2201,6 +2226,56 @@ fn select_mediatek_bluetooth(request: &Request) -> Option<&'static Recipe> {
         .flatten()
 }
 
+/// The Realtek USB Bluetooth driver's request
+/// (`stela_drivers::usb::bluetooth::realtek::Identity`): its USB label, and
+/// a revision label whose stock-ROM readings name the chip. Only the
+/// RTL8852CU's (hci 0x0c/0x000c, lmp_subver 0x8852, key 0) are pinned:
+/// `_v2.bin` under the EPATCH v2 driver, `.bin` under the v1 driver, and
+/// under either its config, which binds the file WHENCE links it to. The
+/// driver selects the ROM's patch from the file itself.
+fn select_realtek_bluetooth(request: &Request) -> Option<&'static Recipe> {
+    let usb: Vec<_> = request.target.hardware.split(':').collect();
+    if usb.len() != 4 || usb[0] != "usb" || !usb[1..].iter().all(|f| hex_field(f, 4)) {
+        return None;
+    }
+    let container = match request.target.driver.as_str() {
+        "realtek-bluetooth-usb-epatch-v1" => "epatch-v1",
+        "realtek-bluetooth-usb-epatch-v2" => "epatch-v2",
+        _ => return None,
+    };
+    let fields: Vec<_> = request.target.revision.split(':').collect();
+    let [label, hci, lmp, manufacturer, register, rom, security] = fields[..] else {
+        return None;
+    };
+    let lmp = lmp
+        .strip_prefix("lmp-")
+        .and_then(|lmp| lmp.strip_suffix("-8852"))
+        .filter(|version| hex_field(version, 2));
+    let rom = rom.strip_prefix("rom-").filter(|rom| hex_field(rom, 2));
+    let key = security
+        .strip_prefix("security-00-")
+        .filter(|second| hex_field(second, 2));
+    if label != container
+        || hci != "hci-0c-000c"
+        || manufacturer != "manufacturer-005d"
+        || register != "register-8852-none"
+        || lmp.is_none()
+        || rom.is_none()
+        || key.is_none()
+    {
+        return None;
+    }
+    let member = match (request.name.as_str(), container) {
+        ("rtl_bt/rtl8852cu_fw_v2.bin", "epatch-v2") => "rtl_bt/rtl8852cu_fw_v2.bin",
+        ("rtl_bt/rtl8852cu_fw.bin", "epatch-v1") => "rtl_bt/rtl8852cu_fw.bin",
+        ("rtl_bt/rtl8852cu_config.bin", _) => "rtl_bt/rtl8761bu_config.bin",
+        _ => return None,
+    };
+    REALTEK_BLUETOOTH
+        .iter()
+        .find(|recipe| recipe.image.member == member)
+}
+
 /// Bind each original PCI/SYS_CFG1 request to its own chip's pinned image.
 /// Provisioning preserves observations; it grants no native radio admission.
 fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
@@ -2389,6 +2464,9 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "wifi-intel" => select_intel_wifi(request),
         "wifi-mt792x" => select_mediatek_wifi(request),
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
+        "realtek-bluetooth-usb-epatch-v1" | "realtek-bluetooth-usb-epatch-v2" => {
+            select_realtek_bluetooth(request)
+        }
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
         "xe" => select_xe(request),

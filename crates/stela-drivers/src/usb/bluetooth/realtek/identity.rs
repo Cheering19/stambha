@@ -214,7 +214,9 @@ impl Identity {
             self.security[1]
         )
     }
-    pub(super) fn target<'a>(
+    /// The target an image request in `container` binds, with
+    /// `hardware` the USB label and `revision` [`Self::revision_label_for`].
+    pub fn target<'a>(
         &self,
         container: Container,
         hardware: &'a str,
