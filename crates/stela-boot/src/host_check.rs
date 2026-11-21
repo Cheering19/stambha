@@ -2,7 +2,7 @@
 //! (so no LA57) and no write to any internal disk.
 //!
 //! `stela.cfg`: `--host-check [--nor-file GUID:/PATH] [--deadline SECONDS]
-//! [--key-seconds SECONDS] [--keep-lines]`.
+//! [--key-seconds SECONDS] [--bluetooth-check] [--keep-lines]`.
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
@@ -18,6 +18,14 @@
 //! - `apic`, `interrupts`: the local APIC timer measured against the TSC,
 //!   then one one-shot and 100 ms of periodic interrupts through the IDT's
 //!   interrupt stacks.
+//! - `bluetooth-found`, `bluetooth-rom`, `bluetooth-firmware`,
+//!   `bluetooth-download`, `bluetooth-version`, `bluetooth-scan` and
+//!   `bluetooth`: with `--bluetooth-check`, the first USB Bluetooth
+//!   controller a Realtek setup takes, as the storage probe brought it up
+//!   with the USB stick's verified host firmware (for USB Bluetooth requests
+//!   alone), then an 8 s passive LE scan through it, an HCI Reset and its
+//!   transport closed ([`bluetooth`]). No xHCI, hub or port is reset for it.
+//!   Without the option, one `CHECK bluetooth SKIP` line.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
@@ -37,6 +45,8 @@
 //! (counted from the start) stops it with `STELA STOPPED`. Every wait
 //! prints `BEAT` every 10 s and flushes the log; a fatal error, panic or
 //! x86 exception flushes it too (`output`).
+mod bluetooth;
+
 use crate::Result;
 use crate::{
     apic::{self, Apic, rdtsc},
@@ -66,7 +76,8 @@ use stela_drivers::{
     block::{BlockDevice, Shared, Transport},
     bus::dma::RegionAllocator,
     input::{Input, InputDevice},
-    probe::probe,
+    probe::{probe, probe_with_provider},
+    usb::bluetooth::UsbHci,
 };
 use stela_runtime::pc::{
     self, boot_log,
@@ -189,6 +200,10 @@ struct Machine {
     apic_base: u64,
     stack_top: usize,
     checks: Vec<Check>,
+    /// The `--bluetooth-check` plan, as prepared before ExitBootServices.
+    bluetooth: bluetooth::Plan,
+    /// The USB Bluetooth transports the probe kept, for that check.
+    usb_bluetooth: Vec<UsbHci>,
 }
 
 impl Machine {
@@ -204,9 +219,11 @@ impl Machine {
     }
 }
 
-/// Run the host check from `stela.cfg`'s `options`; never returns.
-pub fn boot(options: Vec<u8>) -> ! {
-    let (mut machine, tables) = prepare(&options).unwrap_or_else(|error| output::fatal(error));
+/// Run the host check from `stela.cfg`'s `options`, with the USB stick's
+/// host firmware for `--bluetooth-check`; never returns.
+pub fn boot(options: Vec<u8>, host_firmware: crate::host_firmware::Resources) -> ! {
+    let (mut machine, tables) =
+        prepare(&options, &host_firmware).unwrap_or_else(|error| output::fatal(error));
     let stack = machine.stack_top;
     // SAFETY: boot services have ended; the tables map the image, the heap,
     // the stack, every RAM byte in use, the framebuffer and the registers
@@ -233,7 +250,10 @@ pub fn boot(options: Vec<u8>) -> ! {
 
 /// Before ExitBootServices: the options, the CPU and TSC checks, and what
 /// the rest needs from the firmware; then leave boot services.
-fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
+fn prepare(
+    options: &[u8],
+    host_firmware: &crate::host_firmware::Resources,
+) -> Result<(Machine, paging::Tables)> {
     let text = core::str::from_utf8(options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let options = HostCheck::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let started = rdtsc();
@@ -258,6 +278,8 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
         apic_base: apic::base_msr(),
         stack_top: 0,
         checks: Vec::new(),
+        bluetooth: bluetooth::Plan::Off,
+        usb_bluetooth: Vec::new(),
     };
     let missing = cpu::missing_floor();
     machine.record(
@@ -285,6 +307,9 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
     match storage::discover() {
         Ok(handoff) => machine.storage = Some(handoff),
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
+    }
+    if machine.options.bluetooth_check {
+        machine.bluetooth = bluetooth::prepare(host_firmware);
     }
     let guard = firmware::pages(firmware::STACK_PAGES + 1)?;
     machine.stack_top = guard + (firmware::STACK_PAGES + 1) * PAGE;
@@ -369,6 +394,7 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
         None => Vec::new(),
     };
     timer(machine);
+    bluetooth::check(machine);
     match (machine.screen, band) {
         (Some(screen), Some(top)) => bars(machine, &screen, top),
         _ => machine.record(
@@ -385,8 +411,16 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
 fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
     // SAFETY: one CPU after ExitBootServices; `dma` was reserved for this.
     let mut dma = unsafe { RegionAllocator::new(handoff.dma.clone()) };
-    // SAFETY: this handoff describes the running machine and its tables.
-    let mut devices = unsafe { probe(handoff, machine.captures, &mut dma) };
+    // SAFETY: this handoff describes the running machine and its tables;
+    // the firmware lives for the rest of the boot.
+    let mut devices = unsafe {
+        match bluetooth::firmware(&machine.bluetooth, handoff) {
+            Some(firmware) => {
+                probe_with_provider(handoff, machine.captures, &mut dma, firmware, None, None)
+            }
+            None => probe(handoff, machine.captures, &mut dma),
+        }
+    };
     for window in &devices.unmapped {
         output::arguments(format_args!("STORAGE UNMAPPED ecam={window:x?}\n"));
     }
@@ -496,6 +530,11 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
             machine.record("log", verdict, detail);
         }
         None => machine.record("log", Verdict::Skip, String::from("no --nor-file")),
+    }
+    // The Bluetooth check's transports outlive the probe's other owners;
+    // without it they close here, as they always did.
+    if !matches!(machine.bluetooth, bluetooth::Plan::Off) {
+        machine.usb_bluetooth = core::mem::take(&mut devices.bluetooth);
     }
     core::mem::take(&mut devices.inputs)
 }
