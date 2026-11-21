@@ -672,18 +672,22 @@ pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError>
 /// Linux's writes cannot fail and it ignores `ltr_set`'s `-EINVAL`, so every
 /// step runs whatever an earlier one returned; the first error is returned.
 /// The hardware indices restart, so CH12 and the data and management queues
-/// are marked stopped and the RXQ and RPQ host indices restart at 0: only
-/// another `pre_init` starts the rings again.
+/// are marked stopped, and once every index clear succeeded the RXQ and RPQ
+/// host indices restart at 0: only another `pre_init` starts the rings
+/// again. A clear that fails stops the ones after it, the RX clear last, so
+/// the RX host indices stay with the hardware's they still match.
 pub fn deinit<I: AxIo + ?Sized>(io: &mut I, rings: &Rings, ltr: bool) -> Result<(), AxError> {
     rings.ch12_ready.set(false);
     rings.data_ready.set(false);
-    for host in &rings.rx_host {
-        host.set(0);
-    }
     let wake = clear32(io, R_AX_HCI_OPT_CTRL, BIT_WAKE_CTRL);
     let ltr = if ltr { ltr_set_v1(io, false) } else { Ok(()) };
     let dma = ctrl_dma_all(io, false);
     let indices = clr_idx_all(io);
+    if indices.is_ok() {
+        for host in &rings.rx_host {
+            host.set(0);
+        }
+    }
     wake.and(ltr).and(dma).and(indices)
 }
 

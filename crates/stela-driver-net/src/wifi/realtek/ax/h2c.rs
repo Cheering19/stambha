@@ -735,9 +735,13 @@ impl H2c {
     /// words), `arg` 0, 0, then each entry's [`ScanChannel::words`].
     ///
     /// More than [`SCAN_LIST_LIMIT`] entries do not fit one H2C (Linux
-    /// splits its list there, `fw.c:10020-10037`); they are refused with
+    /// splits its list there, `fw.c:10020-10037`), and a list without an
+    /// entry leaves the firmware nothing to scan; both are refused with
     /// `Scan` before a sequence number is taken.
     pub fn add_scanofld_ch(&mut self, list: &[ScanChannel]) -> Result<(u8, Vec<u8>), AxError> {
+        if list.is_empty() {
+            return Err(AxError::Scan("an empty scan list"));
+        }
         if list.len() > SCAN_LIST_LIMIT {
             return Err(AxError::Scan("scan list past 69 channels"));
         }

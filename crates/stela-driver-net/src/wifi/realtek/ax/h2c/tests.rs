@@ -405,6 +405,19 @@ fn add_scanofld_ch_refuses_70_entries_without_advancing_seq() {
 }
 
 #[test]
+fn add_scanofld_ch_refuses_an_empty_list_without_advancing_seq() {
+    // A batch without a channel leaves the firmware nothing to scan; the
+    // live chip refuses an empty list before any H2C, and so does the
+    // builder.
+    let mut h = H2c::at(18);
+    assert_eq!(
+        h.add_scanofld_ch(&[]),
+        Err(AxError::Scan("an empty scan list"))
+    );
+    assert_eq!(h, H2c::at(18));
+}
+
+#[test]
 fn scan_error_display_names_the_scan() {
     assert_eq!(
         format!("{}", AxError::Scan("scan list past 69 channels")),
