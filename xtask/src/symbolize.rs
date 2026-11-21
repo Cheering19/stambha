@@ -73,14 +73,14 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
     let listed: u64 = profile.entries.iter().map(|entry| entry.cycles).sum();
     let _ = writeln!(
         out,
-        "{source}: {} samples, {}M cycles of native code; gone {} ({}M), other {} ({}M); \
+        "{source}: {} samples, {} cycles of native code; gone {} ({}), other {} ({}); \
          listed blocks hold {:.1}%",
         profile.samples,
-        profile.cycles,
+        millions(profile.cycles),
         profile.gone[0],
-        profile.gone[1],
+        millions(profile.gone[1]),
         profile.other[0],
-        profile.other[1],
+        millions(profile.other[1]),
         share(listed),
     );
     let levels: Vec<String> = log::LEVELS
@@ -157,9 +157,9 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
         let short = image.rsplit('/').next().unwrap_or(image);
         let _ = writeln!(
             out,
-            "{:>6.1}%  {:>8}M  {:>7}  {:>6}  {:<7}  {function:<40}  {short}",
+            "{:>6.1}%  {:>9}  {:>7}  {:>6}  {:<7}  {function:<40}  {short}",
             share(row.cycles),
-            row.cycles,
+            millions(row.cycles),
             row.samples,
             row.blocks,
             level_name(log::LEVELS[*level]),
@@ -169,9 +169,9 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
         let rest: u64 = ranked.iter().skip(top).map(|(_, row)| row.cycles).sum();
         let _ = writeln!(
             out,
-            "{:>6.1}%  {:>8}M  and {} more",
+            "{:>6.1}%  {:>9}  and {} more",
             share(rest),
-            rest,
+            millions(rest),
             ranked.len() - top
         );
     }
@@ -185,13 +185,18 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
     for (image, row) in images {
         let _ = writeln!(
             out,
-            "{:>6.1}%  {:>8}M  {:>6}  {image}",
+            "{:>6.1}%  {:>9}  {:>6}  {image}",
             share(row.cycles),
-            row.cycles,
+            millions(row.cycles),
             row.blocks
         );
     }
     out
+}
+
+/// Host cycles in millions with one decimal, as the table prints them.
+fn millions(cycles: u64) -> String {
+    format!("{:.1}M", cycles as f64 / 1e6)
 }
 
 #[cfg(test)]
@@ -209,12 +214,14 @@ mod tests {
         let alpha = BASE_FOR_REPORT + ALPHA;
         let unnamed = BASE_FOR_REPORT + UNNAMED;
         format!(
-            "PES PC TOTAL samples=9 cycles=200M gone=1/16M other=1/10M\n\
-             PES PC TOTAL user samples=8 cycles=180M blocks=5 \
-             {alpha:#x}:3:60@{first:016x}+0 {:#x}:2:40@{first:016x}+40 \
-             {unnamed:#x}:1:30@{first:016x}+400 {:#x}:1:20@{second:016x}+20 \
-             0x100:1:10@00000000000000ab+100\n\
-             PES PC TOTAL kernel samples=1 cycles=20M blocks=1 v+0x2c4d0:1:20@?+4d0\n",
+            "PES PC TOTAL samples=9 cycles=200000000 gone=1/16000000 other=1/10000000\n\
+             PES PC TOTAL user samples=8 cycles=180000000 blocks=5 \
+             {alpha:#x}:3:60000000@{first:016x}+0 {:#x}:2:40000000@{first:016x}+40 \
+             {unnamed:#x}:1:30000000@{first:016x}+400 \
+             {:#x}:1:20000000@{second:016x}+20 \
+             0x100:1:10000000@00000000000000ab+100\n\
+             PES PC TOTAL kernel samples=1 cycles=20000000 blocks=1 \
+             v+0x2c4d0:1:20000000@?+4d0\n",
             alpha + 0x40,
             BASE_FOR_REPORT + 0x2020,
         )
@@ -234,10 +241,12 @@ mod tests {
             .collect();
         // The header counts every sample; the rows rank the functions.
         assert!(
-            table.contains("the last PES PC TOTAL (1 of 1): 9 samples, 200M cycles"),
+            table.contains("the last PES PC TOTAL (1 of 1): 9 samples, 200.0M cycles"),
             "{table}"
         );
-        assert!(table.contains("gone 1 (16M)"), "{table}");
+        assert!(table.contains("gone 1 (16.0M)"), "{table}");
+        // Cycles in millions with a decimal: _alpha's 100M.
+        assert!(table.contains(" 100.0M "), "{table}");
         assert!(table.contains("listed blocks hold 90.0%"), "{table}");
         assert!(
             table.contains("pages: 2 of 3 found, 0 ambiguous"),

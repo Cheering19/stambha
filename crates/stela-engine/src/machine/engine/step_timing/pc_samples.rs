@@ -182,30 +182,30 @@ impl PcSamples {
 
     /// The lines of a report under `prefix` (`PES PC`, `PES PC TOTAL`):
     ///
-    /// - `{prefix} samples=N cycles=CM gone=G/GM other=O/OM`: the samples
-    ///   and their cycles in millions, then those that named no block and
-    ///   those of blocks the table had no room for;
-    /// - per level with samples, `{prefix} {level} samples=N cycles=CM
+    /// - `{prefix} samples=N cycles=C gone=G/GC other=O/OC`: the samples
+    ///   and their host cycles, then those that named no block and those
+    ///   of blocks the table had no room for;
+    /// - per level with samples, `{prefix} {level} samples=N cycles=C
     ///   blocks=B`, then its `shown` blocks with the most cycles, most
-    ///   first, as ` {pc}:{samples}:{cyclesM}@{page}+{offset}`. The PC is
+    ///   first, as ` {pc}:{samples}:{cycles}@{page}+{offset}`. The PC is
     ///   [`super::HotBlock::pc`]'s, an EL1 or guarded one as `v+0x...` or
     ///   `v-0x...` from the vector base; the page 16 hex digits, or `?`
     ///   where its bytes could not be read; the offset hex.
     ///
-    /// No lines without samples.
+    /// Cycles are whole, so that sums of lines stay exact. No lines
+    /// without samples.
     pub fn lines(&self, prefix: &str, shown: usize) -> Vec<String> {
         if self.is_empty() {
             return Vec::new();
         }
-        let millions = |cycles: u64| cycles / 1_000_000;
         let mut lines = alloc::vec![format!(
-            "{prefix} samples={} cycles={}M gone={}/{}M other={}/{}M",
+            "{prefix} samples={} cycles={} gone={}/{} other={}/{}",
             self.samples.iter().sum::<u64>(),
-            millions(self.cycles.iter().sum()),
+            self.cycles.iter().sum::<u64>(),
             self.gone[0],
-            millions(self.gone[1]),
+            self.gone[1],
             self.other[0],
-            millions(self.other[1]),
+            self.other[1],
         )];
         for level in [Level::User, Level::Kernel, Level::Guarded] {
             let samples = self.samples[level as usize];
@@ -218,9 +218,9 @@ impl PcSamples {
                 .filter(|key| key.0 == level as u8)
                 .count();
             let mut line = format!(
-                "{prefix} {} samples={samples} cycles={}M blocks={blocks}",
+                "{prefix} {} samples={samples} cycles={} blocks={blocks}",
                 level_name(level),
-                millions(self.cycles[level as usize]),
+                self.cycles[level as usize],
             );
             for block in self.top(level, shown) {
                 let page = match block.page {
@@ -231,7 +231,7 @@ impl PcSamples {
                     " {}:{}:{}@{page}+{:x}",
                     pc_name(level, block.pc),
                     block.samples,
-                    millions(block.cycles),
+                    block.cycles,
                     block.offset
                 ));
             }
@@ -378,20 +378,23 @@ mod tests {
             cycles: 1_000_000,
         });
         samples.add_gone(1, 16_777_216);
+        // Cycles are printed whole: a block of one sample of a 2^24
+        // period reads 16777216, not 16M, and sums of lines stay exact.
         assert_eq!(
             samples.lines("PES PC", 8),
             [
-                "PES PC samples=4 cycles=68M gone=1/16M other=0/0M",
-                "PES PC user samples=3 cycles=51M blocks=2 \
-                 0x18a2b3c40:2:50@1f2e3d4c5b6a7980+c40 0x100:1:1@00000000000000ab+100",
-                "PES PC kernel samples=1 cycles=16M blocks=1 v+0x2c4d0:1:16@?+4d0",
+                "PES PC samples=4 cycles=68108864 gone=1/16777216 other=0/0",
+                "PES PC user samples=3 cycles=51331648 blocks=2 \
+                 0x18a2b3c40:2:50331648@1f2e3d4c5b6a7980+c40 \
+                 0x100:1:1000000@00000000000000ab+100",
+                "PES PC kernel samples=1 cycles=16777216 blocks=1 v+0x2c4d0:1:16777216@?+4d0",
             ]
         );
         // `shown` bounds each level's blocks, not the counts.
         assert_eq!(
             samples.lines("PES PC TOTAL", 1)[1],
-            "PES PC TOTAL user samples=3 cycles=51M blocks=2 \
-             0x18a2b3c40:2:50@1f2e3d4c5b6a7980+c40"
+            "PES PC TOTAL user samples=3 cycles=51331648 blocks=2 \
+             0x18a2b3c40:2:50331648@1f2e3d4c5b6a7980+c40"
         );
     }
 }

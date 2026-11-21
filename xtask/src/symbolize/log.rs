@@ -11,7 +11,7 @@ pub(super) const LEVELS: [Level; 3] = [Level::User, Level::Kernel, Level::Guarde
 
 /// One block a level line lists: its PC as printed (`0x...`, `v+0x...`,
 /// `v-0x...`), its page key's first 8 bytes and its offset there, and its
-/// samples and cycles in millions.
+/// samples and host cycles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Entry {
     pub level: Level,
@@ -44,8 +44,8 @@ pub(super) enum Source {
     Beats { of: usize },
 }
 
-/// The samples a log's lines hold: the counts (cycles in millions) and
-/// the listed blocks, each once, most cycles first.
+/// The samples a log's lines hold: the counts and the listed blocks, each
+/// once, most cycles first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Profile {
     pub source: Source,
@@ -181,7 +181,7 @@ fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
             let (name, value) = word.split_once('=').context("a `name=value` word")?;
             match name {
                 "samples" => group.samples = number(value)?,
-                "cycles" => group.cycles = millions(value)?,
+                "cycles" => group.cycles = number(value)?,
                 "gone" => group.gone = pair(value)?,
                 "other" => group.other = pair(value)?,
                 _ => {}
@@ -207,14 +207,14 @@ fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
         let (name, value) = word.split_once('=').context("a `name=value` word")?;
         match name {
             "samples" => group.levels[index][0] = number(value)?,
-            "cycles" => group.levels[index][1] = millions(value)?,
+            "cycles" => group.levels[index][1] = number(value)?,
             _ => {}
         }
     }
     Ok(())
 }
 
-/// A block word, `{pc}:{samples}:{cyclesM}@{page}+{offset}`.
+/// A block word, `{pc}:{samples}:{cycles}@{page}+{offset}`.
 fn entry(level: Level, word: &str) -> Result<Entry> {
     let (counts, place) = word.split_once('@').context("a block's `@`")?;
     let (page, offset) = place.split_once('+').context("a block's `+offset`")?;
@@ -241,33 +241,31 @@ fn number(text: &str) -> Result<u64> {
     text.parse().with_context(|| format!("a number `{text}`"))
 }
 
-/// `NM`: N millions.
-fn millions(text: &str) -> Result<u64> {
-    number(text.strip_suffix('M').unwrap_or(text))
-}
-
-/// `N/CM`: samples and their cycles in millions.
+/// `N/C`: samples and their cycles.
 fn pair(text: &str) -> Result<[u64; 2]> {
-    let (samples, cycles) = text.split_once('/').context("a `samples/cyclesM` pair")?;
-    Ok([number(samples)?, millions(cycles)?])
+    let (samples, cycles) = text.split_once('/').context("a `samples/cycles` pair")?;
+    Ok([number(samples)?, number(cycles)?])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Cycles in the lines' units, whole cycles: a million.
+    const M: u64 = 1_000_000;
+
     const LOG: &str = "\
 [   10.000] PES WHERE all: ins=1M cyc=2M
-[   20.000] PES PC samples=3 cycles=50M gone=1/16M other=0/0M
-[   20.000] PES PC user samples=2 cycles=33M blocks=2 0x18a2b3c40:1:17@1f2e3d4c5b6a7980+c40 0x100:1:16@?+100
-[   20.000] PES PC kernel samples=1 cycles=16M blocks=1 v+0x2c4d0:1:16@00000000000000ab+4d0
-[   30.000] PES PC samples=2 cycles=34M gone=0/0M other=1/1M
-[   30.000] PES PC user samples=2 cycles=34M blocks=1 0x18a2b3c40:2:34@1f2e3d4c5b6a7980+c40
-[   30.000] PES PC TOTAL samples=5 cycles=84M gone=1/16M other=1/1M
-[   30.000] PES PC TOTAL user samples=4 cycles=67M blocks=2 0x18a2b3c40:3:51@1f2e3d4c5b6a7980+c40 0x100:1:16@?+100
-[   30.000] PES PC TOTAL kernel samples=1 cycles=16M blocks=1 v+0x2c4d0:1:16@00000000000000ab+4d0
-[   40.000] PES PC samples=1 cycles=16M gone=0/0M other=0/0M
-[   40.000] PES PC guarded samples=1 cycles=16M blocks=1 v-0x40:1:16@00000000000000cd+fc0
+[   20.000] PES PC samples=3 cycles=50000000 gone=1/16000000 other=0/0
+[   20.000] PES PC user samples=2 cycles=33000000 blocks=2 0x18a2b3c40:1:17000000@1f2e3d4c5b6a7980+c40 0x100:1:16000000@?+100
+[   20.000] PES PC kernel samples=1 cycles=16000000 blocks=1 v+0x2c4d0:1:16000000@00000000000000ab+4d0
+[   30.000] PES PC samples=2 cycles=34000000 gone=0/0 other=1/1000000
+[   30.000] PES PC user samples=2 cycles=34000000 blocks=1 0x18a2b3c40:2:34000000@1f2e3d4c5b6a7980+c40
+[   30.000] PES PC TOTAL samples=5 cycles=84000000 gone=1/16000000 other=1/1000000
+[   30.000] PES PC TOTAL user samples=4 cycles=67000000 blocks=2 0x18a2b3c40:3:51000000@1f2e3d4c5b6a7980+c40 0x100:1:16000000@?+100
+[   30.000] PES PC TOTAL kernel samples=1 cycles=16000000 blocks=1 v+0x2c4d0:1:16000000@00000000000000ab+4d0
+[   40.000] PES PC samples=1 cycles=16000000 gone=0/0 other=0/0
+[   40.000] PES PC guarded samples=1 cycles=16000000 blocks=1 v-0x40:1:16000000@00000000000000cd+fc0
 ";
 
     fn entry(
@@ -292,10 +290,10 @@ mod tests {
     fn the_last_total_is_read_by_default() {
         let profile = Profile::parse(LOG, false).unwrap();
         assert_eq!(profile.source, Source::Total { taken: 1, of: 1 });
-        assert_eq!((profile.samples, profile.cycles), (5, 84));
-        assert_eq!(profile.gone, [1, 16]);
-        assert_eq!(profile.other, [1, 1]);
-        assert_eq!(profile.levels, [[4, 67], [1, 16], [0, 0]]);
+        assert_eq!((profile.samples, profile.cycles), (5, 84 * M));
+        assert_eq!(profile.gone, [1, 16 * M]);
+        assert_eq!(profile.other, [1, M]);
+        assert_eq!(profile.levels, [[4, 67 * M], [1, 16 * M], [0, 0]]);
         assert_eq!(
             profile.entries,
             [
@@ -305,10 +303,10 @@ mod tests {
                     Some(0x1f2e_3d4c_5b6a_7980),
                     0xc40,
                     3,
-                    51
+                    51 * M
                 ),
-                entry(Level::User, "0x100", None, 0x100, 1, 16),
-                entry(Level::Kernel, "v+0x2c4d0", Some(0xab), 0x4d0, 1, 16),
+                entry(Level::User, "0x100", None, 0x100, 1, 16 * M),
+                entry(Level::Kernel, "v+0x2c4d0", Some(0xab), 0x4d0, 1, 16 * M),
             ]
         );
         assert_eq!(
@@ -321,10 +319,10 @@ mod tests {
     fn beats_sum_every_beat_group() {
         let profile = Profile::parse(LOG, true).unwrap();
         assert_eq!(profile.source, Source::Beats { of: 3 });
-        assert_eq!((profile.samples, profile.cycles), (6, 100));
-        assert_eq!(profile.gone, [1, 16]);
-        assert_eq!(profile.other, [1, 1]);
-        assert_eq!(profile.levels, [[4, 67], [1, 16], [1, 16]]);
+        assert_eq!((profile.samples, profile.cycles), (6, 100 * M));
+        assert_eq!(profile.gone, [1, 16 * M]);
+        assert_eq!(profile.other, [1, M]);
+        assert_eq!(profile.levels, [[4, 67 * M], [1, 16 * M], [1, 16 * M]]);
         assert_eq!(
             profile.entries,
             [
@@ -334,11 +332,11 @@ mod tests {
                     Some(0x1f2e_3d4c_5b6a_7980),
                     0xc40,
                     3,
-                    51
+                    51 * M
                 ),
-                entry(Level::User, "0x100", None, 0x100, 1, 16),
-                entry(Level::Kernel, "v+0x2c4d0", Some(0xab), 0x4d0, 1, 16),
-                entry(Level::Guarded, "v-0x40", Some(0xcd), 0xfc0, 1, 16),
+                entry(Level::User, "0x100", None, 0x100, 1, 16 * M),
+                entry(Level::Kernel, "v+0x2c4d0", Some(0xab), 0x4d0, 1, 16 * M),
+                entry(Level::Guarded, "v-0x40", Some(0xcd), 0xfc0, 1, 16 * M),
             ]
         );
     }
@@ -352,19 +350,19 @@ mod tests {
             .collect();
         let profile = Profile::parse(&beats, false).unwrap();
         assert_eq!(profile.source, Source::Beats { of: 3 });
-        assert_eq!(profile.cycles, 100);
+        assert_eq!(profile.cycles, 100 * M);
     }
 
     #[test]
     fn a_log_without_lines_or_with_a_broken_entry_is_refused() {
         let none = Profile::parse("PES WHERE all: ins=1M\nPES HOT user samples=3\n", false);
         assert!(none.unwrap_err().to_string().contains("no `PES PC` lines"));
-        let broken = "PES PC samples=1 cycles=16M gone=0/0M other=0/0M\n\
-                      PES PC user samples=1 cycles=16M blocks=1 0x100:1@?+100\n";
+        let broken = "PES PC samples=1 cycles=16000000 gone=0/0 other=0/0\n\
+                      PES PC user samples=1 cycles=16000000 blocks=1 0x100:1@?+100\n";
         let error = Profile::parse(broken, false).unwrap_err();
         assert!(format!("{error:#}").contains("line 2"), "{error:#}");
         // A level line before any header.
-        let orphan = "PES PC user samples=1 cycles=16M blocks=1 0x100:1:16@?+100\n";
+        let orphan = "PES PC user samples=1 cycles=16000000 blocks=1 0x100:1:16000000@?+100\n";
         assert!(Profile::parse(orphan, false).is_err());
     }
 
@@ -415,7 +413,9 @@ mod tests {
         let profile = Profile::parse(&text, false).unwrap();
         assert_eq!(profile.source, Source::Total { taken: 1, of: 1 });
         assert_eq!(profile.samples, 4);
-        assert_eq!(profile.gone, [1, 16]);
+        // Exact cycles: nothing is lost to whole millions.
+        assert_eq!(profile.cycles, 87_108_864);
+        assert_eq!(profile.gone, [1, 16_777_216]);
         assert_eq!(
             profile.entries,
             [
@@ -425,10 +425,10 @@ mod tests {
                     Some(0x1f2e_3d4c_5b6a_7980),
                     0xc40,
                     2,
-                    50
+                    50_331_648
                 ),
-                entry(Level::Kernel, "v+0x2c4d0", None, 0x4d0, 1, 20),
-                entry(Level::Guarded, "v-0x40", Some(7), 0xfc0, 1, 16),
+                entry(Level::Kernel, "v+0x2c4d0", None, 0x4d0, 1, 20_000_000),
+                entry(Level::Guarded, "v-0x40", Some(7), 0xfc0, 1, 16_777_216),
             ]
         );
     }
