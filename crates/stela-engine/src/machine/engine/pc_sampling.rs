@@ -291,6 +291,132 @@ mod tests {
         assert_eq!(samples.top(Level::User, 4)[0].cycles, (1 << 24) + 5);
     }
 
+    /// The samples the host gives for `index` at once, named and taken.
+    fn named(machine: &mut Machine<FakeHost, NoDevices>, index: u64) -> PcSamples {
+        machine.host.block_samples = alloc::vec![BlockSample {
+            block: index,
+            cycles: 1
+        }];
+        machine.take_native_samples();
+        let mut samples = PcSamples::default();
+        machine.take_pc_samples(&mut samples);
+        samples
+    }
+
+    /// Change the block in `index`'s slot as `change` does.
+    fn rewrite(
+        machine: &mut Machine<FakeHost, NoDevices>,
+        index: u64,
+        change: impl FnOnce(&mut Block),
+    ) {
+        let slot = index as usize;
+        machine.code.blocks.retire(slot);
+        let mut block = machine.code.blocks.vacate(slot).expect("a block");
+        change(&mut block);
+        machine.code.blocks.fill(slot, block);
+    }
+
+    /// A block another PE retired stays in its slot until this PE's grace:
+    /// a sample of the run that was in it still names it.
+    #[test]
+    fn a_retired_block_still_in_its_slot_is_named() {
+        let (mut machine, base) = compiled();
+        let index = index_of(&machine, base + 12);
+        machine.code.blocks.retire(index as usize);
+        assert!(machine.code.blocks.installed(index as usize).is_none());
+        let samples = named(&mut machine, index);
+        assert_eq!(samples.gone, [0, 0]);
+        assert_eq!(samples.top(Level::User, 4)[0].pc, base + 12);
+    }
+
+    /// A kernel block's PC is kept less its EL's vector base, EL2's at EL2
+    /// and under VHE at EL0; the PE's guarded state makes it a guarded one;
+    /// its offset is that of its own PC and its page is still read.
+    #[test]
+    fn kernel_and_guarded_samples_are_kept_from_their_vector_base() {
+        use crate::machine::system::Register;
+        const KERNEL: u64 = 0xffff_fe00_0712_3c40;
+        const VBAR_EL1: u64 = 0xffff_fe00_0700_0000;
+        const VBAR_EL2: u64 = 0xffff_fe00_0710_0000;
+        let (mut machine, base) = compiled();
+        let index = index_of(&machine, base + 12);
+        rewrite(&mut machine, index, |block| block.pc = KERNEL);
+        // Their low bits are no part of the base.
+        machine
+            .cpu
+            .registers
+            .set(Register::VBAR_EL1, 0, VBAR_EL1 | 0x7ff);
+        machine.cpu.registers.set(Register::VBAR_EL2, 0, VBAR_EL2);
+        let kept = |machine: &mut Machine<FakeHost, NoDevices>, el, guarded| {
+            machine.cpu.pstate.el = el;
+            machine.cpu.pstate.guarded = guarded;
+            let samples = named(machine, index);
+            let level = if guarded {
+                Level::Guarded
+            } else {
+                Level::Kernel
+            };
+            let top = samples.top(level, 4);
+            assert_eq!(top.len(), 1, "EL{el} guarded={guarded}");
+            assert_eq!(top[0].offset, 0xc40);
+            assert!(top[0].page.is_some());
+            top[0].pc
+        };
+        assert_eq!(kept(&mut machine, 1, false), KERNEL - VBAR_EL1);
+        assert_eq!(kept(&mut machine, 1, true), KERNEL - VBAR_EL1);
+        assert_eq!(kept(&mut machine, 2, false), KERNEL - VBAR_EL2);
+        const HCR_TGE: u64 = 1 << 27;
+        const HCR_E2H: u64 = 1 << 34;
+        machine
+            .cpu
+            .registers
+            .set(Register::HCR_EL2, 0, HCR_TGE | HCR_E2H);
+        assert!(machine.cpu.in_host());
+        assert_eq!(kept(&mut machine, 0, false), KERNEL - VBAR_EL2);
+    }
+
+    /// A block whose page is not RAM is named with no page (`?`).
+    #[test]
+    fn a_page_that_cannot_be_read_names_no_key() {
+        let (mut machine, base) = compiled();
+        let index = index_of(&machine, base + 12);
+        rewrite(&mut machine, index, |block| {
+            block.physical = 0xdead_0000_0000 | (base + 12) & 0xfff
+        });
+        let samples = named(&mut machine, index);
+        let top = samples.top(Level::User, 4);
+        assert_eq!(
+            (top[0].pc, top[0].page, top[0].offset),
+            (base + 12, None, ((base + 12) & 0xfff) as u16)
+        );
+        assert!(samples.lines("PES PC", 4)[1].contains("@?+"));
+    }
+
+    /// A page whose key the board's PEs know for its bytes takes that key
+    /// (`known_keys`) and is not hashed again.
+    #[test]
+    fn a_page_the_board_knows_takes_its_known_key() {
+        let (mut machine, base) = compiled();
+        let index = index_of(&machine, base);
+        let frame = machine.code.blocks.get(index as usize).unwrap().physical & !0xfff;
+        let mut page = [0u8; PAGE_BYTES];
+        assert!(machine.host.read_ram(frame, &mut page));
+        let known = super::super::known_keys::Known {
+            key: Digest([7; 32]),
+            absent: false,
+        };
+        let slots = machine.known_slots;
+        machine
+            .code
+            .known_keys
+            .put(slots, frame, stored::page_check(&page), known);
+        let samples = named(&mut machine, index);
+        assert_eq!(
+            samples.top(Level::User, 1)[0].page,
+            Some(0x0707_0707_0707_0707)
+        );
+    }
+
     /// More samples than one take holds are all taken.
     #[test]
     fn every_sample_of_a_run_is_taken() {
