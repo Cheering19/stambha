@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! A bounded passive LE scan through a controller [`super::initialize`]
+//! A bounded passive LE scan through a controller [`super::initialize()`]
 //! brought up, for the host check's `--bluetooth-check`: the standard HCI
 //! Linux's core sends once btrtl's setup has run, cut to what a passive scan
 //! needs. HCI Reset (`hci_init1_sync`, hci_sync.c:3890-3901); Set Event Mask

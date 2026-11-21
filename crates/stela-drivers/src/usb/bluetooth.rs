@@ -17,8 +17,12 @@
 //! The explicit native [`Hci::initialize_with_provider`] consumer keeps owned
 //! device-specific evidence/errors after the provider is released. Raw attachment
 //! itself never initializes a controller. [`realtek::initialize`] adds exact
-//! RTL8761BU/RTL8822B stock-ROM identification and EPATCH v1 upload with owned
-//! observations. Other vendor/format variants remain explicit unsupported paths.
+//! RTL8761BU/RTL8822B/RTL8852BU/RTL8852CU stock-ROM identification, a running
+//! patch dropped once with 0xfc66 as btrtl drops it, and EPATCH v1 or v2
+//! upload (an RTL8852CU's v2 image, its v1 image when that is missing) with
+//! owned observations; [`realtek::scan()`] a bounded passive LE scan through
+//! such a controller. Other vendor/format variants remain explicit
+//! unsupported paths.
 //! [`broadcom::initialize`] adds source-selected Broadcom/Cypress USB PatchRAM
 //! identification, complete HCD replay, completion/credit handling and
 //! post-download observations. Matching vendor-specific HCI interfaces

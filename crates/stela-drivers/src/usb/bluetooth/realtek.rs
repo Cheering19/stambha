@@ -4,8 +4,12 @@
 //! See NOTICE for exact provenance and limits. Explicit initialization
 //! observes an exact USB/HCI/ROM/security profile, stages exact Provider images
 //! and requires real download completions and post-upload version/address.
+//! Readings no btrtl IC matches, as a warm reboot's running patch gives, are
+//! dropped once with 0xfc66 and read again, as `btrtl_initialize` does.
 //! This establishes observed protocol execution, never vendor authentication,
 //! radio validation or guest services. Generic firmware status is unchanged.
+//! [`scan()`] is a bounded passive LE scan through an initialized controller,
+//! for the host check; it counts advertisers and keeps no address.
 mod firmware;
 mod identity;
 mod initialize;
@@ -123,7 +127,7 @@ pub struct OwnedReport {
     pub v2: Option<V2Metadata>,
     pub download: Vec<DownloadResponse>,
     /// The commands the controller's last completion let the host send,
-    /// which a later exchange ([`scan`]) starts from.
+    /// which a later exchange ([`scan()`]) starts from.
     pub credits: u8,
 }
 #[derive(Debug)]
