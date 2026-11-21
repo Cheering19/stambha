@@ -41,6 +41,51 @@ impl LocalVersion {
         u16::from_le_bytes([self.raw[7], self.raw[8]])
     }
 }
+/// btrtl's `ic_id_table` entries for HCI_USB (btrtl.c:106-340), as
+/// (lmp_subver, hci_rev, hci_ver). The 8703B chip-type entries are UART only.
+const BTRTL_USB_ICS: [(u16, u16, u8); 16] = [
+    (0x1200, 0xb, 0x6),  // 8723A
+    (0x8723, 0xb, 0x6),  // 8723B
+    (0x8723, 0xd, 0x8),  // 8723D
+    (0x8821, 0xa, 0x6),  // 8821A
+    (0x8821, 0xc, 0x8),  // 8821C
+    (0x8761, 0xa, 0x6),  // 8761A
+    (0x8761, 0xb, 0xa),  // 8761BU
+    (0x8761, 0xe, 0),    // 8761CU
+    (0x8822, 0xc, 0xa),  // 8822C
+    (0x8822, 0xb, 0x7),  // 8822B
+    (0x8852, 0xa, 0xb),  // 8852A
+    (0x8852, 0xb, 0xb),  // 8852B
+    (0x8852, 0xc, 0xc),  // 8852C
+    (0x8851, 0xb, 0xc),  // 8851B
+    (0x8922, 0xa, 0xc),  // 8922A
+    (0x8852, 0x87, 0xc), // 8852BT
+];
+
+/// Whether btrtl knows a USB controller with these readings
+/// (`btrtl_match_ic`, btrtl.c:342-372): an entry's hci_ver 0 takes any.
+/// An 8822E, register subversion 0x8822 with revision 0x000e, is matched on
+/// its registers with hci_ver 0x0c and no Read Local Version
+/// (btrtl.c:1094-1108). A miss is what makes btrtl drop a running patch.
+pub(super) fn btrtl_ic(
+    register_subversion: u16,
+    register_revision: Option<u16>,
+    version: &LocalVersion,
+) -> bool {
+    let (lmp, revision, hci) = if register_subversion == 0x8822 && register_revision == Some(0xe) {
+        (0x8822, 0xe, 0xc)
+    } else {
+        (
+            version.lmp_subversion(),
+            version.hci_revision(),
+            version.hci_version(),
+        )
+    };
+    BTRTL_USB_ICS
+        .iter()
+        .any(|&(l, r, v)| (l, r) == (lmp, revision) && (v == hci || v == 0))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsbIdentity {
     pub vendor: u16,

@@ -1048,3 +1048,150 @@ fn both_missing_rtl8852cu_images_fail_on_the_v1_name_with_the_v2_absence_kept() 
     assert_eq!(trace.borrow().commands, 4);
     assert_eq!(hci.state(), State::Closed);
 }
+/// An RTL8852CU a warm reboot left running its patch, as far as its first
+/// identification: its register still reads the ROM's subversion and Read
+/// Local Version the patch's (lmp_subver 0x5678, no btrtl IC). Then 0xfc66,
+/// answered with `events`, and the stock fixture's identification and upload.
+fn patched_fixture(events: &[&[u8]]) -> (Hci<Model>, Catalog, Rc<RefCell<Trace>>) {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    let first = [
+        Step {
+            parameters: command(0xfc61, &[0x10, 0x38, 4, 0x28, 0x80]),
+            response: cc(0xfc61, &[0, 0x52, 0x88]),
+        },
+        Step {
+            parameters: command(0x1001, &[]),
+            response: cc(0x1001, &version(Project::Rtl8852Cu, true)),
+        },
+        Step {
+            parameters: command(0xfc66, &[]),
+            response: events.concat(),
+        },
+    ];
+    for step in first.into_iter().rev() {
+        hci.io.steps.push_front(step);
+    }
+    (hci, catalog, trace)
+}
+#[test]
+fn a_running_patch_is_dropped_once_with_fc66_and_the_stock_rom_then_boots() {
+    // The controller is silent after 0xfc66; or it completes it granting no
+    // credit, which Linux takes for nothing (btrtl sent it outside the
+    // command flow), and sends a vendor event.
+    let completion = [0x0e, 4, 0, 0x66, 0xfc, 0];
+    let vendor = [0xff, 2, 0x01, 0x02];
+    for events in [&[][..], &[&completion[..], &vendor[..]][..]] {
+        let (mut hci, catalog, trace) = patched_fixture(events);
+        let r = initialize(&mut hci, &catalog).unwrap();
+        assert!(hci.io.steps.is_empty(), "every command in order");
+        assert_eq!(trace.borrow().commands, 10);
+        assert_eq!(r.before.project, Project::Rtl8852Cu);
+        assert_eq!(r.before.version.raw, version(Project::Rtl8852Cu, false)[..]);
+        let dropped = r.dropped.as_ref().unwrap();
+        assert_eq!(dropped.register_subversion, 0x8852);
+        assert_eq!(dropped.register_revision, None);
+        assert_eq!(dropped.version.raw, version(Project::Rtl8852Cu, true)[..]);
+        assert_eq!(dropped.event_count, events.len());
+        assert_eq!(
+            dropped.events,
+            events.iter().map(|e| e.to_vec()).collect::<Vec<_>>()
+        );
+        assert_eq!(r.download.len(), 1);
+    }
+}
+#[test]
+fn readings_matching_no_btrtl_ic_after_the_drop_fail_closed_with_both_kept() {
+    let (mut hci, catalog, trace) = patched_fixture(&[]);
+    // The same patched readings again, then nothing more is asked.
+    hci.io.steps.truncate(4);
+    hci.io.steps.push_back(Step {
+        parameters: command(0x1001, &[]),
+        response: cc(0x1001, &version(Project::Rtl8852Cu, true)),
+    });
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Unsupported(_)));
+    assert!(hci.io.steps.is_empty());
+    assert_eq!(trace.borrow().commands, 5);
+    assert_eq!(
+        a.dropped.as_ref().unwrap().version.raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert_eq!(
+        a.version.as_ref().unwrap().raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert!(a.rom_version.is_none() && a.security.is_none() && a.identity.is_none());
+    assert_eq!(hci.state(), State::Closed);
+}
+#[test]
+fn readings_of_another_btrtl_ic_are_never_dropped() {
+    // An 8852B's stock readings under an 8852CE ID match btrtl's 8852B
+    // entry: no 0xfc66, and the USB-pinned profile then refuses them.
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.io.steps[1].response = cc(0x1001, &version(Project::Rtl8852Bu, false));
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Unsupported(_)));
+    assert!(a.dropped.is_none());
+    assert_eq!(trace.borrow().commands, 4);
+}
+#[test]
+fn btrtls_usb_ic_table_decides_a_drop() {
+    let read = |hci: u8, revision: u16, lmp: u16| {
+        let mut b = vec![0, hci];
+        b.extend_from_slice(&revision.to_le_bytes());
+        b.extend_from_slice(&[hci, 0x5d, 0]);
+        b.extend_from_slice(&lmp.to_le_bytes());
+        LocalVersion::parse(&b).unwrap()
+    };
+    for (hci, revision, lmp, known) in [
+        (0xc, 0xc, 0x8852, true),
+        (0xb, 0xb, 0x8852, true),
+        (0xc, 0x87, 0x8852, true),
+        (0xa, 0xb, 0x8761, true),
+        // 8761CU's entry takes any HCI version (btrtl.c:235, :355-357).
+        (0x33, 0xe, 0x8761, true),
+        (0x6, 0xb, 0x1200, true),
+        (0xb, 0xc, 0x8852, false),
+        (0xc, 0xc, 0x5678, false),
+        // 8822C's USB entry is 0xc/0xa; 0xc/0x8 is UART only.
+        (0x8, 0xc, 0x8822, false),
+    ] {
+        assert_eq!(
+            identity::btrtl_ic(lmp, None, &read(hci, revision, lmp)),
+            known,
+            "{lmp:04x} {revision:04x} {hci:02x}"
+        );
+    }
+    // An 8822E is matched on its registers alone, as hci_ver 0x0c, and no
+    // USB entry has it (btrtl.c:1094-1108).
+    assert!(!identity::btrtl_ic(
+        0x8822,
+        Some(0x000e),
+        &read(0xc, 0xb, 0x8822)
+    ));
+    assert!(identity::btrtl_ic(
+        0x8822,
+        Some(0x000b),
+        &read(0x7, 0xb, 0x8822)
+    ));
+}
+#[test]
+fn an_event_no_command_awaits_fails_an_undropped_identification_closed() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8761Bu, true);
+    let mut response = vec![0xff, 2, 0x01, 0x02];
+    response.extend_from_slice(&hci.io.steps[2].response);
+    hci.io.steps[2].response = response;
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    assert!(matches!(
+        attempt(&e).0,
+        Error::Protocol {
+            requirement: "unexpected initialization event",
+            ..
+        }
+    ));
+    assert!(attempt(&e).1.dropped.is_none());
+    assert_eq!(trace.borrow().commands, 3);
+    assert_eq!(hci.state(), State::Closed);
+}

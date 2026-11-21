@@ -64,6 +64,9 @@ pub struct DownloadResponse {
 /// acknowledged commands never credit a ready or successfully booted image.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attempt {
+    /// The first identification, when no btrtl IC matched it and 0xfc66
+    /// dropped the running patch; the fields below are the next one's.
+    pub dropped: Option<FirmwareDrop>,
     pub version: Option<LocalVersion>,
     pub register_subversion: Option<u16>,
     pub register_revision: Option<u16>,
@@ -80,6 +83,18 @@ pub struct Attempt {
     pub download: Vec<DownloadResponse>,
     pub after: Option<LocalVersion>,
 }
+/// A controller's first identification, which matched no btrtl IC, as a
+/// controller a warm reboot left running its patch reads, and what came in
+/// the 200 ms after the 0xfc66 that dropped the patch (btrtl.c:1140-1169).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareDrop {
+    pub register_subversion: u16,
+    pub register_revision: Option<u16>,
+    pub version: LocalVersion,
+    /// The wait's first events, whole; `event_count` counts all of them.
+    pub events: Vec<Vec<u8>>,
+    pub event_count: usize,
+}
 /// Container versions have different wire layouts. V2 keeps all eight raw
 /// bytes in their original order; no truncation or invented scalar endianness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +106,8 @@ pub enum ContainerVersion {
 /// or vendor-signature authentication. No Image/provider/firmware-byte borrow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedReport {
+    /// The identification before 0xfc66 dropped a running patch, if any.
+    pub dropped: Option<Box<FirmwareDrop>>,
     pub before: Identity,
     pub after: LocalVersion,
     pub address: [u8; 6],
