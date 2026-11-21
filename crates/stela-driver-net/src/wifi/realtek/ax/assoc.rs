@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2019-2020  Realtek Corporation
+// The QoS defaults and the WMM parameter checks are adapted from pinned Linux
+// net/mac80211/util.c (ieee80211_set_wmm_default) and mlme.c
+// (_ieee80211_sta_wmm_params): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2003-2008, Jouni Malinen; 2005-2006, Devicescape Software, Inc.; 2006-2007
+// Jiri Benc; 2007 Johannes Berg; 2007 Michael Wu; 2013-2014 Intel Mobile
+// Communications GmbH; 2015-2017 Intel Deutschland GmbH; 2018-2026 Intel
+// Corporation. See NOTICE.
 //! A station's join, association and leaving on an RTL8852C (M3 spec S9-S11),
 //! as Linux's mac80211 drives rtw89 through them, each step the H2Cs and
 //! register accesses of the rtw89 callback mac80211 calls there, in that

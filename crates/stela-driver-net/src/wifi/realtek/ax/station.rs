@@ -1,6 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
+// The duplicate check is adapted from pinned Linux net/mac80211/rx.c
+// (ieee80211_rx_h_check_dup): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2005-2006, Devicescape Software, Inc.; 2006-2007 Jiri Benc; 2007-2010
+// Johannes Berg; 2013-2014 Intel Mobile Communications GmbH; 2015-2017 Intel
+// Deutschland GmbH; 2018-2026 Intel Corporation. See NOTICE.
 //! An RTL8852CE as the connection keeper's radio (M3 spec S14). rtw89
 //! leaves the MAC's soft half to mac80211, as rtw88 does, so the station's
 //! orchestration is Stela's, after rtw88's `realtek/station.rs` (its
