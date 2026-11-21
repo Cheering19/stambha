@@ -304,6 +304,67 @@ fn critical_is_the_firmware_bit_or_the_low_capacity_while_discharging() {
 }
 
 #[test]
+fn a_low_capacity_counts_only_below_a_tenth_of_the_full_one() {
+    let with = |low, full, design| {
+        let readings = Readings {
+            state: Some(DISCHARGING),
+            low_capacity: low,
+            full_charge_capacity: full,
+            design_capacity: design,
+            remaining_capacity: Some(400),
+            rate: Some(800),
+            ..charge()
+        };
+        BatteryState::from_readings(&readings, Some(false))
+    };
+    // 479 of 4800 is below a tenth: trusted, and 400 is under it.
+    let trusted = with(Some(479), Some(4_800), None);
+    assert!(trusted.low_trusted && trusted.critical);
+    // A tenth or more, the whole capacity, or zero: ignored, and only the
+    // firmware's critical bit is left.
+    for low in [Some(480), Some(600), Some(4_800), Some(0), None] {
+        let battery = with(low, Some(4_800), None);
+        assert!(!battery.low_trusted && !battery.critical, "{low:?}");
+    }
+    // Against the design capacity when the full charge capacity is unknown.
+    assert!(with(Some(450), None, Some(5_000)).low_trusted);
+    assert!(!with(Some(450), None, None).low_trusted);
+    // Ignored, the bit still makes it critical.
+    let readings = Readings {
+        state: Some(DISCHARGING | CRITICAL),
+        low_capacity: Some(4_800),
+        ..charge()
+    };
+    assert!(BatteryState::from_readings(&readings, Some(false)).critical);
+}
+
+#[test]
+fn the_thresholds_name_the_warning_and_low_capacities_and_an_ignored_low() {
+    let battery = |readings: Readings| BatteryState::from_readings(&readings, Some(false));
+    assert_eq!(
+        battery(energy()).thresholds().to_string(),
+        "warning=312 mAh low=100 mAh"
+    );
+    let bogus = Readings {
+        low_capacity: Some(600),
+        ..charge()
+    };
+    assert_eq!(
+        battery(bogus).thresholds().to_string(),
+        "warning=480 mAh low=600 mAh (ignored: not below a tenth of full)"
+    );
+    let unknown = Readings {
+        warning_capacity: None,
+        low_capacity: None,
+        ..charge()
+    };
+    assert_eq!(
+        battery(unknown).thresholds().to_string(),
+        "warning=? mAh low=? mAh"
+    );
+}
+
+#[test]
 fn names_keep_31_bytes_up_to_the_first_nul() {
     assert_eq!(Name::new(b"serial\0ignored").text(), b"serial");
     let long = [b'x'; 40];

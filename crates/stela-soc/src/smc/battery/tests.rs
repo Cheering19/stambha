@@ -113,6 +113,7 @@ fn discharging() -> BatteryState {
         design_mah: Some(5_200),
         warning_mah: Some(500),
         low_mah: Some(150),
+        low_trusted: true,
         voltage_mv: Some(15_800),
         current_ma: Some(-2_850),
         power_mw: Some(45_030),

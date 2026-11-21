@@ -168,9 +168,12 @@ pub(super) fn attach(
         ));
         return;
     }
-    output::arguments(format_args!(
-        "POWER {snapshot} (the SMC's battery, one pack, from {source})\n"
-    ));
+    if let Some(battery) = &snapshot.battery {
+        output::arguments(format_args!(
+            "POWER {snapshot} {} (the SMC's battery, one pack, from {source})\n",
+            battery.thresholds()
+        ));
+    }
     LOGGED.store(snapshot.summary().pack(), Ordering::Relaxed);
     if choice == Battery::Host {
         if let Some(acpi) = acpi {

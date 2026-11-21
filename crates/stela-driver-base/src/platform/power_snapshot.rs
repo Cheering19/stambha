@@ -26,7 +26,10 @@
 //! or the design capacity when that is not valid, held at 100. Linux takes
 //! critical from the `_BST` critical bit; this reading also takes it from a
 //! remaining capacity at or below the firmware's Design Capacity of Low while
-//! the battery discharges, the level ACPI names for an emergency shutdown.
+//! the battery discharges, the level ACPI names for an emergency shutdown,
+//! but only a Low above zero and below a tenth of the full capacity: a
+//! firmware's Low of the whole battery, or of 10-20%, would make it critical
+//! as soon as it discharges, and macOS shuts down at critical.
 //! The times are what the rate gives: the remaining capacity while it
 //! discharges, the capacity still to charge while it charges.
 use core::fmt;
@@ -166,6 +169,9 @@ pub struct BatteryState {
     pub design_mah: Option<u32>,
     pub warning_mah: Option<u32>,
     pub low_mah: Option<u32>,
+    /// The firmware's Design Capacity of Low is above zero and below a
+    /// tenth of the full capacity, so it counts toward critical.
+    pub low_trusted: bool,
     pub voltage_mv: Option<u32>,
     /// Positive while charging, negative while discharging, zero otherwise.
     pub current_ma: Option<i32>,
@@ -258,9 +264,15 @@ impl BatteryState {
                 .map(|((full, remaining), rate)| minutes(full.saturating_sub(remaining), rate)),
             _ => None,
         };
-        let low = valid(r.low_capacity)
-            .zip(r.remaining_capacity)
-            .is_some_and(|(low, remaining)| remaining <= low);
+        // A Low at a tenth of the battery or more, or none, is not a level
+        // to call it critical at: only the firmware's critical bit is.
+        let low_trusted = valid(r.low_capacity)
+            .zip(full_capacity)
+            .is_some_and(|(low, full)| u64::from(low) * 10 < u64::from(full));
+        let low = low_trusted
+            && r.low_capacity
+                .zip(r.remaining_capacity)
+                .is_some_and(|(low, remaining)| remaining <= low);
         Self {
             status,
             percent,
@@ -269,6 +281,7 @@ impl BatteryState {
             design_mah: charge(r.design_capacity),
             warning_mah: charge(r.warning_capacity),
             low_mah: charge(r.low_capacity),
+            low_trusted,
             voltage_mv: r.voltage_mv,
             current_ma: flowing(charge(r.rate)),
             power_mw: flowing(power).map(i32::unsigned_abs),
@@ -280,6 +293,30 @@ impl BatteryState {
             model: r.model,
             serial: r.serial,
         }
+    }
+
+    /// The warning and low capacities, for the line that attaches the
+    /// battery, with a low capacity that does not count said so.
+    pub fn thresholds(&self) -> impl fmt::Display + '_ {
+        Thresholds(self)
+    }
+}
+
+struct Thresholds<'a>(&'a BatteryState);
+
+impl fmt::Display for Thresholds<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let battery = self.0;
+        write!(
+            f,
+            "warning={} mAh low={} mAh",
+            Known(battery.warning_mah),
+            Known(battery.low_mah)
+        )?;
+        if battery.low_mah.is_some() && !battery.low_trusted {
+            f.write_str(" (ignored: not below a tenth of full)")?;
+        }
+        Ok(())
     }
 }
 
