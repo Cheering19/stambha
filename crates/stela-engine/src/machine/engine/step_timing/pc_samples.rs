@@ -57,9 +57,12 @@ pub struct PcBlock {
     pub cycles: u64,
 }
 
-/// The blocks [`PcSamples`] holds apart; samples of others are in
-/// [`PcSamples::other`].
+/// The blocks a trimmed [`PcSamples`] holds apart at most
+/// ([`PcSamples::trim`]); samples of others are in [`PcSamples::other`].
 pub const PC_BLOCKS: usize = 1 << 16;
+/// The most blocks a table holds between trims; samples of new blocks
+/// past them are in [`PcSamples::other`].
+pub const PC_BLOCKS_MOST: usize = 2 * PC_BLOCKS;
 
 /// A table key: level, page, offset, PC.
 type Key = (u8, Option<u64>, u16, u64);
@@ -71,7 +74,8 @@ pub struct PcSamples {
     /// Samples and cycles by level, the table's and the others'.
     pub samples: [u64; Level::COUNT],
     pub cycles: [u64; Level::COUNT],
-    /// Samples and cycles of blocks the table had no room for.
+    /// Samples and cycles of blocks a trim folded ([`Self::trim`]) or the
+    /// table had no room for.
     pub other: [u64; 2],
     /// Samples and cycles whose block could not be named: its slot was
     /// empty, or the host kept no block for it ([`NO_BLOCK`]).
@@ -93,7 +97,7 @@ impl PcSamples {
         let level = usize::from(key.0).min(Level::COUNT - 1);
         self.samples[level] += samples;
         self.cycles[level] += cycles;
-        let room = self.blocks.len() < PC_BLOCKS;
+        let room = self.blocks.len() < PC_BLOCKS_MOST;
         match self.blocks.get_mut(&key) {
             Some(counts) => {
                 counts.0 += samples;
@@ -107,6 +111,35 @@ impl PcSamples {
                 self.other[1] += cycles;
             }
         }
+    }
+
+    /// When the table holds more than [`PC_BLOCKS`] blocks, keep the three
+    /// quarters of that many with the most cycles and fold the others'
+    /// samples and cycles into [`Self::other`]: a long boot's total keeps
+    /// the blocks that matter, a later workload's hot ones among them,
+    /// rather than the first it saw. It takes time in the blocks held, so
+    /// the report calls it once a beat, and a trim leaves room for a
+    /// quarter more before the next.
+    pub fn trim(&mut self) {
+        if self.blocks.len() <= PC_BLOCKS {
+            return;
+        }
+        let keep = PC_BLOCKS * 3 / 4;
+        let mut blocks: Vec<(Key, (u64, u64))> =
+            core::mem::take(&mut self.blocks).into_iter().collect();
+        // Most cycles first, then most samples, then by key: a total order.
+        blocks.select_nth_unstable_by(keep, |a, b| {
+            (b.1)
+                .1
+                .cmp(&(a.1).1)
+                .then((b.1).0.cmp(&(a.1).0))
+                .then(a.0.cmp(&b.0))
+        });
+        for (_, (samples, cycles)) in blocks.drain(keep..) {
+            self.other[0] += samples;
+            self.other[1] += cycles;
+        }
+        self.blocks = blocks.into_iter().collect();
     }
 
     /// Count `samples` samples of `cycles` that named no block.
@@ -320,22 +353,58 @@ mod tests {
         assert_eq!(merged.len(), 4);
     }
 
+    /// Between trims a table holds at most PC_BLOCKS_MOST blocks: new
+    /// blocks past it count as other.
     #[test]
     fn a_full_table_counts_new_blocks_as_other() {
         let mut samples = PcSamples::default();
-        for index in 0..PC_BLOCKS as u64 + 3 {
+        for index in 0..PC_BLOCKS_MOST as u64 + 3 {
             samples.add(hit(index * 4, Level::User, None, 2));
         }
-        assert_eq!(samples.len(), PC_BLOCKS);
+        assert_eq!(samples.len(), PC_BLOCKS_MOST);
         assert_eq!(samples.other, [3, 6]);
         // A held block still counts.
         samples.add(hit(0, Level::User, None, 2));
         assert_eq!(samples.top(Level::User, 1)[0].samples, 2);
-        assert_eq!(samples.samples[Level::User as usize], PC_BLOCKS as u64 + 4);
+        assert_eq!(
+            samples.samples[Level::User as usize],
+            PC_BLOCKS_MOST as u64 + 4
+        );
         let mut merged = PcSamples::default();
         merged.merge(&samples);
         assert_eq!(merged.other, [3, 6]);
         assert_eq!(merged.samples, samples.samples);
+    }
+
+    /// A trim keeps the blocks with the most cycles and folds the rest
+    /// into other: a workload's hot blocks that came after the table filled
+    /// with a boot's cold ones are kept, not lost to other.
+    #[test]
+    fn a_trim_keeps_the_blocks_with_the_most_cycles() {
+        let mut samples = PcSamples::default();
+        for index in 0..PC_BLOCKS as u64 {
+            samples.add(hit(index * 4, Level::User, None, 1));
+        }
+        for index in 0..100u64 {
+            samples.add(hit(0x100_0000 + index * 4, Level::User, Some(1), 1000));
+        }
+        samples.add(hit(0xffff_fe00_0000_0000, Level::Kernel, None, 500));
+        assert_eq!(samples.other, [0, 0], "held until a trim");
+        samples.trim();
+        assert_eq!(samples.len(), PC_BLOCKS * 3 / 4);
+        let hot = samples.top(Level::User, 100);
+        assert!(hot.iter().all(|block| block.cycles == 1000), "{hot:?}");
+        assert_eq!(samples.top(Level::Kernel, 4).len(), 1);
+        // The folded blocks' samples and cycles are other's; the levels'
+        // counts stand.
+        let folded = (PC_BLOCKS + 101 - PC_BLOCKS * 3 / 4) as u64;
+        assert_eq!(samples.other, [folded, folded]);
+        assert_eq!(samples.samples, [PC_BLOCKS as u64 + 100, 1, 0]);
+        assert_eq!(samples.cycles, [PC_BLOCKS as u64 + 100_000, 500, 0]);
+        // A table with room is left as it is.
+        let before = samples.clone();
+        samples.trim();
+        assert_eq!(samples, before);
     }
 
     #[test]

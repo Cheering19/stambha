@@ -47,6 +47,10 @@ impl Symbolize {
     }
 }
 
+/// The share of the cycles in `other`, in percent, that the report warns
+/// of.
+const OTHER_WARNING: f64 = 10.0;
+
 /// One row of the table: a function's samples, or a block's no image
 /// names.
 #[derive(Default)]
@@ -93,6 +97,21 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
     let _ = writeln!(out, "levels: {}", levels.join(", "));
     for warning in &profile.warnings {
         let _ = writeln!(out, "warning: {warning}");
+    }
+    // A total trims the blocks with the fewest cycles into `other`.
+    let other = share(profile.other[1]);
+    if other >= OTHER_WARNING {
+        let advice = match profile.source {
+            log::Source::Total { .. } => {
+                "for one workload, cut the log to its beats and read them with --beats"
+            }
+            log::Source::Beats { .. } => "the beats' tables were full",
+        };
+        let _ = writeln!(
+            out,
+            "warning: {other:.1}% of the cycles are of blocks the lines no longer list \
+             (other): {advice}"
+        );
     }
     for loaded in &code.loaded {
         let _ = writeln!(out, "read: {loaded}");
@@ -276,6 +295,26 @@ mod tests {
             short.contains("_alpha") && !short.contains("_beta"),
             "{short}"
         );
+    }
+
+    /// A total whose blocks are mostly folded into `other` says so, and
+    /// how to read one workload instead; a small `other` is not warned of.
+    #[test]
+    fn a_large_other_is_warned_of() {
+        let text = |other: u64| {
+            format!(
+                "PES PC TOTAL samples=4 cycles=100 gone=0/0 other=3/{other}\n\
+                 PES PC TOTAL user samples=4 cycles=100 blocks=1 0x200:1:{}@?+200\n",
+                100 - other
+            )
+        };
+        let large = log::Profile::parse(&text(60), false).unwrap();
+        let table = report(&large, &Code::default(), 10);
+        assert!(table.contains("warning: 60.0% of the cycles"), "{table}");
+        assert!(table.contains("--beats"), "{table}");
+        let small = log::Profile::parse(&text(5), false).unwrap();
+        let table = report(&small, &Code::default(), 10);
+        assert!(!table.contains("warning:"), "{table}");
     }
 
     /// The lines the log's reading skipped are named.

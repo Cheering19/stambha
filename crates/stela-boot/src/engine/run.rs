@@ -775,6 +775,8 @@ fn pc_blocks_report<H: Host>(
     const TOTAL_SHOWN: usize = 256;
     let beat = parallel::pc_samples(machine);
     total.merge(&beat);
+    // The total keeps the blocks with the most cycles, not the first.
+    total.trim();
     for line in beat.lines("PES PC", SHOWN) {
         output::arguments(format_args!("{line}\n"));
     }
