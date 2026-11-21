@@ -14,6 +14,15 @@
 //! Unlike `PES HOT`, which weighs blocks by transfer, a sample here weighs
 //! the cycles its period counted, so a self-loop that runs a whole memcmp
 //! counts for its time.
+//!
+//! What a block's cycles hold: every sample taken while the native run was
+//! in it, its lookup and probe tails and the host routines it called
+//! included (the translated-access helper, the PAC service, a shadow
+//! page-fault fill), which `PES WHERE` tells apart by class. What they do
+//! not: the engine's own time between runs (compiles, exits, devices).
+//! Samples in native code the host did not enter through
+//! `Host::execute` (context-ABI blocks, the boot's diagnostic native runs)
+//! name no block: they are [`PcSamples::gone`]'s.
 use super::Level;
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 
@@ -27,7 +36,8 @@ pub struct BlockSample {
 }
 
 /// A sample no block is named for: taken while native code ran with no
-/// chain control the host knew, or one the host had no room to keep.
+/// chain control the host knew (a context-ABI block, a diagnostic native
+/// run), or one the host had no room to keep.
 pub const NO_BLOCK: u64 = u64::MAX;
 
 /// A sample named by its block ([`PcSamples::add`]).
@@ -78,7 +88,9 @@ pub struct PcSamples {
     /// table had no room for.
     pub other: [u64; 2],
     /// Samples and cycles whose block could not be named: its slot was
-    /// empty, or the host kept no block for it ([`NO_BLOCK`]).
+    /// empty, or the host kept no block for it ([`NO_BLOCK`]): it was taken
+    /// in a context-ABI block or a diagnostic native run, which the host
+    /// enters without a chain control, or found the ring full.
     pub gone: [u64; 2],
 }
 
