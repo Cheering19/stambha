@@ -347,12 +347,19 @@ fn identity(identity: &Identity, drop: Option<&FirmwareDrop>) -> String {
     )
 }
 
-/// The readings of a controller that was not identified.
+/// The readings of a controller that was not identified, with its ROM
+/// version and key id when it was read so far.
 fn readings(attempt: &Attempt, version: &LocalVersion) -> String {
     let mut text = examining(version);
     if let Some(subversion) = attempt.register_subversion {
         text.push(' ');
         text.push_str(&register(subversion, attempt.register_revision));
+    }
+    if let Some(rom) = attempt.rom_version {
+        text.push_str(&format!(" rom_version={rom:x}"));
+    }
+    if let Some([key, second]) = attempt.security {
+        text.push_str(&format!(" key_id={key} (security {key:02x}-{second:02x})"));
     }
     if let Some(drop) = &attempt.dropped {
         text.push_str(&dropped(drop));

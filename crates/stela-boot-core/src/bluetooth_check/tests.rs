@@ -499,3 +499,35 @@ fn only_usb_bluetooth_requests_reach_the_bundle() {
         ErrorKind::Missing
     );
 }
+
+#[test]
+fn a_refused_identification_keeps_the_rom_version_and_key_id_it_read() {
+    // An 8852B's stock readings under an 8852CE ID: ROM and security were
+    // read before the profile refused them.
+    let refused = Attempt {
+        version: Some(LocalVersion {
+            raw: [0, 0x0b, 0x0b, 0, 0x0b, 0x5d, 0, 0x52, 0x88],
+        }),
+        register_subversion: Some(0x8852),
+        rom_version: Some(1),
+        security: Some([0, 0x5a]),
+        ..Attempt::default()
+    };
+    let failed = InitializationError::Realtek(Error::Attempt {
+        cause: Box::new(Error::Unsupported(
+            "USB and observed stock ROM/HCI profile mismatch",
+        )),
+        observation: Box::new(refused),
+    });
+    let got = lines(&[controller(Some(Err(&failed)))], None);
+    assert_eq!(
+        text(&got)[1],
+        (
+            "bluetooth-rom",
+            Verdict::Fail,
+            "hci_ver=0b hci_rev=000b lmp_ver=0b lmp_subver=8852 manufacturer=005d register=8852 \
+             rom_version=1 key_id=0 (security 00-5a): USB and observed stock ROM/HCI profile \
+             mismatch"
+        )
+    );
+}
