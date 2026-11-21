@@ -832,7 +832,7 @@ fn load(
     let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
     crate::status::begin("Setting up Stela's memory");
     let image = memory::prepare_image(&snapshot)?;
-    let mut memory = memory::reserve(cores, &image.ram)?;
+    let mut memory = memory::reserve(cores, &image.ram, system.code_window)?;
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(

@@ -34,6 +34,9 @@ pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
 pub const GUEST_PES: &str = "--guest-pes";
+/// The board's code window in MiB (`--code-window MIB`), in place of the
+/// one sized from the host's RAM (`host_memory::with_window`).
+pub const CODE_WINDOW: &str = "--code-window";
 /// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
 /// place of the monitor's preferred mode: for a capture device that cannot
 /// take the mode its EDID prefers.
@@ -280,6 +283,11 @@ pub struct System {
     /// The source PE count (`--guest-pes N`) recorded by setup for disk
     /// boots whose verified DeviceTree is loaded after firmware exit.
     pub guest_pes: Option<usize>,
+    /// The board's code window in MiB ([`CODE_WINDOW`]): whole
+    /// [`crate::native_resources::CODE_ALIGNMENT`] steps within the
+    /// window's bounds. Each MiB past the sized window takes two from the
+    /// guest (the window and its block records); the guest keeps its floor.
+    pub code_window: Option<u64>,
     /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
     pub display_size: Option<(u32, u32)>,
     /// Check owned AP startup/host resources, then stop before guest entry.
@@ -396,6 +404,7 @@ impl Default for System {
             input: false,
             native_cores: None,
             guest_pes: None,
+            code_window: None,
             display_size: None,
             native_bootstrap_check: false,
             native_shared_check: false,
@@ -846,6 +855,7 @@ impl fmt::Display for System {
         line.flag("--sep-observe", self.sep_observe)?;
         line.value(NATIVE_CORES, self.native_cores)?;
         line.value(GUEST_PES, self.guest_pes)?;
+        line.value(CODE_WINDOW, self.code_window)?;
         line.value(
             DISPLAY_SIZE,
             self.display_size

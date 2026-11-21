@@ -319,6 +319,36 @@ fn native_core_counts_refuse_duplicates_zero_and_over_capacity() {
     );
 }
 
+/// `--code-window` names the board's code window in MiB: whole 16 MiB
+/// steps from 64 MiB to 2 GiB, the window's own bounds, once.
+#[test]
+fn a_code_window_takes_whole_steps_within_the_windows_bounds() {
+    let options = round_trip("--system --code-window 1536");
+    assert_eq!(options.code_window, Some(1536));
+    assert_eq!(options.to_string(), "--system --code-window 1536");
+    assert_eq!(System::default().code_window, None);
+    assert!(!System::default().to_string().contains("--code-window"));
+    for mib in [64, 784, 2048] {
+        let line = format!("--system --code-window {mib}");
+        assert_eq!(round_trip(&line).code_window, Some(mib), "{line}");
+    }
+    for (text, error) in [
+        ("--system --code-window", Error::CodeWindow),
+        ("--system --code-window x", Error::CodeWindow),
+        ("--system --code-window 0", Error::CodeWindow),
+        ("--system --code-window 48", Error::CodeWindow),
+        ("--system --code-window 1000", Error::CodeWindow),
+        ("--system --code-window 2064", Error::CodeWindow),
+        ("--system --code-window 0x600", Error::CodeWindow),
+        (
+            "--system --code-window 1024 --code-window 1024",
+            Error::DuplicateCodeWindow,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
 #[test]
 fn guest_pes_bound_the_executors_that_run_them() {
     for text in [

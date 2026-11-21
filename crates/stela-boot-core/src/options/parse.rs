@@ -75,6 +75,22 @@ impl ParseState<'_> {
                 }
                 options.guest_pes = Some(count);
             }
+            CODE_WINDOW => {
+                use crate::native_resources::{CODE_ALIGNMENT, MAX_WINDOW, MIN_WINDOW};
+                if options.code_window.is_some() {
+                    return Err(Error::DuplicateCodeWindow);
+                }
+                let mib = value()
+                    .and_then(|word| word.parse::<u64>().ok())
+                    .ok_or(Error::CodeWindow)?;
+                let bytes = mib.saturating_mul(1 << 20);
+                if !(MIN_WINDOW..=MAX_WINDOW).contains(&bytes)
+                    || !bytes.is_multiple_of(CODE_ALIGNMENT)
+                {
+                    return Err(Error::CodeWindow);
+                }
+                options.code_window = Some(mib);
+            }
             DISPLAY_SIZE => {
                 let size = value().ok_or(Error::DisplaySize)?;
                 let (width, height) = size.split_once('x').ok_or(Error::DisplaySize)?;
