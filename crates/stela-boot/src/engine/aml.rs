@@ -1513,7 +1513,15 @@ impl HostAcpi {
         provider.reach(physical, bytes).and_then(NonNull::new)
     }
     pub(super) fn retain_power(&self, power: stela_drivers::probe::Power) {
+        super::battery::publish(&power);
         *self.power.borrow_mut() = power;
+    }
+    /// Read the batteries, AC adapter and lid again at the next poll, as a
+    /// notification of them would, while hardware mode runs.
+    pub(super) fn refresh_power(&self) {
+        if self.hardware_active() {
+            POWER_CHANGED.store(true, Ordering::Release);
+        }
     }
     pub(super) fn hardware_active(&self) -> bool {
         self.hardware.load(Ordering::Acquire)
@@ -1615,6 +1623,7 @@ impl HostAcpi {
             {
                 output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"));
             }
+            super::battery::publish(&power);
         }
         self.service_ucsi();
         // SAFETY: run Notify/_Q work queued by device methods on the BSP.

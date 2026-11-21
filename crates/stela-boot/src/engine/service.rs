@@ -432,6 +432,7 @@ impl Service {
             if power.pressed() {
                 devices.serve(|devices| power.press(devices));
             }
+            super::battery::serve(devices);
             lap.part_of(Part::Nor, |_| drivers);
         }
         if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, &mut turn)) {
