@@ -568,7 +568,13 @@ mod tests {
             }
         }
         assert_eq!(sender.phase(), Phase::Complete);
-        assert!(stream.output.ends_with(&data));
+        // The Initiate reply, then the image, each byte once and in order.
+        let output = &stream.output;
+        let ends: Vec<_> = (0..output.len().saturating_sub(7))
+            .filter(|&at| output[at..].starts_with(b"</plist>\n"))
+            .collect();
+        assert_eq!(ends.len(), 1, "one reply");
+        assert!(output[ends[0] + 9..] == data[..], "the image whole, once");
         assert_eq!(source.reads.len(), 4, "the payload is read once");
     }
     /// A source whose every other read runs out of the time it may wait, as
