@@ -38,11 +38,15 @@ Component                          License                            Where
 Linux kernel v7.2.12 (source in    GPL-2.0-only, GPL-2.0-or-later,    stela.efi
 third_party/linux, Rust ports in   MIT, GPL-2.0 OR BSD-3-Clause and
 crates/stela-driver*/,             other per-file terms
-stela-linux, stela-boot-core)
+stela-linux, stela-boot-core,
+stela-soc)
 FreeBSD e1000 driver               BSD-3-Clause                       stela.efi
 MediaTek mt76 Wi-Fi, btmtk and     BSD-3-Clause-Clear, ISC            stela.efi
 wireless regulatory ports
 Asahi Linux hci_bcm4377            GPL-2.0-only OR MIT (MIT used)     stela.efi
+VoodooInput (acidanthera), the     GPL-2.0-only                       stela.efi, stela
+emulated Magic Trackpad 2's
+reports and descriptors
 Intel drm_eld.h definitions        MIT                                stela.efi
 Mesa 26.2.5 (NVK, NIR, NAK,        MIT; c11 threads BSL-1.0           stela.efi
 Vulkan runtime)
@@ -1170,3 +1174,9 @@ crates/stela-linux/src/compat/kernel/: Linux kernel services for the unchanged
     lib/list_sort.c, lib/seq_buf.c, lib/sort.c, lib/usercopy.c,
     lib/vsprintf.c, mm/interval_tree.c, mm/memory.c, mm/mmap.c, mm/slab.h,
     mm/slub.c, mm/util.c, mm/vmalloc.c
+crates/stela-soc/src/usb/: Emulated Magic Trackpad 2 multitouch reports
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/hid/hid-magicmouse.c
+    VoodooInput d897813718c2ef9ad143b6a86240fe52dcb1693e; GPL-2.0-only
+    VoodooInput/VoodooInputSimulator/VoodooInputSimulatorDevice.cpp,
+    VoodooInput/VoodooInputSimulator/VoodooInputSimulatorDevice.hpp

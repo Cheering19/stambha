@@ -11,6 +11,7 @@ pub mod mux;
 pub mod plist;
 pub mod session;
 pub mod storage;
+pub mod trackpad;
 
 /// The initial transport profile has USB2 high-speed packets only.
 pub const MAX_PACKET: usize = 512;
