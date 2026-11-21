@@ -766,9 +766,15 @@ fn add_usbs(
             } else {
                 "none"
             };
+            let trackpad = if usb.trackpad.is_some() {
+                " trackpad=attached"
+            } else {
+                ""
+            };
             devices.attach_input(controller.port, core::mem::take(&mut usb))?;
             log(format_args!(
-                "INPUT attached to USB-C port {} with {disks} USB disks, network={network}\n",
+                "INPUT attached to USB-C port {} with {disks} USB disks, \
+                 network={network}{trackpad}\n",
                 controller.port
             ));
         }

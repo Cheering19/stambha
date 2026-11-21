@@ -57,6 +57,8 @@ pub enum Error {
     DuplicateWifiKey,
     WifiCountry,
     DuplicateWifiCountry,
+    Trackpad,
+    DuplicateTrackpad,
     Usb4Approve,
     DuplicateUsb4Approve,
     Ipv4,
@@ -134,6 +136,7 @@ pub enum Constraint {
     DramAlignment,
     AudioHpetDependency,
     NativePciIoapicExclusive,
+    TrackpadDependency,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -177,6 +180,8 @@ impl Error {
             Self::DuplicateWifiKey => "duplicate --wifi-key",
             Self::WifiCountry => "--wifi-country needs a two-letter country",
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
+            Self::Trackpad => "--trackpad takes mt2 or builtin",
+            Self::DuplicateTrackpad => "duplicate --trackpad",
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",
             Self::Ipv4 => "--ipv4 needs a host ADDRESS/PREFIX, such as 192.168.1.20/24",
@@ -261,6 +266,9 @@ impl Constraint {
             Self::AudioHpetDependency => "--audio-own-hpet requires --audio-check",
             Self::NativePciIoapicExclusive => {
                 "--native-pci-own-ioapic requires the normal system platform path"
+            }
+            Self::TrackpadDependency => {
+                "--trackpad needs --input: the trackpad sits on the native keyboard and pointer's hub"
             }
         }
     }

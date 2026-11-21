@@ -26,6 +26,38 @@ fn native_pci_ioapic_handoff_round_trips_and_refuses_diagnostic_paths() {
 use alloc::{format, string::ToString, vec};
 
 #[test]
+fn options_round_trip_trackpad() {
+    for (word, kind) in [
+        ("mt2", GuestTrackpad::Mt2),
+        ("builtin", GuestTrackpad::Builtin),
+    ] {
+        let text = format!("--system --input --trackpad {word}");
+        let options = System::parse(&text).unwrap();
+        assert_eq!(options.trackpad, Some(kind));
+        assert_eq!(options.to_string(), text);
+        assert_eq!(System::parse(&options.to_string()), Ok(options));
+    }
+    // Without the flag: no trackpad, and the line has no word for it.
+    let plain = System::parse("--system --input").unwrap();
+    assert_eq!(plain.trackpad, None);
+    assert_eq!(plain.to_string(), "--system --input");
+    for (text, error) in [
+        ("--system --input --trackpad nope", Error::Trackpad),
+        ("--system --input --trackpad", Error::Trackpad),
+        (
+            "--system --input --trackpad mt2 --trackpad builtin",
+            Error::DuplicateTrackpad,
+        ),
+        (
+            "--system --trackpad mt2",
+            Error::Constraint(Constraint::TrackpadDependency),
+        ),
+    ] {
+        assert_eq!(System::parse(text).unwrap_err(), error, "{text}");
+    }
+}
+
+#[test]
 fn diagnostic_options_are_typed() {
     for text in ["--system", "--system --wifi --audio-own-hpet"] {
         assert_eq!(System::parse(text).unwrap().diagnostic_option(), None);

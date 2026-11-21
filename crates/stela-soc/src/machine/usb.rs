@@ -151,15 +151,20 @@ impl AppleDevices {
     /// this machine being the downstream-facing port that sources VBUS: the
     /// HPM reports the attach and the controller's host personality finds
     /// the hub on its USB2 port. The keyboard and pointer sit on the hub's
-    /// first port, and `cables` names the USB Ethernet adapter, Bluetooth
-    /// controller and mass storage devices on the next ones.
+    /// first port, and `cables` names the trackpad, USB Ethernet adapter,
+    /// Bluetooth controller and mass storage devices on the next ones. The
+    /// trackpad's serial number is the board's, from its ECID, as the
+    /// Bluetooth model's address is.
     pub fn attach_input(&mut self, connector: u32, cables: UsbCables) -> Result<()> {
         let UsbCables {
             disks,
             network,
             bluetooth,
+            trackpad,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth.is_some());
+        let extras = usize::from(network.is_some())
+            + usize::from(bluetooth.is_some())
+            + usize::from(trackpad.is_some());
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -175,14 +180,17 @@ impl AppleDevices {
             .iter_mut()
             .find(|master| master.number == connector)
             .ok_or(refuse!("no USB controller on that connector"))?;
+        let serial = crate::usb::trackpad::serial(self.ecid);
         let attachments = Attachments {
             input: Peripheral::new(),
+            trackpad: trackpad.map(|config| Trackpad::new(config, &serial)),
             network,
             bluetooth: bluetooth.map(|kind| match kind {
                 UsbBluetooth::Host => Hci::new(),
                 UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
             }),
             disks,
+            touch_dropped: 0,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
         master.connector.set_connection(Some(typec::Attached {
@@ -312,15 +320,46 @@ impl AppleDevices {
             .map(|peripheral| peripheral.ports.input.leds())
     }
 
-    /// One host input change for the attached peripheral.
+    /// One host input change for the attached peripheral; a touch frame
+    /// for the trackpad, dropped and counted without one.
     pub fn input(&mut self, input: Input) -> Result<()> {
-        self.usb_masters
+        let ports = &mut self
+            .usb_masters
             .iter_mut()
             .find_map(|master| master.peripheral.as_mut())
             .ok_or(refuse!("no input peripheral is attached"))?
-            .ports
-            .input
-            .input(input)
+            .ports;
+        match (input, &mut ports.trackpad) {
+            (Input::Touch(frame), Some(trackpad)) => {
+                trackpad.frame(frame);
+                Ok(())
+            }
+            (Input::Touch(_), None) => {
+                ports.touch_dropped += 1;
+                Ok(())
+            }
+            (input, _) => ports.input.input(input),
+        }
+    }
+
+    fn usb_trackpad(&mut self) -> Option<&mut Trackpad> {
+        self.usb_masters
+            .iter_mut()
+            .find_map(|master| master.peripheral.as_mut()?.ports.trackpad.as_mut())
+    }
+
+    /// The trackpad's trace for the owner's log since it was last taken:
+    /// configurations, the mode and features the guest asked for, each
+    /// unknown request once and the frames dropped.
+    pub fn trackpad_trace(&mut self) -> Vec<trackpad::TrackpadEvent> {
+        self.usb_trackpad()
+            .map(Trackpad::take_trace)
+            .unwrap_or_default()
+    }
+
+    /// The trackpad's frame counters; `None` without one.
+    pub fn trackpad_counters(&mut self) -> Option<trackpad::Counters> {
+        self.usb_trackpad().map(|trackpad| trackpad.counters())
     }
 
     /// The machine's power button went down or up. The SMC reports it to
@@ -406,8 +445,14 @@ impl AppleDevices {
                             c.malformed
                         )
                     });
+                let touch = master
+                    .peripheral
+                    .as_ref()
+                    .map(|hub| hub.ports.touch_dropped)
+                    .filter(|dropped| *dropped != 0)
+                    .map_or_else(String::new, |dropped| format!(" touch_dropped={dropped}"));
                 format!(
-                    "port={} attached={}{why}{host}{hub}{net}",
+                    "port={} attached={}{why}{host}{hub}{net}{touch}",
                     master.number,
                     master.attached || master.peripheral.is_some()
                 )

@@ -27,6 +27,7 @@ use crate::usb::{
     hub::{self, Hub},
     session::Session as UsbSession,
     storage::MassStorage,
+    trackpad::{self, Trackpad},
 };
 pub use crate::usb::{
     ecm::Counters as UsbNetworkCounters,
@@ -389,6 +390,9 @@ pub struct UsbCables {
     pub network: Option<Mac>,
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
+    /// An emulated Magic Trackpad 2 fed the host's touch frames, on the
+    /// hub's second port at full speed.
+    pub trackpad: Option<trackpad::Config>,
 }
 
 /// The USB Bluetooth controller on the native hub.
@@ -403,46 +407,67 @@ pub enum UsbBluetooth {
 
 impl UsbCables {
     /// The disks the hub has ports for beside the keyboard and pointer and,
-    /// with `network` and `bluetooth`, the Ethernet adapter and Bluetooth
-    /// controller.
-    pub const fn disk_ports(network: bool, bluetooth: bool) -> usize {
-        hub::MAX_PORTS - 1 - network as usize - bluetooth as usize
+    /// with `network`, `bluetooth` and `trackpad`, the Ethernet adapter,
+    /// Bluetooth controller and trackpad.
+    pub const fn disk_ports(network: bool, bluetooth: bool, trackpad: bool) -> usize {
+        hub::MAX_PORTS - 1 - network as usize - bluetooth as usize - trackpad as usize
     }
 }
 
 /// The functions on the native hub's ports: the keyboard and pointer on
-/// port 1, then the Ethernet adapter and Bluetooth controller when there are
-/// any, then one mass storage device per host disk.
+/// port 1, the trackpad on port 2 when there is one, then the Ethernet
+/// adapter and Bluetooth controller when there are any, then one mass
+/// storage device per host disk.
 struct Attachments {
     input: Peripheral,
+    trackpad: Option<Trackpad>,
     network: Option<Ecm>,
     bluetooth: Option<Hci>,
     disks: Vec<MassStorage>,
+    /// Touch frames that came with no trackpad to take them.
+    touch_dropped: u64,
 }
 
 impl hub::Ports for Attachments {
     fn count(&self) -> usize {
-        1 + usize::from(self.network.is_some())
+        1 + usize::from(self.trackpad.is_some())
+            + usize::from(self.network.is_some())
             + usize::from(self.bluetooth.is_some())
             + self.disks.len()
     }
     fn speed(&self, port: usize) -> Speed {
-        if port == 0 { Speed::Full } else { Speed::High }
+        // The keyboard and pointer and the trackpad are full-speed HID
+        // functions behind the hub's transaction translator.
+        if port == 0 || (port == 1 && self.trackpad.is_some()) {
+            Speed::Full
+        } else {
+            Speed::High
+        }
     }
     fn function(&mut self, port: usize) -> &mut dyn Function {
         let input = core::iter::once(&mut self.input as &mut dyn Function);
+        let trackpad = self.trackpad.iter_mut().map(|f| f as &mut dyn Function);
         let network = self.network.iter_mut().map(|f| f as &mut dyn Function);
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let mut functions = input
+            .chain(trackpad)
+            .chain(network)
+            .chain(bluetooth)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
         let input = core::iter::once(&self.input as &dyn Function);
+        let trackpad = self.trackpad.iter().map(|f| f as &dyn Function);
         let network = self.network.iter().map(|f| f as &dyn Function);
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let mut functions = input
+            .chain(trackpad)
+            .chain(network)
+            .chain(bluetooth)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
 }

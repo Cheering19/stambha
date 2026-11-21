@@ -18,6 +18,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     {
         return Err(Error::Constraint(Constraint::NativePciIoapicExclusive));
     }
+    if options.trackpad.is_some() && !options.input {
+        return Err(Error::Constraint(Constraint::TrackpadDependency));
+    }
     Ok(())
 }
 
