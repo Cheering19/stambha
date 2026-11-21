@@ -523,9 +523,17 @@ fn latches_keep_writes_at_their_confirmed_sizes_only() {
 }
 
 #[test]
-fn ac_changes_and_percent_steps_notify_once_enabled_and_no_closer_than_their_spacing() {
+fn ac_changes_and_a_battery_turning_critical_notify_once_enabled_and_no_closer_than_their_spacing()
+{
     const EXTERNAL_POWER: u64 = 0x18 | 0x7101_0100 << 32;
     const BATTERY_STATE: u64 = 0x18 | 0x7102_0000 << 32;
+    let critical = |critical| PowerSnapshot {
+        battery: Some(BatteryState {
+            critical,
+            ..discharging()
+        }),
+        ..on_battery()
+    };
     let (mut smc, sram) = with_battery();
     // Before the AP enables notifications a change only moves the values,
     // and nothing waits for later.
@@ -535,65 +543,51 @@ fn ac_changes_and_percent_steps_notify_once_enabled_and_no_closer_than_their_spa
     assert!(notifications(&mut smc).is_empty());
     assert_eq!(smc.power_due(60_000), None);
 
-    // Unplugged: the AC change, then the battery's new status.
+    // Unplugged: the AC change alone; the battery's new status is no
+    // notification, macOS polls it.
     assert_eq!(smc.power(&on_battery(), 10_000), None);
-    assert_eq!(notifications(&mut smc), [EXTERNAL_POWER, BATTERY_STATE]);
-    // Voltage, current and time move without a notification.
+    assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
+    // Nor are voltage, current, time or a percent step.
     let drift = PowerSnapshot {
         battery: Some(BatteryState {
             voltage_mv: Some(15_700),
             current_ma: Some(-2_700),
             time_to_empty_min: Some(80),
+            percent: Some(72),
             ..discharging()
         }),
         ..on_battery()
     };
     assert_eq!(smc.power(&drift, 10_100), None);
     assert!(notifications(&mut smc).is_empty());
-    // A percent step 1 s later waits until 5 s after the last.
-    let step = |percent| PowerSnapshot {
-        battery: Some(BatteryState {
-            percent: Some(percent),
-            ..discharging()
-        }),
-        ..on_battery()
-    };
-    let spaced = 10_000 + SPACING_MILLIS[1];
-    assert_eq!(smc.power(&step(72), 11_000), Some(spaced));
+    assert_eq!(read(&mut smc, &sram, b"BUIC"), [72]);
+    // Turning critical is.
+    assert_eq!(smc.power(&critical(true), 20_000), None);
+    assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
+    // Staying critical, or no longer critical, is not.
+    assert_eq!(smc.power(&critical(true), 21_000), None);
+    assert_eq!(smc.power(&critical(false), 22_000), None);
     assert!(notifications(&mut smc).is_empty());
-    // A second step in the wait goes out with the first, as one.
-    assert_eq!(smc.power(&step(71), 12_000), Some(spaced));
+    // Critical again 3 s after the last notice waits for its 5 s spacing.
+    let spaced = 20_000 + SPACING_MILLIS[1];
+    assert_eq!(smc.power(&critical(true), 23_000), Some(spaced));
     assert_eq!(smc.power_due(spaced - 1), Some(spaced));
     assert!(notifications(&mut smc).is_empty());
     assert_eq!(smc.power_due(spaced), None);
     assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
-    assert_eq!(read(&mut smc, &sram, b"BUIC"), [71]);
-    // Plugged in 0.5 s after the unplug's notice: the AC notice waits for
-    // its own 1 s spacing; the status change, past its 5 s, goes at once.
+
+    // Plugged in, then out 0.5 s later: the second AC notice waits for its
+    // 1 s spacing, and two changes in the wait go out as one.
     let (mut smc, sram) = with_battery();
     enable_notifications(&mut smc, &sram);
     assert_eq!(smc.power(&charging(), 20_000), None);
-    assert_eq!(notifications(&mut smc), [EXTERNAL_POWER, BATTERY_STATE]);
-    let ac_due = 20_000 + SPACING_MILLIS[0];
-    assert_eq!(
-        smc.power(&on_battery(), 20_500),
-        Some(ac_due.min(20_000 + SPACING_MILLIS[1]))
-    );
-    assert!(notifications(&mut smc).is_empty());
-    assert_eq!(smc.power_due(ac_due), Some(20_000 + SPACING_MILLIS[1]));
     assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
-    assert_eq!(smc.power_due(20_000 + SPACING_MILLIS[1]), None);
-    assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
-    // Critical is a battery state change.
-    let critical = PowerSnapshot {
-        battery: Some(BatteryState {
-            critical: true,
-            ..discharging()
-        }),
-        ..on_battery()
-    };
-    assert_eq!(smc.power(&critical, 60_000), None);
-    assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
+    let ac_due = 20_000 + SPACING_MILLIS[0];
+    assert_eq!(smc.power(&on_battery(), 20_500), Some(ac_due));
+    assert_eq!(smc.power(&charging(), 20_700), Some(ac_due));
+    assert!(notifications(&mut smc).is_empty());
+    assert_eq!(smc.power_due(ac_due), None);
+    assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
 }
 
 #[test]
@@ -616,10 +610,7 @@ fn a_change_while_the_soc_sleeps_waits_for_its_wake() {
     assert!(notifications(&mut smc).is_empty());
     smc.wake(WakeSource::PowerButton);
     assert_eq!(smc.power_due(32_000), None);
-    assert_eq!(
-        notifications(&mut smc),
-        [0x18 | 0x7101_0100 << 32, 0x18 | 0x7102_0000 << 32]
-    );
+    assert_eq!(notifications(&mut smc), [0x18 | 0x7101_0100 << 32]);
 }
 
 #[test]

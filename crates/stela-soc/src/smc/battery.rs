@@ -56,10 +56,13 @@
 //!
 //! Notifications (event-name table at 0x12d79b8, indexed by subclass):
 //! `pow.ExternalPowerChange` (0x7101) when the AC adapter comes or goes,
-//! and `pow.BatteryStateChange` (0x7102) when the battery's status,
-//! percentage or critical flag changes. Their data bytes are those Asahi
-//! saw from real SMC firmware (`0x710101xx`, `0x71020000`, inferred: no
-//! 26B123 reader of them was traced). Each kind goes out at most once a
+//! and `pow.BatteryStateChange` (0x7102) only when the battery turns
+//! critical, the one occasion Asahi saw it from real SMC firmware; status
+//! and percentage changes send nothing, and macOS's battery driver polls
+//! them (`pollBatteryState`). Their data bytes are those Asahi saw
+//! (`0x710101xx`, `0x71020000`, inferred: no 26B123 reader of either was
+//! traced, and no `AppleSmartBattery` object registers a 0x71 callback by
+//! name). Each kind goes out at most once a
 //! [`SPACING_MILLIS`] apart, a change in between waiting for the spacing to
 //! end, and only once the AP has enabled notifications, as every other: a
 //! change before that only moves the values, which the AP reads when it
@@ -284,8 +287,8 @@ impl Battery {
     }
 
     /// A new reading: the values the keys take, by key. A change in the AC
-    /// adapter, or in the battery's status, percentage or critical flag,
-    /// makes its notification wait ([`Self::due`]).
+    /// adapter, or the battery turning critical, makes its notification
+    /// wait ([`Self::due`]).
     pub(super) fn update(&mut self, snapshot: &PowerSnapshot) -> Vec<(u32, Vec<u8>)> {
         let before = self.shown;
         self.shown = PowerSnapshot {
@@ -298,8 +301,7 @@ impl Battery {
         let summary = self.shown.summary();
         let measured = self.measured;
         self.pending[EXTERNAL_POWER] |= summary.ac_online != measured.ac_online;
-        self.pending[BATTERY_STATE] |= (summary.status, summary.percent, summary.critical)
-            != (measured.status, measured.percent, measured.critical);
+        self.pending[BATTERY_STATE] |= summary.critical && !measured.critical;
         self.measured = summary;
         READINGS
             .iter()
