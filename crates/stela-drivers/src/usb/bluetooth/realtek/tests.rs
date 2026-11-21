@@ -39,6 +39,8 @@ struct Step {
 struct Trace {
     commands: usize,
     closed: usize,
+    /// The model's time when the last command went out.
+    sent_at: u64,
 }
 struct Model {
     steps: VecDeque<Step>,
@@ -58,6 +60,7 @@ impl Io for Model {
         let step = self.steps.pop_front().expect("unexpected command");
         assert_eq!(p, step.parameters);
         self.trace.borrow_mut().commands += 1;
+        self.trace.borrow_mut().sent_at = self.time.get();
         if self.fail_command == Some(self.trace.borrow().commands) {
             return Err(BlockError::Device { status: 0x55 });
         }
@@ -1319,4 +1322,18 @@ fn a_drop_that_could_not_be_sent_is_no_drop() {
     );
     assert_eq!(a.register_subversion, Some(0x8852));
     assert_eq!(trace.borrow().commands, 3);
+}
+#[test]
+fn an_unanswered_command_is_waited_for_as_long_as_btrtls_hci_init_timeout() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8761Bu, true);
+    // The download is never answered.
+    hci.io.steps[4].response.clear();
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    assert!(matches!(
+        attempt(&e).0,
+        Error::Timeout("genuine command completion")
+    ));
+    // HCI_INIT_TIMEOUT, 10 s (hci.h:482), which every btrtl command uses.
+    let waited = hci.io.time.get() - trace.borrow().sent_at;
+    assert!((10_000_000..11_000_000).contains(&waited), "{waited} us");
 }

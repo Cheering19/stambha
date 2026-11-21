@@ -27,7 +27,8 @@ const DROP_FIRMWARE: u16 = 0xfc66;
 const DROP_US: u64 = 200_000;
 /// The events of that wait kept whole; the rest are counted.
 const DROP_EVENTS: usize = 4;
-const COMMAND_US: u64 = 5_000_000;
+/// `HCI_INIT_TIMEOUT` (hci.h:482), which every btrtl command waits.
+const COMMAND_US: u64 = 10_000_000;
 const ATTEMPT_US: u64 = 120_000_000;
 
 #[expect(
