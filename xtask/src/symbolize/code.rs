@@ -78,6 +78,8 @@ pub(super) struct Code {
     pub images: Vec<Image>,
     /// What was read: each cache and image, for the report.
     pub loaded: Vec<String>,
+    /// What was skipped and why, for the report.
+    pub warnings: Vec<String>,
     /// Keep every executable page, wanted or not (the oracle test).
     #[cfg(test)]
     every_page: bool,
@@ -93,18 +95,29 @@ impl Code {
         Ok(code)
     }
 
-    /// Add the code of `paths` ([`Self::load`]).
+    /// Add the code of `paths` ([`Self::load`]). A file that cannot be
+    /// read is skipped with a warning; a path that does not exist is an
+    /// error.
     fn read(&mut self, paths: &[PathBuf], wanted: &HashSet<u64>) -> Result<()> {
         let mut files = Vec::new();
         for path in paths {
             ensure!(path.exists(), "{} does not exist", path.display());
-            collect(path, DEPTH, &mut files)?;
+            // A file named itself is read for what it is, whatever its name.
+            if path.is_file() {
+                files.push((path.clone(), true));
+            } else {
+                let mut found = Vec::new();
+                collect(path, DEPTH, &mut found)?;
+                files.extend(found.into_iter().map(|file| (file, false)));
+            }
         }
         files.sort();
-        files.dedup();
-        for file in files {
-            self.add_path(&file, wanted)
-                .with_context(|| format!("reading {}", file.display()))?;
+        files.dedup_by(|a, b| a.0 == b.0);
+        for (file, named) in files {
+            if let Err(error) = self.add_path(&file, named, wanted) {
+                self.warnings
+                    .push(format!("{}: skipped, {error:#}", file.display()));
+            }
         }
         Ok(())
     }
@@ -119,8 +132,10 @@ impl Code {
     }
 
     /// Add `path` by its content: a main dyld cache file with its
-    /// subcaches beside it, a 64-bit Mach-O, or nothing.
-    fn add_path(&mut self, path: &Path, wanted: &HashSet<u64>) -> Result<()> {
+    /// subcaches beside it, a 64-bit Mach-O, or nothing. A dyld cache file
+    /// whose name has a dot is a subcache, read with its main file, unless
+    /// it was `named` itself; one with no main file beside it is warned of.
+    fn add_path(&mut self, path: &Path, named: bool, wanted: &HashSet<u64>) -> Result<()> {
         use std::io::Read;
         let name = path.display().to_string();
         let mut magic = [0u8; 8];
@@ -129,9 +144,14 @@ impl Code {
             return Ok(());
         }
         if magic.starts_with(b"dyld_v1") {
-            // A subcache (`.01`, `.symbols`) is read with its main file.
             let file_name = path.file_name().and_then(|name| name.to_str());
-            if file_name.is_none_or(|file_name| file_name.contains('.')) {
+            if !named && let Some((main, _)) = file_name.and_then(|name| name.split_once('.')) {
+                if !path.with_file_name(main).is_file() {
+                    self.warnings.push(format!(
+                        "{name}: skipped, a dyld cache file with no main file beside it \
+                         ({main}); name it with --cache to read it as one"
+                    ));
+                }
                 return Ok(());
             }
             let main = Mapped::open(path)?;
@@ -140,10 +160,16 @@ impl Code {
             let mut subcaches = Vec::new();
             for suffix in suffixes {
                 let sub = PathBuf::from(format!("{}{suffix}", path.display()));
-                subcaches.push(
-                    Mapped::open(&sub)
-                        .with_context(|| format!("{name} needs its subcache {}", sub.display()))?,
-                );
+                match Mapped::open(&sub) {
+                    Ok(mapped) => subcaches.push(mapped),
+                    Err(error) => {
+                        self.warnings.push(format!(
+                            "{name}: skipped, it needs its subcache {} ({error:#})",
+                            sub.display()
+                        ));
+                        return Ok(());
+                    }
+                }
             }
             let slices: Vec<&[u8]> = subcaches.iter().map(|sub| &sub[..]).collect();
             return self.add_cache(&main, &slices, &name, wanted);
@@ -167,15 +193,22 @@ impl Code {
         if file.macho_header().filetype.get(file.endian()) == macho::MH_DSYM {
             return Ok(());
         }
+        // Every code range fits the address space before any is kept.
+        let mut code = Vec::new();
+        for segment in file.segments() {
+            if executable(segment.flags()) {
+                let bytes = segment.data().map_err(|e| anyhow!("{name}: {e}"))?;
+                let size = segment.size().max(bytes.len() as u64);
+                end(segment.address(), size).with_context(|| name.to_owned())?;
+                code.push((segment.address(), bytes));
+            }
+        }
         let Some(index) = self.start_file(name) else {
             return Ok(());
         };
         let before = self.pages.len();
-        for segment in file.segments() {
-            if executable(segment.flags()) {
-                let bytes = segment.data().map_err(|e| anyhow!("{name}: {e}"))?;
-                self.hash(index, segment.address(), bytes, wanted);
-            }
+        for (address, bytes) in code {
+            self.hash(index, address, bytes, wanted);
         }
         let starts = function_starts(&file, |offset, size| data.get(offset..offset + size));
         self.add_image(index, &file, name, starts);
@@ -198,15 +231,22 @@ impl Code {
     ) -> Result<()> {
         let cache =
             DyldCache::<Endianness>::parse(main, subcaches).map_err(|e| anyhow!("{name}: {e}"))?;
+        // Every code mapping fits the address space before any is kept.
+        let mut code = Vec::new();
+        for mapping in cache.mappings() {
+            if mapping.init_prot() & macho::VM_PROT_EXECUTE != 0 {
+                let bytes = mapping.data().map_err(|e| anyhow!("{name}: {e}"))?;
+                let size = mapping.size().max(bytes.len() as u64);
+                end(mapping.address(), size).with_context(|| name.to_owned())?;
+                code.push((mapping.address(), bytes));
+            }
+        }
         let Some(index) = self.start_file(name) else {
             return Ok(());
         };
         let before = self.pages.len();
-        for mapping in cache.mappings() {
-            if mapping.init_prot() & macho::VM_PROT_EXECUTE != 0 {
-                let bytes = mapping.data().map_err(|e| anyhow!("{name}: {e}"))?;
-                self.hash(index, mapping.address(), bytes, wanted);
-            }
+        for (address, bytes) in code {
+            self.hash(index, address, bytes, wanted);
         }
         let mut images = 0;
         for image in cache.images() {
@@ -259,10 +299,11 @@ impl Code {
             if !self.keeps(key, wanted) {
                 continue;
             }
-            let at = PageAt::One {
-                file,
-                address: address + (index * PAGE) as u64,
+            // Its callers checked that the bytes fit the address space.
+            let Some(address) = address.checked_add((index * PAGE) as u64) else {
+                break;
             };
+            let at = PageAt::One { file, address };
             self.pages
                 .entry(key)
                 .and_modify(|held| {
@@ -284,11 +325,14 @@ impl Code {
         mut starts: Vec<u64>,
     ) {
         let index = self.images.len();
+        // Ranges past the address space are left out: they name nothing.
         let mut code = Vec::new();
         for segment in file.segments() {
             if executable(segment.flags()) && segment.size() != 0 {
                 let start = segment.address();
-                code.push((start, start + segment.size(), index));
+                if let Some(end) = start.checked_add(segment.size()) {
+                    code.push((start, end, index));
+                }
             }
         }
         // The sections that lie in its code.
@@ -300,11 +344,8 @@ impl Code {
             })
             .filter_map(|section| {
                 let start = section.address();
-                Some((
-                    start,
-                    start + section.size(),
-                    section.name().ok()?.to_owned(),
-                ))
+                let end = start.checked_add(section.size())?;
+                Some((start, end, section.name().ok()?.to_owned()))
             })
             .collect();
         sections.sort();
@@ -402,6 +443,14 @@ impl Code {
             start,
         }
     }
+}
+
+/// The end of `size` bytes of code at `start`, if it fits the address
+/// space.
+fn end(start: u64, size: u64) -> Result<u64> {
+    start.checked_add(size).with_context(|| {
+        format!("code at {start:#x} of {size:#x} bytes runs past the address space")
+    })
 }
 
 /// Whether a segment's initial protection lets it execute.
@@ -823,6 +872,82 @@ mod tests {
 
     fn address_of(code: &Code, key: u64, offset: u16) -> Option<u64> {
         address(code.place(key, offset))
+    }
+
+    /// Code whose addresses run past the address space is refused with an
+    /// error, not a panic, and nothing of it is kept.
+    #[test]
+    fn code_past_the_address_space_is_refused() {
+        let mut file = fixtures::macho(BASE);
+        let [_, second] = keys(&file, 0);
+        // The __TEXT segment's address, after the header and the command's
+        // own words and name.
+        file[56..64].copy_from_slice(&(u64::MAX - 0x1fff).to_le_bytes());
+        let mut code = Code::default();
+        let error = code
+            .add_macho(&file, "wrapped", &HashSet::from([second]))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("past the address space"),
+            "{error:#}"
+        );
+        assert_eq!(code.place(second, 0), Place::Missing);
+        assert!(code.files.is_empty() && code.loaded.is_empty());
+        // A section whose size runs past it is left out; the image reads.
+        let mut file = fixtures::macho(BASE);
+        // The first section's size, after the segment command's 72 bytes
+        // and the section's names and address.
+        file[32 + 72 + 40..32 + 72 + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut code = Code::default();
+        code.add_macho(&file, "huge section", &HashSet::from([second]))
+            .unwrap();
+        assert_eq!(address(code.place(second, 0)), Some(BASE + 0x2000));
+        assert_eq!(code.name(0, BASE + BETA).function, "_beta");
+    }
+
+    /// A cache missing a subcache, or a broken file, is skipped with a
+    /// warning and the rest still loads; a dyld cache file found under a
+    /// name with a dot and no main file beside it is warned of, and read as
+    /// a main file when named itself.
+    #[test]
+    fn a_cache_that_cannot_be_read_is_skipped_with_a_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let split = fixtures::split_cache();
+        let incomplete = directory.path().join("incomplete");
+        std::fs::create_dir(&incomplete).unwrap();
+        for (suffix, bytes) in &split {
+            if *suffix != ".01" {
+                let name = format!("dyld_shared_cache_arm64e{suffix}");
+                std::fs::write(incomplete.join(name), bytes).unwrap();
+            }
+        }
+        let macho = fixtures::macho(BASE);
+        std::fs::write(incomplete.join("kernel.fixture"), &macho).unwrap();
+        let mut broken = fixtures::macho(BASE);
+        broken.truncate(16);
+        std::fs::write(incomplete.join("broken.dylib"), &broken).unwrap();
+        let renamed = directory.path().join("renamed");
+        std::fs::create_dir(&renamed).unwrap();
+        let cache = fixtures::cache();
+        let dotted = renamed.join("dyld_shared_cache_arm64e.copy");
+        std::fs::write(&dotted, &cache).unwrap();
+        let [split_first, _] = keys(&split[0].1, PAGE);
+        let [kernel, _] = keys(&macho, 0);
+        let [cached, _] = keys(&cache, PAGE);
+        let wanted = HashSet::from([split_first, kernel, cached]);
+        let code = Code::load(&[incomplete.clone(), renamed], &wanted).unwrap();
+        assert_eq!(code.place(split_first, 0), Place::Missing);
+        assert_eq!(code.place(cached, 0), Place::Missing);
+        assert_eq!(address(code.place(kernel, 0)), Some(BASE + ALPHA));
+        let warnings = code.warnings.join("\n");
+        assert_eq!(code.warnings.len(), 3, "{warnings}");
+        assert!(warnings.contains("needs its subcache"), "{warnings}");
+        assert!(warnings.contains("broken.dylib"), "{warnings}");
+        assert!(warnings.contains("no main file beside it"), "{warnings}");
+        // Named itself, the dotted file is a main cache.
+        let code = Code::load(&[dotted], &wanted).unwrap();
+        assert_eq!(address(code.place(cached, 0)), Some(CACHE_BASE + ALPHA));
+        assert!(code.warnings.is_empty(), "{:?}", code.warnings);
     }
 
     /// Paths load by content: a directory's main cache and its subcaches
