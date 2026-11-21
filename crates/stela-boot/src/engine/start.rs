@@ -1782,6 +1782,9 @@ fn place_devices(
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();
+    if options.lid_sleep {
+        super::lid::enable_sleep();
+    }
     let (mut devices, restore_usb) = match devices(
         board,
         mount::Inputs {
@@ -1812,6 +1815,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                system_control: options.lid_sleep,
             },
             scanout,
             firmware: &firmware,

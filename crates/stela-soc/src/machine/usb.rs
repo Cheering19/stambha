@@ -158,6 +158,7 @@ impl AppleDevices {
             disks,
             network,
             bluetooth,
+            system_control,
         } = cables;
         let extras = usize::from(network.is_some()) + usize::from(bluetooth.is_some());
         if 1 + extras + disks.len() > hub::MAX_PORTS {
@@ -176,7 +177,11 @@ impl AppleDevices {
             .find(|master| master.number == connector)
             .ok_or(refuse!("no USB controller on that connector"))?;
         let attachments = Attachments {
-            input: Peripheral::new(),
+            input: if system_control {
+                Peripheral::with_system_control()
+            } else {
+                Peripheral::new()
+            },
             network,
             bluetooth: bluetooth.map(|kind| match kind {
                 UsbBluetooth::Host => Hci::new(),
@@ -321,6 +326,18 @@ impl AppleDevices {
             .ports
             .input
             .input(input)
+    }
+
+    /// Ask the guest to sleep, with a System Sleep press and release on the
+    /// keyboard's System Control interface ([`UsbCables::system_control`]).
+    pub fn system_sleep(&mut self) -> Result<()> {
+        self.usb_masters
+            .iter_mut()
+            .find_map(|master| master.peripheral.as_mut())
+            .ok_or(refuse!("no input peripheral is attached"))?
+            .ports
+            .input
+            .system_sleep()
     }
 
     /// The machine's power button went down or up. The SMC reports it to

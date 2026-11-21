@@ -29,6 +29,12 @@
 //! Transactions to an endpoint of an unconfigured device also STALL: the
 //! bus boundary has no no-response outcome.
 //!
+//! A device made [`Peripheral::with_system_control`] has a fourth
+//! interface, a report-protocol Generic Desktop System Control collection
+//! (HID Usage Tables 1.4 section 4.5: System Power Down 81h, System Sleep
+//! 82h and System Wake Up 83h, one bit each), for a host's request that the
+//! guest sleep; the first three are unchanged.
+//!
 //! Each input change queues one report. Queues are bounded; when one is
 //! full the newest report replaces its last entry, so the final state
 //! always reaches the host. The device reports changes alone: a nonzero
@@ -45,15 +51,24 @@ const EP0_PACKET: usize = 64;
 const KEYBOARD_ENDPOINT: u8 = 0x81;
 const POINTER_ENDPOINT: u8 = 0x82;
 const MOUSE_ENDPOINT: u8 = 0x83;
+const SYSTEM_ENDPOINT: u8 = 0x84;
 const KEYBOARD_REPORT: usize = 8;
 const POINTER_REPORT: usize = 7;
 const MOUSE_REPORT: usize = 5;
+const SYSTEM_REPORT: usize = 1;
 /// The boot mouse report: buttons, X and Y (HID 1.11 B.2).
 const BOOT_MOUSE_REPORT: usize = 3;
+/// The keyboard and pointers.
 const INTERFACES: usize = 3;
+/// With the System Control interface.
+const MAX_INTERFACES: usize = 4;
 const KEYBOARD: usize = 0;
 const POINTER: usize = 1;
 const MOUSE: usize = 2;
+const SYSTEM: usize = 3;
+/// System Sleep's bit in the System Control report, whose usages start at
+/// System Power Down (81h).
+const SYSTEM_SLEEP: u8 = 1 << 1;
 /// One relative report's range per axis.
 const MOTION_MAX: i16 = 127;
 const QUEUE: usize = 64;
@@ -154,6 +169,16 @@ const MOUSE_REPORT_DESCRIPTOR: [u8; 61] = [
     0xc0, 0xc0,
 ];
 
+/// System Power Down, System Sleep and System Wake Up as one-bit buttons,
+/// and five bits of padding.
+const SYSTEM_REPORT_DESCRIPTOR: [u8; 25] = [
+    0x05, 0x01, 0x09, 0x80, 0xa1, 0x01, // Generic Desktop, System Control, Application
+    0x19, 0x81, 0x29, 0x83, // System Power Down..System Wake Up
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, // 3 bits
+    0x95, 0x05, 0x81, 0x01, // padding
+    0xc0,
+];
+
 const fn hid_descriptor(report: usize) -> [u8; 9] {
     [
         9,
@@ -170,22 +195,30 @@ const fn hid_descriptor(report: usize) -> [u8; 9] {
 
 /// Each interface's interface, HID and endpoint descriptors.
 const INTERFACE_BYTES: usize = 9 + 9 + 7;
-const CONFIGURATION_BYTES: usize = 9 + INTERFACES * INTERFACE_BYTES;
 
-fn configuration_descriptor() -> [u8; CONFIGURATION_BYTES] {
-    let mut bytes = [0; CONFIGURATION_BYTES];
+/// The configuration descriptor, with the System Control interface last
+/// where `system`.
+fn configuration_descriptor(system: bool) -> Vec<u8> {
+    let interfaces = if system { MAX_INTERFACES } else { INTERFACES };
+    let total = 9 + interfaces * INTERFACE_BYTES;
+    let header = [
+        9,
+        CONFIGURATION,
+        total as u8,
+        (total >> 8) as u8,
+        interfaces as u8,
+        1,    // bConfigurationValue
+        0,    // no string
+        0xc0, // self-powered, no remote wakeup
+        0,
+    ];
+    let system_parts: [&[u8]; 3] = [
+        &[9, 4, SYSTEM as u8, 0, 1, 3, 0, 0, 0], // report-protocol System Control
+        &hid_descriptor(SYSTEM_REPORT_DESCRIPTOR.len()),
+        &[7, 5, SYSTEM_ENDPOINT, 3, SYSTEM_REPORT as u8, 0, 1],
+    ];
     let parts: [&[u8]; 10] = [
-        &[
-            9,
-            CONFIGURATION,
-            CONFIGURATION_BYTES as u8,
-            0,
-            INTERFACES as u8,
-            1,    // bConfigurationValue
-            0,    // no string
-            0xc0, // self-powered, no remote wakeup
-            0,
-        ],
+        &header,
         &[9, 4, KEYBOARD as u8, 0, 1, 3, 1, 1, 0], // boot keyboard
         &hid_descriptor(KEYBOARD_REPORT_DESCRIPTOR.len()),
         &[7, 5, KEYBOARD_ENDPOINT, 3, KEYBOARD_REPORT as u8, 0, 1],
@@ -196,11 +229,13 @@ fn configuration_descriptor() -> [u8; CONFIGURATION_BYTES] {
         &hid_descriptor(MOUSE_REPORT_DESCRIPTOR.len()),
         &[7, 5, MOUSE_ENDPOINT, 3, MOUSE_REPORT as u8, 0, 1],
     ];
-    let mut at = 0;
-    for part in parts {
-        bytes[at..at + part.len()].copy_from_slice(part);
-        at += part.len();
-    }
+    let extra: &[&[u8]] = if system { &system_parts } else { &[] };
+    let bytes: Vec<u8> = parts
+        .iter()
+        .chain(extra)
+        .flat_map(|part| part.iter().copied())
+        .collect();
+    debug_assert_eq!(bytes.len(), total);
     bytes
 }
 
@@ -262,7 +297,11 @@ pub struct Peripheral {
     address: u8,
     configuration: u8,
     control: Control,
-    interfaces: [Interface; INTERFACES],
+    /// The keyboard's, pointer's and mouse's, then the System Control
+    /// interface's where [`Self::system`].
+    interfaces: [Interface; MAX_INTERFACES],
+    /// The device has the System Control interface.
+    system: bool,
     /// The LEDs the host last set: Num, Caps, Scroll, Compose, Kana lock
     /// as bits 0..4.
     leds: u8,
@@ -275,7 +314,7 @@ pub struct Peripheral {
 }
 
 /// The interfaces after configuration.
-fn interfaces() -> [Interface; INTERFACES] {
+fn interfaces() -> [Interface; MAX_INTERFACES] {
     core::array::from_fn(|_| Interface::new())
 }
 
@@ -292,6 +331,7 @@ impl Peripheral {
             configuration: 0,
             control: Control::Idle,
             interfaces: interfaces(),
+            system: false,
             leds: 0,
             modifiers: 0,
             held: Vec::new(),
@@ -300,6 +340,34 @@ impl Peripheral {
             y: 0,
             mouse_buttons: 0,
         }
+    }
+
+    /// The device with the System Control interface after the others.
+    pub fn with_system_control() -> Self {
+        Self {
+            system: true,
+            ..Self::new()
+        }
+    }
+
+    /// How many interfaces the device has.
+    fn count(&self) -> usize {
+        if self.system {
+            MAX_INTERFACES
+        } else {
+            INTERFACES
+        }
+    }
+
+    /// Ask the host to sleep: System Sleep pressed, then released. Like any
+    /// report, it queues only while the device is configured.
+    pub fn system_sleep(&mut self) -> Result<()> {
+        if !self.system {
+            return Err(refuse!("the keyboard has no System Control interface"));
+        }
+        self.queue(SYSTEM, alloc::vec![SYSTEM_SLEEP]);
+        self.queue(SYSTEM, alloc::vec![0]);
+        Ok(())
     }
 
     /// The keyboard LEDs the host last set, Num Lock in bit 0 through Kana
@@ -471,15 +539,18 @@ impl Peripheral {
         match interface {
             KEYBOARD => self.keyboard_report().to_vec(),
             POINTER => self.pointer_report(0, 0).to_vec(),
+            // System Control's buttons are pressed and released at once.
+            SYSTEM => alloc::vec![0; SYSTEM_REPORT],
             _ => self.mouse_report(0, 0, 0, 0).to_vec(),
         }
     }
 
-    fn interface_of(endpoint: u8) -> Option<usize> {
+    fn interface_of(&self, endpoint: u8) -> Option<usize> {
         match endpoint {
             KEYBOARD_ENDPOINT => Some(KEYBOARD),
             POINTER_ENDPOINT => Some(POINTER),
             MOUSE_ENDPOINT => Some(MOUSE),
+            SYSTEM_ENDPOINT if self.system => Some(SYSTEM),
             _ => None,
         }
     }
@@ -498,14 +569,15 @@ impl Peripheral {
         let index = u16::from_le_bytes([setup[4], setup[5]]);
         let configured = self.configuration != 0;
         let interface = usize::from(index as u8);
+        let count = self.count();
         let reply = |bytes: &[u8]| Ok(Outcome::Data(bytes.to_vec()));
         match (kind, request) {
             (0x80, GET_STATUS) => reply(&[1, 0]), // self-powered
-            (0x81, GET_STATUS) if configured && interface < INTERFACES => reply(&[0, 0]),
+            (0x81, GET_STATUS) if configured && interface < count => reply(&[0, 0]),
             (0x82, GET_STATUS) => match index as u8 {
                 0 | 0x80 => reply(&[0, 0]),
                 ep if configured => {
-                    let n = Self::interface_of(ep).ok_or(Stall)?;
+                    let n = self.interface_of(ep).ok_or(Stall)?;
                     reply(&[u8::from(self.interfaces[n].halted), 0])
                 }
                 _ => Err(Stall),
@@ -513,7 +585,7 @@ impl Peripheral {
             (0x02, CLEAR_FEATURE | SET_FEATURE) if value == ENDPOINT_HALT => match index as u8 {
                 0 | 0x80 => Ok(Outcome::Done(None)),
                 ep if configured => {
-                    let n = Self::interface_of(ep).ok_or(Stall)?;
+                    let n = self.interface_of(ep).ok_or(Stall)?;
                     self.interfaces[n].halted = request == SET_FEATURE;
                     Ok(Outcome::Done(None))
                 }
@@ -524,21 +596,22 @@ impl Peripheral {
             }
             (0x80, GET_DESCRIPTOR) => match ((value >> 8) as u8, value as u8) {
                 (DEVICE, 0) => reply(&DEVICE_DESCRIPTOR),
-                (CONFIGURATION, 0) => reply(&configuration_descriptor()),
+                (CONFIGURATION, 0) => reply(&configuration_descriptor(self.system)),
                 (STRING, 0) => reply(&[4, STRING, 0x09, 0x04]),
                 (STRING, 1) if index == ENGLISH => reply(&string("Stela")),
                 (STRING, 2) if index == ENGLISH => reply(&string("Stela Keyboard and Pointers")),
                 _ => Err(Stall),
             },
-            (0x81, GET_DESCRIPTOR) if interface < INTERFACES => {
+            (0x81, GET_DESCRIPTOR) if interface < count => {
                 match ((value >> 8) as u8, value as u8) {
                     (HID, 0) => {
                         let start = 9 + interface * INTERFACE_BYTES + 9;
-                        reply(&configuration_descriptor()[start..start + 9])
+                        reply(&configuration_descriptor(self.system)[start..start + 9])
                     }
                     (REPORT, 0) => reply(match interface {
                         KEYBOARD => &KEYBOARD_REPORT_DESCRIPTOR[..],
                         POINTER => &POINTER_REPORT_DESCRIPTOR[..],
+                        SYSTEM => &SYSTEM_REPORT_DESCRIPTOR[..],
                         _ => &MOUSE_REPORT_DESCRIPTOR[..],
                     }),
                     _ => Err(Stall),
@@ -550,14 +623,12 @@ impl Peripheral {
                 self.interfaces = interfaces();
                 Ok(Outcome::Done(None))
             }
-            (0x81, GET_INTERFACE) if configured && interface < INTERFACES => reply(&[0]),
-            (0x01, SET_INTERFACE) if configured && interface < INTERFACES && value == 0 => {
+            (0x81, GET_INTERFACE) if configured && interface < count => reply(&[0]),
+            (0x01, SET_INTERFACE) if configured && interface < count && value == 0 => {
                 self.interfaces[interface].halted = false;
                 Ok(Outcome::Done(None))
             }
-            (0xa1, GET_REPORT)
-                if interface < INTERFACES && value == u16::from(INPUT_REPORT) << 8 =>
-            {
+            (0xa1, GET_REPORT) if interface < count && value == u16::from(INPUT_REPORT) << 8 => {
                 reply(&self.report(interface, self.current(interface)))
             }
             (0x21, SET_REPORT)
@@ -566,8 +637,8 @@ impl Peripheral {
                 self.leds = data[0] & 0x1f;
                 Ok(Outcome::Done(None))
             }
-            (0xa1, GET_IDLE) if interface < INTERFACES && value == 0 => reply(&[0]),
-            (0x21, SET_IDLE) if interface < INTERFACES && value == 0 => Ok(Outcome::Done(None)),
+            (0xa1, GET_IDLE) if interface < count && value == 0 => reply(&[0]),
+            (0x21, SET_IDLE) if interface < count && value == 0 => Ok(Outcome::Done(None)),
             (0xa1, GET_PROTOCOL) if Self::boot(interface) && value == 0 => {
                 reply(&[self.interfaces[interface].protocol])
             }
@@ -663,7 +734,10 @@ impl Peripheral {
     }
 
     fn interrupt_in(&mut self, endpoint: u8, buffer: &mut [u8]) -> Reply {
-        let Some(n) = Self::interface_of(endpoint).filter(|_| self.configuration != 0) else {
+        let Some(n) = self
+            .interface_of(endpoint)
+            .filter(|_| self.configuration != 0)
+        else {
             return Reply::Stall;
         };
         if self.interfaces[n].halted {
@@ -728,7 +802,7 @@ impl Function for Peripheral {
     fn set_time(&mut self, _: u64) {}
 
     fn ready_at(&self, endpoint: u8) -> Option<u64> {
-        let n = Self::interface_of(endpoint)?;
+        let n = self.interface_of(endpoint)?;
         if self.configuration == 0 || self.interfaces[n].halted {
             return None;
         }

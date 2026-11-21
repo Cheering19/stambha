@@ -432,6 +432,9 @@ impl Service {
             if power.pressed() {
                 devices.serve(|devices| power.press(devices));
             }
+            if let Some(request) = super::lid::take_request() {
+                devices.serve(|devices| lid_request(devices, request));
+            }
             lap.part_of(Part::Nor, |_| drivers);
         }
         if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, &mut turn)) {
@@ -769,6 +772,36 @@ fn hold<R>(f: impl FnOnce(&mut Option<Service>) -> R) -> Option<R> {
     let result = f(unsafe { &mut *SLOT.service.get() });
     SLOT.held.store(false, Ordering::Release);
     Some(result)
+}
+
+/// What a lid change asks of the guest with `--lid-sleep`: a close a
+/// System Sleep on the keyboard's System Control interface, an open the
+/// power button's wake where the guest sleeps. One line for each.
+fn lid_request(devices: &mut stela_soc::machine::AppleDevices, request: super::lid::Request) {
+    match request {
+        super::lid::Request::Sleep => match devices.system_sleep() {
+            Ok(()) => output::arguments(format_args!(
+                "POWER lid closed: asked macOS to sleep (HID System Sleep)\n"
+            )),
+            Err(error) => output::arguments(format_args!(
+                "POWER lid closed: the sleep request was refused: {error}\n"
+            )),
+        },
+        super::lid::Request::Wake if devices.asleep() => {
+            match devices
+                .power_button(true)
+                .and_then(|()| devices.power_button(false))
+            {
+                Ok(()) => output::arguments(format_args!(
+                    "POWER lid open: woke the guest with its power button\n"
+                )),
+                Err(error) => output::arguments(format_args!(
+                    "POWER lid open: the wake was refused: {error}\n"
+                )),
+            }
+        }
+        super::lid::Request::Wake => {}
+    }
 }
 
 /// Give the service its interfaces for the run.

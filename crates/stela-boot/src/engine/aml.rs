@@ -1117,12 +1117,14 @@ unsafe extern "C" fn fatal(_: *mut c_void, status: Status) -> ! {
     ))
 }
 
-/// Publish the lid's state `open` for the scanout ([`super::lid`]), with a
-/// line saying it, `when` qualifying it.
-fn lid_changed(lid: &stela_drivers::platform::lid::Lid<'_>, open: bool, when: &str) {
-    super::lid::set(open);
+/// Publish the lid's state `open` for the scanout and the guest
+/// ([`super::lid`]), with a line saying it: a move since the last reading
+/// where `changed`, else the state it starts in.
+fn lid_changed(lid: &stela_drivers::platform::lid::Lid<'_>, open: bool, changed: bool) {
+    super::lid::set(open, changed);
     let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
     let state = if open { "open" } else { "closed" };
+    let when = if changed { "" } else { " at start" };
     output::arguments(format_args!("HOST ACPI lid {path}: {state}{when}\n"));
 }
 
@@ -1533,7 +1535,7 @@ impl HostAcpi {
         if let Some(lid) = &power.lid
             && let Some(open) = lid.open()
         {
-            lid_changed(lid, open, " at start");
+            lid_changed(lid, open, false);
         }
         *self.power.borrow_mut() = power;
     }
@@ -1672,7 +1674,7 @@ impl HostAcpi {
             }
             if let Some(lid) = &mut power.lid {
                 match lid.change() {
-                    Ok(Some(open)) => lid_changed(lid, open, ""),
+                    Ok(Some(open)) => lid_changed(lid, open, true),
                     Ok(None) => {}
                     Err(error) => {
                         output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"))
