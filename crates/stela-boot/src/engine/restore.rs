@@ -360,14 +360,16 @@ const READ_AHEAD_DEPTH: usize = 4;
 /// read waits for the network (`ranges::BUDGET_MS`).
 const READ_WAIT_MICROS: u64 = 20_000;
 
-/// Chunks of the image each service reads ahead, in one read the size of
-/// the store's largest, which the host's storage moves in its largest
-/// commands.
-const PREFETCH_CHUNKS: usize = 8;
+/// Chunks of the image each service reads ahead, 2 MiB in two reads the
+/// size of the store's largest, which the host's storage moves in its
+/// largest commands: a source read ahead, a partition or a remote image,
+/// usually holds both in memory already, so a service moves on as much as
+/// two did.
+const PREFETCH_CHUNKS: usize = 16;
 
 /// The time a service's read ahead goes on to the next job for, as a remote
 /// read waits for the network (`ranges::BUDGET_MS`): its PE's guest waits
-/// meanwhile, and one job's read moves 1 MiB at most.
+/// meanwhile, and one job's read ahead moves 2 MiB at most.
 const PREFETCH_MICROS: u64 = 20_000;
 
 /// How long an answer waits for its reads before the log names it, and

@@ -17,8 +17,13 @@ const SHA1_BYTES: usize = 20;
 const PACKET_BYTES: u64 = 1450;
 const FEC_STRIDE: u64 = 40;
 const PACKETS_PER_FEC: u64 = 25;
-/// Payload chunks [`Sender::prefetch`] keeps read ahead.
-const AHEAD_CHUNKS: usize = 16;
+/// Payload chunks [`Sender::prefetch`] keeps read ahead, 4 MiB: a host
+/// that reads on while the guest's window is shut has them ready once it
+/// opens.
+const AHEAD_CHUNKS: usize = 32;
+/// Payload chunks one read of the source holds at most, the store's
+/// largest read.
+const READ_CHUNKS: usize = super::store::MAX_READ_BYTES / CHUNK_BYTES;
 pub trait ImageSource {
     fn size(&self, component: &str) -> Result<u64>;
     /// Returns exactly len bytes, or fails. Must preserve source identity.
@@ -120,17 +125,28 @@ impl Sender {
     pub fn progress(&self) -> (u64, u64) {
         (self.offset, self.size)
     }
-    /// Read up to `chunks` payload chunks ahead in one read of the source,
-    /// while fewer than [`AHEAD_CHUNKS`] wait: a caller that must not hold
-    /// the stream's owner while it reads the source does so here, between
-    /// polls.
+    /// Read up to `chunks` payload chunks ahead, in reads of the source of
+    /// [`READ_CHUNKS`] at most, while fewer than [`AHEAD_CHUNKS`] wait: a
+    /// caller that must not hold the stream's owner while it reads the
+    /// source does so here, between polls. A read that fails keeps the
+    /// chunks of those before it.
     pub fn prefetch(&mut self, source: &mut impl ImageSource, chunks: usize) -> Result<()> {
         self.reads_ahead = true;
-        let room = AHEAD_CHUNKS.saturating_sub(self.ahead.len()).min(chunks);
-        if self.phase != Phase::Payload || room == 0 || self.ahead_at == self.size {
+        if self.phase != Phase::Payload {
             return Ok(());
         }
-        let n = (self.size - self.ahead_at).min((room * CHUNK_BYTES) as u64) as usize;
+        let mut room = AHEAD_CHUNKS.saturating_sub(self.ahead.len()).min(chunks);
+        while room != 0 && self.ahead_at != self.size {
+            let most = (room.min(READ_CHUNKS) * CHUNK_BYTES) as u64;
+            let n = (self.size - self.ahead_at).min(most) as usize;
+            self.read_chunks(source, n)?;
+            room -= n.div_ceil(CHUNK_BYTES);
+        }
+        Ok(())
+    }
+    /// Read the `n` image bytes at the read-ahead point, in one read of the
+    /// source, into chunks read ahead.
+    fn read_chunks(&mut self, source: &mut impl ImageSource, n: usize) -> Result<()> {
         let one_chunk = n <= CHUNK_BYTES;
         let read = if one_chunk {
             let buffer = self.chunk_buffer(n);
@@ -489,6 +505,71 @@ mod tests {
         assert_eq!(sender.phase(), Phase::Complete);
         assert!(sender.recycled.is_empty());
         assert!(stream.output.ends_with(&data));
+    }
+    /// A source that keeps each read's length and runs out of the time it
+    /// may wait at the read numbered `late`.
+    struct Counted<S> {
+        source: S,
+        reads: Vec<usize>,
+        late: Option<usize>,
+    }
+    impl<S: ImageSource> ImageSource for Counted<S> {
+        fn size(&self, component: &str) -> Result<u64> {
+            self.source.size(component)
+        }
+        fn read_at(&mut self, component: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+            self.reads.push(len);
+            if self.late == Some(self.reads.len() - 1) {
+                return Err(Error::Pending);
+            }
+            self.source.read_at(component, offset, len)
+        }
+    }
+    /// A prefetch of more chunks than the store reads at once reads them in
+    /// reads of its largest, keeping each read's chunks when a later one runs
+    /// out of its time; the image goes out whole and in order.
+    #[test]
+    fn a_prefetch_of_more_than_a_store_read_reads_in_store_reads() {
+        use super::super::store::MAX_READ_BYTES;
+        let read = MAX_READ_BYTES / CHUNK_BYTES;
+        let data: Vec<_> = (0..(2 * read + 1) * CHUNK_BYTES + 5)
+            .map(|i| (i * 11) as u8)
+            .collect();
+        let mut source = Counted {
+            source: fixture(&data, false),
+            reads: Vec::new(),
+            late: Some(1),
+        };
+        let mut input = xml(Value::dict([("Command", Value::from("Initiate"))]));
+        input.extend(xml(Value::dict([("Command", Value::from("Payload"))])));
+        let mut stream = Ready {
+            input,
+            output: Vec::new(),
+        };
+        let mut sender = Sender::new("os.dmg".into(), &source).unwrap();
+        sender.prefetch(&mut source, 2 * read).unwrap();
+        while sender.phase() != Phase::Payload {
+            assert!(sender.poll(&mut stream, &mut source).is_pending());
+        }
+        assert!(
+            source.reads.is_empty(),
+            "nothing is read before the payload"
+        );
+        let late = sender.prefetch(&mut source, 2 * read);
+        assert!(matches!(late, Err(Error::Pending)), "{late:?}");
+        assert_eq!(source.reads, [MAX_READ_BYTES, MAX_READ_BYTES]);
+        assert_eq!(sender.ahead.len(), read, "the first read's chunks stay");
+        sender.prefetch(&mut source, 2 * read).unwrap();
+        assert_eq!(source.reads[2..], [MAX_READ_BYTES, CHUNK_BYTES + 5]);
+        assert_eq!(sender.ahead.len(), 2 * read + 2);
+        for _ in 0..100 {
+            if sender.poll(&mut stream, &mut source).is_ready() {
+                break;
+            }
+        }
+        assert_eq!(sender.phase(), Phase::Complete);
+        assert!(stream.output.ends_with(&data));
+        assert_eq!(source.reads.len(), 4, "the payload is read once");
     }
     /// A source whose every other read runs out of the time it may wait, as
     /// a network source's does.
