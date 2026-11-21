@@ -419,3 +419,92 @@ fn a_slow_disk_read_ahead_keeps_working_between_its_readers_turns() {
     assert_eq!(asked, 32, "two turns a chunk");
     assert!(ahead <= 17, "one turn a chunk: {ahead}");
 }
+
+/// A read that a chunk in memory and one in flight hold between them takes
+/// the first and waits for the second; past its bound it keeps both for
+/// when it is asked again, and neither is read twice.
+#[test]
+fn a_read_half_in_memory_and_half_in_flight_takes_both() {
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, _, given)) = Delayed::new(numbered(16), 4);
+    released.set(usize::MAX);
+    let device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    let ahead = Ahead::new(ReadAhead::bounded(device, 1024, 2));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    reader.read(0, &mut block).unwrap();
+    released.set(0);
+    ahead.pump();
+    released.set(1);
+    ahead.pump();
+    bound.set(1_000);
+    let mut four = [0; 2048];
+    assert_eq!(reader.read(1, &mut four), Err(BlockError::Timeout));
+    released.set(usize::MAX);
+    bound.set(1_000);
+    reader.read(1, &mut four).unwrap();
+    assert_eq!((four[0], four[512], four[1024], four[1536]), (1, 2, 3, 4));
+    assert_eq!(*given.borrow(), [read(1, 2), read(3, 2)]);
+}
+
+/// A reader that seeks back reads there directly, and the chunks it left
+/// ahead, arriving after, are dropped rather than kept in its window: once
+/// it reads on, it is read ahead in full from where it landed.
+#[test]
+fn a_reader_that_seeks_back_is_read_ahead_in_full_from_where_it_landed() {
+    let (delayed, (released, reads, given)) = Delayed::new(numbered(32), 8);
+    released.set(usize::MAX);
+    let ahead = Ahead::new(ReadAhead::new(Box::new(delayed), 1024, 2));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    reader.read(10, &mut block).unwrap();
+    reader.read(11, &mut block).unwrap();
+    released.set(0);
+    ahead.pump();
+    assert_eq!(*given.borrow(), [read(12, 2), read(14, 2)]);
+    reader.read(2, &mut block).unwrap();
+    assert_eq!(
+        (block[0], reads.get()),
+        (2, 3),
+        "a seek back reads directly"
+    );
+    reader.read(3, &mut block).unwrap();
+    assert_eq!((block[0], reads.get()), (3, 4));
+    // The chunks left ahead arrive only now.
+    released.set(usize::MAX);
+    ahead.pump();
+    assert_eq!(
+        given.borrow()[2..],
+        [read(4, 2), read(6, 2)],
+        "the whole depth"
+    );
+    ahead.pump();
+    let mut two = [0; 1024];
+    reader.read(4, &mut two).unwrap();
+    assert_eq!((two[0], two[512]), (4, 5));
+    reader.read(6, &mut two).unwrap();
+    assert_eq!((two[0], two[512], reads.get()), (6, 7, 4), "found ahead");
+}
+
+/// The last chunk holds only what is left of the device, and nothing is
+/// read ahead past its end.
+#[test]
+fn the_last_chunk_reads_only_what_is_left_of_the_device() {
+    let (delayed, (released, reads, given)) = Delayed::new(numbered(6), 4);
+    released.set(usize::MAX);
+    let ahead = Ahead::new(ReadAhead::new(Box::new(delayed), 2048, 2));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    reader.read(0, &mut block).unwrap();
+    ahead.pump();
+    ahead.pump();
+    assert_eq!(*given.borrow(), [read(1, 4), read(5, 1)]);
+    let mut four = [0; 2048];
+    reader.read(1, &mut four).unwrap();
+    assert_eq!((four[0], four[1536]), (1, 4));
+    reader.read(5, &mut block).unwrap();
+    assert_eq!((block[0], reads.get()), (5, 1), "found ahead");
+    ahead.pump();
+    assert_eq!(given.borrow().len(), 2, "nothing past the end");
+}
