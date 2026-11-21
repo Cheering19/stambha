@@ -493,4 +493,6 @@ impl Bridge {
 #[cfg(test)]
 mod chip;
 #[cfg(test)]
+mod replay;
+#[cfg(test)]
 mod tests;
