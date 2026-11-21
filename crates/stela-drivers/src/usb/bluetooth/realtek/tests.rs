@@ -1303,3 +1303,20 @@ fn a_refused_scan_command_fails_the_scan_and_closes_the_transport() {
     assert_eq!(hci.state(), State::Closed);
     assert_eq!(trace.borrow().closed, 1);
 }
+#[test]
+fn a_drop_that_could_not_be_sent_is_no_drop() {
+    let (mut hci, catalog, trace) = patched_fixture(&[]);
+    // The third command, 0xfc66, fails on the bus.
+    hci.io.fail_command = Some(3);
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Transport(_)));
+    assert!(a.dropped.is_none());
+    // The readings that asked for the drop are kept as the attempt's own.
+    assert_eq!(
+        a.version.as_ref().unwrap().raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert_eq!(a.register_subversion, Some(0x8852));
+    assert_eq!(trace.borrow().commands, 3);
+}

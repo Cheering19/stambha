@@ -287,6 +287,11 @@ impl<B: Io> Engine<'_, B> {
         register_revision: Option<u16>,
         version: LocalVersion,
     ) -> Result<()> {
+        let packet =
+            command::packet(DROP_FIRMWARE, &[]).map_err(|why| Error::protocol(why, &[]))?;
+        self.hci.submit_command(&packet)?;
+        // Kept only once 0xfc66 went out; before, the attempt's own readings
+        // say what asked for it.
         self.attempt.dropped = Some(FirmwareDrop {
             register_subversion,
             register_revision,
@@ -294,9 +299,6 @@ impl<B: Io> Engine<'_, B> {
             events: Vec::new(),
             event_count: 0,
         });
-        let packet =
-            command::packet(DROP_FIRMWARE, &[]).map_err(|why| Error::protocol(why, &[]))?;
-        self.hci.submit_command(&packet)?;
         self.outside = Some(DROP_FIRMWARE);
         let until = self.hci.io.now_us().saturating_add(DROP_US);
         let (mut events, mut count) = (Vec::new(), 0);
