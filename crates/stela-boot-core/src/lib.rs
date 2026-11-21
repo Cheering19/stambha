@@ -86,6 +86,7 @@ pub mod msr;
 pub mod native_memory;
 pub mod native_profile;
 pub mod native_resources;
+pub mod network_link;
 #[cfg(target_arch = "x86_64")]
 pub mod nofault_read;
 pub mod opregion;

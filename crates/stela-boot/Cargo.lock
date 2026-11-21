@@ -1110,6 +1110,7 @@ dependencies = [
 name = "stela-drivers"
 version = "0.5.0"
 dependencies = [
+ "stela-contracts",
  "stela-crypto",
  "stela-driver-audio",
  "stela-driver-base",

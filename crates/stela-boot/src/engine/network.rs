@@ -23,6 +23,7 @@ use core::{
     cell::{Cell, RefCell},
     mem::ManuallyDrop,
 };
+use stela_boot_core::network_link;
 use stela_contracts::refuse;
 use stela_drivers::{
     Clock,
@@ -105,6 +106,9 @@ struct RootLink {
     device: ManuallyDrop<Adapter>,
     root: u64,
     frames: Rc<Frames>,
+    /// The configured Wi-Fi network's name for a Wi-Fi adapter, empty for a
+    /// wired one: hidden in what the link says ([`Self::hidden`]).
+    ssid: Vec<u8>,
 }
 
 /// The frames an adapter took and gave, for the log line of an attempt that
@@ -123,11 +127,18 @@ impl Frames {
 }
 
 impl RootLink {
-    fn new(device: Adapter, root: u64) -> Self {
+    /// `ssid` is the configured Wi-Fi network's name (`--wifi`), kept for a
+    /// Wi-Fi adapter alone.
+    fn new(device: Adapter, root: u64, ssid: Option<&str>) -> Self {
+        let ssid = match device.wireless() {
+            true => ssid.unwrap_or_default().as_bytes().to_vec(),
+            false => Vec::new(),
+        };
         Self {
             device: ManuallyDrop::new(device),
             root,
             frames: Rc::default(),
+            ssid,
         }
     }
 
@@ -136,11 +147,33 @@ impl RootLink {
     fn into_device(self) -> Adapter {
         let mut link = ManuallyDrop::new(self);
         // SAFETY: `link` is never dropped or used again: its frame counts
-        // are dropped here and its device is moved out once.
+        // and network name are dropped here and its device is moved out
+        // once.
         unsafe {
             drop(core::ptr::read(&link.frames));
+            drop(core::ptr::read(&link.ssid));
             ManuallyDrop::take(&mut link.device)
         }
+    }
+
+    /// `error` with the Wi-Fi network's name hidden
+    /// (`network_link::hide_ssid`): a Wi-Fi adapter's connection keeper
+    /// names the network in its failures, which reach the boot as the
+    /// link's errors, and from there its log, its screen and the guest
+    /// network's lines. A wired adapter's, with no name, stay as they are.
+    fn hidden(&self, error: LinkError) -> LinkError {
+        match error {
+            LinkError::Adapter(why) => {
+                LinkError::Adapter(network_link::hide_ssid(&why, &self.ssid))
+            }
+            error => error,
+        }
+    }
+
+    /// The adapter's state line (`Link::diagnostic`) with the network's
+    /// name hidden, as in [`Self::hidden`].
+    fn state(&self, state: Option<String>) -> Option<String> {
+        state.map(|state| network_link::hide_ssid(&state, &self.ssid))
     }
 
     /// Send `frame` inside the host drivers.
@@ -148,15 +181,19 @@ impl RootLink {
         self.device
             .transmit(frame)
             .inspect(|()| Frames::count(&self.frames.sent))
+            .map_err(|error| self.hidden(error))
     }
 
     /// The adapter's next frame, inside the host drivers.
     fn arrived(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
-        self.device.receive().inspect(|frame| {
-            if frame.is_some() {
-                Frames::count(&self.frames.received);
-            }
-        })
+        self.device
+            .receive()
+            .inspect(|frame| {
+                if frame.is_some() {
+                    Frames::count(&self.frames.received);
+                }
+            })
+            .map_err(|error| self.hidden(error))
     }
 
     /// [`Link::transmit`] for a service turn, which does not wait for the
@@ -180,7 +217,8 @@ impl RootLink {
     fn diagnostic_now(&mut self) -> Option<Option<String>> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
-        Some(self.device.diagnostic())
+        let state = self.device.diagnostic();
+        Some(self.state(state))
     }
 
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
@@ -222,11 +260,14 @@ impl Link for RootLink {
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive_reusing(frame).inspect(|&received| {
-            if received {
-                Frames::count(&self.frames.received);
-            }
-        })
+        self.device
+            .receive_reusing(frame)
+            .inspect(|&received| {
+                if received {
+                    Frames::count(&self.frames.received);
+                }
+            })
+            .map_err(|error| self.hidden(error))
     }
     fn signals(&self) -> bool {
         self.device.signals()
@@ -234,7 +275,8 @@ impl Link for RootLink {
     fn diagnostic(&mut self) -> Option<String> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.diagnostic()
+        let state = self.device.diagnostic();
+        self.state(state)
     }
     fn retarget(&mut self, message: stela_drivers::bus::irq::MsiMessage) -> bool {
         // SAFETY: as in `carrier`.
@@ -252,21 +294,31 @@ impl Link for RootLink {
 /// The PC's clock, moving the screen's running step as the stack waits. It
 /// reads the device clock (`host::device_counter`) on whichever processor
 /// serves the host, so the stack's time never goes back when its calls move
-/// between processors.
-struct Ticking(Clock);
+/// between processors. A read past `cut` fails, which ends a Wi-Fi
+/// adapter's wait for an address (`network_link::Cut`); a wired adapter's
+/// is never cut.
+struct Ticking {
+    clock: Clock,
+    cut: Rc<network_link::Cut>,
+}
 
 impl stela_runtime::net::Clock for Ticking {
     fn now_us(&self) -> Result<u64, stela_runtime::net::ClockError> {
         crate::status::tick();
-        self.0
+        let now = self
+            .clock
             .try_now_us()
-            .map_err(stela_runtime::net::ClockError::Calibration)
+            .map_err(stela_runtime::net::ClockError::Calibration)?;
+        if self.cut.passed(now) {
+            return Err(stela_runtime::net::ClockError::Unavailable);
+        }
+        Ok(now)
     }
     /// The adapter's completion signal wakes the boot processor, which runs
     /// the stack.
     fn sleep(&self, until_us: u64) -> Result<(), stela_runtime::net::ClockError> {
         let now = self
-            .0
+            .clock
             .try_now_us()
             .map_err(stela_runtime::net::ClockError::Calibration)?;
         if until_us > now {
@@ -285,9 +337,12 @@ pub struct HostNetwork {
 
 impl HostNetwork {
     /// Try each native adapter, those with carrier first, until DHCPv4 or
-    /// IPv6 SLAAC provides a usable address. A failed adapter keeps its
-    /// diagnostic while the next is tried, and stays in `links` with every
-    /// adapter not tried, for the guest network ([`GuestNetwork::open`]).
+    /// IPv6 SLAAC provides a usable address. A Wi-Fi adapter's wait goes on
+    /// past its connection keeper's failures until its carrier wait and the
+    /// DHCP wait have passed (`network_link::address`). A failed adapter
+    /// keeps its diagnostic while the next is tried, and stays in `links`
+    /// with every adapter not tried, for the guest network
+    /// ([`GuestNetwork::open`]).
     pub fn open(
         links: &mut Links,
         clock: Clock,
@@ -309,7 +364,11 @@ impl HostNetwork {
         // path out, so it is dropped in the loader's root.
         let mut next = 0;
         while next < links.devices.len() {
-            let link = RootLink::new(links.devices.remove(next), links.root);
+            let link = RootLink::new(
+                links.devices.remove(next),
+                links.root,
+                options.ssid.as_deref(),
+            );
             let driver = link.device.driver();
             let wireless = link.device.wireless();
             let location = String::from(link.device.location());
@@ -322,7 +381,12 @@ impl HostNetwork {
             let mut seed = [0u8; 8];
             crate::random::fill(&mut seed)
                 .map_err(|_| refuse!("secure host entropy is unavailable for the network stack"))?;
-            let mut stack = Stack::new(link, Ticking(clock), u64::from_le_bytes(seed))
+            let cut = Rc::new(network_link::Cut::new(wireless, link.carrier_wait_us()));
+            let ticking = Ticking {
+                clock,
+                cut: Rc::clone(&cut),
+            };
+            let mut stack = Stack::new(link, ticking, u64::from_le_bytes(seed))
                 .map_err(|error| refuse!("host network stack: {error}", %error))?;
             if let Some(ipv4) = options.ipv4 {
                 stack
@@ -334,17 +398,25 @@ impl HostNetwork {
                     .set_dns(&options.dns)
                     .map_err(|error| refuse!("host network --dns: {error}", %error))?;
             }
-            let waiting = |seconds: u64| {
+            let mut waiting = |seconds: u64| {
                 crate::status::progress(&format!(
                     "adapter {location}: waiting for the link, {seconds} s"
                 ));
             };
-            let result = stack.automatic_waiting(waiting);
+            // A Wi-Fi adapter's keeper fails and tries again on its own,
+            // and its failure reaches the stack as the link's: the wait is
+            // driven past it until its cut. A wired adapter's ends at its
+            // first failure.
+            let (addressed, retried) =
+                network_link::address(&cut, || stack.automatic_waiting(&mut waiting));
             // The DHCP lease, or what the exchange did without one.
             for note in stack.take_notes() {
                 output::arguments(format_args!("NETWORK adapter {location} {note}\n"));
             }
-            match result {
+            if !retried.is_empty() {
+                output::arguments(format_args!("NETWORK adapter {location} {retried}\n"));
+            }
+            match addressed {
                 Ok(config) => {
                     output::arguments(format_args!("NETWORK driver={driver}\n"));
                     output::arguments(format_args!(
@@ -839,8 +911,9 @@ impl GuestNetwork {
     /// The first adapter left in `links` with carrier now, else the first
     /// one left. The mount's own client, when it runs, has taken its adapter
     /// first ([`HostNetwork::open`]), so the guest never takes the only
-    /// adapter with a cable from an install.
-    pub fn open(links: &mut Links) -> Result<Self> {
+    /// adapter with a cable from an install. `ssid` is the configured
+    /// Wi-Fi network's name, hidden in what a Wi-Fi adapter's link says.
+    pub fn open(links: &mut Links, ssid: Option<&str>) -> Result<Self> {
         if links.devices.is_empty() {
             return Err(refuse!(
                 "the guest network needs a host network adapter of its own; none is left"
@@ -862,7 +935,7 @@ impl GuestNetwork {
             format_args!("{}", device.location()),
         );
         Ok(Self {
-            link: RootLink::new(device, links.root),
+            link: RootLink::new(device, links.root, ssid),
             up: None,
             counters: Default::default(),
             refused: false,

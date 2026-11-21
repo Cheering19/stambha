@@ -37,8 +37,9 @@ pub struct Config {
 /// the link comes up (IEEE 802.1D: 15 s listening, 15 s learning), and the
 /// adapter's start has just dropped and raised the link, so a wait of 30
 /// seconds lost every request there. Other systems' clients ask for a
-/// minute or longer.
-const DHCP_WAIT_US: u64 = 60_000_000;
+/// minute or longer. [`Stack::dhcp`] and [`Stack::automatic`] wait this
+/// long once the link has carrier.
+pub const DHCP_WAIT_US: u64 = 60_000_000;
 /// Seconds between DHCPDISCOVERs while no server answered: RFC 2131 4.1's
 /// first retransmission delay, where smoltcp's default waits 10 s. The
 /// first DISCOVER goes out as the link comes up, when a switch or the

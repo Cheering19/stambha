@@ -3422,7 +3422,7 @@ fn start_devices(
                 Some(Err(_)) | None => None,
             });
             let guest_network = match options.guest_network {
-                true => network::GuestNetwork::open(&mut links)
+                true => network::GuestNetwork::open(&mut links, options.ssid.as_deref())
                     .inspect_err(|error| {
                         output::arguments(format_args!("guest network refusal: {error}\n"));
                         ident::set(

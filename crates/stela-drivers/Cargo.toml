@@ -37,6 +37,8 @@ stela-driver-net = { path = "../stela-driver-net" }
 stela-driver-storage = { path = "../stela-driver-storage" }
 # SHA-1 and SHA-256 over Bluetooth firmware images.
 stela-crypto = { path = "../stela-crypto" }
+# A MAC address in a warning, masked as the engine masks it.
+stela-contracts = { path = "../stela-contracts", default-features = false }
 
 [dev-dependencies]
 stela-driver-base = { path = "../stela-driver-base", features = ["test-support"] }

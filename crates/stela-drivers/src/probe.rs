@@ -277,7 +277,7 @@ impl fmt::Display for PlatformError {
 pub enum Warning {
     Message(&'static str),
     /// A report composed at run time, such as an RTL8852CE's running
-    /// firmware, cut and MAC address.
+    /// firmware, cut and masked MAC address.
     Text(String),
     /// An xHCI controller stopped answering: what it was doing, and whether
     /// it was reset and attached again or this was the second attachment.
@@ -987,9 +987,16 @@ fn rtw89_reported(
             .warnings
             .push((address, Warning::Message(RTW89_WAS_ON)));
     }
-    devices
-        .warnings
-        .push((address, Warning::Text(alloc::format!("{running}"))));
+    devices.warnings.push((address, rtw89_running(running)));
+}
+
+/// What an RTL8852CE's firmware runs, as its warning says it: the chip's
+/// MAC address as the engine prints an adapter's (`masked::Mac`, its
+/// vendor half and last byte), and so any other in the text
+/// (`masked::mask_line`).
+fn rtw89_running(running: &net::wifi::realtek::ax::Running) -> Warning {
+    let text = alloc::format!("{running}");
+    Warning::Text(stela_contracts::masked::mask_line(&text).into_owned())
 }
 
 /// Record an RTL8852CE whose station attach failed: whether its MAC had been
@@ -4531,9 +4538,16 @@ mod tests {
                 "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
                  powered it off before taking the device over",
                 "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
-                 0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, LTR on, \
+                 0.27.56.14, MAC 00:e0:4c:..:..:c0, secure boot off, MAC init done, LTR on, \
                  H2C OFLD_CFG acknowledged (receive and done)",
             ]
+        );
+        // The chip's whole address is in no line, as the engine prints none.
+        assert!(
+            warnings
+                .iter()
+                .all(|line| !line.contains("00:e0:4c:88:52:c0")),
+            "{warnings:?}"
         );
         assert!(devices.failures.is_empty());
     }
@@ -4659,12 +4673,13 @@ mod tests {
             device: 0,
             function: 0,
         };
-        let warning = Warning::Text(running.to_string());
-        // As stela-boot prints `devices.warnings`.
+        let warning = rtw89_running(&running);
+        // As stela-boot prints `devices.warnings`: the MAC as the engine
+        // prints one (`stela_contracts::masked::Mac`).
         assert_eq!(
             format!("HOST WARNING pci={address}: {warning}"),
             "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
-             0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off, MAC init done, LTR off, H2C \
+             0.27.56.14, MAC 00:e0:4c:..:..:c0, secure boot off, MAC init done, LTR off, H2C \
              OFLD_CFG acknowledged (receive only)"
         );
         assert_eq!(

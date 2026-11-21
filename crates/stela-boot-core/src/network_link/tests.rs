@@ -1,0 +1,237 @@
+use super::*;
+use alloc::{string::ToString, vec, vec::Vec};
+use core::cell::{Cell, RefCell};
+use stela_drivers::net::wifi::realtek::ax::WIFI_CARRIER_WAIT_US;
+use stela_runtime::net::{ClockError, NetError, stack::DHCP_WAIT_US};
+
+/// A keeper's failure as the network stack reports it.
+fn not_found() -> NetError {
+    NetError::Link(String::from("rtw89: <ssid> not found"))
+}
+
+/// `address` over `results`, one per attempt, in order: what it gave, what
+/// it said of the failures it went past, and how many attempts it made.
+fn drive(cut: &Cut, results: Vec<Result<u32, NetError>>) -> (Result<u32, NetError>, String, usize) {
+    let results = RefCell::new(results.into_iter());
+    let attempts = Cell::new(0);
+    let (result, retried) = address(cut, || {
+        attempts.set(attempts.get() + 1);
+        results
+            .borrow_mut()
+            .next()
+            .expect("an attempt past the last result")
+    });
+    (result, retried.to_string(), attempts.get())
+}
+
+/// A wired adapter's wait ends at its first failure, whatever it is, as it
+/// did before a Wi-Fi link's went on, and its clock is never cut.
+#[test]
+fn a_wired_link_stops_at_its_first_failure() {
+    for failure in [
+        not_found(),
+        NetError::NoCarrier,
+        NetError::Dhcp("no DHCPv4 lease"),
+        NetError::DuplicateAddress(core::net::Ipv6Addr::LOCALHOST),
+    ] {
+        let cut = Cut::new(false, WIFI_CARRIER_WAIT_US);
+        let (result, retried, attempts) = drive(&cut, vec![Err(failure.clone()), Ok(1)]);
+        assert_eq!(result, Err(failure));
+        assert_eq!((retried.as_str(), attempts), ("", 1));
+        assert!(!cut.passed(0) && !cut.passed(u64::MAX) && !cut.reached());
+    }
+    let cut = Cut::new(false, WIFI_CARRIER_WAIT_US);
+    assert_eq!(drive(&cut, vec![Ok(7)]), (Ok(7), String::new(), 1));
+}
+
+/// A Wi-Fi link's keeper fails and tries again on its own, and its failure
+/// reaches the stack as the link's: the wait goes on past it.
+#[test]
+fn a_wifi_link_is_driven_past_its_keepers_failures() {
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    let (result, retried, attempts) = drive(&cut, vec![Err(not_found()), Ok(7)]);
+    assert_eq!((result, attempts), (Ok(7), 2));
+    assert_eq!(
+        retried,
+        "retried past 1 failure: network link: rtw89: <ssid> not found"
+    );
+    // The wait is over: the stack's later reads, a download's, are never
+    // cut.
+    assert!(!cut.passed(u64::MAX) && !cut.reached());
+
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    let (result, retried, attempts) = drive(
+        &cut,
+        vec![
+            Err(not_found()),
+            Err(NetError::NoCarrier),
+            Err(NetError::Dhcp("no lease")),
+            Ok(7),
+        ],
+    );
+    assert_eq!((result, attempts), (Ok(7), 4));
+    assert_eq!(
+        retried,
+        "retried past 3 failures, first: network link: rtw89: <ssid> not found, last: DHCP: \
+         no lease"
+    );
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    let (_, retried, _) = drive(&cut, vec![Err(not_found()), Err(not_found()), Ok(7)]);
+    assert_eq!(
+        retried,
+        "retried past 2 failures: network link: rtw89: <ssid> not found"
+    );
+}
+
+/// A failure no other attempt mends ends a Wi-Fi link's wait at once, as a
+/// wired one's, and so does a clock that failed before the cut.
+#[test]
+fn a_wifi_link_stops_at_a_failure_no_attempt_mends() {
+    for failure in [
+        NetError::DuplicateAddress(core::net::Ipv6Addr::LOCALHOST),
+        NetError::Invalid("DHCP after a configuration by hand"),
+        NetError::Clock(ClockError::Unavailable),
+    ] {
+        let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+        let (result, retried, attempts) = drive(&cut, vec![Err(not_found()), Err(failure.clone())]);
+        assert_eq!((result, attempts), (Err(failure), 2));
+        assert_eq!(
+            retried,
+            "retried past 1 failure: network link: rtw89: <ssid> not found"
+        );
+        assert!(!cut.passed(u64::MAX));
+    }
+}
+
+/// A Wi-Fi link's wait lasts its carrier wait and then the DHCP wait, the
+/// stack's, from the stack's first read of the clock; a read at or past
+/// that fails from then on.
+#[test]
+fn a_wifi_links_wait_is_its_carrier_wait_and_the_dhcp_wait() {
+    assert_eq!(DHCP_WAIT_US, 60_000_000);
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    let start = 5_000_000;
+    let end = start + WIFI_CARRIER_WAIT_US + DHCP_WAIT_US;
+    assert!(!cut.passed(start));
+    assert!(!cut.passed(end - 1));
+    assert!(!cut.reached());
+    assert!(cut.passed(end));
+    assert!(cut.reached());
+    // Once cut, every read is: the stack refuses from then on.
+    assert!(cut.passed(start));
+}
+
+/// The stack's clock cut drives a Wi-Fi link's wait to its end: the
+/// failure is the last one gone past, so a keeper that never joined still
+/// reads as no carrier.
+#[test]
+fn a_wifi_links_wait_ends_at_its_cut() {
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    let now = Cell::new(1_000);
+    let attempts = Cell::new(0);
+    // Each attempt reads the clock as it starts, then waits out the carrier
+    // wait without carrier.
+    let (result, retried) = address(&cut, || {
+        attempts.set(attempts.get() + 1);
+        if cut.passed(now.get()) {
+            return Err::<u32, _>(NetError::Clock(ClockError::Unavailable));
+        }
+        now.set(now.get() + WIFI_CARRIER_WAIT_US);
+        Err(NetError::NoCarrier)
+    });
+    assert_eq!((result, attempts.get()), (Err(NetError::NoCarrier), 4));
+    assert_eq!(
+        retried.to_string(),
+        "retried past 3 failures: network link has no carrier; no address within 90 s"
+    );
+    assert!(!cut.passed(u64::MAX));
+
+    // Cut inside its first attempt, with no failure gone past: a lease that
+    // did not come.
+    let cut = Cut::new(true, WIFI_CARRIER_WAIT_US);
+    assert!(!cut.passed(0));
+    assert!(cut.passed(WIFI_CARRIER_WAIT_US + DHCP_WAIT_US));
+    let (result, retried, attempts) =
+        drive(&cut, vec![Err(NetError::Clock(ClockError::Unavailable))]);
+    assert_eq!(attempts, 1);
+    assert_eq!(result, Err(NetError::Dhcp(NO_LEASE_IN_TIME)));
+    assert_eq!(retried, "no address within 90 s");
+}
+
+#[test]
+fn hide_ssid_hides_every_occurrence_of_the_name() {
+    // The connection keeper's failures name the network after the radio.
+    assert_eq!(
+        hide_ssid("rtw89: test not found", b"test"),
+        "rtw89: <ssid> not found"
+    );
+    assert_eq!(
+        hide_ssid(
+            "rtw89: test offers no supported security: Akm; test",
+            b"test"
+        ),
+        "rtw89: <ssid> offers no supported security: Akm; <ssid>"
+    );
+    // Byte for byte: another case, or part of the name, is not the name.
+    for text in ["rtw89: TEST not found", "rtw89: tes not found", ""] {
+        assert_eq!(hide_ssid(text, b"test"), text);
+    }
+    // A name of several-byte characters, and one that is not UTF-8, which
+    // the keeper writes as from_utf8_lossy does.
+    assert_eq!(
+        hide_ssid("rtw89: café ü not found", "café ü".as_bytes()),
+        "rtw89: <ssid> not found"
+    );
+    assert_eq!(
+        hide_ssid("rtw89: caf\u{fffd} not found", b"caf\xe9"),
+        "rtw89: <ssid> not found"
+    );
+    // An empty name, a wired adapter's, hides nothing.
+    assert_eq!(hide_ssid("rtw89:  not found", b""), "rtw89:  not found");
+}
+
+#[test]
+fn hide_ssid_hides_a_name_inside_other_words_too() {
+    // The line gives up legibility, never the name.
+    assert_eq!(
+        hide_ssid("eapol rx 2; scan rx", b"rx"),
+        "eapol <ssid> 2; scan <ssid>"
+    );
+    assert_eq!(
+        hide_ssid("scans 1, assoc", b"s"),
+        "<ssid>can<ssid> 1, a<ssid><ssid>oc"
+    );
+    // Overlapping occurrences are hidden as one, touching ones one each.
+    assert_eq!(hide_ssid("x aaa y", b"aa"), "x <ssid> y");
+    assert_eq!(hide_ssid("ababa", b"aba"), "<ssid>");
+    assert_eq!(hide_ssid("abab", b"ab"), "<ssid><ssid>");
+}
+
+#[test]
+fn hide_ssid_leaves_a_hidden_name_hidden() {
+    // A `<ssid>` already written stays as it is, so hiding twice changes
+    // nothing, even for a name that is part of it or is it.
+    let text = "rtw89: test not found; <ssid>";
+    for name in ["test", "s", "ssid", "id>", "<", "<ssid>"] {
+        let once = hide_ssid(text, name.as_bytes());
+        assert!(once.ends_with("; <ssid>"), "{name}: {once}");
+        assert_eq!(hide_ssid(&once, name.as_bytes()), once, "{name}");
+    }
+    // A name longer than the placeholder is still hidden over it.
+    assert_eq!(hide_ssid("<ssid> <ssid>x", b"<ssid>x"), "<ssid> <ssid>");
+}
+
+/// The boot's `NETWORK adapter … failed` line and its account on the
+/// screen write the network stack's error, which carries the keeper's
+/// failure as the link's.
+#[test]
+fn a_keeper_failure_reaches_the_boot_with_the_name_hidden() {
+    let failure = hide_ssid("rtw89: test not found", b"test");
+    let error = NetError::Link(failure);
+    assert_eq!(error.to_string(), "network link: rtw89: <ssid> not found");
+    assert_eq!(
+        alloc::format!("0000:03:00.0: no address ({error})."),
+        "0000:03:00.0: no address (network link: rtw89: <ssid> not found)."
+    );
+    assert!(!error.to_string().contains("test"));
+}
