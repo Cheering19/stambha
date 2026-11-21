@@ -9,6 +9,7 @@ pub mod elan;
 mod held;
 pub mod hid_i2c;
 pub mod ish;
+pub mod multitouch;
 pub mod observation;
 pub mod ps2;
 pub mod ptp;
@@ -66,6 +67,9 @@ pub enum Input {
     MouseWheel(i8),
     /// Mouse horizontal wheel (AC Pan) detents, positive right.
     MouseHWheel(i8),
+    /// A precision touchpad's whole frame, for a guest multitouch device
+    /// ([`multitouch`]); only a touchpad in frames mode gives one.
+    Touch(multitouch::Frame),
 }
 
 #[cfg(test)]
