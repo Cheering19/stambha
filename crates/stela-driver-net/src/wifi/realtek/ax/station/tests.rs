@@ -21,6 +21,7 @@ use crate::wifi::realtek::ax::c2h::RaReport;
 use crate::wifi::realtek::ax::regd::Regd;
 use crate::wifi::realtek::ax::rx::{Rate, RateMode};
 use crate::wifi::realtek::ccmp;
+use crate::wifi::regulatory::channel::NO_IR;
 use crate::wifi::sae::{self, Derivation, Exchange};
 use crate::wifi::station::multi_link::Mld;
 use crate::wifi::station::phy::AccessCategory;
@@ -3111,4 +3112,89 @@ fn progress_line_has_the_m4_fields() {
         "{line}"
     );
     assert!(!names_an_address(&line), "{line}");
+}
+
+/// wireless-regdb's IN rules (M4 spec S14.1: 5725-5875 MHz at 80 MHz, so
+/// 149-173 by the rules), and a US-like 5 GHz whose 5835-5895 MHz rule is
+/// NO-IR, as [`regdb`] builds rules (regulatory.db's flags: DFS 1 << 2,
+/// NO-IR 1 << 3).
+const IN_RULES: [(u32, u32, u8, u16); 5] = [
+    (2_402_000, 2_482_000, 0, 3000),
+    (5_150_000, 5_250_000, 0, 3000),
+    (5_250_000, 5_350_000, 1 << 2, 2400),
+    (5_470_000, 5_725_000, 1 << 2, 2400),
+    (5_725_000, 5_875_000, 0, 3000),
+];
+const UNII4_RULES: [(u32, u32, u8, u16); 3] = [
+    (2_402_000, 2_472_000, 0, 3000),
+    (5_735_000, 5_835_000, 0, 3000),
+    (5_835_000, 5_895_000, 1 << 3, 2700),
+];
+
+/// The 5 GHz channel numbers `channels` offers, and their flags.
+fn five_ghz(offered: &[(Channel, u32)]) -> Vec<(u16, u32)> {
+    offered
+        .iter()
+        .filter(|(c, _)| c.band == Band::Ghz5)
+        .map(|(c, flags)| (c.number, *flags))
+        .collect()
+}
+
+#[test]
+fn unii4_is_us_only_without_acpi() {
+    // rtw89_regd_apply_policy_unii4 (regd.c:770-797) disables channels 169,
+    // 173 and 177 (from RTW89_5GHZ_UNII4_START_INDEX 25, core.h:6991-6992)
+    // for every regd but US, whatever the country's rules allow.
+    // A database's countries are in alpha2 order.
+    let database = regdb(&[
+        (*b"CA", &UNII4_RULES[..]),
+        (*b"IN", &IN_RULES[..]),
+        (*b"US", &UNII4_RULES[..]),
+    ]);
+    let india = channels(&database.clone().select(*b"IN").unwrap(), *b"IN");
+    assert!(five_ghz(&india).iter().all(|&(n, _)| n < 169), "{india:?}");
+    let us = five_ghz(&channels(&database.clone().select(*b"US").unwrap(), *b"US"));
+    let unii4: Vec<u16> = us.iter().map(|&(n, _)| n).filter(|&n| n >= 169).collect();
+    assert_eq!(unii4, [169, 173, 177]);
+    // Each keeps its rule's flags (NO-IR here).
+    assert!(
+        us.iter()
+            .filter(|&&(n, _)| n >= 169)
+            .all(|&(_, f)| f & NO_IR != 0)
+    );
+    let canada = channels(&database.clone().select(*b"CA").unwrap(), *b"CA");
+    assert!(five_ghz(&canada).iter().all(|&(n, _)| n < 169));
+    // The world regd, and a US channel plan under the world regd's index.
+    let world = channels(&database.clone().select(*b"US").unwrap(), *b"00");
+    assert!(five_ghz(&world).iter().all(|&(n, _)| n < 169));
+    // The radio takes the regd its chip found (Live::regds' alpha2).
+    let model = |alpha2: [u8; 2]| {
+        Model(Rc::new(RefCell::new(Air {
+            link: LinkCounts {
+                regd: Some((alpha2, Regd::Fcc)),
+                ..LinkCounts::default()
+            },
+            ..Air::default()
+        })))
+    };
+    for (alpha2, unii4) in [(*b"US", 3), (*b"IN", 0)] {
+        let country = database.clone().select(*b"US").unwrap();
+        let radio = Rtl8852c::new(model(alpha2), Mac(LOCAL), country, CLOCK).unwrap();
+        let offered = radio.channels(Band::Ghz5);
+        let past = offered.iter().filter(|(c, _)| c.number >= 169).count();
+        assert_eq!(past, unii4, "{alpha2:?}");
+    }
+}
+
+#[test]
+fn in_keeps_149_to_165() {
+    let database = regdb(&[(*b"IN", &IN_RULES[..])]);
+    let india = five_ghz(&channels(&database.clone().select(*b"IN").unwrap(), *b"IN"));
+    let upper: Vec<u16> = india
+        .iter()
+        .map(|&(n, _)| n)
+        .filter(|&n| n >= 149)
+        .collect();
+    assert_eq!(upper, [149, 153, 157, 161, 165]);
+    assert!(india.iter().all(|&(_, f)| f & NO_IR == 0));
 }

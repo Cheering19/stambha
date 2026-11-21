@@ -152,6 +152,7 @@ pub mod chip;
 use self::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
 use super::assoc::HtPeer;
 use super::c2h::{RaReport, ra_rate};
+use super::regd::unii4_allowed;
 use super::rx::{Rate, RateMode};
 use super::txd;
 use crate::{
@@ -257,6 +258,9 @@ const CHANNELS_5GHZ: [u16; 28] = [
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
     149, 153, 157, 161, 165, 169, 173, 177,
 ];
+/// `RTW89_5GHZ_UNII4_START_INDEX` (`core.h:6991`): channel 169's.
+const UNII4_START_INDEX: usize = 25;
+const _: () = assert!(CHANNELS_5GHZ[UNII4_START_INDEX] == 169);
 /// The Supported Channels a spectrum-managed request names (spec S14.4).
 const SUPPORTED_2GHZ: [u8; 2] = [1, 14];
 const SUPPORTED_5GHZ: [u8; 4] = [36, 28, 149, 9];
@@ -604,8 +608,14 @@ fn rate_elements(band: Band) -> &'static [u8] {
     }
 }
 
-/// The channels mac80211 registers for rtw89, as `country` leaves them.
-fn channels(country: &Country) -> Vec<(Channel, u32)> {
+/// The channels mac80211 registers for rtw89, as `country` leaves them,
+/// then UNII-4 (169, 173 and 177, from `RTW89_5GHZ_UNII4_START_INDEX`,
+/// `core.h:6991-6992`) dropped unless the regd `alpha2` names may use it
+/// ([`unii4_allowed`], M4 spec S14.2): `rtw89_regd_apply_policy_unii4`
+/// disables them from the regd notifier, after cfg80211's own channel and
+/// HT40 flags (`wiphy_update_regulatory`'s `reg_call_notifier` comes last),
+/// so the channels below keep the flags they had with UNII-4 present.
+fn channels(country: &Country, alpha2: [u8; 2]) -> Vec<(Channel, u32)> {
     let mut out = Vec::new();
     let mut band = |band: Band, numbers: &[u16], frequency: fn(u16) -> u16| {
         let centers: Vec<u16> = numbers.iter().map(|&number| frequency(number)).collect();
@@ -633,6 +643,10 @@ fn channels(country: &Country) -> Vec<(Channel, u32)> {
         }
     });
     band(Band::Ghz5, &CHANNELS_5GHZ, |number| 5000 + 5 * number);
+    if !unii4_allowed(alpha2) {
+        let unii4 = &CHANNELS_5GHZ[UNII4_START_INDEX..];
+        out.retain(|(channel, _)| !(channel.band == Band::Ghz5 && unii4.contains(&channel.number)));
+    }
     out
 }
 
@@ -741,7 +755,8 @@ pub struct Rtl8852c<C: Chip> {
 impl<C: Chip> Rtl8852c<C> {
     /// `chip`, running at `address` under `country`, as a keeper's radio.
     pub fn new(chip: C, address: Mac, country: Country, clock: Clock) -> Result<Self, Error> {
-        let channels = channels(&country);
+        let alpha2 = chip.link_counts().regd.map_or(*b"00", |(alpha2, _)| alpha2);
+        let channels = channels(&country, alpha2);
         Ok(Self {
             chip,
             address,
