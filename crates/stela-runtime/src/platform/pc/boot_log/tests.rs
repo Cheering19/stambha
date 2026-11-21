@@ -1390,3 +1390,54 @@ fn reading_back_to_a_marked_boot_stops_where_asking_every_chunk_does() {
         assert!(stream.ends_with(&marked));
     }
 }
+
+/// A log of a boot for each of `boots`, its lines and whether it has
+/// device-start lines, in a region that is all ring of `ring` bytes.
+fn marked_boots(ring: u64, boots: &[(usize, bool)]) -> Recorder {
+    use super::super::device_starts::{START, STARTED};
+    let mut disk = Recorder::new(HEADER_BYTES + ring, 512);
+    for (boot, &(count, marked)) in boots.iter().enumerate() {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        if marked {
+            writer.append(format!("{START} pci=0000:05:00.0 id=144d:a808\n{STARTED}\n").as_bytes());
+        }
+        writer.append(&lines(boot * 1000, count));
+        writer.flush(&mut disk).unwrap();
+    }
+    disk
+}
+
+/// In a ring the stream has wrapped round, read back across its end, the
+/// read asked only as markers come stops where asking after every chunk
+/// does, at every chunk, one that cuts a marker line among them; and where
+/// the ring wrote over every marked boot, both read it whole.
+#[test]
+fn reading_back_a_wrapped_ring_stops_where_asking_every_chunk_does() {
+    use super::super::device_starts::{BOOT, settled};
+    let settles: alloc::vec::Vec<_> = (0..9).map(|boot| (250 + 9 * boot, boot % 3 == 0)).collect();
+    let gone: alloc::vec::Vec<_> = (0..9).map(|boot| (250 + 9 * boot, boot == 0)).collect();
+    for (boots, settling) in [(settles, Some("=== STELA BOOT 7 ")), (gone, None)] {
+        let mut disk = marked_boots(16 << 10, &boots);
+        let log = disk.log().unwrap();
+        assert!(
+            log.overwritten() > 0 && !log.head.is_multiple_of(16 << 10),
+            "wrapped"
+        );
+        let text = String::from_utf8(log.stream.clone()).unwrap();
+        let mut chunks = alloc::vec![1, 512, 700, 1000, 1536, 4099, 1 << 20];
+        for boot in ["=== STELA BOOT 9 "].into_iter().chain(settling) {
+            let at = text.find(boot).unwrap();
+            chunks.push((log.stream.len() - at - 5) as u64);
+        }
+        for chunk in chunks {
+            let every = read_newest(&mut disk, chunk, settled).unwrap();
+            let marked = read_newest_marked(&mut disk, chunk, BOOT.as_bytes(), settled).unwrap();
+            assert_eq!(marked, every, "chunk {chunk}");
+            assert_eq!(settled(&marked), settling.is_some(), "chunk {chunk}");
+            assert!(log.stream.ends_with(&marked));
+            if settling.is_none() {
+                assert_eq!(marked, log.stream, "read whole: chunk {chunk}");
+            }
+        }
+    }
+}
