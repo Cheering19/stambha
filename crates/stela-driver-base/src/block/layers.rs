@@ -560,19 +560,21 @@ impl ReadAhead {
         if at < blocks {
             // A miss: what nothing read ahead holds is read here. The
             // read-ahead goes on after it where a chunk starts there, else
-            // over from there, with only the last read's chunks kept.
+            // over from there, so none reads what this read asks for; once
+            // the read is done, only this read's chunks stay. A read that
+            // failed keeps them all, for when it is asked again.
             let continued = self.ready.contains_key(&end)
                 || self.running.iter().any(|(first, _)| *first == end);
             if !continued {
-                let (last, wanted) = (self.last, self.wanted.min(end));
-                let size = u64::from(self.device.identity().block_size.max(1));
-                self.ready.retain(|first, data| {
-                    *first < wanted && *first + data.len() as u64 / size > last
-                });
                 self.next = end;
             }
             let to = at as usize * block;
             self.device.read(lba + at, &mut buffer[to..])?;
+            if !continued {
+                let size = u64::from(self.device.identity().block_size.max(1));
+                self.ready
+                    .retain(|first, data| *first < end && *first + data.len() as u64 / size > lba);
+            }
         }
         self.streaming = served || (self.last..=self.wanted).contains(&lba);
         self.last = lba;

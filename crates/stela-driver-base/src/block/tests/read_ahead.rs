@@ -160,6 +160,38 @@ fn a_caller_reading_again_after_its_bound_finds_its_last_read_in_memory() {
     );
 }
 
+/// A read served in part from memory whose rest misses keeps the chunk it
+/// was served from until the rest is read: a rest that ran past its bound
+/// is read again alone, not with the part memory held.
+#[test]
+fn a_read_served_in_part_keeps_its_chunk_until_its_rest_is_read() {
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, _, given)) = Delayed::new(numbered(16), 4);
+    released.set(usize::MAX);
+    let device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    let ahead = Ahead::new(ReadAhead::bounded(device, 1024, 1));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    reader.read(0, &mut block).unwrap();
+    ahead.pump();
+    ahead.pump();
+    assert_eq!(*given.borrow(), [read(1, 2)]);
+    released.set(0);
+    bound.set(1_000);
+    let mut four = [0; 2048];
+    assert_eq!(reader.read(1, &mut four), Err(BlockError::Timeout));
+    released.set(usize::MAX);
+    bound.set(1_000);
+    reader.read(1, &mut four).unwrap();
+    assert_eq!((four[0], four[512], four[1024], four[1536]), (1, 2, 3, 4));
+    assert_eq!(
+        given.borrow()[1..],
+        [read(3, 2)],
+        "the rest read once, alone"
+    );
+}
+
 /// A reader that jumps elsewhere, as one serving two places in turn, is
 /// read ahead again only once it reads on from where it landed, so a jump
 /// costs no chunks read for nothing.
