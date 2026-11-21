@@ -904,13 +904,14 @@ pub struct HostCheck {
     /// Read the NOR image from this FAT32 partition's file (`--nor-file
     /// GUID:/PATH`).
     pub nor_file: Option<(Guid, String)>,
+    /// Start only the xHCI of a Realtek USB Bluetooth controller, bring the
+    /// controller up with the USB stick's firmware and scan through it
+    /// (`--bluetooth-check`).
+    pub bluetooth_check: bool,
     /// Stop after this many seconds (`--deadline`).
     pub deadline: Option<u64>,
     /// How long a prompt waits for a key (`--key-seconds`).
     pub key_seconds: u64,
-    /// Bring the first Realtek USB Bluetooth controller up with the USB
-    /// stick's firmware and scan through it (`--bluetooth-check`).
-    pub bluetooth_check: bool,
     /// Keep the newest lines, the summary among them, in the firmware's
     /// stop-record variables once the checks end (`--keep-lines`).
     pub keep_lines: bool,
@@ -920,9 +921,9 @@ impl Default for HostCheck {
     fn default() -> Self {
         Self {
             nor_file: None,
+            bluetooth_check: false,
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
-            bluetooth_check: false,
             keep_lines: false,
         }
     }
@@ -957,9 +958,9 @@ impl HostCheck {
                         String::from(path),
                     ));
                 }
+                "--bluetooth-check" => options.bluetooth_check = true,
                 "--deadline" => options.deadline = Some(seconds(words.next())?),
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
-                "--bluetooth-check" => options.bluetooth_check = true,
                 "--keep-lines" => options.keep_lines = true,
                 _ => return Err(Error::UnknownHostOption),
             }
@@ -975,11 +976,11 @@ impl fmt::Display for HostCheck {
         if let Some((guid, path)) = &self.nor_file {
             write!(line.0, " --nor-file {guid}:{path}")?;
         }
+        line.flag("--bluetooth-check", self.bluetooth_check)?;
         line.value("--deadline", self.deadline)?;
         if self.key_seconds != DEFAULT_KEY_SECONDS {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }
-        line.flag("--bluetooth-check", self.bluetooth_check)?;
         line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }

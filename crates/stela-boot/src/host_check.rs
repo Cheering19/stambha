@@ -18,19 +18,19 @@
 //! - `apic`, `interrupts`: the local APIC timer measured against the TSC,
 //!   then one one-shot and 100 ms of periodic interrupts through the IDT's
 //!   interrupt stacks.
-//! - `bluetooth-found`, `bluetooth-rom`, `bluetooth-firmware`,
-//!   `bluetooth-download`, `bluetooth-version`, `bluetooth-scan` and
-//!   `bluetooth`: with `--bluetooth-check`, in place of the storage probe,
-//!   the one xHCI the firmware's USB stack found a Realtek USB Bluetooth
-//!   controller on is started alone, the controller brought up with the USB
-//!   stick's verified host firmware, then scanned for 8 s, reset and closed
-//!   ([`bluetooth`]). No other PCI function is touched, so `storage`, `gpt`
-//!   and `log` are skipped, and nothing writes to the stick, which that xHCI
-//!   may hold and its start then resets. Without the option, one
-//!   `CHECK bluetooth SKIP` line.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
+//! - `bluetooth-found`, `bluetooth-rom`, `bluetooth-firmware`,
+//!   `bluetooth-download`, `bluetooth-version`, `bluetooth-scan` and
+//!   `bluetooth`, before `apic`: with `--bluetooth-check`, in place of the
+//!   storage probe, the one xHCI the firmware's USB stack found a Realtek
+//!   USB Bluetooth controller on is started alone, the controller brought up
+//!   with the USB stick's verified host firmware, then scanned for 8 s, reset
+//!   and closed ([`bluetooth`]). No other PCI function is touched, so
+//!   `storage`, `gpt` and `log` are skipped, and nothing writes to the
+//!   stick, which that xHCI may hold and its start then resets. Without the
+//!   option, one `CHECK bluetooth SKIP` line.
 //!
 //! `HOST CHECK END` and the summary follow, all flushed to the log. With
 //! `--keep-lines` the newest lines, up to 24 KiB with the summary at their

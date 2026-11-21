@@ -55,49 +55,17 @@ fn host_check_lines_round_trip_and_refuse_bad_values() {
     assert_eq!(HostCheck::parse("--host-check"), Ok(HostCheck::default()));
     for text in [
         "--system",
+        "--host-check --bluetooth-check=1",
+        "--host-check --bluetooth-check on",
         "--host-check --native-dma-check",
         "--host-check --deadline 0",
         "--host-check --nor-file x",
         "--host-check --unknown",
         "--host-check --keep-lines=1",
         "--host-check --keep-lines 1",
-        "--host-check --bluetooth-check=1",
-        "--host-check --bluetooth-check on",
     ] {
         assert!(HostCheck::parse(text).is_err(), "{text}");
     }
-}
-
-#[test]
-fn host_check_bluetooth_check_is_off_unless_named_and_round_trips() {
-    assert!(!HostCheck::parse("--host-check").unwrap().bluetooth_check);
-    assert!(
-        !HostCheck::parse("--host-check --keep-lines")
-            .unwrap()
-            .bluetooth_check
-    );
-    let options =
-        HostCheck::parse("--host-check --keep-lines --bluetooth-check --deadline 600").unwrap();
-    assert!(options.bluetooth_check && options.keep_lines);
-    assert_eq!(
-        options.to_string(),
-        "--host-check --deadline 600 --bluetooth-check --keep-lines"
-    );
-    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
-    assert_eq!(
-        HostCheck::parse("--host-check --bluetooth-check --bluetooth-check").unwrap(),
-        HostCheck {
-            bluetooth_check: true,
-            ..HostCheck::default()
-        }
-    );
-    // Without it, the line prints as before.
-    assert_eq!(
-        HostCheck::parse("--host-check --key-seconds 5")
-            .unwrap()
-            .to_string(),
-        "--host-check --key-seconds 5"
-    );
 }
 
 #[test]
@@ -474,3 +442,35 @@ fn numbers_take_decimal_and_separated_hex() {
 
 mod constraints;
 mod grammar;
+
+#[test]
+fn host_check_bluetooth_check_is_off_unless_named_and_round_trips() {
+    assert!(!HostCheck::parse("--host-check").unwrap().bluetooth_check);
+    assert!(
+        !HostCheck::parse("--host-check --keep-lines")
+            .unwrap()
+            .bluetooth_check
+    );
+    let options =
+        HostCheck::parse("--host-check --keep-lines --bluetooth-check --deadline 600").unwrap();
+    assert!(options.bluetooth_check && options.keep_lines);
+    assert_eq!(
+        options.to_string(),
+        "--host-check --bluetooth-check --deadline 600 --keep-lines"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    assert_eq!(
+        HostCheck::parse("--host-check --bluetooth-check --bluetooth-check").unwrap(),
+        HostCheck {
+            bluetooth_check: true,
+            ..HostCheck::default()
+        }
+    );
+    // Without it, the line prints as before.
+    assert_eq!(
+        HostCheck::parse("--host-check --key-seconds 5")
+            .unwrap()
+            .to_string(),
+        "--host-check --key-seconds 5"
+    );
+}
