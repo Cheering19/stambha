@@ -776,6 +776,55 @@ mod tests {
         assert_eq!(named(shifted_first, 0x10).image, Some("kext"));
     }
 
+    /// A cache of the layout macOS 13 and later ship: its main file names
+    /// its subcaches and `.symbols`, read beside it, and the image's
+    /// symbols and function starts come from its `__LINKEDIT` in `.01`,
+    /// another file than its code.
+    #[test]
+    fn a_split_cache_reads_its_linkedit_from_a_subcache() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = fixtures::split_cache();
+        for (suffix, bytes) in &files {
+            let name = format!("dyld_shared_cache_arm64e{suffix}");
+            std::fs::write(directory.path().join(name), bytes).unwrap();
+        }
+        let [first, second] = keys(&files[0].1, PAGE);
+        let code = Code::load(
+            &[directory.path().to_path_buf()],
+            &HashSet::from([first, second]),
+        )
+        .unwrap();
+        assert_eq!(code.loaded.len(), 1, "{:?}", code.loaded);
+        assert!(
+            code.loaded[0].ends_with("dyld_shared_cache_arm64e: 1 image, 2 of 2 wanted pages"),
+            "{:?}",
+            code.loaded
+        );
+        let Place::Found { file, address } = code.place(first, 0x10) else {
+            panic!("{:?}", code.place(first, 0x10));
+        };
+        assert_eq!(address, CACHE_BASE + ALPHA + 0x10);
+        assert_eq!(
+            code.name(file, address),
+            Named {
+                image: Some(fixtures::SPLIT_PATH),
+                function: "_alpha".into(),
+                start: CACHE_BASE + ALPHA
+            }
+        );
+        // The function no symbol names comes from `.01`'s function starts.
+        assert_eq!(
+            code.name(file, CACHE_BASE + UNNAMED + 8).function,
+            format!("sub_{:x}", CACHE_BASE + UNNAMED)
+        );
+        assert_eq!(code.name(file, CACHE_BASE + BETA + 8).function, "_beta");
+        assert_eq!(address_of(&code, second, 0x20), Some(CACHE_BASE + 0x2020));
+    }
+
+    fn address_of(code: &Code, key: u64, offset: u16) -> Option<u64> {
+        address(code.place(key, offset))
+    }
+
     /// Paths load by content: a directory's main cache and its subcaches
     /// once, a Mach-O, and nothing of other files.
     #[test]
@@ -809,10 +858,12 @@ mod tests {
 
     /// The guest's own dyld shared cache (`STELA_SYMBOLIZE_DSC`, its main
     /// file or the directory holding it, its subcaches and `.symbols`):
-    /// its images parse, almost all of its code pages are unique, and the
-    /// page key and offset of `objc_msgSend` and `_platform_memmove` name
-    /// them back in their images. Whether a guest's RAM holds these bytes
-    /// at run time only a boot shows.
+    /// its images parse, almost all of its code pages are unique, almost
+    /// every image has function starts, all inside its own executable
+    /// ranges, and the page key and offset of `objc_msgSend` and
+    /// `_platform_memmove`, and of an address inside each, name them back
+    /// in their images. Whether a guest's RAM holds these bytes at run time
+    /// only a boot shows.
     #[test]
     #[ignore = "oracle: STELA_SYMBOLIZE_DSC"]
     fn a_real_cache_names_its_own_functions_back() {
@@ -825,6 +876,36 @@ mod tests {
         code.read(&[path], &HashSet::new()).unwrap();
         println!("{:?}", code.loaded);
         assert!(code.images.len() > 1000, "{} images", code.images.len());
+        // Function starts, read from each image's __LINKEDIT in whichever
+        // subcache holds it, and each inside its own image's code.
+        let started = code
+            .images
+            .iter()
+            .filter(|image| !image.starts.is_empty())
+            .count();
+        assert!(
+            started * 10 > code.images.len() * 9,
+            "{started} of {} images have function starts",
+            code.images.len()
+        );
+        for (index, image) in code.images.iter().enumerate() {
+            let ranges: Vec<(u64, u64)> = code
+                .files
+                .iter()
+                .flat_map(|file| file.ranges.iter())
+                .filter(|range| range.2 == index)
+                .map(|range| (range.0, range.1))
+                .collect();
+            for &start in &image.starts {
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|range| range.0 <= start && start < range.1),
+                    "{}: start {start:#x} outside its code {ranges:x?}",
+                    image.path
+                );
+            }
+        }
         let unique = code
             .pages
             .values()
@@ -867,6 +948,19 @@ mod tests {
             let named = code.name(file, address);
             assert!(named.function.ends_with(wanted), "{wanted}: {named:?}");
             assert_eq!(named.image, Some(image.as_str()), "{wanted}");
+            // An address inside the function names it too, from its page.
+            let inside = address + 0x10;
+            let page = inside & !(PAGE as u64 - 1);
+            let key = *by_address
+                .get(&page)
+                .unwrap_or_else(|| panic!("{wanted}+0x10's page {page:#x} is ambiguous"));
+            let Place::Found { file, address: at } = code.place(key, (inside - page) as u16) else {
+                panic!("{wanted}+0x10 not found");
+            };
+            assert_eq!(at, inside);
+            let named = code.name(file, inside);
+            assert!(named.function.ends_with(wanted), "{wanted}+0x10: {named:?}");
+            assert_eq!(named.start, address, "{wanted}+0x10");
             println!("{wanted}: {address:#x} in {image}, page {key:016x}+{offset:x}");
         }
     }

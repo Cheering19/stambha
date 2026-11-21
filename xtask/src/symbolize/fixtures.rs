@@ -217,6 +217,118 @@ pub(super) fn cache() -> Vec<u8> {
     file
 }
 
+/// The split cache's image path.
+pub(super) const SPLIT_PATH: &str = "/usr/lib/libsplit.dylib";
+
+/// A dyld shared cache of the layout macOS 13 and later ship: a main file
+/// whose header names its subcaches (V2 entries, with their suffixes) and
+/// a `.symbols` file by UUID, the image's `__TEXT` in the main file and
+/// its `__LINKEDIT` (symbols, function starts) in `.01`. Each file's
+/// suffix and bytes, the main file's suffix empty; [`image`] at
+/// [`CACHE_BASE`] as [`SPLIT_PATH`], its code unlike the others'. The
+/// header's fields lie where `object`'s `DyldCacheHeader` reads them.
+pub(super) fn split_cache() -> [(&'static str, Vec<u8>); 3] {
+    use core::mem::{offset_of, size_of};
+    use object::LittleEndian as Le;
+    use object::macho::{DyldCacheHeader, DyldCacheImageInfo, DyldSubCacheEntryV2};
+    type Header = DyldCacheHeader<Le>;
+    const MAIN: [u8; 16] = [1; 16];
+    const SUB: [u8; 16] = [2; 16];
+    const SYMBOLS: [u8; 16] = [3; 16];
+    const MAPPINGS: usize = 0x400;
+    const SUBCACHES: usize = 0x500;
+    const IMAGES: usize = 0x600;
+    const PATHS: usize = 0x700;
+    let put32 = |file: &mut Vec<u8>, at: usize, value: u32| {
+        file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    let put64 = |file: &mut Vec<u8>, at: usize, value: u64| {
+        file[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    // A header of `uuid` whose mappings (with slide info, V2) are
+    // `(address, size, file offset, protection)`.
+    let header = |uuid: [u8; 16], mappings: &[(u64, u64, u64, u32)], bytes: usize| {
+        let mut file = vec![0u8; bytes];
+        file[..16].copy_from_slice(b"dyld_v1  arm64e\0");
+        put32(
+            &mut file,
+            offset_of!(Header, mapping_offset),
+            size_of::<Header>() as u32,
+        );
+        file[offset_of!(Header, uuid)..][..16].copy_from_slice(&uuid);
+        put32(
+            &mut file,
+            offset_of!(Header, mapping_with_slide_offset),
+            MAPPINGS as u32,
+        );
+        put32(
+            &mut file,
+            offset_of!(Header, mapping_with_slide_count),
+            mappings.len() as u32,
+        );
+        for (index, &(address, size, offset, protection)) in mappings.iter().enumerate() {
+            let at = MAPPINGS + 56 * index;
+            put64(&mut file, at, address);
+            put64(&mut file, at + 8, size);
+            put64(&mut file, at + 16, offset);
+            put32(&mut file, at + 48, protection);
+            put32(&mut file, at + 52, protection);
+        }
+        file
+    };
+    let linkedit_at = PAGE;
+    let (text, linkedit) = image(
+        CACHE_BASE,
+        PAGE as u32,
+        linkedit_at as u32,
+        3,
+        ["_alpha", "_beta"],
+    );
+    let mut main = header(
+        MAIN,
+        &[(CACHE_BASE, TEXT as u64, PAGE as u64, 5)],
+        PAGE + TEXT,
+    );
+    put32(
+        &mut main,
+        offset_of!(Header, sub_cache_array_offset),
+        SUBCACHES as u32,
+    );
+    put32(&mut main, offset_of!(Header, sub_cache_array_count), 1);
+    main[SUBCACHES..][..16].copy_from_slice(&SUB);
+    put64(
+        &mut main,
+        SUBCACHES + offset_of!(DyldSubCacheEntryV2<Le>, cache_vm_offset),
+        TEXT as u64,
+    );
+    main[SUBCACHES + offset_of!(DyldSubCacheEntryV2<Le>, file_suffix)..][..3]
+        .copy_from_slice(b".01");
+    main[offset_of!(Header, symbol_file_uuid)..][..16].copy_from_slice(&SYMBOLS);
+    put32(&mut main, offset_of!(Header, images_offset), IMAGES as u32);
+    put32(&mut main, offset_of!(Header, images_count), 1);
+    put64(&mut main, IMAGES, CACHE_BASE);
+    put32(
+        &mut main,
+        IMAGES + offset_of!(DyldCacheImageInfo<Le>, path_file_offset),
+        PATHS as u32,
+    );
+    main[PATHS..][..SPLIT_PATH.len()].copy_from_slice(SPLIT_PATH.as_bytes());
+    main[PAGE..].copy_from_slice(&text);
+    let mut sub = header(
+        SUB,
+        &[(
+            CACHE_BASE + TEXT as u64,
+            LINKEDIT as u64,
+            linkedit_at as u64,
+            1,
+        )],
+        linkedit_at + LINKEDIT,
+    );
+    sub[linkedit_at..].copy_from_slice(&linkedit);
+    let symbols = header(SYMBOLS, &[], PAGE);
+    [("", main), (".01", sub), (".symbols", symbols)]
+}
+
 /// The first 8 bytes of the SHA-256 of `page`, as the lines print them.
 pub(super) fn key(page: &[u8]) -> u64 {
     use sha2::{Digest, Sha256};
