@@ -28,7 +28,10 @@
 use super::host;
 use crate::output;
 use core::arch::asm;
-use stela_boot_core::power_button::{FORCE_WINDOW_MILLIS, Press, Presses};
+use stela_boot_core::power_button::{
+    FORCE_WINDOW_MILLIS, NOTIFY_DEBOUNCE_MILLIS, NOTIFY_SETTLE_MILLIS, Notifications, Notified,
+    Press, Presses,
+};
 use stela_runtime::pc::power::{HostPower, POWER_BUTTON, SCI_ENABLE};
 use stela_soc::machine::AppleDevices;
 
@@ -149,8 +152,20 @@ pub struct HostPowerControl {
     /// The last press that may still be pending: a second one soon after
     /// stands for a hold ([`stela_boot_core::power_button`]).
     presses: Presses,
+    /// A control-method power button's notifications, debounced.
+    notifications: Notifications,
     /// When the PM1 status registers were last read.
     looked: u64,
+}
+
+/// What stood for a press of the host's power button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pressed {
+    /// The fixed event or the PM1 status: two close together stand for a
+    /// hold ([`Presses`]).
+    Fixed,
+    /// A control-method button's notification: never part of a hold.
+    Notified,
 }
 
 /// How often the PM1 status registers are read for the power button. Its
@@ -178,6 +193,7 @@ impl HostPowerControl {
             button: false,
             refused: false,
             presses: Presses::new(),
+            notifications: Notifications::new(),
             looked: 0,
         };
         control.button = control.arm_button();
@@ -227,7 +243,21 @@ impl HostPowerControl {
     /// not asleep since, stands for one: the Mac turns off however the
     /// guest fares, and the run's translations are kept as at any power-off.
     /// Any later press, or one after a sleep, is a new request.
-    pub fn press(&mut self, devices: &mut AppleDevices) {
+    /// A press a control-method button's notification stood for is a press
+    /// and a release alone, and no part of a hold: a held button's
+    /// firmware may repeat its notification.
+    pub fn press(&mut self, devices: &mut AppleDevices, pressed: Pressed) {
+        if pressed == Pressed::Notified {
+            let result = devices
+                .power_button(true)
+                .and_then(|()| devices.power_button(false));
+            if let Err(error) = result
+                && !core::mem::replace(&mut self.refused, true)
+            {
+                output::arguments(format_args!("POWER host button refused: {error}\n"));
+            }
+            return;
+        }
         // The service moves between cores: the corrected count, not a core's
         // raw TSC.
         let window = host::COUNTER_HZ / 1000 * FORCE_WINDOW_MILLIS;
@@ -267,24 +297,62 @@ impl HostPowerControl {
         }
     }
 
-    /// Whether the host's power button was pressed since the last call.
-    pub fn pressed(&mut self) -> bool {
+    /// Whether the host's power button was pressed since the last call, and
+    /// how. A control-method button's notifications are debounced
+    /// ([`Notifications`]), each look that saw some is named with their
+    /// count, and those within the settling after the first look are
+    /// dropped as leftovers of the firmware's start.
+    pub fn pressed(&mut self) -> Option<Pressed> {
         if let Some(acpi) = self.acpi.filter(|acpi| acpi.hardware_active()) {
-            return acpi.take_power_button();
+            let (fixed, notified) = acpi.take_power_button();
+            let now = host::fresh_counter();
+            let millis = host::COUNTER_HZ / 1000;
+            let debounce = millis * NOTIFY_DEBOUNCE_MILLIS;
+            self.notifications.look(now);
+            let mut pressed = None;
+            if fixed {
+                if self.notifications.fixed(now, debounce) {
+                    output::arguments(format_args!("POWER host button pressed (fixed event)\n"));
+                    pressed = Some(Pressed::Fixed);
+                } else {
+                    output::arguments(format_args!(
+                        "POWER host button: a fixed event within {NOTIFY_DEBOUNCE_MILLIS} ms of \
+                         a notification, the same press: dropped\n"
+                    ));
+                }
+            }
+            if notified > 0 {
+                let what =
+                    match self
+                        .notifications
+                        .notified(now, millis * NOTIFY_SETTLE_MILLIS, debounce)
+                    {
+                        Notified::Press => {
+                            pressed = Some(Pressed::Notified);
+                            "a press"
+                        }
+                        Notified::Repeat => "the press before it again: dropped",
+                        Notified::Settling => {
+                            "within the settling after the boot's first look: dropped"
+                        }
+                    };
+                output::arguments(format_args!(
+                    "POWER host button: {notified} ACPI power button notification(s): {what}\n"
+                ));
+            }
+            return pressed;
         }
-        let Some(power) = self.power.as_ref().filter(|_| self.button) else {
-            return false;
-        };
+        let power = self.power.as_ref().filter(|_| self.button)?;
         let now = host::rdtsc();
         if now.wrapping_sub(self.looked) < self.tsc_hz / 1000 * BUTTON_MILLIS {
-            return false;
+            return None;
         }
         self.looked = now;
         let pressed = power.take_power_button(&mut crate::stop::Io);
         if pressed {
             output::arguments(format_args!("POWER host button pressed\n"));
         }
-        pressed
+        pressed.then_some(Pressed::Fixed)
     }
 
     /// Restart the host machine, unless the stop could not store the

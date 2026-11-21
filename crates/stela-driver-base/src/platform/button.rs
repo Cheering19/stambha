@@ -8,7 +8,7 @@
 //! presses only this way, typically from an embedded controller query.
 use super::acpi::{self, Notification, Session};
 use alloc::{string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// `ACPI_BUTTON_HID_POWER`.
 pub const POWER: &str = "PNP0C0C";
@@ -22,7 +22,7 @@ pub fn press(value: u32) -> bool {
     value == NOTIFY_STATUS
 }
 
-/// A control-method power button, whose presses set the flag
+/// A control-method power button, whose presses count in the counter
 /// [`attach_power_buttons`] was given while this lives.
 pub struct PowerButton<'a> {
     pub path: String,
@@ -36,14 +36,14 @@ pub struct PowerButtons<'a> {
     pub refused: Vec<(String, acpi::Error)>,
 }
 
-/// On every present PNP0C0C device, a notify handler that sets `pressed`
-/// at each press, as Linux's `acpi_button_add_event_handler` installs
+/// On every present PNP0C0C device, a notify handler that counts in
+/// `pressed` each press, as Linux's `acpi_button_add_event_handler` installs
 /// `acpi_button_notify` on a control-method button. The handler takes the
 /// device notifications, where STATUS is; Linux's takes the system ones
 /// too, of which it only marks WAKE as a wakeup.
 pub fn attach_power_buttons<'a>(
     session: &'a Session,
-    pressed: &'static AtomicBool,
+    pressed: &'static AtomicU32,
 ) -> Result<PowerButtons<'a>, acpi::Error> {
     let mut found = PowerButtons {
         buttons: Vec::new(),
@@ -53,7 +53,7 @@ pub fn attach_power_buttons<'a>(
         let path = handle.path().unwrap_or_else(|_| String::from(POWER));
         let notified = handle.notify(move |value| {
             if press(value) {
-                pressed.store(true, Ordering::Release);
+                pressed.fetch_add(1, Ordering::AcqRel);
             }
         });
         match notified {
@@ -122,8 +122,8 @@ mod tests {
     }
 
     #[test]
-    fn a_buttons_status_notification_sets_the_flag() {
-        static PRESSED: AtomicBool = AtomicBool::new(false);
+    fn a_buttons_status_notifications_are_counted() {
+        static PRESSED: AtomicU32 = AtomicU32::new(0);
         let _serial = TEST_SERIAL.lock().unwrap();
         // SAFETY: the fixture owns every ACPICA service; serialized singleton.
         let session = unsafe {
@@ -149,12 +149,15 @@ mod tests {
             .evaluate(Some("FIRE"), &[Argument::Integer(0x80)])
             .unwrap();
         drain();
-        assert!(!PRESSED.load(Ordering::Acquire));
-        button
-            .evaluate(Some("FIRE"), &[Argument::Integer(0x80)])
-            .unwrap();
+        assert_eq!(PRESSED.load(Ordering::Acquire), 0);
+        // Each notification counts, for the boot to tell repeats apart.
+        for _ in 0..2 {
+            button
+                .evaluate(Some("FIRE"), &[Argument::Integer(0x80)])
+                .unwrap();
+        }
         drain();
-        assert!(PRESSED.swap(false, Ordering::AcqRel));
+        assert_eq!(PRESSED.swap(0, Ordering::AcqRel), 2);
         drop(found);
         session.shutdown().unwrap();
     }
@@ -164,7 +167,7 @@ mod tests {
     /// power button, which presses it.
     #[test]
     fn the_fa608pps_ec_query_presses_its_power_button() {
-        static PRESSED: AtomicBool = AtomicBool::new(false);
+        static PRESSED: AtomicU32 = AtomicU32::new(0);
         let Some(services) = test_support::named_dsdt_fixture() else {
             return;
         };
@@ -181,7 +184,8 @@ mod tests {
             .invoke(None, &[])
             .unwrap();
         drain();
-        assert!(PRESSED.swap(false, Ordering::AcqRel));
+        // One run of the query, one notification.
+        assert_eq!(PRESSED.swap(0, Ordering::AcqRel), 1);
         drop(found);
         session.shutdown().unwrap();
     }

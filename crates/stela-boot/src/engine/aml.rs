@@ -1166,9 +1166,9 @@ pub struct HostAcpi {
 static EC_EVENT: AtomicBool = AtomicBool::new(false);
 static POWER_CHANGED: AtomicBool = AtomicBool::new(false);
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
-/// A control-method power button (PNP0C0C) was pressed: its firmware
-/// notified it, as a FADT with PWR_BUTTON set reports presses.
-static BUTTON_NOTIFIED: AtomicBool = AtomicBool::new(false);
+/// A control-method power button's (PNP0C0C) notifications since the power
+/// control took them: a FADT with PWR_BUTTON set reports presses so.
+static BUTTON_NOTIFIED: AtomicU32 = AtomicU32::new(0);
 /// The display outputs with `_BCL` and `_BCM` whose brightness keys are
 /// followed, at most.
 const BACKLIGHTS: usize = 8;
@@ -1576,23 +1576,21 @@ impl HostAcpi {
     pub(super) fn hardware_active(&self) -> bool {
         self.hardware.load(Ordering::Acquire)
     }
-    /// Whether the power button was pressed since the last call: the fixed
-    /// event, or a control-method button's notification.
-    pub(super) fn take_power_button(&self) -> bool {
-        let fixed = POWER_BUTTON.swap(false, Ordering::AcqRel);
-        let notified = BUTTON_NOTIFIED.swap(false, Ordering::AcqRel);
-        if notified {
-            output::arguments(format_args!(
-                "POWER host button pressed: the firmware notified its ACPI power button\n"
-            ));
-        }
-        fixed || notified
+    /// What the power button did since the last call: whether its fixed
+    /// event fired, and how many notifications its control-method buttons
+    /// had, which the power control debounces (`engine::power`).
+    pub(super) fn take_power_button(&self) -> (bool, u32) {
+        (
+            POWER_BUTTON.swap(false, Ordering::AcqRel),
+            BUTTON_NOTIFIED.swap(0, Ordering::AcqRel),
+        )
     }
 
     /// Linux's `acpi_button` on each control-method power button (PNP0C0C),
     /// whose presses a firmware with PWR_BUTTON set in its FADT sends as
-    /// notifications rather than the fixed event: each press reaches the
-    /// guest as the fixed button's does. One line for each button.
+    /// notifications rather than the fixed event: each counts, and the
+    /// power control takes them as presses (`engine::power`). One line for
+    /// each button.
     fn attach_power_buttons(&'static self) {
         use stela_drivers::platform::button;
         let found = match button::attach_power_buttons(&self.session, &BUTTON_NOTIFIED) {

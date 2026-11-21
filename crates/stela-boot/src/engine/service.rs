@@ -429,8 +429,8 @@ impl Service {
                 });
                 drivers = line;
             }
-            if power.pressed() {
-                devices.serve(|devices| power.press(devices));
+            if let Some(pressed) = power.pressed() {
+                devices.serve(|devices| power.press(devices, pressed));
             }
             if let Some(request) = super::lid::take_request() {
                 devices.serve(|devices| lid_request(devices, request));
