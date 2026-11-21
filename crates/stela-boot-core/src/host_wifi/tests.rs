@@ -1,11 +1,14 @@
 use super::*;
+use core::net::Ipv4Addr;
 
-/// What an rtw89 radio prints once M3a's handshake ran (M3 spec S14.6),
-/// the chip's counts after the `; `.
-const HANDSHAKEN: &str = "scans 1 (12 networks, target found ch 6 -48 dBm), auth 1/1 status 0, \
-     assoc 1/1 status 0 aid 3, eapol rx 2 tx 2 acked 1, keys -, port closed, \
-     last \"keys before M3b\"; tx sent 4 reported 3 acked 3 full 0, rpq skipped 0 stale 0, \
-     rx fcs 0 other 0 short 0 overflow 0, held dropped 0";
+/// What an rtw89 radio prints once M3b's handshake ran (M3 spec S14.6): its
+/// keys installed, the port open and the data counts, then the chip's
+/// counts after the `; `, Block Ack and PN drops among them.
+const KEYED: &str = "scans 1 (12 networks, target found ch 157 -41 dBm), auth 1/1 status 0, \
+     assoc 1/1 status 0 aid 4, eapol rx 2 tx 2 acked 2, keys 2, port open, rx data 9 sealed 0 \
+     nokey 0 refused 1, tx data 7; tx sent 14 reported 14 acked 14 full 0, rpq skipped 0 \
+     stale 0, rx fcs 0 other 40 short 2 overflow 0, held dropped 0, ba started 1 stopped 0, \
+     pn dropped 1";
 
 #[test]
 fn mask_addresses_masks_every_sextet() {
@@ -36,65 +39,79 @@ fn mask_addresses_masks_every_sextet() {
 }
 
 #[test]
-fn progress_reads_the_eapol_counts_and_a_refusal() {
-    let progress = Progress::read(HANDSHAKEN);
+fn progress_reads_the_eapol_counts_the_keys_and_the_port() {
+    let progress = Progress::read(KEYED);
     assert_eq!(
         progress,
         Progress {
             eapol: Some(Eapol {
                 received: 2,
                 sent: 2,
-                acked: 1
+                acked: 2
             }),
-            keys_refused: true,
+            keys: Some(2),
+            port_open: true,
         }
     );
-    assert!(progress.handshaken());
-    // Nothing reached yet: no EAPOL, no refusal.
+    assert!(progress.keyed());
+    // Nothing reached yet.
     let fresh = "scans 0 (0 networks, target -), auth -, assoc -, eapol -, keys -, \
                  port closed; tx sent 0 reported 0 acked 0 full 0";
     assert_eq!(Progress::read(fresh), Progress::default());
-    assert!(!Progress::read(fresh).handshaken());
+    assert!(!Progress::read(fresh).keyed());
 }
 
 #[test]
-fn the_handshake_needs_two_each_way_and_the_radios_refusal() {
-    const KEYS: Option<&str> = Some("keys before M3b");
-    for (eapol, last, handshaken) in [
-        ("eapol rx 2 tx 2 acked 2", KEYS, true),
-        ("eapol rx 3 tx 4 acked 0", KEYS, true),
-        ("eapol rx 2 tx 1 acked 1", KEYS, false),
-        ("eapol rx 1 tx 2 acked 2", KEYS, false),
-        ("eapol rx 2 tx 2 acked 2", None, false),
-        // Another refusal, or one that only begins as the first key's, is
-        // no pass, however many frames went each way.
-        ("eapol rx 2 tx 2 acked 2", Some("SAE before M3b"), false),
-        ("eapol rx 2 tx 2 acked 2", Some("tx power"), false),
-        (
-            "eapol rx 2 tx 2 acked 2",
-            Some("keys before M3b, again"),
-            false,
-        ),
-        ("eapol rx 2 tx 2 acked 2", Some("no keys before M3b"), false),
-        ("eapol rx 2 tx 2 acked 2", Some(""), false),
+fn m3b_needs_both_keys_and_the_port_open() {
+    for (keys, port, keyed) in [
+        ("keys 2", "port open", true),
+        // A rekey counts on.
+        ("keys 5", "port open", true),
+        ("keys 1", "port open", false),
+        ("keys 0", "port open", false),
+        ("keys -", "port open", false),
+        ("keys 2", "port closed", false),
+        ("keys x", "port open", false),
     ] {
         let line = alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, assoc 1/1 \
-             status 0 aid 1, {eapol}, keys -, port closed{}; tx sent 2",
-            match last {
-                Some(last) => alloc::format!(", last \"{last}\""),
-                None => String::new(),
-            }
+             status 0 aid 1, eapol rx 2 tx 2 acked 2, {keys}, {port}, rx data 0 sealed 0 \
+             nokey 0 refused 0, tx data 0; tx sent 2"
         );
-        assert_eq!(Progress::read(&line).handshaken(), handshaken, "{line}");
+        assert_eq!(Progress::read(&line).keyed(), keyed, "{line}");
     }
-    // The refusal is the station's own, before the chip's counts.
-    assert!(
-        !Progress::read(
-            "eapol rx 2 tx 2 acked 2, keys -, port closed; tx sent 2, last \"keys before M3b\""
-        )
-        .handshaken()
-    );
+}
+
+#[test]
+fn an_sae_join_beacon_loss_and_a_refusal_read_the_same() {
+    // `sae t/a` stands where `auth t/a status s` does; `beacon lost` and
+    // `last` follow the data counts.
+    let line = "scans 2 (9 networks, target found ch 36 -60 dBm), sae 2/2, assoc 1/1 status 0 \
+                aid 2, eapol rx 4 tx 4 acked 4, keys 4, port open, rx data 3 sealed 1 nokey 0 \
+                refused 0, tx data 5, beacon lost 1, last \"a key other than CCMP-128 on an \
+                RTL8852C\"; tx sent 3";
+    let progress = Progress::read(line);
+    assert_eq!(progress.keys, Some(4));
+    assert!(progress.keyed());
+    assert_eq!(progress.eapol.map(|e| e.received), Some(4));
+}
+
+#[test]
+fn only_the_stations_own_fields_count() {
+    // The chip's part, after the first `; `, and the radio's last refusal
+    // are no fields of the station's, whatever they read.
+    for line in [
+        "eapol rx 2 tx 2 acked 2, keys -, port closed; keys 2, port open",
+        "eapol rx 2 tx 2 acked 2, keys 2, port closed; tx sent 2, port open",
+        "eapol rx 2 tx 2 acked 2, keys -, port closed, last \"x, keys 2, port open\"; tx",
+        "keys 2, port closed, last \"port open\"",
+        "keys 2, port closed, last \"a, port open, b\"",
+        // A field is read whole.
+        "keys 2, port closed, report open",
+        "keys 2, port opening",
+    ] {
+        assert!(!Progress::read(line).keyed(), "{line}");
+    }
     // A malformed count reads as no EAPOL at all.
     assert_eq!(
         Progress::read("eapol rx 2 tx x acked 2, last \"a\"").eapol,
@@ -102,103 +119,130 @@ fn the_handshake_needs_two_each_way_and_the_radios_refusal() {
     );
 }
 
-/// A progress line with `rx`/`tx` EAPOL frames, a refusal when `last`.
-fn line(rx: u32, tx: u32, last: bool) -> Progress {
-    Progress::read(&alloc::format!(
-        "scans 1 (1 networks, target found ch 1 -40 dBm), eapol rx {rx} tx {tx} acked 0, keys -, \
-         port closed{}; tx sent 2",
-        if last {
-            ", last \"keys before M3b\""
-        } else {
-            ""
-        }
-    ))
-}
-
 #[test]
-fn the_watch_polls_on_for_the_flush_after_the_handshake() {
-    let mut watch = Watch::new(1_000, None);
-    assert_eq!(watch.after(2_000, &line(0, 0, false)), None);
-    assert_eq!(watch.after(3_000, &line(2, 2, false)), None);
-    // Handshaken at 4 ms: polled on for FLUSH_US more, whatever the line
-    // says meanwhile, then passed.
-    assert_eq!(watch.after(4_000, &line(2, 2, true)), None);
-    assert_eq!(watch.after(4_000 + FLUSH_US - 1, &line(2, 2, true)), None);
-    assert_eq!(watch.after(4_000 + FLUSH_US - 1, &line(0, 0, false)), None);
-    assert_eq!(
-        watch.after(4_000 + FLUSH_US, &line(2, 2, true)),
-        Some(End::Handshaken)
-    );
-}
-
-#[test]
-fn the_watch_fails_at_the_budget_without_the_handshake() {
-    let mut watch = Watch::new(1_000, None);
-    assert_eq!(
-        watch.after(1_000 + STATION_BUDGET_US - 1, &line(2, 1, true)),
-        None
-    );
-    assert_eq!(
-        watch.after(1_000 + STATION_BUDGET_US, &line(2, 1, true)),
-        Some(End::Budget)
-    );
-    // A handshake just before the budget still gets its flush, then passes.
-    let mut watch = Watch::new(0, None);
-    assert_eq!(watch.after(STATION_BUDGET_US - 10, &line(2, 2, true)), None);
-    assert_eq!(watch.after(STATION_BUDGET_US + 10, &line(2, 2, true)), None);
-    assert_eq!(
-        watch.after(STATION_BUDGET_US - 10 + FLUSH_US, &line(2, 2, true)),
-        Some(End::Handshaken)
-    );
+fn the_cut_is_the_budget_without_a_near_deadline() {
+    assert_eq!(STATION_BUDGET_US, 90_000_000);
+    let cut = Cut::new(1_000, None);
+    assert_eq!(cut.end(), End::Budget);
+    assert!(!cut.reached(1_000 + STATION_BUDGET_US - 1));
+    assert!(cut.reached(1_000 + STATION_BUDGET_US));
     // A clock that runs backwards ends nothing early.
-    for deadline in [None, Some(100_000_000)] {
-        let mut watch = Watch::new(5_000, deadline);
-        assert_eq!(watch.after(0, &line(0, 0, false)), None);
-    }
-}
-
-#[test]
-fn the_watch_stops_a_margin_before_the_deadline() {
-    // `--deadline` 30 s after the start: stopped DEADLINE_MARGIN_US short
-    // of it, inside the budget.
-    let deadline = 1_000 + 30_000_000;
-    let stop = deadline - DEADLINE_MARGIN_US;
-    let mut watch = Watch::new(1_000, Some(deadline));
-    assert_eq!(watch.after(stop - 1, &line(2, 1, true)), None);
-    assert_eq!(watch.after(stop, &line(2, 1, true)), Some(End::Deadline));
+    assert!(!cut.reached(0));
     // A deadline whose margin starts at or past the budget leaves the
-    // budget's stop.
+    // budget's cut.
     for deadline in [
         STATION_BUDGET_US + DEADLINE_MARGIN_US,
         STATION_BUDGET_US + DEADLINE_MARGIN_US + 1,
         u64::MAX,
     ] {
-        let mut watch = Watch::new(0, Some(deadline));
-        assert_eq!(watch.after(STATION_BUDGET_US - 1, &line(0, 0, false)), None);
-        assert_eq!(
-            watch.after(STATION_BUDGET_US, &line(0, 0, false)),
-            Some(End::Budget)
-        );
+        let cut = Cut::new(0, Some(deadline));
+        assert_eq!(cut.end(), End::Budget, "{deadline}");
+        assert!(!cut.reached(STATION_BUDGET_US - 1));
+        assert!(cut.reached(STATION_BUDGET_US));
     }
-    // A deadline nearer than the margin, or already past: stopped at the
-    // first poll.
+}
+
+#[test]
+fn the_cut_is_a_margin_before_a_near_deadline() {
+    // `--deadline` 30 s after the start: cut DEADLINE_MARGIN_US short of
+    // it, inside the budget.
+    let deadline = 1_000 + 30_000_000;
+    let cut = Cut::new(1_000, Some(deadline));
+    assert_eq!(cut.end(), End::Deadline);
+    assert!(!cut.reached(deadline - DEADLINE_MARGIN_US - 1));
+    assert!(cut.reached(deadline - DEADLINE_MARGIN_US));
+    // A deadline nearer than the margin, or already past: cut at once.
     for deadline in [0, 1_000, 1_000 + DEADLINE_MARGIN_US - 1, DEADLINE_MARGIN_US] {
-        let mut watch = Watch::new(1_000, Some(deadline));
-        assert_eq!(
-            watch.after(1_000, &line(0, 0, false)),
-            Some(End::Deadline),
-            "{deadline}"
-        );
+        let cut = Cut::new(1_000, Some(deadline));
+        assert_eq!(cut.end(), End::Deadline, "{deadline}");
+        assert!(cut.reached(1_000), "{deadline}");
     }
-    // A handshake seen by the stop still gets its flush, which the margin
-    // holds (with the deauthentication's).
-    let mut watch = Watch::new(0, Some(20_000_000));
-    let stop = 20_000_000 - DEADLINE_MARGIN_US;
-    assert_eq!(watch.after(stop, &line(2, 2, true)), None);
-    assert_eq!(watch.after(stop + FLUSH_US - 1, &line(2, 2, true)), None);
+}
+
+#[test]
+fn failures_keep_the_count_the_first_and_the_last() {
+    let mut failures = Failures::default();
+    assert!(failures.is_empty());
+    assert_eq!(alloc::format!("{failures}"), "");
+    failures.note(String::from("network link has no carrier"));
+    assert!(!failures.is_empty());
     assert_eq!(
-        watch.after(stop + FLUSH_US, &line(2, 2, true)),
-        Some(End::Handshaken)
+        alloc::format!("{failures}"),
+        "stack failed once: network link has no carrier"
+    );
+    failures.note(String::from("network link has no carrier"));
+    assert_eq!(
+        alloc::format!("{failures}"),
+        "stack failed 2 times: network link has no carrier"
+    );
+    failures.note(String::from(
+        "network link: rtw89: the AP ended the association",
+    ));
+    failures.note(String::from("DHCP: no IPv4 lease"));
+    assert_eq!(
+        alloc::format!("{failures}"),
+        "stack failed 4 times, first: network link has no carrier, last: DHCP: no IPv4 lease"
+    );
+}
+
+fn lease(router: Option<Ipv4Addr>) -> Outcome {
+    Outcome::Leased(Lease {
+        address: Ipv4Addr::new(192, 168, 1, 23),
+        prefix: 24,
+        router,
+        after_us: 7_900_000,
+    })
+}
+
+#[test]
+fn a_lease_with_the_keys_and_the_port_open_passes() {
+    let progress = Progress::read(KEYED);
+    assert_eq!(
+        ending(&lease(Some(Ipv4Addr::new(192, 168, 1, 1))), &progress),
+        (
+            true,
+            String::from("; DHCP lease 192.168.1.23/24 router 192.168.1.1 after 7 s")
+        )
+    );
+    assert_eq!(
+        ending(&lease(None), &progress).1,
+        "; DHCP lease 192.168.1.23/24 router - after 7 s"
+    );
+}
+
+#[test]
+fn every_other_ending_fails_and_says_why() {
+    let keyed = Progress::read(KEYED);
+    let closed = Progress::read(&KEYED.replace("port open", "port closed"));
+    assert_eq!(
+        ending(&lease(None), &closed),
+        (
+            false,
+            String::from(
+                "; DHCP lease 192.168.1.23/24 router - after 7 s, but not \"keys 2, port open\""
+            )
+        )
+    );
+    assert_eq!(
+        ending(&Outcome::Cut(End::Budget), &keyed),
+        (false, String::from("; no DHCP lease within 90 s"))
+    );
+    assert_eq!(
+        ending(&Outcome::Cut(End::Deadline), &keyed),
+        (
+            false,
+            String::from("; stopped 10 s before --deadline without a DHCP lease")
+        )
+    );
+    assert_eq!(
+        ending(
+            &Outcome::Failed(String::from("invalid request: interface address capacity")),
+            &keyed
+        ),
+        (
+            false,
+            String::from("; no DHCP lease: invalid request: interface address capacity")
+        )
     );
 }
 

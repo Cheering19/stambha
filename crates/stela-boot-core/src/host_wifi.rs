@@ -1,10 +1,13 @@
 //! What the host check's `--wifi` station check (M3 spec S17) reads and
-//! prints: the EAPOL counts and refusal in an rtw89 radio's progress line
-//! (spec S14.6), every MAC address in text it prints masked (S17.5), and
-//! its `stela.cfg` line and its own line with the network's name left out.
+//! prints: the EAPOL counts, keys and port in an rtw89 radio's progress
+//! line (spec S14.6), when the network stack's wait for a DHCP lease is
+//! cut, the stack's failures, the line's ending (M3b's "Done means"),
+//! every MAC address in text it prints masked (S17.5), and its `stela.cfg`
+//! line and its own line with the network's name left out.
 use crate::options::WIFI;
 use alloc::string::String;
-use stela_drivers::net::wifi::realtek::ax::live::KEYS_BEFORE_M3B;
+use core::{fmt, net::Ipv4Addr};
+use stela_drivers::net::wifi::realtek::ax::WIFI_CARRIER_WAIT_US;
 
 /// What a masked address reads as.
 const MASKED: &str = "xx:xx:xx:xx:xx:xx";
@@ -120,14 +123,18 @@ pub struct Eapol {
 }
 
 /// What the station check needs of an rtw89 radio's progress line (M3 spec
-/// S14.6): its EAPOL counts, once the handshake began, and whether the
-/// radio's last refusal of its own is M3a's, the first key's.
+/// S14.6), read from the station's own fields: before the first `; ` (the
+/// chip's counts follow it) and before `, last "` (the radio's last
+/// refusal, which could read as anything). The authentication's field,
+/// `auth t/a status s` or `sae t/a`, and the data, beacon loss, Block Ack
+/// and PN counts are printed, not judged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
+    /// Once the association was configured.
     pub eapol: Option<Eapol>,
-    /// The station's part of the line (before its first `; `, the chip's
-    /// counts) ends `, last "keys before M3b"` ([`KEYS_BEFORE_M3B`]).
-    pub keys_refused: bool,
+    /// The keys installed, once the first install began (`keys -` before).
+    pub keys: Option<u32>,
+    pub port_open: bool,
 }
 
 impl Progress {
@@ -135,97 +142,197 @@ impl Progress {
     /// not reached.
     pub fn read(line: &str) -> Self {
         let station = line.split_once("; ").map_or(line, |(station, _)| station);
-        let keys_refused = station
-            .strip_suffix('"')
-            .and_then(|rest| rest.strip_suffix(KEYS_BEFORE_M3B))
-            .is_some_and(|rest| rest.ends_with(", last \""));
+        let station = station
+            .split_once(", last \"")
+            .map_or(station, |(fields, _)| fields);
+        let fields = || station.split(", ");
         Self {
-            eapol: eapol(line),
-            keys_refused,
+            eapol: eapol(station),
+            keys: fields()
+                .find_map(|field| field.strip_prefix("keys "))
+                .and_then(|keys| keys.parse().ok()),
+            port_open: fields().any(|field| field == "port open"),
         }
     }
 
-    /// M3a's stop (spec S17.3): messages 1 and 3 received, 2 and 4 sent,
-    /// and the radio's last refusal the first key's.
-    pub fn handshaken(&self) -> bool {
-        self.keys_refused
-            && self
-                .eapol
-                .is_some_and(|eapol| eapol.received >= 2 && eapol.sent >= 2)
+    /// M3b's (spec "Done means"): the pairwise and group keys in the
+    /// hardware and the port open, `keys 2, port open`; a rekey counts on.
+    pub fn keyed(&self) -> bool {
+        self.port_open && self.keys.is_some_and(|keys| keys >= 2)
     }
 }
 
-/// How long the station check keeps the keeper going for the handshake
-/// (`WIFI_STATION_BUDGET_US`, M3 plan Global Constraints).
-pub const STATION_BUDGET_US: u64 = 60_000_000;
+/// `stela_runtime`'s `DHCP_WAIT_US`: how long the network stack's `dhcp`
+/// waits for a lease once the link has carrier.
+pub const DHCP_WAIT_US: u64 = 60_000_000;
 
-/// How long before `--deadline` the station check stops without the
-/// handshake, so that its teardown (the flush after the handshake, the
-/// deauthentication's and the chip's stop) ends before the deadline stops
-/// the host check with the chip still up.
+/// How long the station check lets the network stack go for a lease (M3
+/// spec S17.3): its wait for the radio's carrier ([`WIFI_CARRIER_WAIT_US`],
+/// the scan, authentication and 4-way handshake) and then for the lease
+/// ([`DHCP_WAIT_US`]). The stack is driven again past a failure of its own
+/// (the keeper's failures reach it as the link's) until this passes.
+pub const STATION_BUDGET_US: u64 = WIFI_CARRIER_WAIT_US + DHCP_WAIT_US;
+
+/// How long before `--deadline` the station check stops without a lease,
+/// so that its teardown (the deauthentication, its flush and the chip's
+/// stop) ends before the deadline stops the host check with the chip up.
 pub const DEADLINE_MARGIN_US: u64 = 10_000_000;
 const _: () = assert!(DEADLINE_MARGIN_US > 10 * FLUSH_US);
 
-/// How long the station check keeps polling after the handshake, so m4's
-/// release report is counted, and again after its deauthentication, so the
-/// frame leaves the ring before the chip stops: the longest
+/// How long the station check keeps polling after its deauthentication,
+/// so the frame leaves the ring before the chip stops: the longest
 /// `rtw89_mac_flush_txq` waits for the queues to empty (200 ms,
 /// `mac.c:6352-6361`, from `rtw89_ops_flush`, `mac80211.c:1122-1135`).
 pub const FLUSH_US: u64 = 200_000;
 
-/// Why the station check stopped polling ([`Watch::after`]).
+/// Which bound cut the network stack's wait ([`Cut`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
-    /// The handshake ran, and [`FLUSH_US`] passed after it.
-    Handshaken,
-    /// [`STATION_BUDGET_US`] passed without the handshake.
+    /// [`STATION_BUDGET_US`] passed.
     Budget,
     /// The deadline came within [`DEADLINE_MARGIN_US`] first.
     Deadline,
 }
 
-/// The station check's stop: polling goes on until the handshake
-/// ([`Progress::handshaken`]) and [`FLUSH_US`] after it, or without it
-/// until [`STATION_BUDGET_US`] or [`DEADLINE_MARGIN_US`] before the
-/// deadline, whichever comes first.
+/// When the station check stops waiting for a lease: [`STATION_BUDGET_US`]
+/// after it began, or [`DEADLINE_MARGIN_US`] before `--deadline` when that
+/// comes first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Watch {
-    start_us: u64,
-    /// [`DEADLINE_MARGIN_US`] before the deadline, when that comes before
-    /// the budget ends.
-    cut_us: Option<u64>,
-    handshaken_us: Option<u64>,
+pub struct Cut {
+    at_us: u64,
+    end: End,
 }
 
-impl Watch {
-    /// A watch begun at `now_us`, with the deadline at `deadline_us` on the
-    /// same clock when there is one.
+impl Cut {
+    /// The cut of a wait begun at `now_us`, with the deadline at
+    /// `deadline_us` on the same clock when there is one.
     pub fn new(now_us: u64, deadline_us: Option<u64>) -> Self {
         let budget_us = now_us.saturating_add(STATION_BUDGET_US);
-        Self {
-            start_us: now_us,
-            cut_us: deadline_us
-                .map(|deadline| deadline.saturating_sub(DEADLINE_MARGIN_US))
-                .filter(|&cut| cut < budget_us),
-            handshaken_us: None,
+        match deadline_us
+            .map(|deadline| deadline.saturating_sub(DEADLINE_MARGIN_US))
+            .filter(|&cut| cut < budget_us)
+        {
+            Some(at_us) => Self {
+                at_us,
+                end: End::Deadline,
+            },
+            None => Self {
+                at_us: budget_us,
+                end: End::Budget,
+            },
         }
     }
 
-    /// After one poll at `now_us` whose progress line read `progress`:
-    /// `None` to poll on, else why to stop. A handshake reached is kept,
-    /// whatever later lines read, and gets its flush even past the cut,
-    /// which the margin holds.
-    pub fn after(&mut self, now_us: u64, progress: &Progress) -> Option<End> {
-        if self.handshaken_us.is_none() && progress.handshaken() {
-            self.handshaken_us = Some(now_us);
+    /// Whether the wait is over at `now_us`.
+    pub fn reached(&self, now_us: u64) -> bool {
+        now_us >= self.at_us
+    }
+
+    pub fn end(&self) -> End {
+        self.end
+    }
+}
+
+/// The network stack's failures within the wait, which the check drives
+/// the stack on past: how many, the first and the last.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Failures {
+    count: u32,
+    first: Option<String>,
+    last: Option<String>,
+}
+
+impl Failures {
+    pub fn note(&mut self, failure: String) {
+        self.count = self.count.saturating_add(1);
+        if self.first.is_none() {
+            self.first = Some(failure);
+        } else {
+            self.last = Some(failure);
         }
-        if let Some(at) = self.handshaken_us {
-            return (now_us.saturating_sub(at) >= FLUSH_US).then_some(End::Handshaken);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Nothing without a failure; else `stack failed once: <first>`, `stack
+/// failed <n> times: <first>` when the last was the first's words, or
+/// `stack failed <n> times, first: <first>, last: <last>`.
+impl fmt::Display for Failures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(first) = &self.first else {
+            return Ok(());
+        };
+        match &self.last {
+            None => write!(f, "stack failed once: {first}"),
+            Some(last) if last == first => write!(f, "stack failed {} times: {first}", self.count),
+            Some(last) => write!(
+                f,
+                "stack failed {} times, first: {first}, last: {last}",
+                self.count
+            ),
         }
-        if self.cut_us.is_some_and(|cut| now_us >= cut) {
-            return Some(End::Deadline);
+    }
+}
+
+/// A DHCPv4 lease, `after_us` after the station began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+    pub router: Option<Ipv4Addr>,
+    pub after_us: u64,
+}
+
+/// How the network stack's wait ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Leased(Lease),
+    /// Cut without a lease ([`Cut`]).
+    Cut(End),
+    /// The stack failed in a way driving it again cannot mend.
+    Failed(String),
+}
+
+/// The station check's verdict and the line's ending after the progress
+/// (M3 spec "Done means", M3b): a pass is a lease with
+/// [`Progress::keyed`], `; DHCP lease <a.b.c.d>/<p> router <r|-> after <s>
+/// s`; anything else fails and says which way.
+pub fn ending(outcome: &Outcome, progress: &Progress) -> (bool, String) {
+    match outcome {
+        Outcome::Leased(lease) => {
+            let router = lease
+                .router
+                .map_or_else(|| String::from("-"), |router| alloc::format!("{router}"));
+            let line = alloc::format!(
+                "; DHCP lease {}/{} router {router} after {} s",
+                lease.address,
+                lease.prefix,
+                lease.after_us / 1_000_000
+            );
+            if progress.keyed() {
+                (true, line)
+            } else {
+                (
+                    false,
+                    alloc::format!("{line}, but not \"keys 2, port open\""),
+                )
+            }
         }
-        (now_us.saturating_sub(self.start_us) >= STATION_BUDGET_US).then_some(End::Budget)
+        Outcome::Cut(End::Budget) => (
+            false,
+            alloc::format!("; no DHCP lease within {} s", STATION_BUDGET_US / 1_000_000),
+        ),
+        Outcome::Cut(End::Deadline) => (
+            false,
+            alloc::format!(
+                "; stopped {} s before --deadline without a DHCP lease",
+                DEADLINE_MARGIN_US / 1_000_000
+            ),
+        ),
+        Outcome::Failed(why) => (false, alloc::format!("; no DHCP lease: {why}")),
     }
 }
 

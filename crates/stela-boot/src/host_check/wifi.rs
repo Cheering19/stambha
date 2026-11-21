@@ -19,20 +19,24 @@
 //!
 //! With `--wifi SSID` (M3 spec S17) the key file's secret is parsed before
 //! ExitBootServices and its bytes wiped ([`Key`]), and a ChaCha20 stream is
-//! seeded for the handshake's nonces. After it, regulatory.db is loaded
-//! from the same catalog before the function is touched, and the same
-//! take-over runs `ax::attach` in place of `bring_up`
+//! seeded for the handshake's nonces and the network stack's seed. After
+//! it, regulatory.db is loaded from the same catalog before the function is
+//! touched, and the same take-over runs `ax::attach` in place of `bring_up`
 //! (`rtw89_attach_with`): the chip stays up as an rtw89 station kept by the
-//! connection keeper, polled through `carrier()` until its progress line
-//! shows the 4-way handshake's frames both ways and the radio's refusal of
-//! the first key, which M3a does not install, then [`FLUSH_US`] more, or
-//! until [`STATION_BUDGET_US`] passes or `--deadline` comes within
-//! [`DEADLINE_MARGIN_US`]. The keeper's last failure is taken, the station
-//! deauthenticates and is polled [`FLUSH_US`] more, and the chip is stopped
-//! (`Live::stop`); its rings and TX pools are kept. The network's name is
-//! hidden wherever the line would print it (the keeper's failures name it),
-//! then every address is masked; the secret is never printed: it lives in
-//! the keeper's network, which clears it when the keeper goes.
+//! connection keeper, and Stela's network stack (`stela_runtime::net`, as a
+//! normal boot opens a wired link) runs DHCP over it: the stack waits for
+//! the keeper's carrier (the scan, the join, the 4-way handshake and both
+//! keys), then for a lease, and is driven again past a failure of its own,
+//! until the lease, or until [`STATION_BUDGET_US`] passes or `--deadline`
+//! comes within [`DEADLINE_MARGIN_US`] ([`HostClock`]). The keeper's last
+//! failure is taken, the station deauthenticates and is polled
+//! [`FLUSH_US`] more, and the chip is stopped (`Live::stop`); its rings and
+//! TX pools are kept. A PASS is the lease with the station's keys and its
+//! port open. The network's name is hidden wherever the line would print it
+//! (the keeper's failures name it), then every address is masked; the
+//! lease's private LAN addresses are printed (spec "Done means"); the
+//! secret is never printed: it lives in the keeper's network, which clears
+//! it when the keeper goes.
 //!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
@@ -41,14 +45,21 @@
 //! fails at the first step the chip reads memory in, the firmware download
 //! (`dma rings` only allocates and maps; CH12's descriptors or the
 //! firmware's ready status then time out).
+//!
+//! [`STATION_BUDGET_US`]: stela_boot_core::host_wifi::STATION_BUDGET_US
+//! [`DEADLINE_MARGIN_US`]: stela_boot_core::host_wifi::DEADLINE_MARGIN_US
 use super::{Machine, Timing, Verdict};
 use alloc::{boxed::Box, format, string::String, string::ToString, sync::Arc, vec, vec::Vec};
-use core::{any::Any, ops::Range, ptr::NonNull};
+use core::{
+    any::Any,
+    cell::{Cell, RefCell},
+    ops::Range,
+    ptr::NonNull,
+};
 use stela_boot_core::{
     heap::Heap,
     host_wifi::{
-        DEADLINE_MARGIN_US, End, FLUSH_US, Progress, STATION_BUDGET_US, Watch, hide_ssid,
-        mask_addresses,
+        Cut, FLUSH_US, Failures, Lease, Outcome, Progress, ending, hide_ssid, mask_addresses,
     },
     native_memory::NativeMemory,
     options::{DEFAULT_WIFI_KEY, HostCheck},
@@ -86,6 +97,7 @@ use stela_drivers::{
         native::{Rtw89Device, rtw89_attach, rtw89_attach_with},
     },
 };
+use stela_runtime::net::{ClockError, NetError, Stack};
 use uefi::boot::{self, AllocateType, MemoryType};
 
 /// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
@@ -99,7 +111,10 @@ const BAR: u8 = 2;
 /// block header before each page-aligned block); the TX pools of the data
 /// and management queues that every start now allocates (M3 spec S5.1)
 /// take 43 more in one allocation, 44 with its header page: 322. The rest
-/// is room.
+/// is room. M3b adds none (spec S17.6, re-checked at Task 20): the chip
+/// takes these only in `live::start`, keys and Block Ack agreements go to
+/// its CAMs by H2C over CH12, and the network stack and its DHCP client
+/// live on the host check's heap, their frames copied into the TX pools.
 const DMA_PAGES: usize = 384;
 /// `WLAN_REASON_DEAUTH_LEAVING`, the station check's departure (spec S17.4).
 const DEAUTH_LEAVING: u16 = 3;
@@ -159,15 +174,18 @@ impl Drop for Key {
 }
 
 /// What `--wifi` keeps the chip connected to: the network, with the key
-/// file's secret, and the handshake nonces' source.
+/// file's secret, the handshake nonces' source, and the network stack's
+/// seed (its TCP sequence numbers, ports and DHCP transaction IDs).
 struct Station {
     network: Network,
     entropy: Arc<dyn Entropy>,
+    seed: u64,
 }
 
 /// The network `options` names, with `key`'s secret: a key file that is
 /// missing, empty or unusable fails as `key: …`, without its contents; and
-/// a stream seeded before ExitBootServices for the handshake's nonces.
+/// a stream seeded before ExitBootServices for the handshake's nonces,
+/// which gives the network stack's seed first.
 fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, String> {
     let path = options.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
     if key.0.is_empty() {
@@ -181,6 +199,10 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, St
         .as_deref()
         .and_then(|code| code.as_bytes().try_into().ok());
     let (source, _) = crate::entropy::source().map_err(|error| format!("entropy: {error}"))?;
+    let mut seed = [0; 8];
+    source
+        .fill(&mut seed)
+        .map_err(|error| format!("entropy: {error:?}"))?;
     Ok(Box::new(Station {
         network: Network {
             ssid: ssid.as_bytes().to_vec(),
@@ -188,6 +210,7 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, St
             country,
         },
         entropy: Arc::new(source),
+        seed: u64::from_le_bytes(seed),
     }))
 }
 
@@ -585,17 +608,22 @@ struct Kept {
 }
 
 /// The station check (M3 spec S17.3-S17.5) on a chip `rtw89_attach_with`
-/// took over: `ax::attach` with `station`, `database` and `clock`, the
-/// keeper polled through `carrier()` until [`Watch`] ends it, the keeper's
-/// last failure taken with one `receive()` (`into_radio` drops one not yet
-/// reported), then the deauthentication, [`FLUSH_US`] of service and the
-/// stop. The line is the bring-up's report and the station's progress, with
-/// the keeper's failure when it had one, the network's name hidden and then
-/// every address masked; a PASS once the handshake ran, a FAIL when the
-/// budget or the deadline's margin passed first or the attach failed.
-/// `timing` beats through every wait but never stops here: the watch stops
-/// [`DEADLINE_MARGIN_US`] short of `--deadline`, so the chip is stopped
-/// (and then Bus Master cleared) before the deadline can end the check.
+/// took over: `ax::attach` with `station`, `database` and `clock`; then
+/// Stela's network stack over the keeper, seeded with the station's seed,
+/// its `dhcp` driven again past each failure of its own ([`lease`]) until
+/// the lease or [`HostClock`]'s cut; the keeper's last failure taken with
+/// one `receive()` (`into_radio` drops one not yet reported); then the
+/// deauthentication, [`FLUSH_US`] of service and the stop. The line is the
+/// bring-up's report, the station's progress and how the wait ended
+/// ([`ending`]), then on no lease the DHCP exchange's counts, the stack's
+/// failures and the keeper's, the network's name hidden and then every
+/// address masked; a PASS is a lease with `keys 2, port open`, a FAIL
+/// anything else. `timing` beats through every wait but never stops here:
+/// the cut comes [`DEADLINE_MARGIN_US`] short of `--deadline`, so the chip
+/// is stopped (and then Bus Master cleared) before the deadline can end
+/// the check.
+///
+/// [`DEADLINE_MARGIN_US`]: stela_boot_core::host_wifi::DEADLINE_MARGIN_US
 #[expect(
     clippy::too_many_arguments,
     reason = "rtw89_attach_with's step 5 inputs, then the station's own."
@@ -618,6 +646,7 @@ fn keep(
 ) -> Kept {
     // The keeper owns the network once attached, and its failures name it.
     let ssid = station.network.ssid.clone();
+    let seed = station.seed;
     let inputs = Inputs {
         clock,
         database,
@@ -631,7 +660,7 @@ fn keep(
     // check is its one worker. The station lives only inside this call,
     // while that holds, and is stopped before it returns.
     let attached = unsafe { ax::attach(io, pages, domain, cut, file, host, inputs) };
-    let mut wifi = match attached {
+    let wifi = match attached {
         Ok(wifi) => wifi,
         Err((error, returned)) => {
             return Kept {
@@ -641,25 +670,12 @@ fn keep(
             };
         }
     };
-    let now = clock.now_us();
-    let deadline = timing
-        .until_deadline_us()
-        .map(|left| now.saturating_add(left));
-    let mut watch = Watch::new(now, deadline);
-    let end = loop {
-        timing.beat();
-        wifi.carrier();
-        let line = wifi.diagnostic().unwrap_or_default();
-        if let Some(end) = watch.after(clock.now_us(), &Progress::read(&line)) {
-            break end;
-        }
-    };
+    let (mut wifi, outcome, summary, failures) = lease(wifi, clock, timing, seed);
     let failure = match wifi.receive() {
         Err(LinkError::Adapter(failure)) => Some(failure),
         Err(error) => Some(format!("{error:?}")),
         Ok(_) => None,
-    }
-    .map(|failure| hide_ssid(&failure, &ssid));
+    };
     let progress = wifi.diagnostic().unwrap_or_default();
     // Spec S17.4: leave, let the deauthentication go out, stop the chip.
     let mut radio = wifi.into_radio();
@@ -676,31 +692,127 @@ fn keep(
     let running = *live.running();
     // SAFETY: as for `ax::attach` above, still holding.
     let (_, rings, pools) = unsafe { live.stop() };
-    let mut detail = format!("{running}; station {progress}");
+    let (passed, ended) = ending(&outcome, &Progress::read(&progress));
+    let mut detail = format!("{running}; station {progress}{ended}");
+    if let Some(summary) = summary {
+        detail.push_str(&format!("; dhcp {summary}"));
+    }
+    if !failures.is_empty() {
+        detail.push_str(&format!("; {failures}"));
+    }
     if let Some(failure) = failure {
         detail.push_str(&format!("; keeper {failure}"));
-    }
-    match end {
-        End::Handshaken => {}
-        End::Budget => detail.push_str(&format!(
-            "; no EAPOL handshake within {} s",
-            STATION_BUDGET_US / 1_000_000
-        )),
-        End::Deadline => detail.push_str(&format!(
-            "; stopped {} s before --deadline without an EAPOL handshake",
-            DEADLINE_MARGIN_US / 1_000_000
-        )),
     }
     let detail = mask_addresses(&hide_ssid(&detail, &ssid));
     let lines = running.rf18_lines().map(|line| line.to_string()).collect();
     Kept {
-        result: if end == End::Handshaken {
+        result: if passed {
             Ok((detail, lines))
         } else {
             Err(detail)
         },
         rings: Some(rings),
         pools: Some(pools),
+    }
+}
+
+/// Stela's network stack over `wifi` until a DHCP lease (spec S17.3,
+/// M3b), as a normal boot's `HostNetwork::open` runs it over a wired link:
+/// `Stack::dhcp` waits for the keeper's carrier, then for the lease; a
+/// failure it may get past (the keeper's failures reach it as the link's,
+/// carrier that did not come or went) is noted and `dhcp` driven again,
+/// until [`HostClock`]'s cut ends the wait. Gives back the station, how the
+/// wait ended, without a lease what the DHCP exchange did, and the
+/// failures driven past.
+fn lease<L: Link>(
+    wifi: L,
+    clock: Clock,
+    timing: &mut Timing,
+    seed: u64,
+) -> (L, Outcome, Option<String>, Failures) {
+    let mut failures = Failures::default();
+    // The stack's every time comes after this one, which it takes as its
+    // start (smoltcp's `Instant` is an i64 of microseconds).
+    let start = match clock.try_now_us() {
+        Ok(start) if i64::try_from(start).is_ok() => start,
+        // Unreachable once the keeper ran on this clock. The stack, which
+        // would drop the station with a failure of its clock, is not made.
+        other => {
+            let why = format!("the TSC cannot time the network stack: {other:?}");
+            return (wifi, Outcome::Failed(why), None, failures);
+        }
+    };
+    let deadline = timing
+        .until_deadline_us()
+        .map(|left| start.saturating_add(left));
+    let stop = Cut::new(start, deadline);
+    let timing = RefCell::new(timing);
+    let armed = Cell::new(false);
+    let cut = Cell::new(false);
+    let host = HostClock {
+        clock,
+        start,
+        timing: &timing,
+        stop,
+        armed: &armed,
+        cut: &cut,
+    };
+    // `Stack::new` fails only on its clock's one read or that read past
+    // i64: the unarmed clock gives `start`, which fits, so the stack always
+    // holds the station, and hands it back below.
+    let Ok(mut stack) = Stack::new(wifi, host, seed) else {
+        unreachable!("an unarmed host clock gives a start that fits an i64")
+    };
+    armed.set(true);
+    let outcome = loop {
+        match stack.dhcp() {
+            Ok(config) => {
+                break Outcome::Leased(Lease {
+                    address: config.address.address(),
+                    prefix: config.address.prefix_len(),
+                    router: config.router,
+                    after_us: clock.now_us().saturating_sub(start),
+                });
+            }
+            Err(NetError::Clock(_)) if cut.get() => break Outcome::Cut(stop.end()),
+            Err(error) if error.retryable() => failures.note(error.to_string()),
+            Err(error) => break Outcome::Failed(error.to_string()),
+        }
+    };
+    let summary = match outcome {
+        Outcome::Leased(_) => None,
+        _ => stack.dhcp_summary(),
+    };
+    (stack.into_link(), outcome, summary, failures)
+}
+
+/// The network stack's clock (M3 plan Task 20): the TSC, as the radio's
+/// own, beating `timing` on every read as the host check's other waits do,
+/// so `BEAT` keeps printing while the stack waits. Until `armed` it gives
+/// `start`, the stack's own start. Armed, a read at or past `stop` fails
+/// and sets `cut`, which ends the stack's wait (the stack then refuses
+/// every operation, and the station check asks it none).
+struct HostClock<'a, 't> {
+    clock: Clock,
+    start: u64,
+    timing: &'a RefCell<&'t mut Timing>,
+    stop: Cut,
+    armed: &'a Cell<bool>,
+    cut: &'a Cell<bool>,
+}
+
+impl stela_runtime::net::Clock for HostClock<'_, '_> {
+    fn now_us(&self) -> Result<u64, ClockError> {
+        self.timing.borrow_mut().beat();
+        if !self.armed.get() {
+            return Ok(self.start);
+        }
+        let now = self.clock.try_now_us().map_err(ClockError::Calibration)?;
+        if self.stop.reached(now) {
+            self.cut.set(true);
+            return Err(ClockError::Unavailable);
+        }
+        Ok(now)
     }
 }
 
