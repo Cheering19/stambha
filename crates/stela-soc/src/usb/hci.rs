@@ -73,6 +73,7 @@ use alloc::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
 use stela_contracts::refuse;
 use stela_drivers::usb::bluetooth::MAX_ACL_PAYLOAD;
 
+pub mod bridge;
 pub mod capture;
 pub mod model;
 
