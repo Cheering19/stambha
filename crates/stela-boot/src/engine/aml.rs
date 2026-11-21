@@ -1117,6 +1117,15 @@ unsafe extern "C" fn fatal(_: *mut c_void, status: Status) -> ! {
     ))
 }
 
+/// Publish the lid's state `open` for the scanout ([`super::lid`]), with a
+/// line saying it, `when` qualifying it.
+fn lid_changed(lid: &stela_drivers::platform::lid::Lid<'_>, open: bool, when: &str) {
+    super::lid::set(open);
+    let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+    let state = if open { "open" } else { "closed" };
+    output::arguments(format_args!("HOST ACPI lid {path}: {state}{when}\n"));
+}
+
 /// The firmware's ACPI namespace, for the host's power transitions.
 /// One namespace serves the whole program: [`HostAcpi::start`] leaks it, and
 /// the host drivers and power transitions borrow it for `'static`.
@@ -1520,6 +1529,12 @@ impl HostAcpi {
         provider.reach(physical, bytes).and_then(NonNull::new)
     }
     pub(super) fn retain_power(&self, power: stela_drivers::probe::Power) {
+        // The state the lid starts in counts, as Linux reports it.
+        if let Some(lid) = &power.lid
+            && let Some(open) = lid.open()
+        {
+            lid_changed(lid, open, " at start");
+        }
         *self.power.borrow_mut() = power;
     }
     pub(super) fn hardware_active(&self) -> bool {
@@ -1655,10 +1670,14 @@ impl HostAcpi {
             {
                 output::arguments(format_args!("HOST ACPI AC refresh failed: {error:?}\n"));
             }
-            if let Some(lid) = &mut power.lid
-                && let Err(error) = lid.refresh()
-            {
-                output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"));
+            if let Some(lid) = &mut power.lid {
+                match lid.change() {
+                    Ok(Some(open)) => lid_changed(lid, open, ""),
+                    Ok(None) => {}
+                    Err(error) => {
+                        output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"))
+                    }
+                }
             }
         }
         self.service_ucsi();

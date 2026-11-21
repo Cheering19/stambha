@@ -72,6 +72,7 @@ pub mod install_progress;
 pub mod interrupt_image;
 pub mod ioapic;
 pub mod irq_context;
+pub mod lid_panel;
 pub mod linux_pump;
 pub mod load_lines;
 pub mod loader_lines;

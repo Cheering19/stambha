@@ -106,6 +106,10 @@ struct KmsScanout {
     vblank_tsc: Option<u64>,
     /// The display's frames its GPU composes.
     composition: composition::Composition,
+    /// The power the guest's display last asked of the outputs.
+    guest_on: bool,
+    /// The lid state the display last followed ([`Self::follow_lid`]).
+    lid_closed: bool,
 }
 
 impl Scanout for KmsScanout {
@@ -224,7 +228,8 @@ impl Scanout for KmsScanout {
 
     fn queued(&self) -> bool {
         let looking = self.display.is_some() || !self.waiting.is_empty();
-        (looking && host::rdtsc() >= self.next_look)
+        let lid = self.display.is_some() && crate::engine::lid::closed() != self.lid_closed;
+        lid || (looking && host::rdtsc() >= self.next_look)
             || self
                 .display
                 .as_ref()
@@ -238,6 +243,7 @@ impl Scanout for KmsScanout {
             let flushed = display.flush();
             finish_present(display, flushed)?;
         }
+        self.follow_lid();
         self.look();
         Ok(())
     }
@@ -249,21 +255,68 @@ impl Scanout for KmsScanout {
         self.blank
     }
 
+    /// A closed lid keeps a display on built-in panels alone dark through
+    /// a wake ([`Self::follow_lid`]).
     fn set_power(&mut self, on: bool) -> Result<()> {
+        self.guest_on = on;
         let Some((_, display)) = &mut self.display else {
             return Ok(());
         };
-        display.set_power(on).map_err(|error| {
+        // A sleeping display may have passed no flush since the lid moved.
+        self.lid_closed = crate::engine::lid::closed();
+        let lit = stela_boot_core::lid_panel::lit(on, self.lid_closed, panels_only(display));
+        display.set_power(lit).map_err(|error| {
             refuse!(
                 "the GPU's display refused to turn its outputs {state}: {error}",
-                state = if on { "on" } else { "off" },
+                state = if lit { "on" } else { "off" },
                 error = format!("{error:?}")
             )
         })
     }
 }
 
+/// Whether every output showing `display` is a built-in panel.
+fn panels_only(display: &Display<Node>) -> bool {
+    display.ports().all(|port| port.panel())
+}
+
 impl KmsScanout {
+    /// Follow a change of the host's lid ([`crate::engine::lid`]) on the
+    /// display taken, as the guest's display sleep's power is applied: a
+    /// closed lid darkens a display shown on built-in panels alone, and an
+    /// open one lights it again unless the guest's display sleeps. A
+    /// display taken later follows the lid at its first flush.
+    fn follow_lid(&mut self) {
+        let Some((name, display)) = &mut self.display else {
+            return;
+        };
+        let closed = crate::engine::lid::closed();
+        if closed == self.lid_closed {
+            return;
+        }
+        self.lid_closed = closed;
+        let state = if closed { "closed" } else { "open" };
+        if !panels_only(display) {
+            output::arguments(format_args!(
+                "GPU {name}: lid {state}: the display shows on an external monitor too, so it \
+                 stays as the guest's display sleep has it\n"
+            ));
+            return;
+        }
+        let lit = stela_boot_core::lid_panel::lit(self.guest_on, closed, true);
+        let what = match (closed, lit) {
+            (true, _) => "built-in panel off",
+            (false, true) => "built-in panel on",
+            (false, false) => "built-in panel stays off while the guest's display sleeps",
+        };
+        match display.set_power(lit) {
+            Ok(()) => output::arguments(format_args!("GPU {name}: lid {state}: {what}\n")),
+            Err(error) => output::arguments(format_args!(
+                "GPU {name}: lid {state}: the display refused to turn its outputs {}: {error:?}\n",
+                if lit { "on" } else { "off" }
+            )),
+        }
+    }
     fn new(
         mode: ScanoutMode,
         refresh_millihertz: u32,
@@ -286,6 +339,8 @@ impl KmsScanout {
             reported: false,
             vblank_tsc: None,
             composition: composition::Composition::default(),
+            guest_on: true,
+            lid_closed: false,
         }
     }
 

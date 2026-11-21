@@ -33,6 +33,7 @@ mod install_progress;
 pub(crate) mod interrupts;
 mod kernel_work;
 mod large_blocks;
+mod lid;
 pub(crate) use kernel_work::FirmwareContext;
 mod network;
 pub(crate) mod nor;
