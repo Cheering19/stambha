@@ -469,7 +469,7 @@ impl H2c {
 
     /// `rtw89_fw_h2c_cam(vif, NULL, NULL, upd_mode)` for M2c's unassociated
     /// vif: [`H2c::addr_cam_with`] for [`AddrCam::unassociated`].
-    pub fn addr_cam(&mut self, mac: [u8; 6], macid: u8, port: u8) -> (u8, Vec<u8>) {
+    pub fn addr_cam_unassociated(&mut self, mac: [u8; 6], macid: u8, port: u8) -> (u8, Vec<u8>) {
         self.addr_cam_with(&AddrCam::unassociated(mac), macid, port)
     }
 

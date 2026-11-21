@@ -18,7 +18,8 @@
 //! 4. the limit: `rtw89_phy_set_txpwr_limit_ax` (phy.c:3154-3187) with
 //!    `rtw89_phy_fill_txpwr_limit_ax` (:2824-2853) at 20 MHz (:2660-2673),
 //!    each value read by `rtw89_phy_read_txpwr_limit` (:2570-2646, as
-//!    [`read_limit`]) at `rtw89_channel_to_idx` (:2535-2553, [`ch_idx`]);
+//!    `read_limit`, which takes the regd [`Regds::txpwr`] maps) at
+//!    `rtw89_channel_to_idx` (:2535-2553, [`ch_idx`]);
 //! 5. the RU limit: `rtw89_phy_set_txpwr_limit_ru_ax` (:3189-3222) with
 //!    `rtw89_phy_fill_txpwr_limit_ru_ax` (:3037-3066) at 20 MHz
 //!    (:2928-2942), read by `rtw89_phy_read_txpwr_limit_ru` (:2855-2926);
@@ -188,7 +189,7 @@ const fn mac_to_rf(v: i8) -> i16 {
 /// bandwidth past the band's table reads 0, as Linux returns before the
 /// table (phy.c:2593-2596).
 #[allow(clippy::too_many_arguments)] // One argument per table index.
-pub fn read_limit(
+fn read_limit(
     t: &TxPowerTables,
     regd: Regd,
     band: HwBand,
@@ -215,14 +216,7 @@ pub fn read_limit(
 
 /// `rtw89_phy_read_txpwr_limit_ru` (phy.c:2855-2926), as [`read_limit`]
 /// reads a limit.
-pub fn read_limit_ru(
-    t: &TxPowerTables,
-    regd: Regd,
-    band: HwBand,
-    ru: u8,
-    nt: u8,
-    ch_idx: usize,
-) -> i8 {
+fn read_limit_ru(t: &TxPowerTables, regd: Regd, band: HwBand, ru: u8, nt: u8, ch_idx: usize) -> i8 {
     let lmt_ru = match t.lmt_ru(band, ru, nt, regd as u8, ch_idx) {
         0 => t.lmt_ru(band, ru, nt, Regd::Ww as u8, ch_idx),
         v => v,

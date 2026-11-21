@@ -472,7 +472,7 @@ fn disassociate_releases_the_channel_to_the_default() {
     assert_eq!(kicks(t), 1);
     let switch = first_of(t, |o| matches!(o, Op::W32(0xC398, _)));
     assert!(first_of(t, |o| matches!(o, Op::W16(0x1080, _))) < switch);
-    let (seq, cleared) = next.addr_cam(MAC, 0, 0);
+    let (seq, cleared) = next.addr_cam_unassociated(MAC, 0, 0);
     assert_eq!(live.h2c(), next);
     assert_eq!(h2c_of(&m, 1, 6, 0, seq)[24..], cleared[24..]);
     // One whose AP authenticated the station, and that never associated:
@@ -499,7 +499,7 @@ fn disassociate_releases_the_channel_to_the_default() {
     let (s0, cmac) = next.assoc_cmac_tbl(0, 0, HwBand::G5);
     let (s1, join) = next.join_info(0, 0, false);
     let (s2, cam) = next.addr_cam_with(&AddrCam::with_bssid(MAC, AP), 0, 0);
-    let (s3, cleared) = next.addr_cam(MAC, 0, 0);
+    let (s3, cleared) = next.addr_cam_unassociated(MAC, 0, 0);
     assert_eq!(live.h2c(), next);
     for (class, func, seq, want) in [
         (5, 0x0A, s0, cmac),

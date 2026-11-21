@@ -2089,7 +2089,9 @@ impl<C: Chip> Rtl8852c<C> {
         if first.is_ok() {
             first = left;
         }
-        if let Some(ticket) = self.departing.take() {
+        // rtw88's order: the ticket stays until the removal is completed,
+        // and `clear` drops it with the rest.
+        if let Some(ticket) = self.departing {
             self.station
                 .complete_removal(ticket, Completion::Accepted)
                 .map_err(Error::Station)?;

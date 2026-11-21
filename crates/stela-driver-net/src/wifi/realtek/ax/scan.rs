@@ -749,7 +749,7 @@ pub(super) unsafe fn hw_scan_start<I: AxIo + ?Sized>(
     clear32(io, R_AX_PORT_CFG_P0, B_AX_TSF_UDT_EN)?;
     io.write32(R_AX_INT_MIT_RX_V1, 0)?;
     let edcca = config_edcca(io)?;
-    let packet = session.h2c.addr_cam(mac, MAC_ID, PORT);
+    let packet = session.h2c.addr_cam_unassociated(mac, MAC_ID, PORT);
     // SAFETY: the caller's contract is `send`'s, word for word.
     unsafe { session.send(io, packet, sink) }?;
     set_rx_fltr(io, SCAN_RX_FLTR)?;
@@ -870,7 +870,7 @@ pub(super) unsafe fn hw_scan_complete<I: AxIo + ?Sized>(
     session.rx.set_mode(Mode::Station);
     // `rtw89_core_scan_complete`: the address CAM with the vif's own
     // address again, then EDCCA.
-    let packet = session.h2c.addr_cam(mac, MAC_ID, PORT);
+    let packet = session.h2c.addr_cam_unassociated(mac, MAC_ID, PORT);
     // SAFETY: the caller's contract is `send`'s, word for word.
     unsafe { session.send(io, packet, sink) }?;
     restore_edcca(io, edcca)?;
