@@ -16,9 +16,16 @@
 //!   H2C's acks, one scan report, or one frame with its status) into the
 //!   free entries, as many buffers as fit while one entry stays empty, and
 //!   reports the hardware index past them, wrapping at 32.
+//!
+//! [`Air`] is its TX side, behind the index reads of the data and
+//! management channels (ACH0-3, CH8) and of RPQ (0x121C).
 extern crate std;
-use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read, device_write, rxq_buffer};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, RX_ENTRIES, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::tests::{
+    FWCMD, TX_POOL, device_read, device_write, rpp, rpq_buffer, rpq_buffer_iova, rxq_buffer,
+};
+use crate::wifi::realtek::ax::pci::{
+    FWCMD_SLOT_BYTES, RX_ENTRIES, TX_ENTRIES, TxChannel, WD_HEAD_BYTES,
+};
 use crate::wifi::realtek::ax::tests::model::RegisterModel;
 use crate::wifi::realtek::beacon::tests::Model;
 use alloc::{boxed::Box, collections::VecDeque, rc::Rc, sync::Arc, vec, vec::Vec};
@@ -506,5 +513,184 @@ impl State {
         self.batches
             .push_back(vec![scanofld(END_SCAN, self.fw.end_status, 0, 0, 0)]);
         self.batches.extend(self.fw.after_end.iter().cloned());
+    }
+}
+
+/// The data and management channels [`Air`] serves: their channel, TX ring
+/// and IDX register (`pci.h:556-559`).
+const TX_RINGS: [(TxChannel, usize, u32); 5] = [
+    (TxChannel::Ach0, 0, 0x1058),
+    (TxChannel::Ach1, 1, 0x105C),
+    (TxChannel::Ach2, 2, 0x1060),
+    (TxChannel::Ach3, 3, 0x1064),
+    (TxChannel::Ch8, 8, 0x1078),
+];
+const RPQ_IDX: u32 = 0x121C;
+/// `RTW89_TX_RETRY_LIMIT` (`core.h:4677`), and the RPP's TX_STATUS field.
+const TX_RETRY_LIMIT: u32 = 1;
+const RPP_TX_STATUS: u32 = 0x7 << 13;
+/// The TXBD length of every frame: WD head, wp_info and one addr_info.
+const WD_BYTES: usize = 70;
+
+/// One frame the chip sent: the channel whose ring held its TXBD, its WD
+/// head (body and info), the WD page wp_info names, and its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub ch: TxChannel,
+    pub head: [u8; WD_HEAD_BYTES],
+    pub page: u8,
+    pub bytes: Vec<u8>,
+}
+
+/// The TX side of a scripted RTL8852C: the DMA engine of the data and
+/// management channels and the MAC's release reports. A read of any of
+/// their IDX registers, or of RPQ's, first takes every TXBD kicked on every
+/// one of them, as the device sends on its own: it reads the TXBD (length
+/// 70), the WD page it names and the payload its addr_info names, records
+/// the frame ([`Air::sent`]), and queues its RPP (the page's seq, the head's
+/// qsel, status DONE unless [`Air::drop_tx`]). A TX IDX read then reports
+/// that ring's hardware index past what it took; an RPQ IDX read writes
+/// every queued RPP into one RPQ buffer, unless [`Air::silent_rpq`] holds
+/// them, and reports RPQ's hardware index past it.
+#[derive(Clone)]
+pub struct Air(Rc<RefCell<AirState>>);
+
+struct AirState {
+    m: Arc<Mutex<Model>>,
+    /// Each served ring's hardware index: the next TXBD it reads.
+    hw: [usize; 5],
+    sent: Vec<Sent>,
+    /// The next frames whose report says RETRY_LIMIT.
+    drops: usize,
+    silent: bool,
+    /// RPP dwords not yet written to RPQ.
+    reports: Vec<u32>,
+    /// RPQ's hardware index.
+    rpq_hw: usize,
+}
+
+impl Air {
+    /// Serve the TX and RPQ index reads of `io`, whose DMA `m` models,
+    /// replacing any earlier hooks of them.
+    pub(in crate::wifi::realtek) fn install(io: &mut RegisterModel, m: &Arc<Mutex<Model>>) -> Self {
+        let air = Self(Rc::new(RefCell::new(AirState {
+            m: m.clone(),
+            hw: [0; 5],
+            sent: Vec::new(),
+            drops: 0,
+            silent: false,
+            reports: Vec::new(),
+            rpq_hw: 0,
+        })));
+        for (n, &(_, _, idx)) in TX_RINGS.iter().enumerate() {
+            let state = air.0.clone();
+            io.on_read(
+                idx,
+                Box::new(move |r: &mut RegisterModel| {
+                    let mut state = state.borrow_mut();
+                    state.take(r);
+                    (r.get32(idx) & 0xFFF) | (state.hw[n] as u32) << 16
+                }),
+            );
+        }
+        let state = air.0.clone();
+        io.on_read(
+            RPQ_IDX,
+            Box::new(move |r: &mut RegisterModel| state.borrow_mut().rpq(r)),
+        );
+        air
+    }
+
+    /// Every frame sent so far, in the order the device took them.
+    pub fn sent(&self) -> Vec<Sent> {
+        self.0.borrow().sent.clone()
+    }
+
+    /// RPQ speaks again: every report it held goes out acknowledged, as
+    /// does every later one.
+    pub fn ack_all(&mut self) {
+        let mut state = self.0.borrow_mut();
+        state.silent = false;
+        state.drops = 0;
+        for report in &mut state.reports {
+            *report &= !RPP_TX_STATUS;
+        }
+    }
+
+    /// The next `n` frames sent are reported unacknowledged (RETRY_LIMIT).
+    pub fn drop_tx(&mut self, n: usize) {
+        self.0.borrow_mut().drops += n;
+    }
+
+    /// From now on RPQ writes nothing: the reports wait for
+    /// [`Air::ack_all`]. The TXBDs are still taken.
+    pub fn silent_rpq(&mut self) {
+        self.0.borrow_mut().silent = true;
+    }
+
+    /// Queue `rpp`, a raw RPP dword, after the reports already queued.
+    pub fn report(&mut self, rpp: u32) {
+        self.0.borrow_mut().reports.push(rpp);
+    }
+}
+
+impl AirState {
+    /// Take every TXBD kicked on a served ring, oldest first per ring.
+    fn take(&mut self, r: &RegisterModel) {
+        for (n, &(ch, ring, idx)) in TX_RINGS.iter().enumerate() {
+            let host = (r.get32(idx) & 0xFFF) as usize % TX_ENTRIES;
+            while self.hw[n] != host {
+                let entry = self.hw[n];
+                let frame = {
+                    let m = self.m.lock().unwrap();
+                    let bd_at = u64::from(TX_POOL) + ((ring * TX_ENTRIES + entry) * 8) as u64;
+                    let bd = device_read(&m, bd_at, 8);
+                    assert_eq!(u16::from_le_bytes([bd[0], bd[1]]), WD_BYTES as u16);
+                    let wd_at = u64::from(u32::from_le_bytes(bd[4..8].try_into().unwrap()));
+                    let wd = device_read(&m, wd_at, WD_BYTES);
+                    let seq0 = u16::from_le_bytes([wd[56], wd[57]]);
+                    assert_ne!(seq0 & 0x8000, 0, "wp_info without VALID");
+                    let length_opt = u16::from_le_bytes([wd[64], wd[65]]);
+                    assert_ne!(length_opt & 0x8000, 0, "addr_info without LS");
+                    let low = u16::from_le_bytes([wd[66], wd[67]]);
+                    let high = u16::from_le_bytes([wd[68], wd[69]]);
+                    let at = u64::from(u32::from(high) << 16 | u32::from(low));
+                    Sent {
+                        ch,
+                        head: wd[..WD_HEAD_BYTES].try_into().unwrap(),
+                        page: (seq0 & 0x7FFF) as u8,
+                        bytes: device_read(&m, at, usize::from(length_opt & 0x7FF)),
+                    }
+                };
+                let body2 = u32::from_le_bytes(frame.head[8..12].try_into().unwrap());
+                let status = if self.drops > 0 {
+                    self.drops -= 1;
+                    TX_RETRY_LIMIT
+                } else {
+                    0
+                };
+                self.reports
+                    .push(rpp(u32::from(frame.page), status, (body2 >> 17) & 0x3F));
+                self.sent.push(frame);
+                self.hw[n] = (entry + 1) % TX_ENTRIES;
+            }
+        }
+    }
+
+    /// An RPQ index read.
+    fn rpq(&mut self, r: &mut RegisterModel) -> u32 {
+        self.take(r);
+        let host = (r.get32(RPQ_IDX) & 0xFFF) as usize % RX_ENTRIES;
+        let free = (host + RX_ENTRIES - self.rpq_hw - 1) % RX_ENTRIES;
+        if !self.silent && !self.reports.is_empty() && free > 0 {
+            let buffer = rpq_buffer(0, &core::mem::take(&mut self.reports));
+            device_write(
+                &self.m.lock().unwrap(),
+                rpq_buffer_iova(self.rpq_hw),
+                &buffer,
+            );
+            self.rpq_hw = (self.rpq_hw + 1) % RX_ENTRIES;
+        }
+        (host | self.rpq_hw << 16) as u32
     }
 }

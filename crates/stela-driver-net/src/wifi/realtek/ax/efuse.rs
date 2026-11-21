@@ -13,7 +13,8 @@
 //! (`rtw8852c.c:633-662`) and `rtw8852c_read_phycap` (`:807-814`), with the
 //! phycap window dumped as `rtw89_parse_phycap_map_ax` does (`efuse.c:350-381`),
 //! and the RX gain offsets of `rtw8852c_efuse_parsing_gain_offset`
-//! (`rtw8852c.c:565-622`). Only the DDV (non-DAV) physical map is read; the
+//! (`rtw8852c.c:565-622`), and the country code of `rtw8852c_read_efuse`
+//! (`rtw8852c.c:641-642`). Only the DDV (non-DAV) physical map is read; the
 //! DAV map, the efuse version byte, the TSSI tables and all other logical
 //! fields are not ported. This module does not grant firmware download, secure-boot
 //! support or any claim that the MAC address is valid.
@@ -305,6 +306,25 @@ pub fn rx_gain(logical: &[u8]) -> RxGain {
         gain.valid |= data != 0xFF;
     }
     gain
+}
+
+/// Logical offset of `country_code[2]` in `struct rtw8852c_efuse`
+/// (`rtw8852c.h:61-62`), the two bytes after `rfe_type`.
+pub const COUNTRY_CODE: usize = 0x2CB;
+
+/// `efuse->country_code` as `rtw8852c_read_efuse` copies it
+/// (`rtw8852c.c:641-642`), kept only when both bytes are ASCII upper-case
+/// letters, as every alpha2 a REGD map can name is. Unprogrammed `FF FF`,
+/// `00 00`, any other byte, or a map too short to hold the field gives
+/// `None`. Linux copies the bytes unchecked and finds no map entry for
+/// them (`regd.c:307-320`), which [`super::regd::select`] reads the same
+/// way.
+pub fn country_code(logical: &[u8]) -> Option<[u8; 2]> {
+    let code: [u8; 2] = logical
+        .get(COUNTRY_CODE..COUNTRY_CODE + 2)?
+        .try_into()
+        .ok()?;
+    code.iter().all(u8::is_ascii_uppercase).then_some(code)
 }
 
 /// `ether_addr_copy(efuse->addr, map->e.mac_addr)` (`rtw8852c.c:648`). A map
@@ -650,6 +670,44 @@ mod tests {
         off += 1 + 1 + 1; // swing 2g/5g, pwr_trk, then trx_path
         off += 1;
         assert_eq!(off, RFE_TYPE_OFFSET);
+    }
+
+    #[test]
+    fn country_code_offset_matches_the_layout() {
+        // rtw8852c.h:33-62, packed: country_code[2] follows rfe_type.
+        let tssi = 6 + 5 + 7 + 14;
+        let mut off = 0x210;
+        off += tssi + 10 + tssi + 94; // path A, rsvd1, path B, rsvd2
+        off += 1 + 1 + 1 + 1 + 5; // channel_plan, xtal_k, rsvd3, iqk_lck, rsvd4
+        off += 1 + 1 + 1 + 1 + 1; // bitfield, rsvd5, bitfield, eeprom_version, customer_id
+        off += 1 + 1 + 1 + 1 + 1; // swing 2g/5g, pwr_trk, trx_path, rfe_type
+        assert_eq!(off, COUNTRY_CODE);
+        assert_eq!(COUNTRY_CODE, 0x2CB);
+        // rsvd7, therm a/b and rsvd8 lie between it and rx_gain_2g_ofdm.
+        assert_eq!(COUNTRY_CODE + 2 + 3 + 1 + 1 + 2, RX_GAIN_OFFSETS[1]);
+    }
+
+    #[test]
+    fn country_code_takes_two_upper_case_letters_only() {
+        let mut log = vec![0xFFu8; 2048];
+        log[0x2CA] = 0x02; // rfe_type, not part of it
+        log[0x2CD] = b'Q'; // rsvd7, not part of it
+        // Unprogrammed.
+        assert_eq!(country_code(&log), None);
+        log[0x2CB..0x2CD].copy_from_slice(b"US");
+        assert_eq!(country_code(&log), Some(*b"US"));
+        log[0x2CB..0x2CD].copy_from_slice(&[0, 0]);
+        assert_eq!(country_code(&log), None);
+        // One bad byte is enough.
+        for bad in [*b"U\xFF", *b"\xFFS", *b"us", *b"U1", *b"00", *b"U@", *b"[S"] {
+            log[0x2CB..0x2CD].copy_from_slice(&bad);
+            assert_eq!(country_code(&log), None, "{bad:?}");
+        }
+        log[0x2CB..0x2CD].copy_from_slice(b"AZ");
+        assert_eq!(country_code(&log), Some(*b"AZ"));
+        // A map too short to hold it has none.
+        assert_eq!(country_code(&log[..0x2CC]), None);
+        assert_eq!(country_code(&log[..0x2CD]), Some(*b"AZ"));
     }
 
     #[test]

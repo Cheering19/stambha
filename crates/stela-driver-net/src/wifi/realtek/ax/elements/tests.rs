@@ -20,14 +20,25 @@ pub(crate) fn container(shift: u32, size: u32) -> Vec<u8> {
 /// Append one element: id, size, ver, aid, the union's 8-byte head
 /// (`idx` first for reg2), then `body`, padded to the next element.
 pub(crate) fn element(b: &mut Vec<u8>, id: u32, ver: [u8; 4], aid: u16, idx: u8, body: &[u8]) {
+    element_with_head(b, id, ver, aid, [idx, 0, 0, 0, 0, 0, 0, 0], body);
+}
+
+/// Append one element whose union head is `head`.
+pub(crate) fn element_with_head(
+    b: &mut Vec<u8>,
+    id: u32,
+    ver: [u8; 4],
+    aid: u16,
+    head: [u8; 8],
+    body: &[u8],
+) {
     assert_eq!(b.len() % 16, 0);
     b.extend_from_slice(&id.to_le_bytes());
     b.extend_from_slice(&(body.len() as u32).to_le_bytes());
     b.extend_from_slice(&ver);
     b.extend_from_slice(&aid.to_le_bytes());
     b.extend_from_slice(&[0; 2 + 4 + 4]);
-    b.push(idx);
-    b.extend_from_slice(&[0; 7]);
+    b.extend_from_slice(&head);
     b.extend_from_slice(body);
     let padded = b.len().next_multiple_of(16);
     b.resize(padded, 0);

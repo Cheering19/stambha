@@ -442,6 +442,57 @@ pub fn dig_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     Ok(())
 }
 
+/// DIG's pause for PHY 0, `bb->dig.pause_dig` with `rtw89_phy_dig_ctrl`
+/// (phy.c:7850-7901). It starts unpaused: the driver state is zeroed at
+/// probe and nothing in `rtw89_phy_dig_init` sets it. A suspend or resume
+/// that finds the pause already as asked does nothing (phy.c:7859), so a
+/// scan begun after a join that never associated, with DIG still suspended
+/// by the join, leaves the register alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dig {
+    paused: bool,
+}
+
+impl Dig {
+    /// Whether DIG is suspended.
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// `rtw89_phy_dig_suspend`: unless already paused, the PD lower bound 0
+    /// (`disabled_dm_bitmap` is only set from debugfs) and spatial reuse off,
+    /// each a masked write, then paused.
+    pub fn suspend<I: AxIo + ?Sized>(&mut self, io: &mut I) -> Result<(), AxError> {
+        if self.paused {
+            return Ok(());
+        }
+        bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
+        bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK, 0)?;
+        self.paused = true;
+        Ok(())
+    }
+
+    /// `rtw89_phy_dig_resume(restore)`: when paused, the PD lower bound
+    /// `restore ? bak_dig : 0`, which is 0 either way as only DIG tracking
+    /// moves `bak_dig` off the 0 `rtw89_phy_dig_reset` left (phy.c:7651-7676,
+    /// :7707-7714) and no tracking runs, then spatial reuse on when
+    /// `total_sta_assoc > 0`, which `linked` says; then unpaused.
+    pub fn resume<I: AxIo + ?Sized>(&mut self, io: &mut I, linked: bool) -> Result<(), AxError> {
+        if !self.paused {
+            return Ok(());
+        }
+        bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
+        bb::field32(
+            io,
+            R_SEG0R_PD,
+            B_SEG0R_PD_SPATIAL_REUSE_EN_MSK,
+            u32::from(linked),
+        )?;
+        self.paused = false;
+        Ok(())
+    }
+}
+
 /// `B_AX_XTAL_SC_MASK` (reg.h:289): the crystal cap's 7 bits, applied to
 /// the raw efuse byte with no default for an unprogrammed 0xFF
 /// (phy.c:5078).

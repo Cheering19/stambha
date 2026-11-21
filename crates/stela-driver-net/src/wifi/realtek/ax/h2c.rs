@@ -14,13 +14,22 @@
 //! `rtw89_cam_fill_addr_cam_info` and `rtw89_cam_fill_bssid_cam_info`
 //! (`cam.c:762-927`), `rtw89_fw_h2c_default_cmac_tbl` (`fw.c:3612-3661`),
 //! `rtw89_fw_h2c_scan_list_offload_ax` (`fw.c:7418-7488`) and
-//! `rtw89_fw_h2c_scan_offload_ax` (`fw.c:7609-7684`).
+//! `rtw89_fw_h2c_scan_offload_ax` (`fw.c:7609-7684`). For the association
+//! (M3 spec S9-S11): `rtw89_fw_h2c_cam` for any [`AddrCam`],
+//! `rtw89_fw_h2c_assoc_cmac_tbl` (`fw.c:3889-3976`), `rtw89_fw_h2c_join_info`
+//! connected or not, `rtw89_fw_h2c_ra` (`fw.c:5560-5649`, AX format),
+//! `rtw89_fw_h2c_set_bcn_fltr_cfg` (`fw.c:5397-5470`) and
+//! `rtw89_fw_h2c_set_edca` (`fw.c:5241-5276`).
 //!
-//! Each of those is fixed to the one unassociated station interface of
-//! milestone 2c's spec: wifi role STATION, self role CLIENT, net type
-//! NO_LINK, MAC 0, PHY 0, zero BSSID, address CAM 0 and BSSID CAM 0, no
-//! extra-op, no delay and no target channel. It only builds bytes: it submits
-//! nothing, waits for no acknowledgement and grants no register access.
+//! Each of those is fixed to the one station interface of milestone 2c's
+//! spec: wifi role STATION, self role CLIENT, MAC 0, PHY 0, address CAM 0
+//! and BSSID CAM 0, no extra-op, no delay and no target channel; its net
+//! type is NO_LINK until the association makes it INFRA, its BSSID zero
+//! until a join sets it. The station's peer, the AP, takes the vif's macid
+//! (`mac80211.c:500-505`) and no address CAM of its own. It only builds
+//! bytes: it submits nothing, waits for no acknowledgement and grants no
+//! register access.
+use super::assoc::{AddrCam, RaInfo};
 use super::chan::HwBand;
 use super::elements::RfPath;
 use super::fwdl::{RX_TYPE_H2C, descriptor};
@@ -54,13 +63,18 @@ pub(super) const H2C_FUNC_MAC_FWROLE_MAINTAIN: u8 = 4;
 /// The FW_OFLD funcs of `enum rtw89_fw_ofld_h2c_func` the scan sends
 /// (`fw.h:4768-4774`).
 pub(super) const H2C_FUNC_MAC_MACID_PAUSE: u8 = 0x8;
+pub(super) const H2C_FUNC_USR_EDCA: u8 = 0xF;
 pub(super) const H2C_FUNC_ADD_SCANOFLD_CH: u8 = 0x16;
 pub(super) const H2C_FUNC_SCANOFLD: u8 = 0x17;
+pub(super) const H2C_FUNC_CFG_BCNFLTR: u8 = 0x1E;
 /// `H2C_CL_BA_CAM` / `H2C_FUNC_MAC_BA_CAM` (`fw.h:4808-4809`).
 pub(super) const H2C_CL_BA_CAM: u8 = 0xC;
 pub(super) const H2C_FUNC_MAC_BA_CAM: u8 = 0;
 /// `H2C_CAT_OUTSRC` (`fw.h:4877`).
 pub const H2C_CAT_OUTSRC: u8 = 2;
+/// `H2C_CL_OUTSRC_RA` and `H2C_FUNC_OUTSRC_RA_MACIDCFG` (`fw.h:4879-4880`).
+pub const H2C_CL_OUTSRC_RA: u8 = 1;
+pub const H2C_FUNC_OUTSRC_RA_MACIDCFG: u8 = 0;
 /// `H2C_CL_OUTSRC_RF_REG_A` and `_B` (`fw.h:4890-4891`).
 pub const H2C_CL_OUTSRC_RF_REG_A: u8 = 8;
 pub const H2C_CL_OUTSRC_RF_REG_B: u8 = 9;
@@ -77,6 +91,27 @@ pub const SCAN_LIST_LIMIT: usize = 69;
 const WIFI_ROLE_STATION: u32 = 1;
 const SELF_ROLE_CLIENT: u32 = 0;
 const NET_TYPE_NO_LINK: u32 = 0;
+/// `RTW89_NET_TYPE_INFRA` (`core.h:252`): the station once associated
+/// (`rtw89_vif_type_mapping`, `core.c:5712-5722`).
+const NET_TYPE_INFRA: u32 = 2;
+/// `RTW89_ADDR_CAM_SEC_NORMAL` (`core.h:310`), the address CAM's
+/// `sec_ent_mode` (`cam.c:672`).
+const ADDR_CAM_SEC_NORMAL: u32 = 2;
+/// `H2C_CMC_TBL_LEN` (`fw.c:3612`): 17 dwords.
+const CMC_TBL_DWORDS: usize = 17;
+/// `RTW89_HW_RATE_CCK1` and `RTW89_HW_RATE_OFDM6` (`core.h:344-349`).
+const HW_RATE_CCK1: u32 = 0x0;
+const HW_RATE_OFDM6: u32 = 0x4;
+/// `RTW89_DEFAULT_CQM_HYST`, `RTW89_DEFAULT_CQM_THOLD` (`fw.h:261-262`),
+/// `MAX_RSSI` (`core.h:59`), `RTW89_BCN_LOSS_CNT` (`fw.h:352`) and
+/// `RTW89_BCN_FLTR_OFFLOAD_MODE_DEFAULT` (`fw.h:270`); `bss_conf`'s CQM
+/// hysteresis and threshold are 0 unless userspace sets a CQM RSSI monitor,
+/// which no Stela station does.
+const CQM_HYST: u32 = 4;
+const CQM_THOLD: i32 = -70;
+const MAX_RSSI: i32 = 110;
+const BCN_LOSS_CNT: u8 = 60;
+const BCN_FLTR_OFFLOAD_MODE_DEFAULT: u32 = 0;
 
 /// `FIELD_PREP(GENMASK(hi, lo), v)` as `le32_encode_bits` does it: `v` is
 /// masked to the field's width before it is shifted in.
@@ -314,17 +349,27 @@ impl H2c {
         )
     }
 
-    /// `rtw89_fw_h2c_join_info(vif, NULL, dis_conn = true)` for M2c's
+    /// `rtw89_fw_h2c_join_info(vif, sta, dis_conn = !connect)` for the
     /// station vif in the AX format (`struct rtw89_h2c_join`, 4 bytes):
     /// MAC / MEDIA_RPT / JOININFO, rack 0, dack 1. w0 = macid [7:0] | OP
-    /// b8 = 1 | band b9 = 0 | wmm 0 [11:10] | trigger b12 = 0 | the HE and
-    /// DL fields 0 | port [23:21] | net_type NO_LINK 0 [25:24] | wifi_role
-    /// STATION 1 [29:26] | self_role CLIENT 0 [31:30] (`fw.h:1837-1849`).
-    pub fn join_info_disconnect(&mut self, macid: u8, port: u8) -> (u8, Vec<u8>) {
+    /// b8 = `!connect` | band b9 = 0 | wmm 0 [11:10] | trigger b12 = 0
+    /// (`bss_conf->he_support`, false for the HT or legacy BSS of M3 spec
+    /// S1.7) | the HE and DL fields 0 | port [23:21] | net_type [25:24] |
+    /// wifi_role STATION 1 [29:26] | self_role CLIENT 0 [31:30]
+    /// (`fw.h:1837-1849`). The net type is the one `rtw89_vif_type_mapping`
+    /// left: INFRA when connecting (`mac80211.c:568`), NO_LINK when
+    /// disconnecting, at vif init and after `rtw89_core_sta_link_disconnect`'s
+    /// mapping (`core.c:5835-5838`).
+    pub fn join_info(&mut self, macid: u8, port: u8, connect: bool) -> (u8, Vec<u8>) {
+        let net_type = if connect {
+            NET_TYPE_INFRA
+        } else {
+            NET_TYPE_NO_LINK
+        };
         let w0 = field(u32::from(macid), 7, 0)
-            | field(1, 8, 8)
+            | field(u32::from(!connect), 8, 8)
             | field(u32::from(port), 23, 21)
-            | field(NET_TYPE_NO_LINK, 25, 24)
+            | field(net_type, 25, 24)
             | field(WIFI_ROLE_STATION, 29, 26)
             | field(SELF_ROLE_CLIENT, 31, 30);
         self.packet(
@@ -336,37 +381,68 @@ impl H2c {
         )
     }
 
-    /// `rtw89_fw_h2c_cam(vif, NULL, NULL, upd_mode)` in the v0 layout AX
+    /// `rtw89_fw_h2c_join_info(vif, NULL, dis_conn = true)` for M2c's fresh
+    /// station vif: [`H2c::join_info`] disconnected.
+    pub fn join_info_disconnect(&mut self, macid: u8, port: u8) -> (u8, Vec<u8>) {
+        self.join_info(macid, port, false)
+    }
+
+    /// `rtw89_fw_h2c_cam(vif, NULL, NULL, upd_mode)` for M2c's unassociated
+    /// vif: [`H2c::addr_cam_with`] for [`AddrCam::unassociated`].
+    pub fn addr_cam(&mut self, mac: [u8; 6], macid: u8, port: u8) -> (u8, Vec<u8>) {
+        self.addr_cam_with(&AddrCam::unassociated(mac), macid, port)
+    }
+
+    /// `rtw89_fw_h2c_cam(vif, sta, NULL, upd_mode)` in the v0 layout AX
     /// always uses (`struct rtw89_h2c_addr_cam_v0`, 60 bytes,
-    /// `fw.c:2302-2305`; bits `cam.h:38-116`): MAC / ADDR_CAM_UPDATE /
-    /// ADDR_CAM_UPD, rack 0, dack 1. v0 carries no `upd_mode`, so CREATE
-    /// and INFO_CHANGE build the same bytes.
+    /// `fw.c:2302-2305`; `rtw89_cam_fill_addr_cam_info` and
+    /// `rtw89_cam_fill_bssid_cam_info`, `cam.c:762-927`; bits
+    /// `cam.h:38-116`): MAC / ADDR_CAM_UPDATE / ADDR_CAM_UPD, rack 0, dack 1.
+    /// v0 carries no `upd_mode`, so CREATE, INFO_CHANGE and CON_DISCONN build
+    /// the same bytes.
     ///
     /// The vif's address CAM 0 (offset 0, len `ADDR_CAM_ENT_SIZE` 0x20,
     /// valid, no address mask, `sec_ent_mode` NORMAL 2) and BSSID CAM 0
     /// (len `BSSID_CAM_ENT_SIZE` 8, valid, PHY 0) are those
-    /// `rtw89_cam_init` picks for the first vif (`cam.c:631-760`); SMA is
-    /// `mac`, TMA the zero BSSID, BSS color 0, and the BSSID mask
-    /// `RTW89_BSSID_MATCH_ALL` (0x3F). No security entry, AID or WoWLAN
-    /// bit is set for a NO_LINK vif.
-    pub fn addr_cam(&mut self, mac: [u8; 6], macid: u8, port: u8) -> (u8, Vec<u8>) {
-        let m = mac.map(u32::from);
-        let sma_hash = mac.iter().fold(0u8, |h, b| h ^ b);
-        let tma_hash = 0u32;
+    /// `rtw89_cam_init` picks for the first vif (`cam.c:741-761`), and a
+    /// station's AP shares them (`rtw89_get_addr_cam_of`); SMA is `cam.mac`;
+    /// TMA, the station's address or else the vif's BSSID, and the BSSID
+    /// CAM's BSSID are both `cam.bssid` for a station, whose AP is its BSSID;
+    /// the net type is `cam.net_type`, and the AID [11:0] of w9 is carried
+    /// for INFRA only (`cam.c:901-904`); the key IDs are `cam.keys.keyids`'
+    /// w9 [31:18], w10 and w11 its security entries. BSS color 0 (no HE),
+    /// the BSSID mask `RTW89_BSSID_MATCH_ALL` (0x3F, not nontransmitted), no
+    /// trigger, no WoWLAN bit, no scan address.
+    pub fn addr_cam_with(&mut self, cam: &AddrCam, macid: u8, port: u8) -> (u8, Vec<u8>) {
+        let s = cam.mac.map(u32::from);
+        let t = cam.bssid.map(u32::from);
+        let hash = |a: &[u8; 6]| u32::from(a.iter().fold(0u8, |h, b| h ^ b));
+        let net_type = u32::from(cam.net_type);
         let port = u32::from(port);
+        let aid = if net_type == NET_TYPE_INFRA {
+            u32::from(cam.aid) & 0xFFF
+        } else {
+            0
+        };
         let mut w = [0u32; 15];
         w[1] = field(0, 7, 0) | field(0, 15, 8) | field(0x20, 23, 16);
         w[2] = field(1, 0, 0)
-            | field(NET_TYPE_NO_LINK, 2, 1)
-            | field(u32::from(sma_hash), 23, 16)
-            | field(tma_hash, 31, 24);
+            | field(net_type, 2, 1)
+            | field(hash(&cam.mac), 23, 16)
+            | field(hash(&cam.bssid), 31, 24);
         w[3] = field(0, 5, 0);
-        w[4] = field(m[0], 7, 0) | field(m[1], 15, 8) | field(m[2], 23, 16) | field(m[3], 31, 24);
-        w[5] = field(m[4], 7, 0) | field(m[5], 15, 8);
+        w[4] = field(s[0], 7, 0) | field(s[1], 15, 8) | field(s[2], 23, 16) | field(s[3], 31, 24);
+        w[5] = field(s[4], 7, 0) | field(s[5], 15, 8) | field(t[0], 23, 16) | field(t[1], 31, 24);
+        w[6] = field(t[2], 7, 0) | field(t[3], 15, 8) | field(t[4], 23, 16) | field(t[5], 31, 24);
         w[8] = field(u32::from(macid), 7, 0) | field(port, 10, 8) | field(port, 13, 11);
-        w[9] = field(2, 17, 16);
+        w[9] = field(aid, 11, 0)
+            | field(ADDR_CAM_SEC_NORMAL, 17, 16)
+            | (cam.keys.keyids & 0xFFFC_0000);
+        w[10] = cam.keys.valid_and_ents;
+        w[11] = cam.keys.ents_hi;
         w[12] = field(0, 7, 0) | field(0, 15, 8) | field(8, 23, 16);
-        w[13] = field(1, 0, 0) | field(0x3F, 7, 2);
+        w[13] = field(1, 0, 0) | field(0x3F, 7, 2) | field(t[0], 23, 16) | field(t[1], 31, 24);
+        w[14] = field(t[2], 7, 0) | field(t[3], 15, 8) | field(t[4], 23, 16) | field(t[5], 31, 24);
         self.packet(
             H2C_CAT_MAC,
             H2C_CL_MAC_ADDR_CAM_UPDATE,
@@ -396,6 +472,128 @@ impl H2c {
             H2C_FUNC_MAC_CCTLINFO_UD_V1,
             true,
             &le_words(&w),
+        )
+    }
+
+    /// `rtw89_fw_h2c_assoc_cmac_tbl(vif, sta)` for the station's AP on
+    /// `band` (M3 spec S10.1), with 8852C's CCTLINFO_UD_V1: MAC / FR_EXCHG
+    /// / CCTLINFO_UD_V1, rack 0, dack 1, 68 bytes. Each field and its mask
+    /// (`fw.h:734-1303`): d0 macid [6:0] | operation b7; DISRTSFB d1 b25
+    /// and DISDATAFB d1 b26 = 1; RTS_RTY_LOWEST_RATE d2 [31:28] = CCK1 on
+    /// 2.4 GHz, else OFDM6 (not P2P); RTS_TXCNT_LMT_SEL d2 b11 and
+    /// DATA_TXCNT_LMT_SEL d3 b6 = 0; MULTI_PORT_ID d5 [2:0] = `port`;
+    /// BSR_QUEUE_SIZE_FORMAT d6 b13 = 0 (no HE peer); the four nominal
+    /// packet paddings d7 [7:0] = 0 (no HE peer); ULDL d7 b17 = 1 (a
+    /// station). DATA_DCM is AP-only.
+    pub fn assoc_cmac_tbl(&mut self, macid: u8, port: u8, band: HwBand) -> (u8, Vec<u8>) {
+        let lowest_rate = if band == HwBand::G2 {
+            HW_RATE_CCK1
+        } else {
+            HW_RATE_OFDM6
+        };
+        let mut w = [0u32; CMC_TBL_DWORDS];
+        w[0] = field(u32::from(macid), 6, 0) | field(1, 7, 7);
+        w[1] = field(1, 25, 25) | field(1, 26, 26);
+        w[9] = field(1, 25, 25) | field(1, 26, 26);
+        w[2] = field(lowest_rate, 31, 28) | field(0, 11, 11);
+        w[10] = field(0xF, 31, 28) | field(1, 11, 11);
+        w[3] = field(0, 6, 6);
+        w[11] = field(1, 6, 6);
+        w[5] = field(u32::from(port), 2, 0);
+        w[13] = field(0x7, 2, 0);
+        w[6] = field(0, 13, 13);
+        w[14] = field(1, 13, 13);
+        w[7] = field(0, 7, 0) | field(1, 17, 17);
+        w[15] = field(0xFF, 7, 0) | field(1, 17, 17);
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_FR_EXCHG,
+            H2C_FUNC_MAC_CCTLINFO_UD_V1,
+            true,
+            &le_words(&w),
+        )
+    }
+
+    /// `rtw89_fw_h2c_ra(ra, csi = false)` in the AX format (`struct
+    /// rtw89_h2c_ra`, 16 bytes, M3 spec S10.4): OUTSRC / RA / MACIDCFG,
+    /// rack 0, dack 0. w0 = IS_DIS 0 | MODE [5:1] | BW_CAP 0 [7:6] (20 MHz) |
+    /// MACID [15:8] | DCM 0 b16 | ER 0 b17 (no HE) | INIT_RATE_LV [19:18] |
+    /// UPD_ALL b20 = 1 | SGI b21 | LDPC b22 | STBC b23 | SS_NUM [26:24] |
+    /// GILTF 0 and the update masks 0 (`fw.h:427-441`); w1 the mask's low 32
+    /// bits, w2 bits [62:32] in [30:0] with BFEE_CSI_CTL b31 0; w3 0: no
+    /// fixed GI-LTF (HE and EHT only) and no CSI (a VHT or HE beamformer
+    /// only, `rtw89_sta_has_beamformer_cap`).
+    pub fn ra(&mut self, macid: u8, ra: &RaInfo) -> (u8, Vec<u8>) {
+        let w0 = field(0, 0, 0)
+            | field(u32::from(ra.mode), 5, 1)
+            | field(0, 7, 6)
+            | field(u32::from(macid), 15, 8)
+            | field(u32::from(ra.init_rate_lv), 19, 18)
+            | field(1, 20, 20)
+            | field(u32::from(ra.sgi), 21, 21)
+            | field(u32::from(ra.ldpc), 22, 22)
+            | field(u32::from(ra.stbc), 23, 23)
+            | field(u32::from(ra.ss_num), 26, 24);
+        let w1 = ra.ra_mask as u32;
+        let w2 = field((ra.ra_mask >> 32) as u32, 30, 0);
+        self.packet(
+            H2C_CAT_OUTSRC,
+            H2C_CL_OUTSRC_RA,
+            H2C_FUNC_OUTSRC_RA_MACIDCFG,
+            false,
+            &le_words(&[w0, w1, w2, 0]),
+        )
+    }
+
+    /// `rtw89_fw_h2c_set_bcn_fltr_cfg(vif, connect)` (M3 spec S10.5,
+    /// `struct rtw89_h2c_bcnfltr`, 4 bytes): MAC / FW_OFLD / CFG_BCNFLTR,
+    /// rack 0, dack 1. w0 = MON_RSSI b0, MON_BCN b1 and MON_EN b2 =
+    /// `connect` | MODE 0 [4:3] | the loss count `RTW89_BCN_LOSS_CNT` (60)
+    /// capped at 127 with BEACON_LOSS_COUNT_V1 (`loss_count_v1`), else at
+    /// 15, as BCN_LOSS_CNT_H3 [7:5] = count >> 4 and _L4 [11:8] = count &
+    /// 0xF | RSSI_HYST [15:12] = 4 | RSSI_THRESHOLD [23:16] = -70 + 110 |
+    /// MAC_ID [31:24] (`fw.h:4321-4329`). The caller checks the firmware's
+    /// BEACON_FILTER feature and the INFRA net type Linux refuses without
+    /// (`fw.c:5409-5414`).
+    pub fn bcn_fltr(&mut self, macid: u8, connect: bool, loss_count_v1: bool) -> (u8, Vec<u8>) {
+        let max_cnt = if loss_count_v1 {
+            (1 << 7) - 1
+        } else {
+            (1 << 4) - 1
+        };
+        let cnt = u32::from(BCN_LOSS_CNT.min(max_cnt));
+        let on = u32::from(connect);
+        let w0 = field(on, 0, 0)
+            | field(on, 1, 1)
+            | field(on, 2, 2)
+            | field(BCN_FLTR_OFFLOAD_MODE_DEFAULT, 4, 3)
+            | field(cnt >> 4, 7, 5)
+            | field(cnt & 0xF, 11, 8)
+            | field(CQM_HYST, 15, 12)
+            | field((CQM_THOLD + MAX_RSSI) as u32, 23, 16)
+            | field(u32::from(macid), 31, 24);
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_FW_OFLD,
+            H2C_FUNC_CFG_BCNFLTR,
+            true,
+            &le_words(&[w0]),
+        )
+    }
+
+    /// `rtw89_fw_h2c_set_edca(vif, ac, param)` (M3 spec S10.8, 12 bytes):
+    /// MAC / FW_OFLD / USR_EDCA, rack 0, dack 1. w0 = SEL 0 [1:0] | BAND
+    /// (`mac_idx` 0) b3 | WMM 0 b4 | AC [6:5], the firmware's AC index,
+    /// which is the WMM ACI (`ac_to_fw_idx`, `mac80211.c:386-391`); w1 =
+    /// `param`; w2 = 0 (`fw.h:546-573`).
+    pub fn edca(&mut self, ac: u8, param: u32) -> (u8, Vec<u8>) {
+        let w0 = field(0, 1, 0) | field(0, 3, 3) | field(0, 4, 4) | field(u32::from(ac), 6, 5);
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_FW_OFLD,
+            H2C_FUNC_USR_EDCA,
+            true,
+            &le_words(&[w0, param, 0]),
         )
     }
 

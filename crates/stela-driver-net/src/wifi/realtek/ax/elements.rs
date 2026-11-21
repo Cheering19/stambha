@@ -6,8 +6,9 @@
 //! `rtw89_build_phy_tbl_from_elm` (fw.c:1099) builds them: BB, BB gain, each
 //! radio slot and NCTL. Linux prefers these to the chip's built-in tables
 //! (phy.c:1892, 2021-2022, 2073). Nothing here writes a register or grants
-//! BB/RF setup, and TX power, regulatory and every other element are walked
-//! past unread.
+//! BB/RF setup. The TX power and regulatory elements are read through the
+//! same walk by [`super::txpwr_tables`]; every other element is walked past
+//! unread.
 
 /// `RTW89_FW_ELEMENT_ID_BB_REG` (fw.h:4385).
 pub const ID_BB_REG: u32 = 2;
@@ -111,9 +112,47 @@ pub enum ElementError {
 /// The PHY tables in `firmware`, keeping only elements whose aid is 0 or
 /// `chip_aid` (0 on every AX chip).
 pub fn phy_tables(firmware: &[u8], chip_aid: u16) -> Result<PhyTables<'_>, ElementError> {
+    let mut tables = PhyTables::default();
+    let mut failed = None;
+    let stopped = walk(firmware, &mut |element| {
+        // Linux returns the handler's error at once (fw.c:1604-1605); the
+        // elements after it are never taken.
+        if failed.is_none()
+            && let Err(error) = tables.take(element, chip_aid)
+        {
+            failed = Some(error);
+        }
+    })?;
+    tables.stopped = stopped;
+    failed.map_or(Ok(tables), Err)
+}
+
+/// One element as `rtw89_fw_recognize_elements` hands it to its handler: the
+/// fixed header's fields, the union's 8-byte head and the `size` bytes after
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Element<'a> {
+    /// Where its header starts in the file.
+    pub offset: usize,
+    pub id: u32,
+    pub version: [u8; 4],
+    pub aid: u16,
+    /// `u.common.priv`: the union's head (`u.reg2.idx`, the TX power and
+    /// REGD heads of fw.h:4475-4491).
+    pub head: [u8; 8],
+    pub contents: &'a [u8],
+}
+
+/// Walk the elements after the MFW container as `rtw89_fw_recognize_elements`
+/// (fw.c:1560-1615) does, handing each one to `each`, whatever its id or
+/// aid. Returns the offset of an element that ran past the file, where the
+/// walk stopped as Linux's does.
+pub(super) fn walk<'a>(
+    firmware: &'a [u8],
+    each: &mut dyn FnMut(Element<'a>),
+) -> Result<Option<usize>, ElementError> {
     let len = firmware.len();
     let mut offset = elements_start(firmware)?;
-    let mut tables = PhyTables::default();
     // fw.c:1584: while (offset + sizeof(*hdr) < firmware->size).
     while offset + HEADER < len {
         let id = le32(firmware, offset);
@@ -124,28 +163,31 @@ pub fn phy_tables(firmware: &[u8], chip_aid: u16) -> Result<PhyTables<'_>, Eleme
             .checked_add(size)
             .filter(|&end| offset + size < len && end <= len)
         else {
-            tables.stopped = Some(offset);
-            break;
+            return Ok(Some(offset));
         };
-        tables.take(firmware, offset, id, end, chip_aid)?;
+        let mut version = [0; 4];
+        version.copy_from_slice(&firmware[offset + 8..offset + 12]);
+        let mut head = [0; 8];
+        head.copy_from_slice(&firmware[offset + UNION..offset + HEADER]);
+        each(Element {
+            offset,
+            id,
+            version,
+            aid: u16::from_le_bytes([firmware[offset + 12], firmware[offset + 13]]),
+            head,
+            contents: &firmware[offset + HEADER..end],
+        });
         // fw.c:1611-1612.
         offset = end.next_multiple_of(ELEMENT_ALIGN);
     }
-    Ok(tables)
+    Ok(None)
 }
 
 impl<'a> PhyTables<'a> {
-    /// `rtw89_build_phy_tbl_from_elm` for the element at `offset`, whose
-    /// contents end at `end`; any other id is walked past.
-    fn take(
-        &mut self,
-        firmware: &'a [u8],
-        offset: usize,
-        id: u32,
-        end: usize,
-        chip_aid: u16,
-    ) -> Result<(), ElementError> {
-        let radio = match id {
+    /// `rtw89_build_phy_tbl_from_elm` for `element`; any other id is walked
+    /// past.
+    fn take(&mut self, element: Element<'a>, chip_aid: u16) -> Result<(), ElementError> {
+        let radio = match element.id {
             ID_RADIO_A => Some(RfPath::A),
             ID_RADIO_B => Some(RfPath::B),
             ID_RADIO_C => Some(RfPath::C),
@@ -154,21 +196,16 @@ impl<'a> PhyTables<'a> {
             _ => return Ok(()),
         };
         let table = Reg2 {
-            version: [
-                firmware[offset + 8],
-                firmware[offset + 9],
-                firmware[offset + 10],
-                firmware[offset + 11],
-            ],
-            regs: &firmware[offset + HEADER..end],
+            version: element.version,
+            regs: element.contents,
         };
         // fw.c:1136-1138: ignore an element for another aid.
-        let aid = u16::from_le_bytes([firmware[offset + 12], firmware[offset + 13]]);
-        if aid != 0 && aid != chip_aid {
+        if element.aid != 0 && element.aid != chip_aid {
             return Ok(());
         }
+        let offset = element.offset;
         if let Some(path) = radio {
-            let idx = firmware[offset + REG2_IDX];
+            let idx = element.head[0];
             let slot = self
                 .radio
                 .get_mut(usize::from(idx))
@@ -177,7 +214,7 @@ impl<'a> PhyTables<'a> {
             slot.get_or_insert(Radio { path, table });
             return Ok(());
         }
-        let slot = match id {
+        let slot = match element.id {
             ID_BB_REG => &mut self.bb,
             ID_BB_GAIN => &mut self.bb_gain,
             _ => &mut self.nctl,
@@ -221,8 +258,8 @@ const ELEMENT_ALIGN: usize = 16;
 /// `sizeof(struct rtw89_fw_element_hdr)` (fw.h:4570-4630): 24 fixed bytes
 /// and the union's 8-byte head; `size` excludes it.
 const HEADER: usize = 32;
-/// `u.reg2.idx`, the first byte of the union.
-const REG2_IDX: usize = 24;
+/// Where the union starts: its first byte is `u.reg2.idx`.
+const UNION: usize = 24;
 /// `sizeof(struct rtw89_reg2_def)`.
 const PAIR: usize = 8;
 

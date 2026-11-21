@@ -159,3 +159,253 @@ pub(crate) fn assert_secondary_key_waits_for_retirement<R: Radio>(
     assert!(keeper.link.carrier());
     keeper
 }
+
+/// A radio that keeps the [`Link`] defaults, as the wired links do.
+struct Wired {
+    mac: Mac,
+}
+
+/// A radio whose link names its own carrier wait and state.
+struct Tuned {
+    mac: Mac,
+}
+
+impl Link for Wired {
+    fn mac(&self) -> Mac {
+        self.mac
+    }
+    fn transmit(&mut self, _frame: &[u8]) -> Result<(), LinkError> {
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        Ok(None)
+    }
+}
+
+impl Link for Tuned {
+    fn mac(&self) -> Mac {
+        self.mac
+    }
+    fn carrier_wait_us(&self) -> u64 {
+        30_000_000
+    }
+    fn transmit(&mut self, _frame: &[u8]) -> Result<(), LinkError> {
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        Ok(None)
+    }
+    fn diagnostic(&mut self) -> Option<String> {
+        Some(String::from("x"))
+    }
+}
+
+/// A [`Radio`] the keeper is only built over: none of its operations run.
+macro_rules! inert_radio {
+    ($radio:ty) => {
+        impl Radio for $radio {
+            type Handle = ();
+            type Profile = ();
+            type Management = ();
+            type Error = &'static str;
+            const NAME: &'static str = "inert";
+            const LISTEN_INTERVAL: u16 = 1;
+            fn deferred(_: &Self::Error) -> bool {
+                false
+            }
+            fn service(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn take_event(&mut self) -> Option<Event> {
+                None
+            }
+            fn stage(&self) -> Stage {
+                Stage::Idle
+            }
+            fn station(&self) -> &Station {
+                unreachable!()
+            }
+            fn channels(&self, _: Band) -> Vec<(Channel, u32)> {
+                Vec::new()
+            }
+            fn probes(&self, _: Channel) -> bool {
+                false
+            }
+            fn supported_channels(&self, _: Band) -> &'static [u8] {
+                &[]
+            }
+            fn regulated_power_dbm(&self, _: u16) -> i32 {
+                0
+            }
+            fn advertisement(&self, _: Band) -> Result<Advertisement, Self::Error> {
+                Err("inert")
+            }
+            fn profile(&self, _: Peer) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn begin_scan(&mut self, _: scan::Request, _: u64) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            unsafe fn retire_scan(&mut self) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn six_ghz_scan(
+                &self,
+                _: &scan::Request,
+                _: scan::six_ghz::Options,
+            ) -> Result<Option<scan::Request>, Self::Error> {
+                Err("inert")
+            }
+            fn bss(&self) -> Vec<((), &Bss)> {
+                Vec::new()
+            }
+            fn observation(&self, _: ()) -> Result<Arc<NativeBssObservation>, Self::Error> {
+                Err("inert")
+            }
+            fn join(&mut self, _: (), _: Join, _: ()) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn begin_external_authentication(
+                &mut self,
+                _: (),
+                _: (),
+                _: Option<Affiliation>,
+                _: u64,
+            ) -> Result<Arc<external::Session>, Self::Error> {
+                Err("inert")
+            }
+            fn begin_six_ghz_external_authentication(
+                &mut self,
+                _: (),
+                _: Selection,
+                _: (),
+                _: Option<Affiliation>,
+                _: u64,
+            ) -> Result<Arc<external::Session>, Self::Error> {
+                Err("inert")
+            }
+            fn transmit_external_authentication(
+                &mut self,
+                _: &external::Session,
+                _: external::Frame<'_>,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn associate_external(
+                &mut self,
+                _: &external::Session,
+                _: (),
+                _: Join,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn configure(&mut self) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn send_control(
+                &mut self,
+                _: &[u8],
+                _: Option<KeyIdentity>,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn install_key(
+                &mut self,
+                _: bool,
+                _: u8,
+                _: &[u8],
+                _: ReplaySeed,
+            ) -> Result<KeyIdentity, Self::Error> {
+                Err("inert")
+            }
+            fn install_link_key(
+                &mut self,
+                _: u8,
+                _: u8,
+                _: &[u8],
+                _: ReplaySeed,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            unsafe fn install_management_key(
+                &mut self,
+                _: u64,
+                _: u8,
+                _: &[u8],
+                _: PacketNumber,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            unsafe fn rotate_management_key(
+                &mut self,
+                _: &(),
+                _: u8,
+                _: &[u8],
+                _: PacketNumber,
+            ) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn authorize_port(&mut self, _: u64) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            fn deauthenticate(&mut self, _: u16) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+            unsafe fn retire_peer(&mut self) -> Result<(), Self::Error> {
+                Err("inert")
+            }
+        }
+    };
+}
+
+inert_radio!(Wired);
+inert_radio!(Tuned);
+
+struct NoEntropy;
+
+impl Entropy for NoEntropy {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), stela_driver_base::entropy::EntropyError> {
+        bytes.fill(0);
+        Ok(())
+    }
+}
+
+const LOCAL: Mac = Mac([2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+fn kept<R: Radio>(radio: R) -> Keeper<R> {
+    let network = Network {
+        ssid: b"test".to_vec(),
+        secret: Secret::Psk(Zeroizing::new([0; 32])),
+        country: None,
+    };
+    let clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    Keeper::keep(radio, network, Arc::new(NoEntropy), clock)
+}
+
+#[test]
+fn keeper_forwards_the_radios_carrier_wait() {
+    assert_eq!(kept(Tuned { mac: LOCAL }).carrier_wait_us(), 30_000_000);
+}
+
+#[test]
+fn keeper_forwards_the_radios_diagnostic() {
+    assert_eq!(
+        kept(Tuned { mac: LOCAL }).diagnostic().as_deref(),
+        Some("x")
+    );
+}
+
+#[test]
+fn other_keepers_keep_the_wired_carrier_wait() {
+    let mut keeper = kept(Wired { mac: LOCAL });
+    assert_eq!(keeper.carrier_wait_us(), crate::WIRED_CARRIER_WAIT_US);
+    assert_eq!(keeper.diagnostic(), None);
+}
+
+#[test]
+fn into_radio_returns_the_radio() {
+    let radio = kept(Tuned { mac: LOCAL }).into_radio();
+    assert_eq!(radio.mac, LOCAL);
+}

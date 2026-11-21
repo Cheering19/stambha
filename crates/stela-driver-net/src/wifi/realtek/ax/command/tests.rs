@@ -1,6 +1,6 @@
 extern crate std;
 use super::*;
-use crate::wifi::realtek::ax::c2h::{SCAN_END, SCAN_ENTER_CH, ScanOfld};
+use crate::wifi::realtek::ax::c2h::{BcnFltr, SCAN_END, SCAN_ENTER_CH, ScanOfld};
 use crate::wifi::realtek::ax::chan::HwBand;
 use crate::wifi::realtek::ax::h2c::ScanChannel;
 use crate::wifi::realtek::ax::pci::{
@@ -407,6 +407,7 @@ const BSSID: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
 #[derive(Debug, PartialEq, Eq)]
 enum Sunk {
     Scan(ScanOfld),
+    BeaconFilter(BcnFltr),
     Frame(Received),
     OtherC2h,
 }
@@ -414,6 +415,7 @@ enum Sunk {
 fn sunk(event: Event<'_>) -> Sunk {
     match event {
         Event::C2h(C2h::ScanOfld(s)) => Sunk::Scan(s),
+        Event::C2h(C2h::BeaconFilter(b)) => Sunk::BeaconFilter(b),
         Event::C2h(_) => Sunk::OtherC2h,
         Event::Frame(f) => Sunk::Frame(f),
     }
@@ -969,4 +971,282 @@ fn firmware_without_end_answers_the_stop() {
             ..
         }))
     ));
+}
+
+// Waits for a receipt or for a DONE_ACK of any class (M3 spec S1.12, S12.5).
+
+/// An H2C cat 1 / `class` / `func` with REC_ACK and no DONE_ACK, as SEC_UPD
+/// is sent (`cam.c:11-99`), 24 payload bytes.
+fn rack_only(s: &mut Session<'_>, class: u8, func: u8) -> (u8, Vec<u8>) {
+    s.h2c.packet_with(1, class, func, true, false, &[0; 24])
+}
+
+fn receipt_wait(buffers: Vec<Vec<u8>>) -> InSession<Result<u8, CommandError>> {
+    in_session(19, scripted(buffers), &mut |s, io, sink| {
+        let packet = rack_only(s, 0xA, 1);
+        // SAFETY: as in `send_drains_rxq_after_the_submit`.
+        unsafe { s.send_and_wait_for(io, packet, Wait::Received, sink) }
+    })
+}
+
+#[test]
+fn send_and_wait_for_received_matches_seq() {
+    // Seq 18's receipt does not end a seq-19 wait, nor does seq 19's for
+    // another H2C (class 0xB, or func 2).
+    let r = receipt_wait(vec![
+        firmware::rec_ack(0xA, 1, 18),
+        firmware::rec_ack(0xB, 1, 19),
+        firmware::rec_ack(0xA, 2, 19),
+    ]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Wait(AxError::NoAck {
+            class: 0xA,
+            func: 1,
+            seq: 19,
+            other_c2h: 0,
+            unmatched_ack: 3,
+            skipped: 0,
+            rxq_hw: 3,
+        }))
+    );
+    assert!(r.elapsed >= 100_000, "elapsed {}", r.elapsed);
+    assert!(r.io.writes().contains(&Op::Delay(50)));
+    assert_eq!(r.ledger.rec_acks, 3);
+    // Seq 19's ends it.
+    let r = receipt_wait(vec![
+        firmware::rec_ack(0xA, 1, 18),
+        firmware::rec_ack(0xA, 1, 19),
+    ]);
+    assert_eq!(r.got, Ok(19));
+    assert!(r.elapsed < 100_000, "elapsed {}", r.elapsed);
+    assert_eq!(r.ledger.rec_acks, 2);
+}
+
+#[test]
+fn a_done_ack_never_ends_a_receipt_wait() {
+    let r = receipt_wait(vec![firmware::done_ack(0xA, 1, 19, 0)]);
+    assert!(
+        matches!(
+            r.got,
+            Err(CommandError::Wait(AxError::NoAck {
+                class: 0xA,
+                func: 1,
+                seq: 19,
+                unmatched_ack: 1,
+                ..
+            }))
+        ),
+        "{:?}",
+        r.got
+    );
+    assert_eq!(r.ledger.done_acks, 1);
+}
+
+#[test]
+fn send_and_wait_for_done_on_class_6() {
+    let cam_wait = |buffers: Vec<Vec<u8>>| {
+        in_session(7, scripted(buffers), &mut |s, io, sink| {
+            let packet = s.h2c.packet_with(1, 6, 0, false, true, &[0; 60]);
+            let wait = Wait::Done {
+                class: 6,
+                func: 0,
+                mask: 0xFF,
+            };
+            // SAFETY: as in `send_drains_rxq_after_the_submit`.
+            unsafe { s.send_and_wait_for(io, packet, wait, sink) }
+        })
+    };
+    // Class 9 func 0 is another H2C's; class 6 func 0 ends the wait whatever
+    // its seq, as `rtw89_complete_cond` matches.
+    let r = cam_wait(vec![
+        firmware::done_ack(9, 0, 7, 0),
+        firmware::rec_ack(6, 0, 7),
+        firmware::done_ack(6, 0, 3, 0),
+    ]);
+    assert_eq!(r.got, Ok(7));
+    assert!(r.elapsed < 100_000, "elapsed {}", r.elapsed);
+    assert_eq!((r.ledger.done_acks, r.ledger.refused), (2, None));
+    // A non-zero return fails it, and the wait consumed that DONE_ACK.
+    let r = cam_wait(vec![firmware::done_ack(6, 0, 7, 1)]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Submit(AxError::H2cRejected {
+            class: 6,
+            func: 0,
+            seq: 7,
+            ret: 1
+        }))
+    );
+    assert_eq!(r.ledger.refused, None);
+    // Class 9 with class 6's func, and nothing else, times out.
+    let r = cam_wait(vec![firmware::done_ack(9, 0, 7, 0)]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Wait(AxError::NoAck {
+            class: 6,
+            func: 0,
+            seq: 7,
+            other_c2h: 0,
+            unmatched_ack: 1,
+            skipped: 0,
+            rxq_hw: 1,
+        }))
+    );
+    assert!(r.elapsed >= 100_000, "elapsed {}", r.elapsed);
+}
+
+#[test]
+fn send_and_wait_is_the_fw_ofld_done_wait() {
+    // M2c's `send_and_wait(func, mask)` is `Wait::Done { class: 9, .. }`.
+    let r = in_session(
+        18,
+        scripted(vec![firmware::done_ack(9, 0x16, 18, 0x41)]),
+        &mut |s, io, sink| {
+            let packet = ofld(s, 0x16);
+            let wait = Wait::Done {
+                class: 9,
+                func: 0x16,
+                mask: 0x3F,
+            };
+            // SAFETY: as in `send_drains_rxq_after_the_submit`.
+            unsafe { s.send_and_wait_for(io, packet, wait, sink) }
+        },
+    );
+    assert_eq!(
+        r.got,
+        Err(CommandError::Submit(AxError::H2cRejected {
+            class: 9,
+            func: 0x16,
+            seq: 18,
+            ret: 0x41
+        }))
+    );
+}
+
+#[test]
+fn the_firmware_model_answers_receipt_and_cam_waits() {
+    const MAC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let r = in_session(
+        5,
+        |io, m| Firmware::new(m).install(io),
+        &mut |s, io, sink| {
+            let sec = rack_only(s, 0xA, 1);
+            // SAFETY: as in `send_drains_rxq_after_the_submit`.
+            let received = unsafe { s.send_and_wait_for(io, sec, Wait::Received, sink) };
+            let cam = s.h2c.addr_cam(MAC, 0, 0);
+            let done = Wait::Done {
+                class: 6,
+                func: 0,
+                mask: 0xFF,
+            };
+            // SAFETY: as above.
+            let cammed = unsafe { s.send_and_wait_for(io, cam, done, sink) };
+            (received, cammed)
+        },
+    );
+    assert_eq!(r.got, (Ok(5), Ok(6)));
+    assert_eq!((r.ledger.rec_acks, r.ledger.done_acks), (1, 1));
+    // A silent firmware leaves the receipt wait without one.
+    let r = in_session(
+        5,
+        |io, m| {
+            let mut fw = Firmware::new(m);
+            fw.silent(0xA, 1);
+            fw.install(io);
+        },
+        &mut |s, io, sink| {
+            let sec = rack_only(s, 0xA, 1);
+            // SAFETY: as in `send_drains_rxq_after_the_submit`.
+            unsafe { s.send_and_wait_for(io, sec, Wait::Received, sink) }
+        },
+    );
+    assert!(
+        matches!(
+            r.got,
+            Err(CommandError::Wait(AxError::NoAck {
+                class: 0xA,
+                func: 1,
+                seq: 5,
+                ..
+            }))
+        ),
+        "{:?}",
+        r.got
+    );
+}
+
+#[test]
+fn a_receipt_wait_refuses_a_packet_without_its_header() {
+    let (m, mut rings, mut io) = running();
+    reclaim_at_once(&mut io);
+    script(&mut io, &m, vec![firmware::rec_ack(0xA, 1, 0)]);
+    let mut h2c = H2c::at(0);
+    let mut session = Session::new(&mut rings, &mut h2c, G2_1);
+    // SAFETY: as in `send_drains_rxq_after_the_submit`.
+    let got = unsafe {
+        session.send_and_wait_for(&mut io, (0, vec![0; 19]), Wait::Received, &mut |_| {})
+    };
+    assert_eq!(
+        got,
+        Err(CommandError::Submit(AxError::Dma(
+            "CH12 packet without an H2C header"
+        )))
+    );
+    assert!(io.writes().is_empty(), "{:x?}", io.writes());
+    assert!(!io.trace.contains(&Op::R32(0x1218)));
+}
+
+#[test]
+fn a_beacon_filter_report_during_a_wait_reaches_the_sink() {
+    let report = c2h(1, 1, 0xD, &0x0028_0000u32.to_le_bytes());
+    let r = in_session(
+        19,
+        scripted(vec![report.clone(), firmware::done_ack(9, 0x17, 19, 0)]),
+        &mut |s, io, sink| {
+            let packet = ofld(s, 0x17);
+            // SAFETY: as in `send_drains_rxq_after_the_submit`.
+            unsafe { s.send_and_wait(io, packet, 0x17, 0xFF, sink) }
+        },
+    );
+    assert_eq!(r.got, Ok(19));
+    let beacon_loss = BcnFltr {
+        macid: 0,
+        kind: 0,
+        event: 0,
+        ma: 0x28,
+    };
+    assert_eq!(r.sunk, [Sunk::BeaconFilter(beacon_loss)]);
+    // Not the ledger's: it goes on, as scan reports and frames do.
+    assert_eq!(r.ledger.other_c2h, 0);
+    // During a wait that fails, it is one of the C2Hs that were not acks.
+    let r = receipt_wait(vec![report]);
+    assert!(
+        matches!(
+            r.got,
+            Err(CommandError::Wait(AxError::NoAck {
+                other_c2h: 1,
+                unmatched_ack: 0,
+                ..
+            }))
+        ),
+        "{:?}",
+        r.got
+    );
+    assert_eq!(r.sunk, [Sunk::BeaconFilter(beacon_loss)]);
+}
+
+#[test]
+fn ofld_cfg_counts_a_beacon_filter_report_as_another_c2h() {
+    let r = ran(vec![
+        c2h(1, 1, 0xD, &0x0028_0000u32.to_le_bytes()),
+        done_ack(0),
+    ]);
+    assert_eq!(
+        r.got,
+        Ok(H2cAck {
+            other_c2h: 1,
+            ..acked(false, true)
+        })
+    );
 }

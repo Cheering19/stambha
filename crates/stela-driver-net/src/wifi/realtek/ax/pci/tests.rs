@@ -1,6 +1,6 @@
 extern crate std;
 use super::*;
-use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
+use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use alloc::{boxed::Box, vec, vec::Vec};
 use std::sync::Mutex;
@@ -970,4 +970,925 @@ fn pre_init_restarts_rxq_at_entry_0() {
     let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
     assert_eq!(order, [1, 2]);
     assert_eq!(io.writes(), [Op::W16(0x1218, 2)]);
+}
+
+// TX pools, the data and management queues, and RPQ (M3 spec S5.1, S5.2,
+// S5.5, S6).
+
+/// `TxPools::install` maps its one pool after the rings' 67 mappings: WD
+/// pages first (5 channels x 16 x 128 bytes), then the payload slots (5 x 16
+/// x 2048 bytes).
+const POOLS: u32 = 0x1044_0000;
+const POOL_BYTES: usize = 5 * 16 * 128 + 5 * 16 * 2048;
+
+fn pools(m: &Arc<Mutex<Model>>) -> TxPools {
+    // SAFETY: as `install`: the model domain isolates only the modeled
+    // requester, its pages are kept test RAM, and this test is the only
+    // worker.
+    unsafe { TxPools::install(&Source, Arc::new(Domain(m.clone()))) }.unwrap()
+}
+
+/// The device address of channel slot `slot`'s WD page `page`.
+fn wd_page(slot: usize, page: usize) -> u64 {
+    u64::from(POOLS) + ((slot * 16 + page) * 128) as u64
+}
+
+/// The device address of channel slot `slot`'s payload slot `page`.
+fn payload_slot(slot: usize, page: usize) -> u64 {
+    u64::from(POOLS) + (5 * 16 * 128 + (slot * 16 + page) * 2048) as u64
+}
+
+/// TX ring `ring`'s BD entry `entry`, as the device sees it.
+fn tx_bd(ring: usize, entry: usize) -> u64 {
+    u64::from(TX_POOL) + ((ring * 16 + entry) * 8) as u64
+}
+
+/// A WD body and info of bytes counting up from `fill`, with WD_INFO_EN
+/// (body dword 0 b22) set, as on every frame Linux sends.
+fn head(fill: u8) -> [u8; WD_HEAD_BYTES] {
+    let mut head = core::array::from_fn(|i| fill.wrapping_add(i as u8));
+    head[2] |= 0x40;
+    head
+}
+
+fn transmit(
+    rings: &mut Rings,
+    pools: &mut TxPools,
+    io: &mut RegisterModel,
+    ch: TxChannel,
+    head: &[u8; WD_HEAD_BYTES],
+    payload: &[u8],
+) -> Result<Option<u8>, AxError> {
+    // SAFETY: every test submits on the same `RegisterModel` that `start`
+    // programmed with these rings, under the same model-only contract.
+    unsafe { rings.txq(pools, ch).submit(io, head, payload) }
+}
+
+fn reclaim(
+    rings: &mut Rings,
+    pools: &mut TxPools,
+    io: &mut RegisterModel,
+    ch: TxChannel,
+) -> Result<(), AxError> {
+    // SAFETY: as `transmit`.
+    unsafe { rings.txq(pools, ch).reclaim(io) }
+}
+
+fn free(rings: &mut Rings, pools: &mut TxPools, ch: TxChannel) -> usize {
+    rings.txq(pools, ch).free()
+}
+
+/// Every later read of TX ring `ring`'s IDX reports hardware index `hw`
+/// over the host index last written.
+fn tx_hardware_index(io: &mut RegisterModel, ring: usize, hw: u32) {
+    let idx = [0x1058, 0x105C, 0x1060, 0x1064, 0, 0, 0, 0, 0x1078][ring];
+    io.on_read(
+        idx,
+        Box::new(move |m: &mut RegisterModel| hw << 16 | (m.get32(idx) & 0xFFF)),
+    );
+}
+
+fn running_with_pools() -> (Arc<Mutex<Model>>, Rings, TxPools, RegisterModel) {
+    let (m, rings, io) = running();
+    let pools = pools(&m);
+    (m, rings, pools, io)
+}
+
+fn page(pools: &TxPools, ch: TxChannel, seq: usize) -> Page {
+    pools.channels[ch.slot()].pages[seq]
+}
+
+fn pages_free(pools: &TxPools, ch: TxChannel) -> usize {
+    (0..WD_PAGES)
+        .filter(|&seq| !page(pools, ch, seq).in_flight)
+        .count()
+}
+
+#[test]
+fn tx_error_prints_its_subsystem() {
+    assert_eq!(alloc::format!("{}", AxError::Tx("x")), "tx: x");
+}
+
+#[test]
+fn tx_channels_follow_qsel_and_ring() {
+    let all = [
+        (0x00, TxChannel::Ach0, 0),
+        (0x01, TxChannel::Ach1, 1),
+        (0x02, TxChannel::Ach2, 2),
+        (0x03, TxChannel::Ach3, 3),
+        (0x12, TxChannel::Ch8, 8),
+    ];
+    for (qsel, ch, ring) in all {
+        assert_eq!(TxChannel::of_qsel(qsel), Some(ch));
+        assert_eq!(ch.ring(), ring);
+    }
+    // BE_1, VO_3, B0_BCN, B0_HI, B0_NOPS, B0_MGMT_FAST and anything past
+    // QSEL's 5 bits map to no pool here.
+    for qsel in [0x04, 0x0F, 0x10, 0x11, 0x13, 0x14, 0x1F, 0x20, 0xFF] {
+        assert_eq!(TxChannel::of_qsel(qsel), None);
+    }
+    assert_eq!(
+        (
+            WD_PAGES,
+            WD_PAGE_BYTES,
+            PAYLOAD_BYTES,
+            MAX_TX_FRAME,
+            WD_HEAD_BYTES
+        ),
+        (16, 128, 2048, 2044, 56)
+    );
+    assert_eq!(TX_DONE, 0);
+}
+
+#[test]
+fn pools_take_one_to_device_allocation_of_43_pages() {
+    let m = Arc::new(Mutex::new(Model::default()));
+    let pools = pools(&m);
+    let (count, bytes, direction) = {
+        let state = m.lock().unwrap();
+        let (iova, (pages, _)) = state.mappings.iter().next().unwrap();
+        (state.mappings.len(), pages.bytes(), state.directions[iova])
+    };
+    assert_eq!(count, 1);
+    // 174 080 bytes take 43 whole pages.
+    assert_eq!(POOL_BYTES, 174_080);
+    assert_eq!(bytes, 43 * 4096);
+    assert_eq!(direction, Direction::ToDevice);
+    // Never handed to the device: the mapping is returned.
+    drop(pools);
+    assert!(m.lock().unwrap().mappings.is_empty());
+}
+
+#[test]
+fn submit_writes_wd_tail_bd_and_kicks() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let payload: Vec<u8> = (0..30).map(|i| 0xA0 ^ i as u8).collect();
+    let (before, cpu_before) = syncs(&m);
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ach0,
+            &head(1),
+            &payload
+        ),
+        Ok(Some(0))
+    );
+    assert_eq!(io.trace, [Op::W16(0x1058, 1)]);
+    let (wd, bd, slot) = {
+        let state = m.lock().unwrap();
+        (
+            device_read(&state, wd_page(0, 0), 128),
+            device_read(&state, tx_bd(0, 0), 8),
+            device_read(&state, payload_slot(0, 0), 30),
+        )
+    };
+    // Body and info as given, then wp_info: seq0 = page 0 | VALID b15.
+    assert_eq!(wd[..56], head(1));
+    assert_eq!(wd[56..64], [0x00, 0x80, 0, 0, 0, 0, 0, 0]);
+    // addr_info v1: LEN [10:0] | LS b15, then the slot's dma[15:0], [31:16].
+    let dma = payload_slot(0, 0) as u32;
+    let mut addr = Vec::new();
+    addr.extend((30u16 | 0x8000).to_le_bytes());
+    addr.extend((dma as u16).to_le_bytes());
+    addr.extend(((dma >> 16) as u16).to_le_bytes());
+    assert_eq!(wd[64..70], addr[..]);
+    assert_eq!(wd[70..], [0; 58]);
+    assert_eq!(bd, encode_txbd(70, wd_page(0, 0)));
+    assert_eq!(slot, payload);
+    // WD page and payload slot, then the TXBD, made visible before the kick.
+    assert_eq!(syncs(&m), (before + 3, cpu_before));
+    assert!(page(&pools, TxChannel::Ach0, 0).in_flight);
+    // The device may now read the pool: it is never unmapped.
+    drop(pools);
+    assert_eq!(m.lock().unwrap().mappings.len(), MAPPINGS + 1);
+}
+
+#[test]
+fn ch8_kicks_0x1078() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ch8,
+            &head(9),
+            &[0xB0; 24]
+        ),
+        Ok(Some(0))
+    );
+    assert_eq!(io.trace, [Op::W16(0x1078, 1)]);
+    // CH8 is pool slot 4 and TX ring 8; ACH0's ring is untouched.
+    let (bd, wd, slot, ach0) = {
+        let state = m.lock().unwrap();
+        (
+            device_read(&state, tx_bd(8, 0), 8),
+            device_read(&state, wd_page(4, 0), 56),
+            device_read(&state, payload_slot(4, 0), 24),
+            device_read(&state, tx_bd(0, 0), 8),
+        )
+    };
+    assert_eq!(bd, encode_txbd(70, wd_page(4, 0)));
+    assert_eq!(wd, head(9));
+    assert_eq!(slot, [0xB0; 24]);
+    assert_eq!(ach0, [0; 8]);
+}
+
+#[test]
+fn submit_refuses_frames_past_2044() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let before = syncs(&m);
+    for len in [2045, 4096] {
+        assert_eq!(
+            transmit(
+                &mut rings,
+                &mut pools,
+                &mut io,
+                TxChannel::Ach0,
+                &head(0),
+                &vec![1; len]
+            ),
+            Err(AxError::Tx("frame longer than one TX address entry"))
+        );
+    }
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ach0,
+            &head(0),
+            &[]
+        ),
+        Err(AxError::Tx("empty frame"))
+    );
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    assert_eq!(pages_free(&pools, TxChannel::Ach0), 16);
+    // 2044 bytes fit one address entry.
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ach0,
+            &head(0),
+            &vec![2; 2044]
+        ),
+        Ok(Some(0))
+    );
+    let wd = device_read(&m.lock().unwrap(), wd_page(0, 0), 70);
+    assert_eq!(wd[64..66], (2044u16 | 0x8000).to_le_bytes());
+}
+
+#[test]
+fn submit_refuses_a_head_without_wd_info() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    let refused = Err(AxError::Tx("WD head without its WD info"));
+    // wp_info always follows at byte 56; without WD_INFO_EN Linux puts it
+    // at 32 (pci.c:1524-1527), so such a head is refused untouched, however
+    // many other dword-0 bits it sets.
+    let mut bare = head(1);
+    bare[2] &= !0x40;
+    let mut all_but = [0xFF; WD_HEAD_BYTES];
+    all_but[2] = !0x40;
+    let before = syncs(&m);
+    for head in [bare, all_but, [0; WD_HEAD_BYTES]] {
+        assert_eq!(
+            transmit(&mut rings, &mut pools, &mut io, ch, &head, &[1; 8]),
+            refused
+        );
+    }
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    assert_eq!(pages_free(&pools, ch), 16);
+    assert_eq!(free(&mut rings, &mut pools, ch), 15);
+    // WD_INFO_EN alone is enough.
+    let mut only = [0; WD_HEAD_BYTES];
+    only[2] = 0x40;
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &only, &[1]),
+        Ok(Some(0))
+    );
+    assert_eq!(io.trace, [Op::W16(0x1058, 1)]);
+}
+
+#[test]
+fn submit_refuses_before_pre_init() {
+    let m = Arc::new(Mutex::new(Model::default()));
+    let mut rings = install(&m);
+    let mut pools = pools(&m);
+    let mut io = settled();
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ach0,
+            &head(0),
+            &[1]
+        ),
+        Err(AxError::Tx("TX rings are stopped"))
+    );
+    assert!(io.trace.is_empty());
+    // Never handed over: both are returned.
+    drop(pools);
+    drop(rings);
+    assert!(m.lock().unwrap().mappings.is_empty());
+}
+
+#[test]
+fn submit_refuses_when_pages_are_out() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach1;
+    assert_eq!(free(&mut rings, &mut pools, ch), 15);
+    for seq in 0..15u8 {
+        assert_eq!(
+            transmit(&mut rings, &mut pools, &mut io, ch, &head(seq), &[seq; 8]),
+            Ok(Some(seq))
+        );
+    }
+    // 15 in flight: the BD ring keeps one entry empty (pci.c:1222-1231).
+    assert_eq!(free(&mut rings, &mut pools, ch), 0);
+    io.trace.clear();
+    let before = syncs(&m);
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]),
+        Ok(None)
+    );
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    // The DMA engine reads all 15, but RPQ stays silent: every BD is free
+    // again and only the page never used remains.
+    tx_hardware_index(&mut io, 1, 15);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert_eq!(free(&mut rings, &mut pools, ch), 1);
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(15), &[15; 8]),
+        Ok(Some(15))
+    );
+    io.trace.clear();
+    let before = syncs(&m);
+    assert_eq!(free(&mut rings, &mut pools, ch), 0);
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]),
+        Ok(None)
+    );
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    // No page was reused: each still holds the frame it was given.
+    let state = m.lock().unwrap();
+    for seq in 0..16 {
+        assert_eq!(device_read(&state, wd_page(1, seq), 1), [seq as u8]);
+        assert_eq!(device_read(&state, payload_slot(1, seq), 8), [seq as u8; 8]);
+    }
+}
+
+#[test]
+fn page_returns_only_after_both_bd_and_report() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach2;
+    for seq in 0..2u8 {
+        assert_eq!(
+            transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[seq]),
+            Ok(Some(seq))
+        );
+    }
+    assert_eq!(free(&mut rings, &mut pools, ch), 13);
+    // Page 0: the report first, then the hardware index past it.
+    assert!(pools.release(ch, 0));
+    assert!(page(&pools, ch, 0).reported && page(&pools, ch, 0).in_flight);
+    assert_eq!(pages_free(&pools, ch), 14);
+    tx_hardware_index(&mut io, 2, 1);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert_eq!(page(&pools, ch, 0), Page::default());
+    assert_eq!(pages_free(&pools, ch), 15);
+    // BDs: one still outstanding of 15.
+    assert_eq!(free(&mut rings, &mut pools, ch), 14);
+    // Page 1: the hardware index first, then the report.
+    tx_hardware_index(&mut io, 2, 2);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert!(page(&pools, ch, 1).in_flight && page(&pools, ch, 1).bd_done);
+    assert_eq!(pages_free(&pools, ch), 15);
+    assert!(pools.release(ch, 1));
+    assert_eq!(page(&pools, ch, 1), Page::default());
+    assert_eq!(pages_free(&pools, ch), 16);
+    assert_eq!(free(&mut rings, &mut pools, ch), 15);
+    // A second report for a returned page, a page never sent, a seq past
+    // the pool and another channel's report change nothing.
+    assert!(!pools.release(ch, 1));
+    assert!(!pools.release(ch, 7));
+    assert!(!pools.release(ch, 16));
+    assert!(!pools.release(TxChannel::Ach0, 0));
+    // The next frame takes the lowest returned page.
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[9]),
+        Ok(Some(0))
+    );
+}
+
+#[test]
+fn a_report_twice_does_not_return_a_page_in_flight() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach3;
+    transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    assert!(pools.release(ch, 0));
+    assert!(!pools.release(ch, 0));
+    assert!(page(&pools, ch, 0).in_flight);
+    assert_eq!(pages_free(&pools, ch), 15);
+}
+
+#[test]
+fn reclaim_reads_nothing_with_no_bd_outstanding() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert!(io.trace.is_empty());
+    transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    io.trace.clear();
+    // Not consumed yet: one read, nothing written.
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert_eq!(io.trace, [Op::R32(0x1058)]);
+    assert!(!page(&pools, ch, 0).bd_done);
+}
+
+#[test]
+fn reclaim_refuses_an_index_the_host_never_gave() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    for _ in 0..3 {
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    }
+    io.trace.clear();
+    let before = syncs(&m);
+    for (hw, error) in [
+        (4, AxError::Tx("TX hardware index past the host index")),
+        (15, AxError::Tx("TX hardware index past the host index")),
+        (16, AxError::Tx("TX hardware index out of range")),
+        (0xFFF, AxError::Tx("TX hardware index out of range")),
+    ] {
+        tx_hardware_index(&mut io, 0, hw);
+        assert_eq!(reclaim(&mut rings, &mut pools, &mut io, ch), Err(error));
+    }
+    io.on_read(0x1058, Box::new(|_m: &mut RegisterModel| u32::MAX));
+    assert_eq!(
+        reclaim(&mut rings, &mut pools, &mut io, ch),
+        Err(AxError::AllOnes { register: 0x1058 })
+    );
+    // Nothing was taken back or written.
+    assert_eq!(syncs(&m), before);
+    assert!(io.writes().is_empty());
+    assert!((0..3).all(|seq| !page(&pools, ch, seq).bd_done));
+    // A sane index still reclaims, each BD taken back for the CPU.
+    tx_hardware_index(&mut io, 0, 3);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert!((0..3).all(|seq| page(&pools, ch, seq).bd_done));
+    assert_eq!(syncs(&m), (before.0, before.1 + 3));
+}
+
+#[test]
+fn submit_wraps_the_bd_ring_and_reuses_entries_only_once_passed() {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    // 20 frames, each read and reported as soon as it is sent.
+    for n in 0..20u32 {
+        let seq = transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[n as u8])
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 0);
+        tx_hardware_index(&mut io, 0, (n + 1) % 16);
+        reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+        assert!(pools.release(ch, seq));
+    }
+    let kicks: Vec<u16> = io
+        .trace
+        .iter()
+        .filter_map(|op| match op {
+            Op::W16(0x1058, v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    let mut want: Vec<u16> = (1..16).collect();
+    want.extend([0, 1, 2, 3, 4]);
+    assert_eq!(kicks, want);
+    // Entry 3 was rewritten by frame 19, pointing at page 0 again.
+    let (bd, slot) = {
+        let state = m.lock().unwrap();
+        (
+            device_read(&state, tx_bd(0, 3), 8),
+            device_read(&state, payload_slot(0, 0), 1),
+        )
+    };
+    assert_eq!(bd, encode_txbd(70, wd_page(0, 0)));
+    assert_eq!(slot, [19]);
+}
+
+#[test]
+fn pre_init_restarts_the_data_rings_and_keeps_pages_out() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    start(&mut io, 2, &rings).unwrap();
+    io.trace.clear();
+    // The ring restarts at entry 0; page 0 may still be the device's, so it
+    // is never handed out again.
+    assert_eq!(free(&mut rings, &mut pools, ch), 15);
+    assert_eq!(
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[2]),
+        Ok(Some(1))
+    );
+    assert_eq!(io.trace, [Op::W16(0x1058, 1)]);
+    assert!(page(&pools, ch, 0).in_flight);
+}
+
+#[test]
+fn deinit_stops_the_data_rings() {
+    let (_m, mut rings, mut pools, mut io) = running_with_pools();
+    deinit(&mut io, &rings, false).unwrap();
+    io.trace.clear();
+    assert_eq!(
+        transmit(
+            &mut rings,
+            &mut pools,
+            &mut io,
+            TxChannel::Ach0,
+            &head(0),
+            &[1]
+        ),
+        Err(AxError::Tx("TX rings are stopped"))
+    );
+    assert!(io.trace.is_empty());
+}
+
+/// ACH0 with its host index wrapped and three TXBDs outstanding: 14 frames
+/// sent, 13 of them read and reported (their pages back), then 2 more,
+/// which take pages 0 and 1 at entries 14 and 15. Entries 13-15 (pages 13,
+/// 0 and 1) are the device's; the host index is 0 and the last hardware
+/// index read 13.
+fn wrapped_with_three_outstanding() -> (Arc<Mutex<Model>>, Rings, TxPools, RegisterModel) {
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    for seq in 0..14u8 {
+        assert_eq!(
+            transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[seq]),
+            Ok(Some(seq))
+        );
+    }
+    tx_hardware_index(&mut io, 0, 13);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    for seq in 0..13 {
+        assert!(pools.release(ch, seq));
+    }
+    for seq in 0..2u8 {
+        assert_eq!(
+            transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[0x40 | seq]),
+            Ok(Some(seq))
+        );
+    }
+    assert_eq!(io.trace.last(), Some(&Op::W16(0x1058, 0)));
+    (m, rings, pools, io)
+}
+
+/// Pages 13, 0 and 1 of ACH0 are in flight with no TXBD read proven.
+fn three_unproven(pools: &TxPools) -> bool {
+    [13, 0, 1].iter().all(|&seq| {
+        let page = page(pools, TxChannel::Ach0, seq);
+        page.in_flight && !page.bd_done
+    })
+}
+
+#[test]
+fn reclaim_refuses_rings_deinit_stopped() {
+    let (m, mut rings, mut pools, mut io) = wrapped_with_three_outstanding();
+    let ch = TxChannel::Ach0;
+    deinit(&mut io, &rings, false).unwrap();
+    // rtw89_pci_clr_idx_all_ax restarted the hardware index at 0, which from
+    // a last read of 13 and host index 0 would pass for three TXBDs read.
+    tx_hardware_index(&mut io, 0, 0);
+    io.trace.clear();
+    let before = syncs(&m);
+    assert_eq!(
+        reclaim(&mut rings, &mut pools, &mut io, ch),
+        Err(AxError::Tx("TX rings are stopped"))
+    );
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    assert!(three_unproven(&pools));
+    // Their reports alone return none of them.
+    for seq in [13, 0, 1] {
+        assert!(pools.release(ch, seq));
+    }
+    assert!(three_unproven(&pools));
+    assert_eq!(pages_free(&pools, ch), 13);
+    // A fresh pre_init restarts the ring with nothing outstanding, and the
+    // three pages stay out.
+    start(&mut io, 2, &rings).unwrap();
+    io.trace.clear();
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert!(io.trace.is_empty());
+    assert_eq!(pages_free(&pools, ch), 13);
+    assert_eq!(free(&mut rings, &mut pools, ch), 13);
+}
+
+#[test]
+fn reclaim_refuses_rings_a_failed_pre_init_stopped() {
+    let (m, mut rings, mut pools, mut io) = wrapped_with_three_outstanding();
+    let ch = TxChannel::Ach0;
+    // pre_init fails in rtw89_pci_mode_op (its first R_AX_HAXI_EXP_CTRL
+    // read), after rtw89_pci_clr_idx_all_ax zeroed every hardware index and
+    // before rtw89_pci_reset_trx_rings programmed any ring.
+    io.trace.clear();
+    io.fail_reads_of(0x1204);
+    assert_eq!(start(&mut io, 2, &rings), Err(READ_FAILED));
+    let writes = io.writes();
+    let cleared = writes
+        .iter()
+        .position(|op| *op == Op::W32(0x1200, 0x3))
+        .unwrap();
+    assert_eq!(
+        writes[cleared - 2..=cleared],
+        [
+            Op::W32(0x1014, 0x07FF),
+            Op::W32(0x11C4, 0x3),
+            Op::W32(0x1200, 0x3)
+        ]
+    );
+    // Only mode_op's three R_AX_HAXI_INIT_CFG1 steps follow.
+    assert_eq!(writes[cleared + 1..], [Op::W32(0x1000, 0x1102_0102); 3]);
+    tx_hardware_index(&mut io, 0, 0);
+    io.trace.clear();
+    let before = syncs(&m);
+    assert_eq!(
+        reclaim(&mut rings, &mut pools, &mut io, ch),
+        Err(AxError::Tx("TX rings are stopped"))
+    );
+    assert!(io.trace.is_empty());
+    assert_eq!(syncs(&m), before);
+    assert!(three_unproven(&pools));
+}
+
+#[test]
+fn a_pre_init_failing_after_the_index_clear_restarts_the_rx_host_indices() {
+    let (_m, mut rings, mut io) = running();
+    hardware_index(&mut io, 2);
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 3 << 16));
+    let mut seen = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(2));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(3));
+    // As above: rtw89_pci_clr_idx_all_ax ran, then pre_init failed.
+    io.fail_reads_of(0x1204);
+    assert_eq!(start(&mut io, 2, &rings), Err(READ_FAILED));
+    // Both hardware indices restarted at 0. Read against the old host
+    // indices that would be 30 RXQ and 29 RPQ entries filled, every one
+    // stale, and on RPQ every stale report could return a page since reused.
+    hardware_index(&mut io, 0);
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 0));
+    io.trace.clear();
+    seen.clear();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(0));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(0));
+    assert!(seen.is_empty());
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::R32(0x121C)]);
+}
+
+/// An RPQ buffer as the device writes it: the RX BD info word (FS | LS |
+/// WRITE_SIZE), a long RX descriptor with `drv_info` 8-byte units of driver
+/// info after it, then one RPP dword per entry of `rpps`.
+pub(crate) fn rpq_buffer(drv_info: u32, rpps: &[u32]) -> Vec<u8> {
+    let rpp_at = 4 + 32 + drv_info as usize * 8;
+    let size = rpp_at + rpps.len() * 4;
+    let mut b = vec![0u8; RX_BUFFER_BYTES];
+    b[0..4].copy_from_slice(&(1u32 << 15 | 1 << 14 | size as u32).to_le_bytes());
+    // d0: LONG_RXD b31, DRV_INFO_SIZE [30:28], RPKT_TYPE 3 [27:24], RPKT_LEN.
+    let d0 = 1u32 << 31 | drv_info << 28 | 3 << 24 | (rpps.len() * 4) as u32;
+    b[4..8].copy_from_slice(&d0.to_le_bytes());
+    b[8..rpp_at].fill(0xEE);
+    for (i, rpp) in rpps.iter().enumerate() {
+        b[rpp_at + i * 4..rpp_at + i * 4 + 4].copy_from_slice(&rpp.to_le_bytes());
+    }
+    b
+}
+
+/// An RPP dword: SEQ [30:16], TX_STATUS [15:13], QSEL [12:8], MACID [7:0].
+pub(crate) fn rpp(seq: u32, status: u32, qsel: u32) -> u32 {
+    seq << 16 | status << 13 | qsel << 8 | 0x5A
+}
+
+#[test]
+fn releases_parse_every_rpp_in_a_buffer() {
+    let buffer = rpq_buffer(
+        1,
+        &[
+            rpp(3, 0, 0x12),
+            rpp(16, 0, 0x00),
+            rpp(15, 1, 0x00),
+            rpp(4, 0, 0x04),
+            1 << 31 | rpp(0, 3, 0x03),
+        ],
+    );
+    // Seq 16 is past the pools and qsel 4 names no channel: both skipped
+    // and counted (spec S6).
+    assert_eq!(
+        releases(&buffer),
+        Ok(Releases {
+            reports: vec![
+                Release {
+                    seq: 3,
+                    status: TX_DONE,
+                    qsel: 0x12
+                },
+                Release {
+                    seq: 15,
+                    status: 1,
+                    qsel: 0
+                },
+                Release {
+                    seq: 0,
+                    status: 3,
+                    qsel: 3
+                },
+            ],
+            invalid: 2,
+        })
+    );
+    // A short descriptor and no driver info: the RPPs start at byte 20.
+    let mut short = vec![0u8; 64];
+    short[0..4].copy_from_slice(&(1u32 << 15 | 1 << 14 | 28).to_le_bytes());
+    short[20..24].copy_from_slice(&rpp(2, 2, 0x01).to_le_bytes());
+    short[24..28].copy_from_slice(&rpp(5, 0, 0x02).to_le_bytes());
+    // Past WRITE_SIZE: not a report.
+    short[28..32].copy_from_slice(&rpp(6, 0, 0x02).to_le_bytes());
+    let found = releases(&short).unwrap();
+    let seqs: Vec<u16> = found.reports.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, [2, 5]);
+    assert_eq!(found.invalid, 0);
+    // A trailing partial dword is not read (pci.c:681).
+    short[0..4].copy_from_slice(&(1u32 << 15 | 1 << 14 | 31).to_le_bytes());
+    assert_eq!(releases(&short).unwrap().reports.len(), 2);
+}
+
+#[test]
+fn releases_refuse_malformed_buffers() {
+    let mut buffer = rpq_buffer(0, &[rpp(1, 0, 0)]);
+    assert_eq!(
+        releases(&buffer[..7]),
+        Err(AxError::Tx("release report shorter than its descriptor"))
+    );
+    // Not FS and LS (pci.c:672-675).
+    buffer[1] &= !0x80;
+    assert_eq!(
+        releases(&buffer),
+        Err(AxError::Tx("release report is not one whole buffer"))
+    );
+    let whole = rpq_buffer(0, &[rpp(1, 0, 0)]);
+    assert_eq!(
+        releases(&whole[..39]),
+        Err(AxError::Tx("release report longer than its buffer"))
+    );
+    assert_eq!(releases(&whole[..40]).unwrap().reports.len(), 1);
+}
+
+/// RPQ entry `entry`'s buffer: RPQ is ring 1, after RXQ's 32 buffers.
+pub(crate) fn rpq_buffer_iova(entry: usize) -> u64 {
+    u64::from(RX_BUFFER0) + 0x10000 * (RX_ENTRIES + entry) as u64
+}
+
+fn drain_rpq(
+    rings: &mut Rings,
+    io: &mut RegisterModel,
+    seen: &mut Vec<Vec<u8>>,
+) -> Result<usize, AxError> {
+    // SAFETY: as `drain`.
+    unsafe {
+        rings.rpq().poll(io, &mut |buffer| {
+            seen.push(buffer.to_vec());
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn rpq_polls_its_own_index() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..3 {
+            let buffer = rpq_buffer(0, &[rpp(entry as u32, 0, 0)]);
+            device_write(&state, rpq_buffer_iova(entry), &buffer);
+        }
+        // RXQ's buffers are not RPQ's.
+        device_write(&state, rxq_buffer(0), &[0xCC; 8]);
+    }
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 3 << 16));
+    let (before, cpu_before) = syncs(&m);
+    let mut seen = Vec::new();
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(3));
+    assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 3)]);
+    assert_eq!(syncs(&m), (before + 3, cpu_before + 3));
+    let seqs: Vec<u16> = seen
+        .iter()
+        .flat_map(|buffer| releases(buffer).unwrap().reports)
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(seqs, [0, 1, 2]);
+    // RXQ's host index did not move.
+    hardware_index(&mut io, 1);
+    let mut rx = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut rx), Ok(1));
+    assert_eq!(rx[0][..8], [0xCC; 8]);
+    // RPQ wraps as RXQ does.
+    io.trace.clear();
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 1 << 16));
+    seen.clear();
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(30));
+    assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 1)]);
+    // An index past the ring and an all-ones read are refused untouched.
+    io.trace.clear();
+    let before = syncs(&m);
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 32 << 16));
+    assert_eq!(
+        drain_rpq(&mut rings, &mut io, &mut seen),
+        Err(AxError::Tx("RPQ hardware index out of range"))
+    );
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| u32::MAX));
+    assert_eq!(
+        drain_rpq(&mut rings, &mut io, &mut seen),
+        Err(AxError::AllOnes { register: 0x121C })
+    );
+    assert!(io.writes().is_empty());
+    assert_eq!(syncs(&m), before);
+    // A full RPQ is not counted as a full RXQ.
+    assert_eq!(rings.rxq_full_batches(), 0);
+}
+
+#[test]
+fn rpq_buffer_read_but_not_given_back_is_still_consumed() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..4 {
+            let buffer = rpq_buffer(0, &[rpp(entry as u32, 0, 0)]);
+            device_write(&state, rpq_buffer_iova(entry), &buffer);
+        }
+    }
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 4 << 16));
+    // Entry 1's give-back fails after `each` has read its reports.
+    {
+        let mut state = m.lock().unwrap();
+        state.fail_sync_at = Some(state.syncs + 2);
+    }
+    let mut seen = Vec::new();
+    assert_eq!(
+        drain_rpq(&mut rings, &mut io, &mut seen),
+        Err(AxError::Dma("ring memory visibility failed"))
+    );
+    assert_eq!(seen.len(), 2);
+    // It is consumed with entry 0, so its reports are never replayed.
+    assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 2)]);
+    // Entry 2: `each` fails and so does the give-back; the first cause
+    // wins, and the entry is consumed all the same.
+    {
+        let mut state = m.lock().unwrap();
+        state.fail_sync_at = Some(state.syncs + 1);
+    }
+    io.trace.clear();
+    // SAFETY: as `drain`.
+    let polled = unsafe {
+        rings.rpq().poll(&mut io, &mut |buffer| {
+            seen.push(buffer.to_vec());
+            Err(AxError::Tx("refused"))
+        })
+    };
+    assert_eq!(polled, Err(AxError::Tx("refused")));
+    assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 3)]);
+    // The next poll delivers entry 3 alone.
+    m.lock().unwrap().fail_sync_at = None;
+    io.trace.clear();
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(1));
+    assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 4)]);
+    let seqs: Vec<u16> = seen
+        .iter()
+        .flat_map(|buffer| releases(buffer).unwrap().reports)
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(seqs, [0, 1, 2, 3]);
+}
+
+#[test]
+fn pre_init_and_deinit_restart_rpq_at_entry_0() {
+    let (_m, mut rings, mut io) = running();
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 3 << 16));
+    let mut seen = Vec::new();
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(3));
+    deinit(&mut io, &rings, false).unwrap();
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 2 << 16));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(2));
+    start(&mut io, 2, &rings).unwrap();
+    io.trace.clear();
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 1 << 16));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(1));
+    assert_eq!(io.writes(), [Op::W16(0x121C, 1)]);
 }

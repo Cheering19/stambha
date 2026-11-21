@@ -4,7 +4,8 @@
 //! An RTL8852C's channel switch, `__rtw89_set_channel` (`core.c:568-598`)
 //! on MAC 0 and PHY 0 without DBCC, for a 20 MHz 2.4 or 5 GHz [`Chan`].
 //! [`set_channel`] runs its parts in `rtw8852c_set_channel`'s order
-//! (`rtw8852c.c:1932-1940`), between the two halves of the help:
+//! (`rtw8852c.c:1932-1940`), then `chip->ops->set_txpwr` (`core.c:586`),
+//! all between the two halves of the help:
 //! - [`help_enter`] is `rtw8852c_set_channel_help(enter)`
 //!   (`rtw8852c.c:1960-1974`): `rtw89_mac_stop_sch_tx_v1` (`mac.c:3444-3495`
 //!   with `rtw89_set_hw_sch_tx_en_v1`, `:3385-3401`), PPDU status off
@@ -31,28 +32,31 @@
 //!   (`:3899-3933`), `_ctrl_bw` (`:3867-3897`) with `_bw_setting`
 //!   (`:3822-3865`), and `_rxbb_bw` (`:3998-4012`) with `_set_rxbb_bw` and
 //!   `_set_tia_bw` (`:3961-3996`);
+//! - then `chip->ops->set_txpwr`, `rtw8852c_set_txpwr`
+//!   ([`super::txpwr::set_txpwr`]), with the TX scheduler still stopped and
+//!   the BB still held in reset;
 //! - [`help_exit`] is `rtw8852c_set_channel_help(exit)` (`:1975-1982`), with
 //!   `rtw89_mac_resume_sch_tx_v1` (`mac.c:3497-3507`).
 //!
 //! The BB part takes the firmware's BB gain table, the efuse RX gain
 //! offsets, the RPL bias and the chip cut as [`ChannelInputs`]; the cut
-//! goes to [`set_channel_rf`]. RF 0x18 (`RR_CFGCH`) is reached twice per
-//! path: as 0x18, which `rtw89_phy_write_rf_v1` sends over SWSI (the "DAV"
-//! register), and as 0x10018 (`RR_CFGCH_V1`, address bit 16 set), which
-//! goes to the path's direct BB window at `rf_base_addr[path] + 0x18 * 4`
-//! (MMIO 0x1E060 for A, 0x1F060 for B; the "DDV" register). Each is read
-//! and rewritten from its own value ([`super::rf`]).
+//! goes to [`set_channel_rf`]. The TX power takes the firmware's TX power
+//! tables at the regulatory indices as [`TxPower`]. RF 0x18 (`RR_CFGCH`) is
+//! reached twice per path: as 0x18, which `rtw89_phy_write_rf_v1` sends
+//! over SWSI (the "DAV" register), and as 0x10018 (`RR_CFGCH_V1`, address
+//! bit 16 set), which goes to the path's direct BB window at
+//! `rf_base_addr[path] + 0x18 * 4` (MMIO 0x1E060 for A, 0x1F060 for B; the
+//! "DDV" register). Each is read and rewritten from its own value
+//! ([`super::rf`]).
 //!
 //! Where Linux ignores a failed CMAC check (`rtw8852c.c:1967-1969`,
 //! `:1976`, `:1981`), this fails, as a disabled CMAC is a broken MAC (spec
 //! S6.1). The TSSI DE write of `tssi_cont_en(true)` (`_tssi_set_efuse_to_de`)
-//! only sets TX power and is not ported (spec S1.6). `_ctrl_bw`'s path-B
+//! only serves TSSI, which is not ported (M3 spec S1.8). `_ctrl_bw`'s path-B
 //! workaround for the CAV cut (`:3888-3895`, `hal.cv == CHIP_CAV`) is
 //! ported and runs only when [`set_channel_rf`] is given cut 0; this
-//! laptop's chip is CBV (cut 1). `chip->ops->set_txpwr` between the RF part
-//! and the help's exit (`core.c:586`) only sets TX power and is not ported
-//! (spec S1.6). A [`Chan`] that [`Chan::new20`] would not build is refused
-//! before any I/O. This module grants no TX power, no DBCC or PHY 1, no
+//! laptop's chip is CBV (cut 1). A [`Chan`] that [`Chan::new20`] would not
+//! build is refused before any I/O. This module grants no DBCC or PHY 1, no
 //! 6 GHz and no 40, 80 or 160 MHz channel, and transmits nothing.
 use super::bb::{self, BbGain};
 use super::chan::{Chan, HwBand, Subband};
@@ -61,7 +65,10 @@ use super::dm::ctrl_btg_bt_rx;
 use super::efuse::RxGain;
 use super::elements::RfPath;
 use super::io::{AxError, AxIo};
+use super::regd::Regds;
 use super::rf::{RFREG_MASK, read_rf, write_rf};
+use super::txpwr;
+use super::txpwr_tables::TxPowerTables;
 
 // reg.h (pinned rtw89): MAC registers of band 0.
 const R_AX_CTN_DRV_TXEN: u32 = 0xC398;
@@ -156,8 +163,8 @@ fn tssi_cont_en<I: AxIo + ?Sized>(io: &mut I, en: bool) -> Result<(), AxError> {
     for path in 0..2 {
         bb::field32(io, TSSI_TRK[path], B_TSSI_TRK, v)?;
         bb::field32(io, TSSI_EN[path], B_TSSI_EN, v)?;
-        // `_tssi_set_efuse_to_de` would follow here when `en`: TX power only,
-        // not ported (spec S1.6).
+        // `_tssi_set_efuse_to_de` would follow here when `en`: TSSI only,
+        // not ported (M3 spec S1.8).
     }
     Ok(())
 }
@@ -661,7 +668,7 @@ pub fn set_gain_offset<I: AxIo + ?Sized>(
 /// A [`Chan`] exactly as [`Chan::new20`] builds it, or an error: the BB
 /// tables are indexed by channel and the SCO divides by the frequency, and
 /// the fields are public.
-fn check_chan(chan: &Chan) -> Result<(), AxError> {
+pub(super) fn check_chan(chan: &Chan) -> Result<(), AxError> {
     match Chan::new20(chan.band, chan.channel) {
         Ok(built) if built == *chan => Ok(()),
         _ => Err(AxError::Phy("not a 20 MHz 2.4 or 5 GHz channel")),
@@ -893,28 +900,58 @@ pub fn set_channel_bb<I: AxIo + ?Sized>(
     bb::bb_reset(io)
 }
 
+/// What `chip->ops->set_txpwr` reads in `__rtw89_set_channel`: the
+/// firmware's TX power tables for the efuse RFE type
+/// ([`super::txpwr_tables`]) and the regulatory indices
+/// ([`super::regd::select`]).
+#[derive(Clone, Copy)]
+pub struct TxPower<'a> {
+    pub tables: &'a TxPowerTables,
+    pub regds: Regds,
+}
+
+/// A failed channel switch: `step` is `"set channel"` for the help, MAC,
+/// BB or RF part (or a channel refused before any I/O), `"tx power"` for
+/// [`super::txpwr::set_txpwr`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelError {
+    pub step: &'static str,
+    pub error: AxError,
+}
+
+fn at(step: &'static str) -> impl Fn(AxError) -> ChannelError {
+    move |error| ChannelError { step, error }
+}
+
 /// `__rtw89_set_channel` (`core.c:568-598`) on MAC 0 and PHY 0 for a 20 MHz
 /// 2.4 or 5 GHz [`Chan`], as `rtw8852c_set_channel` (`rtw8852c.c:1932-1940`)
 /// orders the chip parts: [`help_enter`], [`set_channel_mac`],
-/// [`set_channel_bb`], [`set_channel_rf`] on `inputs.cut`, then
-/// [`help_exit`] with the TX enable `help_enter` returned. `set_txpwr`
-/// (`core.c:586`) is not ported (spec S1.6), and the band notify that
-/// follows does no I/O in Stela's state (spec S6.6).
+/// [`set_channel_bb`], [`set_channel_rf`] on `inputs.cut`; then
+/// `chip->ops->set_txpwr` (`core.c:586`, [`super::txpwr::set_txpwr`] from
+/// `power`), with the TX scheduler still stopped and the BB still held in
+/// reset; then [`help_exit`] with the TX enable `help_enter` returned
+/// (`core.c:588`). The band notify that follows does no I/O in Stela's state
+/// (spec S6.6).
 ///
 /// A channel [`Chan::new20`] would not build is refused before any I/O.
 /// Any failure stops the switch where it happened, leaving the TX scheduler
-/// stopped; the caller powers the chip off (spec S1.16).
+/// stopped and the BB held in reset as far as [`help_enter`] got; the
+/// caller powers the chip off (spec S1.16). The error names the part as its
+/// step.
 pub fn set_channel<I: AxIo + ?Sized>(
     io: &mut I,
     chan: &Chan,
     inputs: &ChannelInputs<'_>,
-) -> Result<(), AxError> {
-    check_chan(chan)?;
-    let tx_en = help_enter(io, chan)?;
-    set_channel_mac(io, chan)?;
-    set_channel_bb(io, chan, inputs)?;
-    set_channel_rf(io, chan, inputs.cut)?;
-    help_exit(io, chan, tx_en)
+    power: TxPower<'_>,
+) -> Result<(), ChannelError> {
+    let switching = at("set channel");
+    check_chan(chan).map_err(&switching)?;
+    let tx_en = help_enter(io, chan).map_err(&switching)?;
+    set_channel_mac(io, chan).map_err(&switching)?;
+    set_channel_bb(io, chan, inputs).map_err(&switching)?;
+    set_channel_rf(io, chan, inputs.cut).map_err(&switching)?;
+    txpwr::set_txpwr(io, power.tables, power.regds, chan).map_err(at("tx power"))?;
+    help_exit(io, chan, tx_en).map_err(switching)
 }
 
 #[cfg(test)]

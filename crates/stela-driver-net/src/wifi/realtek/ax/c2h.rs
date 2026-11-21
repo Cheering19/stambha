@@ -3,9 +3,13 @@
 //! C2H parser: the header of `rtw89_fw_c2h_parse_attr` (`fw.c:9043`,
 //! `fw.h:3926`), the class 0 REC_ACK, DONE_ACK and log handlers
 //! (`mac.c:5459`, `:5495`, `:5559`) and the formatted-log test of
-//! `rtw89_fw_log_dump` (`fw.c:2249`), and the class 1 SCANOFLD_RSP fields
-//! `rtw89_mac_c2h_scanofld_rsp` reads (`mac.c:5283`, `fw.h:4093`). Formatted logs are not rendered (the
-//! firmware's format table is not ported). It grants no I/O.
+//! `rtw89_fw_log_dump` (`fw.c:2249`), the class 1 SCANOFLD_RSP fields
+//! `rtw89_mac_c2h_scanofld_rsp` reads (`mac.c:5283`, `fw.h:4093`), and the
+//! class 1 BCNFLTR_RPT fields `rtw89_mac_bcn_fltr_rpt` reads (`mac.c:5390-5405`,
+//! `fw.h:4005-4014`). Formatted logs are not rendered (the firmware's format
+//! table is not ported), and nothing is acted on: a beacon filter report is
+//! decoded, not matched to a link or turned into a beacon loss. It grants no
+//! I/O.
 
 const C2H_HEADER_LEN: usize = 8;
 const ACK_LEN: usize = 12;
@@ -16,8 +20,15 @@ const FUNC_DONE_ACK: u8 = 1;
 const FUNC_LOG: u8 = 2;
 const C2H_CLASS_OFLD: u8 = 1;
 const FUNC_SCANOFLD_RSP: u8 = 9;
+/// `RTW89_MAC_C2H_FUNC_BCNFLTR_RPT` (`mac.h:415`).
+const FUNC_BCNFLTR_RPT: u8 = 0xD;
 /// Bytes through `w5`, the last word read.
 const SCANOFLD_LEN: usize = 24;
+/// `struct rtw89_c2h_mac_bcnfltr_rpt`: w0, w1 and w2 (`fw.h:4005-4009`).
+const BCNFLTR_LEN: usize = 12;
+/// `RTW89_BCN_FLTR_BEACON_LOSS`, the first `enum rtw89_bcn_fltr_type`
+/// (`fw.h:273-277`); RSSI is 1 and NOTIFY 2.
+pub const BCNFLTR_BEACON_LOSS: u8 = 0;
 /// `enum rtw89_scan_ofld_notify_reason` and `rtw89_scanofld_status`
 /// (`fw.h:228-245`).
 pub const SCAN_ENTER_CH: u8 = 3;
@@ -45,6 +56,18 @@ pub struct ScanOfld {
     pub mac_idx: bool,
 }
 
+/// The w2 fields of `struct rtw89_c2h_mac_bcnfltr_rpt` (`fw.h:4011-4014`),
+/// raw: `macid` [7:0], `kind` (`TYPE`, [9:8]: [`BCNFLTR_BEACON_LOSS`],
+/// RSSI 1 or NOTIFY 2), `event` [11:10] and `ma` [23:16], the moving average
+/// whose signal Linux takes as `ma - MAX_RSSI` (`mac.c:5403`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BcnFltr {
+    pub macid: u8,
+    pub kind: u8,
+    pub event: u8,
+    pub ma: u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum C2h<'a> {
     RecAck {
@@ -63,6 +86,7 @@ pub enum C2h<'a> {
     Log(&'a [u8]),
     FormattedLog,
     ScanOfld(ScanOfld),
+    BeaconFilter(BcnFltr),
     Other {
         cat: u8,
         class: u8,
@@ -70,14 +94,23 @@ pub enum C2h<'a> {
     },
 }
 
-/// `None` when the payload is shorter than the header, than an ack's 12
-/// bytes, or than a scan report's 24.
+/// `None` when the payload is shorter than the header, than an ack's or a
+/// beacon filter report's 12 bytes, or than a scan report's 24.
 pub fn parse(payload: &[u8]) -> Option<C2h<'_>> {
     let w0 = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
     payload.get(4..C2H_HEADER_LEN)?;
     let cat = (w0 & 0x3) as u8;
     let class = ((w0 >> 2) & 0x3F) as u8;
     let func = ((w0 >> 8) & 0xFF) as u8;
+    if cat == C2H_CAT_MAC && class == C2H_CLASS_OFLD && func == FUNC_BCNFLTR_RPT {
+        let w2 = u32::from_le_bytes(payload.get(8..BCNFLTR_LEN)?.try_into().ok()?);
+        return Some(C2h::BeaconFilter(BcnFltr {
+            macid: w2 as u8,
+            kind: ((w2 >> 8) & 0x3) as u8,
+            event: ((w2 >> 10) & 0x3) as u8,
+            ma: (w2 >> 16) as u8,
+        }));
+    }
     if cat == C2H_CAT_MAC && class == C2H_CLASS_OFLD && func == FUNC_SCANOFLD_RSP {
         let word = |n: usize| -> Option<u32> {
             let at = n * 4;

@@ -9,7 +9,9 @@
 //! `rtw89_fw_download` with its 5-try loop, `fw.c:2043`) and
 //! `rtw89_parse_efuse_map_ax` (`efuse.c:281`) for the MAC address, RFE
 //! type and crystal cap, then `rtw89_parse_phycap_map_ax` (`efuse.c:350`)
-//! for the trims. From there it continues, on the same power-on and
+//! for the trims, then `rtw89_fw_recognize_elements` (`core.c:7413`) for the
+//! firmware's TX power tables of that RFE type, with the regulatory index
+//! of `rtw89_regd_setup`. From there it continues, on the same power-on and
 //! download (spec S1.1), with the rest of `rtw89_mac_init` (`mac.c:4360`):
 //! `rtw89_chip_enable_bb_rf` (`rtw8852c_mac_enable_bb_rf`,
 //! `rtw8852c.c:2999`), `sys_init_ax` (`mac.c:1701`), `trx_init_ax`
@@ -19,36 +21,41 @@
 //! (`core.c:6687-6697`) with the radio steps of [`phy::init_radio`]: the
 //! BB/RF reset, the firmware's BB, BB gain and radio tables with the RF_REG
 //! H2Cs, and the coex init's Wi-Fi grant; then `rtw89_phy_dm_init` with
-//! NCTL, RCK, DACK and RX DCK ([`phy::calibrate`]). Then, as
-//! `rtw89_ops_hw_scan` runs from idle (`mac80211.c:1279-1320`), the first
-//! passive scan ([`scan::run`], M2c spec S2): the rest of `rtw89_core_start`,
-//! `rtw89_set_channel` to 2.4 GHz channel 1 with the BB gain table, efuse RX
-//! gain offsets, RPL bias and cut the steps before produced,
-//! `rtw89_mac_vif_init`, and the firmware's scan offload over 38 channels,
-//! whose networks the result reports. After the coex init the coex half of
-//! `rtw89_core_stop` (`core.c:6738, 6760`) hands the antenna back; once the
-//! post-init has run, the HCI is torn down as `rtw89_core_stop` does
-//! (`core.c:6765-6767`): `rtw89_pci_ops_deinit` (`pci.c:3053`), then the
-//! power-off. Last comes `rtw89_mac_pwr_off` (`mac.c:1603`), which Linux runs
-//! on success and on every failure after power-on.
+//! NCTL, RCK, DACK and RX DCK ([`phy::calibrate`]). [`power_up`] is these
+//! steps, which the live chip ([`live::start`]) continues from with
+//! `rtw89_leave_ips` (the rest of `rtw89_core_start`, `rtw89_set_channel`
+//! to 2.4 GHz channel 1 with its TX power, `rtw89_mac_vif_init`). Then, as
+//! `rtw89_ops_hw_scan` runs from idle (`mac80211.c:1279-1320`),
+//! [`bring_up`] runs the first passive scan ([`scan::run_once`], M2c spec
+//! S2): the firmware's scan offload over 38 channels, whose networks the
+//! result reports. After the coex init the coex half of `rtw89_core_stop`
+//! (`core.c:6738, 6760`) hands the antenna back; once the post-init has run,
+//! the HCI is torn down as `rtw89_core_stop` does (`core.c:6765-6767`):
+//! `rtw89_pci_ops_deinit` (`pci.c:3053`), then the power-off
+//! ([`shut_down`]). Last comes `rtw89_mac_pwr_off` (`mac.c:1603`), which
+//! Linux runs on success and on every failure after power-on.
 //!
-//! This module does not grant a usable radio: the chip is powered off again
-//! before `bring_up` returns. It sets no channel but the scan's boot channel
-//! and runs no IQK, DPK, TSSI, association, transmission request or
+//! [`bring_up`] does not grant a usable radio: the chip is powered off again
+//! before it returns. It sets no channel but the scan's boot channel and
+//! runs no IQK, DPK, TSSI, association, transmission request or
 //! interrupts; the scan is passive, and `rtw89_hw_scan_complete`'s restores
-//! are left to the power-off. It does not support secure-boot chips, and it
-//! does not claim the MAC address read from the efuse is valid.
-use super::channel::ChannelInputs;
+//! are left to the power-off. This module does not support secure-boot
+//! chips, and it does not claim the MAC address read from the efuse is
+//! valid.
+use super::bb::BbGain;
 use super::command::{self, CommandError, H2cAck};
 use super::efuse::{self, PhyEfuse, RxGain, SecureBoot};
-use super::elements::{PhyTables, RfPath};
+use super::elements::{self, PhyTables, RfPath};
 use super::h2c::H2c;
 use super::io::{AxError, AxIo};
+use super::live::{self, StartError};
 use super::pci::Rings;
 use super::phy::{self, PhyReport, RfkReport};
 use super::radio::RfAt;
+use super::regd::{self, Regds};
 use super::rf::{RFREG_MASK, read_rf};
-use super::scan::{self, ScanInputs, ScanReport};
+use super::scan::{self, ScanReport};
+use super::txpwr_tables::{self, TxPowerTables};
 use super::{coex, dmac, fwdl, pci, power, sys, trx};
 use crate::bus::dma::{mapping::DmaDomain, memory::PageSource};
 use crate::wifi::realtek::firmware::AxImage;
@@ -86,6 +93,18 @@ pub struct Host {
     pub ltr: bool,
 }
 
+/// The firmware an RTL8852CE is brought up with: `image`, the normal
+/// firmware the download sends, and `file`, the whole
+/// `rtw89/rtw8852c_fw-2.bin` it came from, whose elements after the MFW
+/// container carry the PHY tables ([`elements::phy_tables`]) and the TX
+/// power and regulatory tables ([`txpwr_tables::tx_power_tables`]), both
+/// read from it as `rtw89_fw_recognize_elements` reads them (`fw.c:1560`).
+#[derive(Clone, Copy)]
+pub struct FirmwareFile<'a> {
+    pub image: &'a AxImage<'a>,
+    pub file: &'a [u8],
+}
+
 /// An RTL8852CE whose firmware reported `RTW89_FWDL_WCPU_FW_INIT_RDY`, whose
 /// MAC was initialized, and whose firmware acknowledged an H2C.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,8 +138,10 @@ pub struct Running {
     /// the radio's report: always `Some` from [`bring_up`]. It is printed on
     /// lines of its own ([`Rf18::lines`]), not on this one.
     pub rf18: Option<Rf18>,
-    /// What the first passive scan heard: always `Some` from [`bring_up`].
-    /// Its networks print on lines of their own ([`ScanReport::listed`]).
+    /// What the first passive scan heard: always `Some` from [`bring_up`],
+    /// `None` from a live chip's [`live::Live::running`], which has not
+    /// scanned. Its networks print on lines of their own
+    /// ([`ScanReport::listed`]).
     pub scan: Option<ScanReport>,
 }
 
@@ -151,8 +172,8 @@ pub struct Rf18Line {
 
 impl Rf18 {
     /// Path A's line, then path B's.
-    pub fn lines(&self) -> impl Iterator<Item = Rf18Line> {
-        let Self { dav, ddv } = *self;
+    pub fn lines(self) -> impl Iterator<Item = Rf18Line> {
+        let Self { dav, ddv } = self;
         [('A', 0), ('B', 1)]
             .into_iter()
             .map(move |(path, i)| Rf18Line {
@@ -173,7 +194,11 @@ impl fmt::Display for Rf18Line {
     }
 }
 
-/// [`Rf18`]: path A's DAV then DDV, then path B's.
+/// [`Rf18`]: path A's DAV then DDV, then path B's. The DAV reads repeat the
+/// SWSI reads of [`PhyReport::rf18`] on purpose, a few register accesses
+/// later: each window is paired with a reading of the other taken back to
+/// back, and two SWSI reads that disagree show the serial interface itself
+/// misreading.
 fn read_rf18<I: AxIo + ?Sized>(io: &mut I) -> Result<Rf18, AxError> {
     let mut rf18 = Rf18 {
         dav: [0; 2],
@@ -184,6 +209,13 @@ fn read_rf18<I: AxIo + ?Sized>(io: &mut I) -> Result<Rf18, AxError> {
         rf18.ddv[i] = read_rf(io, path, RR_CFGCH_V1, RFREG_MASK)?;
     }
     Ok(rf18)
+}
+
+impl Running {
+    /// The `WIFI RF18` lines of [`Running::rf18`], path A then B.
+    pub fn rf18_lines(&self) -> impl Iterator<Item = Rf18Line> {
+        self.rf18.into_iter().flat_map(|rf18| rf18.lines())
+    }
 }
 
 impl fmt::Display for Running {
@@ -253,12 +285,14 @@ impl fmt::Display for Running {
 pub struct BringUpError {
     /// One of `"phy tables"`, `"power on"`, `"secure boot"`, `"dma rings"`,
     /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`,
-    /// `"phycap"`, `"bb rf enable"`, `"sys init"`, `"dmac init"`,
-    /// `"cmac init"`, `"imr"`, `"pci post-init"`, `"h2c"`, `"c2h"`,
-    /// `"bb rf reset"`, `"bb init"`, `"rf init"`, `"rf h2c"`, `"coex init"`,
-    /// `"phy report"`, `"dm init"`, `"nctl init"`, `"rfk init"`,
-    /// `"dm tail"`, `"core start"`, `"set channel"`, `"vif init"`,
-    /// `"scan start"`, `"scan"`; the probe that opens the register window,
+    /// `"phycap"`, `"tx power"` (the file's TX power tables),
+    /// `"bb rf enable"`, `"sys init"`, `"dmac init"`, `"cmac init"`,
+    /// `"imr"`, `"pci post-init"`, `"h2c"`, `"c2h"`, `"bb rf reset"`,
+    /// `"bb init"`, `"rf init"`, `"rf h2c"`, `"coex init"`, `"phy report"`,
+    /// `"dm init"`, `"nctl init"`, `"rfk init"`, `"dm tail"`,
+    /// `"core start"`, `"set channel"`, `"tx power"` (its writes),
+    /// `"vif init"`, `"tx rings"`, `"scan start"`, `"scan"`; the probe that
+    /// opens the register window,
     /// stages the firmware, checks its PHY tables (`"phy tables"`) and runs
     /// [`quiesce`] before [`bring_up`] adds `"register window"`,
     /// `"identity"`, `"firmware"` and `"quiesce"`.
@@ -271,6 +305,10 @@ pub struct BringUpError {
     /// For `"rf init"` and `"rf h2c"`, the RF path, and for a page its
     /// index, the step failed on; printed between the step and the error.
     pub rf: Option<RfAt>,
+    /// RF 0x18 through both windows, when the failure came after it was read
+    /// (any calibration or scan step): as [`Running::rf18`], printed on
+    /// lines of its own ([`BringUpError::rf18_lines`]), not on this one.
+    pub rf18: Option<Rf18>,
 }
 
 /// What a retried bring-up step ran into before the error it reports.
@@ -315,7 +353,14 @@ impl BringUpError {
             error,
             earlier: Earlier::Nothing,
             rf: None,
+            rf18: None,
         }
+    }
+
+    /// The `WIFI RF18` lines of [`BringUpError::rf18`], path A then B; none
+    /// when the failure came before RF 0x18 was read.
+    pub fn rf18_lines(&self) -> impl Iterator<Item = Rf18Line> {
+        self.rf18.into_iter().flat_map(|rf18| rf18.lines())
     }
 }
 
@@ -352,15 +397,18 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
     move |error| BringUpError::new(step, error)
 }
 
-/// Bring an RTL8852CE of chip cut `cut` up to running firmware `image`, read
+/// Bring an RTL8852CE of chip cut `cut` up to running `firmware.image`, read
 /// its MAC address, initialize its MAC for `host`, have its firmware
-/// acknowledge one H2C, configure its BB and RF from `tables`, grant its RF
-/// to Wi-Fi, calibrate it and run its firmware's passive scan, then power it
-/// off again.
+/// acknowledge one H2C, configure its BB and RF from `firmware.file`'s PHY
+/// tables, grant its RF to Wi-Fi, calibrate it, set its boot channel with
+/// the file's TX power and run its firmware's passive scan, then power it
+/// off again: [`live::start`], then [`scan::run_once`], then
+/// [`live::Live::stop`] (M3 spec S3.3).
 ///
-/// First `tables` are checked ([`phy::check_tables`]); a file without the
-/// tables the radio steps apply is refused as `"phy tables"` before any I/O.
-/// Then, in Linux's order:
+/// First the file's PHY tables are found ([`elements::phy_tables`]) and
+/// checked ([`phy::check_tables`]); a file whose elements cannot be walked,
+/// or which lacks a table the radio steps apply, is refused as
+/// `"phy tables"` before any I/O. Then, in Linux's order:
 ///
 /// 1. `"power on"`: `power::power_on`, with Linux's own power-off and
 ///    single retry (`rtw89_mac_pwr_on`). When the retry fails too, the error
@@ -383,6 +431,16 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///    1216-byte map does not reach; with the logical map it gives the RFE
 ///    type, crystal cap and trims (`efuse::phy_efuse`, `"efuse"` if a map
 ///    is short).
+///    `"tx power"`: the file's TX power and REGD tables for that RFE type
+///    ([`txpwr_tables::tx_power_tables`]), as `rtw89_chip_info_setup`
+///    recognizes the firmware elements right after the efuse
+///    (`core.c:7409-7417`). A file without them fails here, before the MAC
+///    init and before any of its PHY tables reach the chip: Stela has no
+///    built-in tables to fall back on (M3 spec S1.8), and Linux takes no
+///    element once one fails (`fw.c:1604-1605`), so neither set is used
+///    without the other. The regulatory index is chosen from the efuse
+///    country, else the network's, else the world's (M3 spec S4.2;
+///    [`regd::select`]); [`bring_up`] has no network.
 ///
 /// Then, on the same power-on and download (spec S1.1), the rest of
 /// `rtw89_mac_init` and the first H2C:
@@ -417,16 +475,19 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///     order. A calibration poll that times out does not fail its step: it
 ///     is reported in [`Running::rfk`], as Linux only logs it.
 ///
-/// Then the first passive scan, [`scan::run`] (M2c spec S2), with the efuse
-/// MAC, the image's version, and as channel inputs the BB gain table
-/// [`phy::init_radio`] decoded, the efuse RX gain offsets of the logical map
-/// from step 7 ([`efuse::rx_gain`]), PHY 0's RPL bias from
-/// [`phy::calibrate`] and cut `cut`; its H2Cs go on from the sequence state
-/// the RF pages left (seq 3):
+/// Then `rtw89_leave_ips` ([`live::leave_ips`], M3 spec S2), with the efuse
+/// MAC, as channel inputs the BB gain table [`phy::init_radio`] decoded, the
+/// efuse RX gain offsets of the logical map from step 7
+/// ([`efuse::rx_gain`]), PHY 0's RPL bias from [`phy::calibrate`] and cut
+/// `cut`, and as TX power the tables and regulatory index of step 7; its
+/// H2Cs go on from the sequence state the RF pages left (seq 3). Then the
+/// TX pools, and the first passive scan ([`scan::run_once`], M2c spec S2)
+/// with the image's version:
 ///
-/// 15. `"core start"`, `"set channel"`, `"vif init"`, `"scan start"`,
-///     `"scan"`, in that order. A scan that never ends is stopped and
-///     reported in [`Running::scan`], not failed.
+/// 15. `"core start"`, `"set channel"` with `"tx power"` between its RF
+///     part and its help's exit (`core.c:584-588`), `"vif init"`,
+///     `"tx rings"`, `"scan start"`, `"scan"`, in that order. A scan that
+///     never ends is stopped and reported in [`Running::scan`], not failed.
 ///
 /// Once `"coex init"` has succeeded (on success, and on a failure of
 /// `"phy report"` or of any step of 14 or 15, a DACK or RX DCK I/O failure
@@ -468,7 +529,8 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 /// stopped reading or writing them (the deinit stops the HCI DMA but waits
 /// for nothing, as Linux does not). On a failure after the rings were
 /// programmed, they are dropped after the power-off and stay quarantined the
-/// same way.
+/// same way. The TX pools are dropped after the power-off: no TXBD ever
+/// named them, so the chip never had their addresses.
 ///
 /// # Safety
 /// The contracts of `Rings::install`, `pci::pre_init`, `Ch12::submit` and
@@ -483,63 +545,137 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
     source: &dyn PageSource,
     domain: Arc<dyn DmaDomain>,
     cut: u8,
-    image: &AxImage<'_>,
+    firmware: FirmwareFile<'_>,
     host: Host,
-    tables: &PhyTables<'_>,
 ) -> Result<(Running, Rings), BringUpError> {
-    phy::check_tables(tables).map_err(at("phy tables"))?;
+    // SAFETY: the caller's contract is `start`'s, word for word, for the
+    // same window borrowed.
+    let mut live = match unsafe { live::start(&mut *io, source, domain, cut, firmware, host, None) }
+    {
+        Ok(live) => live,
+        // `start` powered the chip off; the rings it hands back drop here.
+        Err(StartError { error, .. }) => return Err(error),
+    };
+    // SAFETY: as above; `start` returned the live chip on this window.
+    let scanned = unsafe { scan::run_once(&mut live) };
+    let mut running = *live.running();
+    // SAFETY: as above.
+    let (_, rings, pools) = unsafe { live.stop() };
+    drop(pools);
+    match scanned {
+        Ok(report) => {
+            running.scan = Some(report);
+            Ok((running, rings))
+        }
+        // The rings drop after the power-off.
+        Err(error) => Err(BringUpError {
+            rf18: running.rf18,
+            ..BringUpError::new(error.step, error.error)
+        }),
+    }
+}
+
+/// What the bring-up through `rtw89_phy_dm_init` leaves for the live chip:
+/// M2b2's report (no scan), the H2C sequence state, the inputs of every
+/// channel switch, and the TX power tables with their regulatory index and
+/// the alpha2 it came from.
+pub(super) struct Calibrated {
+    pub running: Running,
+    pub h2c: H2c,
+    pub gain: BbGain,
+    pub rx_gain: RxGain,
+    pub offset_base: i8,
+    pub tables: TxPowerTables,
+    pub regds: (Regds, [u8; 2]),
+}
+
+/// [`bring_up`]'s steps before `rtw89_leave_ips` (its "phy tables" check
+/// and steps 1-14), with the teardown each failure needs: the chip is
+/// powered off on every error, and the rings, once installed, come back
+/// with it for the caller to keep.
+///
+/// # Safety
+/// [`bring_up`]'s contract.
+#[expect(
+    clippy::result_large_err,
+    reason = "A failure hands the rings back by value: they are never freed, as nothing proves the DMA stopped."
+)]
+pub(super) unsafe fn power_up<I: AxIo + ?Sized>(
+    io: &mut I,
+    source: &dyn PageSource,
+    domain: Arc<dyn DmaDomain>,
+    cut: u8,
+    firmware: FirmwareFile<'_>,
+    host: Host,
+    network_country: Option<[u8; 2]>,
+) -> Result<(Calibrated, Rings), (BringUpError, Option<Rings>)> {
+    let tables = elements::phy_tables(firmware.file, 0).map_err(|_| {
+        let unreadable = AxError::FirmwareFile("firmware elements are unreadable");
+        (BringUpError::new("phy tables", unreadable), None)
+    })?;
+    phy::check_tables(&tables).map_err(|error| (BringUpError::new("phy tables", error), None))?;
     if let Err(error) = power::power_on(io) {
         power_down(io);
-        return Err(BringUpError {
+        let failed = BringUpError {
             step: "power on",
             error: error.retry,
             earlier: Earlier::first_of(POWER_ON_TRIES, error.first, error.retry),
             rf: None,
-        });
+            rf18: None,
+        };
+        return Err((failed, None));
     }
     // SAFETY: the caller's `Rings::install` contract, forwarded unchanged.
     let mut rings = match unsafe { prepare(io, source, domain) } {
         Ok(rings) => rings,
         Err(error) => {
             power_down(io);
-            return Err(error);
+            return Err((error, None));
         }
     };
     // SAFETY: the caller's `pci::pre_init`, `Ch12::submit` and `Rxq::poll`
     // contracts; `rings` were installed on `domain` for the requester behind
     // `io`.
-    let result = match unsafe { start(io, cut, &mut rings, image, host) } {
-        Ok(started) => {
-            // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts;
-            // `start` programmed `rings` through this `io` with
-            // `pci::pre_init`, and nothing since re-programmed or stopped
-            // them.
-            let (acked, coex_up) = unsafe { acknowledge(io, &mut rings, started, host, tables) };
-            // rtw89_core_stop (core.c:6738, 6760): with the coex set up,
-            // rtw89_btc_ntfy_radio_state(WL_OFF) and rtw89_btc_ntfy_poweroff
-            // hand the antenna to BT and clear the driver's scoreboard bits
-            // before the HCI is touched. Linux ignores every result there,
-            // and so does this.
-            if coex_up {
-                let _ = coex::radio_off(io);
-            }
-            // rtw89_core_stop (core.c:6765-6767): rtw89_hci_deinit between
-            // rtw89_hci_stop (interrupts and NAPI, neither ported) and
-            // rtw89_mac_pwr_off. Linux ignores its result, and so does this.
-            let _ = pci::deinit(io, &rings, host.ltr);
-            acked
-        }
+    let started = match unsafe { init_mac(io, cut, &mut rings, firmware, host, network_country) } {
+        Ok(started) => started,
         Err(error) => {
             // From "mac pre-init" on the HCI DMA is enabled
             // (rtw89_mac_dmac_func_pre_en_ax): stop it before the power-off.
             // Stela's own; its result is ignored like the power-off's.
             let _ = pci::stop_dma(io);
-            Err(error)
+            power_down(io);
+            return Err((error, Some(rings)));
         }
     };
+    // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts;
+    // `init_mac` programmed `rings` through this `io` with `pci::pre_init`,
+    // and nothing since re-programmed or stopped them.
+    match unsafe { acknowledge(io, &mut rings, started, host, &tables) } {
+        (Ok(calibrated), _) => Ok((calibrated, rings)),
+        (Err(error), coex_up) => {
+            // As `shut_down`, the coex half only once the coex init ran.
+            if coex_up {
+                let _ = coex::radio_off(io);
+            }
+            let _ = pci::deinit(io, &rings, host.ltr);
+            power_down(io);
+            Err((error, Some(rings)))
+        }
+    }
+}
+
+/// `rtw89_core_stop` (`core.c:6727-6767`) of a chip whose coex init and
+/// PCIe post-init ran: with the coex set up, `rtw89_btc_ntfy_radio_state
+/// (WL_OFF)` and `rtw89_btc_ntfy_poweroff` (`core.c:6738, 6760`) hand the
+/// antenna to BT and clear the driver's scoreboard bits before the HCI is
+/// touched ([`coex::radio_off`]); then `rtw89_hci_deinit` between
+/// `rtw89_hci_stop` (interrupts and NAPI, neither ported) and
+/// `rtw89_mac_pwr_off` (`core.c:6765-6767`, [`pci::deinit`]); then the
+/// power-off. Linux ignores every result there, and so does this.
+pub(super) fn shut_down<I: AxIo + ?Sized>(io: &mut I, rings: &Rings, host: Host) {
+    let _ = coex::radio_off(io);
+    let _ = pci::deinit(io, rings, host.ltr);
     power_down(io);
-    // On a failure `rings` drop here, after the power-off.
-    Ok((result?, rings))
 }
 
 /// `rtw89_mac_pwr_off` (`mac.c:1603`): `rtw89_mac_power_switch(false)`,
@@ -608,7 +744,7 @@ unsafe fn prepare<I: AxIo + ?Sized>(
     unsafe { Rings::install(source, domain) }.map_err(at("dma rings"))
 }
 
-/// What [`start`] leaves for [`acknowledge`].
+/// What [`init_mac`] leaves for [`acknowledge`].
 struct Started {
     cut: u8,
     firmware: (u8, u8, u8, u8),
@@ -621,23 +757,30 @@ struct Started {
     efuse: PhyEfuse,
     /// The efuse RX gain offsets of the logical map (spec S5).
     rx_gain: RxGain,
+    /// The file's TX power tables for the efuse RFE type.
+    tables: TxPowerTables,
+    /// Their regulatory index, and the alpha2 it was found by.
+    regds: (Regds, [u8; 2]),
 }
 
 /// `rtw89_chip_efuse_info_setup` (`core.c:7274`) through the phycap map:
 /// `rtw89_mac_partial_init` (`mac.c:4307`), then the efuse map, then the
-/// phycap window; then the rest of `rtw89_mac_init` (`mac.c:4360`) through
-/// the PCIe post-init.
+/// phycap window; then `rtw89_fw_recognize_elements`' TX power tables for
+/// the efuse RFE type (`core.c:7413`) and the regulatory index; then the
+/// rest of `rtw89_mac_init` (`mac.c:4360`) through the PCIe post-init.
 ///
 /// # Safety
 /// The `pci::pre_init`, `Ch12::submit` and `Rxq::poll` contracts for `io`
 /// and `rings`.
-unsafe fn start<I: AxIo + ?Sized>(
+unsafe fn init_mac<I: AxIo + ?Sized>(
     io: &mut I,
     cut: u8,
     rings: &mut Rings,
-    image: &AxImage<'_>,
+    firmware: FirmwareFile<'_>,
     host: Host,
+    network_country: Option<[u8; 2]>,
 ) -> Result<Started, BringUpError> {
+    let image = firmware.image;
     // rtw89_mac_ctrl_hci_dma_trx and rtw89_mac_dmac_pre_init, then the
     // HCI's mac_pre_init. rtw89_mac_fwdl_preconfig is NULL for AX
     // (mac.c:7516).
@@ -663,6 +806,18 @@ unsafe fn start<I: AxIo + ?Sized>(
     // RFE type and crystal cap come from the logical map.
     let window = efuse::phycap(io).map_err(at("phycap"))?;
     let phy_efuse = efuse::phy_efuse(&logical, &window).map_err(at("efuse"))?;
+    // rtw89_fw_recognize_elements (core.c:7413), which rtw89_chip_info_setup
+    // runs right after the efuse because the TX power elements are chosen
+    // by its RFE type (fw.c:1175-1221); AX chips have aid 0. Then the
+    // regulatory index: the efuse country first (rtw8852c.c:641-642,
+    // regd.c:738-768), else the network's, else the world's.
+    let tables = txpwr_tables::tx_power_tables(firmware.file, 0, phy_efuse.rfe_type)
+        .map_err(at("tx power"))?;
+    let regds = regd::select(
+        tables.regd_map(),
+        efuse::country_code(&logical),
+        network_country,
+    );
 
     // rtw89_mac_init (mac.c:4360) after rtw89_mac_partial_init:
     // rtw89_chip_enable_bb_rf, sys_init_ax, trx_init_ax, then the HCI's
@@ -683,22 +838,23 @@ unsafe fn start<I: AxIo + ?Sized>(
         // rtw8852c_efuse_parsing_gain_offset (rtw8852c.c:575-622), which
         // rtw8852c_read_efuse runs on the same logical map.
         rx_gain: efuse::rx_gain(&logical),
+        tables,
+        regds,
     })
 }
 
 /// `rtw89_fw_h2c_set_ofld_cfg` (`mac.c:4394`), the last step of
 /// `rtw89_mac_init`, with Stela's own wait for its acknowledgement; then
 /// the radio steps of `rtw89_core_start` through the coex init
-/// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence,
-/// `rtw89_phy_dm_init` (`core.c:6697`, [`phy::calibrate`]), and the first
-/// passive scan ([`scan::run`]) on the same H2C sequence still. Also
-/// returns whether the coex init completed, which the teardown must undo
+/// (`core.c:6687-6695`, [`phy::init_radio`]) on the same H2C sequence and
+/// `rtw89_phy_dm_init` (`core.c:6697`, [`phy::calibrate`]). Also returns
+/// whether the coex init completed, which the teardown must undo
 /// ([`coex::radio_off`]): on success, and on any failure from the coex
-/// init's report on, every scan step's included.
+/// init's report on.
 ///
 /// # Safety
 /// The `Ch12::submit` and `Rxq::poll` contracts for `io` and `rings`, which
-/// [`start`] programmed through this `io` with a `pci::pre_init` that
+/// [`init_mac`] programmed through this `io` with a `pci::pre_init` that
 /// succeeded.
 unsafe fn acknowledge<I: AxIo + ?Sized>(
     io: &mut I,
@@ -706,7 +862,7 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
     started: Started,
     host: Host,
     tables: &PhyTables<'_>,
-) -> (Result<Running, BringUpError>, bool) {
+) -> (Result<Calibrated, BringUpError>, bool) {
     let mut h2c = started.h2c;
     // SAFETY: the caller's `Ch12::submit` and `Rxq::poll` contracts.
     let ack = match unsafe { command::ofld_cfg(io, rings, &mut h2c) } {
@@ -737,32 +893,17 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         Ok(rf18) => rf18,
         Err(error) => return (Err(BringUpError::new("phy report", error)), true),
     };
-    // rtw89_phy_dm_init (core.c:6697).
+    // rtw89_phy_dm_init (core.c:6697). A failure after the reads keeps
+    // them: a failed run is the one most likely to need them.
     let (rfk, offset_base) = match phy::calibrate(io, tables, &started.efuse, started.cut) {
         Ok(done) => done,
-        Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
-    };
-    // rtw89_ops_hw_scan from idle (mac80211.c:1279-1320; spec S2). The BB
-    // gain table is memory only on AX (bb.rs); it, the efuse RX gain
-    // offsets, PHY 0's RPL bias (`efuse_gain.offset_base[RTW89_PHY_0]`, which
-    // bb_sethw set) and the cut are `__rtw89_set_channel`'s.
-    let inputs = ScanInputs {
-        mac: started.mac,
-        firmware: started.firmware,
-        channel: ChannelInputs {
-            gain: &gain,
-            rx_gain: &started.rx_gain,
-            offset_base: offset_base[0],
-            cut: started.cut,
-        },
-    };
-    // SAFETY: the caller's contract is `scan::run`'s: `start` programmed
-    // `rings` through this `io` with a `pci::pre_init` that succeeded, its
-    // contract still holds, and the OFLD_CFG wait and the radio steps polled
-    // and submitted on the same rings since.
-    let scan = match unsafe { scan::run(io, rings, &mut h2c, &inputs) } {
-        Ok(report) => report,
-        Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
+        Err(error) => {
+            let failed = BringUpError {
+                rf18: Some(rf18),
+                ..BringUpError::new(error.step, error.error)
+            };
+            return (Err(failed), true);
+        }
     };
     let running = Running {
         cut: started.cut,
@@ -776,9 +917,21 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         phy: Some(phy),
         rfk: Some(rfk),
         rf18: Some(rf18),
-        scan: Some(scan),
+        scan: None,
     };
-    (Ok(running), true)
+    // The BB gain table is memory only on AX (bb.rs); it, the efuse RX gain
+    // offsets, PHY 0's RPL bias (`efuse_gain.offset_base[RTW89_PHY_0]`, which
+    // bb_sethw set) and the cut are every `__rtw89_set_channel`'s.
+    let calibrated = Calibrated {
+        running,
+        h2c,
+        gain,
+        rx_gain: started.rx_gain,
+        offset_base: offset_base[0],
+        tables: started.tables,
+        regds: started.regds,
+    };
+    (Ok(calibrated), true)
 }
 
 /// `rtw89_fw_download(RTW89_FW_NORMAL)` (`fw.c:2043`): up to five attempts
@@ -815,6 +968,7 @@ unsafe fn download<I: AxIo + ?Sized>(
                         first: (attempt > 2 && first != last).then_some(first),
                     },
                     rf: None,
+                    rf18: None,
                 });
             }
         }
@@ -830,8 +984,9 @@ unsafe fn download<I: AxIo + ?Sized>(
         error: last,
         earlier: Earlier::first_of(FWDL_TRIES, first, last),
         rf: None,
+        rf18: None,
     })
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

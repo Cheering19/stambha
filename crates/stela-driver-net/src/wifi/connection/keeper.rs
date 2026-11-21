@@ -489,6 +489,11 @@ impl<R: Radio> Keeper<R> {
         }
     }
 
+    /// Stop keeping the connection and hand the radio back, as it stands.
+    pub fn into_radio(self) -> R {
+        self.link
+    }
+
     /// The radio, for device models.
     #[cfg(test)]
     pub(crate) fn radio(&self) -> &R {
@@ -1495,6 +1500,9 @@ impl<R: Radio> Link for Keeper<R> {
         self.poll();
         self.link.carrier()
     }
+    fn carrier_wait_us(&self) -> u64 {
+        self.link.carrier_wait_us()
+    }
     fn signals(&self) -> bool {
         self.link.signals()
     }
@@ -1510,6 +1518,9 @@ impl<R: Radio> Link for Keeper<R> {
             return Err(LinkError::Adapter(failure));
         }
         self.link.receive()
+    }
+    fn diagnostic(&mut self) -> Option<String> {
+        self.link.diagnostic()
     }
 }
 

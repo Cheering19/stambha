@@ -2,40 +2,60 @@
 // Copyright(c) 2019-2020  Realtek Corporation
 // Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2020-2022  Realtek Corporation
-//! An RTL8852C's RX dispatcher for the scan: each RXQ buffer goes where
+//! An RTL8852C's RX dispatcher: each RXQ buffer goes where
 //! `rtw89_core_rx` (`core.c:4527-4559`) sends it. A C2H is parsed and
 //! handed on (`rtw89_core_rx_process_report`, `core.c:4087-4103`), and a
 //! SCANOFLD_RSP with reason ENTER_CH or ENTER_OP first moves the channel
 //! tag as `rtw89_mac_c2h_scanofld_rsp` does with `rtw89_chan_create` and
-//! `rtw89_assign_entity_chan` (`mac.c:5369-5383`, `chan.c:199-215`). A
+//! `rtw89_assign_entity_chan` (`mac.c:5369-5383`, `chan.c:199-215`); a
+//! channel switch moves it the same way through [`Receiver::set_tag`]. A
 //! PPDU status is parsed by [`ppdu::parse`] and pairs the frames waiting
 //! for it as `rtw89_core_rx_pending_skb` does (`core.c:4036-4057`), with
 //! `rtw8852c_query_ppdu` and `rtw8852c_fill_freq_with_ppdu`
 //! (`rtw8852c.c:2963-2996`) for the RSSI and the IE01 channel, and
 //! `rtw89_correct_cck_chan` (`core.c:3187-3201`). A WIFI frame flushes the
 //! queue when its PPDU count changes (`rtw89_core_flush_ppdu_rx_queue`,
-//! `core.c:4477-4491`), is tagged with the scan channel as
-//! `rtw89_core_update_rx_status` does during an offloaded scan
-//! (`core.c:4363-4397`), and waits for its status only when its descriptor
-//! is long and typed MGNT or DATA (`PPDU_FILTER_BITMAP`, `phy.h:147`). A
-//! frame delivered without a matched status has no signal, as mac80211
-//! gets `RX_FLAG_NO_SIGNAL_VAL` (`core.c:3816-3820`). Spec S10.2 and
-//! S11.4-S11.7.
+//! `core.c:4477-4491`), is tagged with the scan channel during an
+//! offloaded scan and with the tuned channel otherwise, and carries the
+//! security status, as `rtw89_core_update_rx_status` does
+//! (`core.c:4363-4401`). A frame that may wait for its status waits only
+//! when its descriptor is long and typed MGNT or DATA
+//! (`PPDU_FILTER_BITMAP`, `phy.h:147`). A frame delivered without a matched
+//! status has no signal, as mac80211 gets `RX_FLAG_NO_SIGNAL_VAL`
+//! (`core.c:3816-3820`). M2c spec S10.2 and S11.4-S11.7; M3 spec S7.
 //!
-//! Stela keeps only beacons and probe responses (FC type 0, subtype 8 or
-//! 5) and counts every other WIFI frame as dropped (spec S1.10); Linux
-//! matches and flushes each queued frame on its own, so the restriction
-//! changes no kept frame's outcome. Unlike Linux's unbounded `rx_queue`,
-//! at most [`MAX_PENDING`] frames wait; past that a frame is delivered at
-//! once without a signal, ahead of the older frames still waiting, so
-//! delivery is then out of arrival order. Each delivered frame loses its
-//! 4-byte FCS (`RX_INCLUDES_FCS`, `core.c:7497`). Rate conversion,
-//! radiotap, station statistics, the PN check and the MCC channel fix are
-//! not ported: none applies to an unassociated scan. Device input is bounds-checked: a
-//! malformed buffer is an error, a short frame or C2H is counted, and the
-//! queue never grows past its bound. This module reads no register and
-//! grants no DMA, no channel switch and no frame parsing past the frame
-//! control byte.
+//! What is kept depends on the [`Mode`]:
+//!
+//! - [`Mode::Scan`] (M2c spec S1.10): only beacons and probe responses (FC
+//!   type 0, subtype 8 or 5); every other WIFI frame is counted as dropped,
+//!   and a frame failing its FCS or ICV is delivered flagged.
+//! - [`Mode::Station`] (M3 spec S7.1): every WIFI frame, once. A frame
+//!   failing its FCS or ICV (`RX_FLAG_FAILED_FCS_CRC`) is dropped and
+//!   counted, as mac80211 drops it, and so are, as its `should_drop_frame`
+//!   drops them, one under 16 bytes without the FCS and a control frame
+//!   other than PS-Poll and BlockAckReq; one shorter than its
+//!   `ieee80211_hdrlen` and the FCS is dropped as mac80211 drops it short.
+//!   Beacons and probe responses still wait for their status; every other
+//!   frame is delivered at once without a signal. Linux queues data frames
+//!   for their status too (`core.c:4554-4558`), but no Stela station
+//!   decision reads a data frame's signal.
+//!
+//! Linux matches and flushes each queued frame on its own, so neither
+//! restriction changes a kept frame's outcome, only its order relative to
+//! the frames delivered at once. Unlike Linux's unbounded `rx_queue`, at
+//! most [`MAX_PENDING`] frames wait; past that a frame is delivered at once
+//! without a signal, ahead of the older frames still waiting, so delivery
+//! is then out of arrival order. Each delivered frame loses its 4-byte FCS
+//! (`RX_INCLUDES_FCS`, `core.c:7497`) and keeps everything else: a frame
+//! the hardware decrypted keeps its CCMP header and MIC, as no
+//! `RX_FLAG_*_STRIPPED` flag is set. Rate conversion, radiotap, station
+//! statistics, the PN check (`rtw89_core_skb_pn_valid`, `core.c:3943-4007`,
+//! left to the station's replay check), `rtw89_core_rx_pkt_hdl` (an AP's
+//! power save) and the MCC channel fix are not ported. Device input is
+//! bounds-checked: a malformed buffer is an error, a short frame or C2H is
+//! counted, and the queue never grows past its bound. This module reads no
+//! register and grants no DMA, no channel switch, no decryption and no
+//! frame parsing past the frame control field.
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -46,6 +66,7 @@ use super::ppdu::{self, MAX_PPDU_CNT, PhyPpdu, RateKey};
 use super::rx::{
     self, FRAME_DATA, FRAME_MGNT, RX_TYPE_C2H, RX_TYPE_PPDU_STAT, RX_TYPE_WIFI, RxBuffer, RxDesc,
 };
+use crate::wifi::frame::header_len;
 
 /// The most frames that wait for their PPDU status.
 pub const MAX_PENDING: usize = 64;
@@ -59,6 +80,14 @@ const FCS_LEN: usize = 4;
 const FC0_TYPE_SUBTYPE: u8 = 0xFC;
 const FC0_BEACON: u8 = 0x80;
 const FC0_PROBE_RESP: u8 = 0x50;
+/// Type [3:2] 1 is control; PS-Poll and BlockAckReq are its subtypes 0xA
+/// and 8 (`ieee80211_is_pspoll`, `ieee80211_is_back_req`).
+const FC0_TYPE: u8 = 0x0C;
+const FC0_TYPE_CTL: u8 = 0x04;
+const FC0_PSPOLL: u8 = 0xA4;
+const FC0_BACK_REQ: u8 = 0x84;
+/// The shortest frame mac80211 keeps (`should_drop_frame`'s 16).
+const MIN_FRAME_LEN: usize = 16;
 /// `RTW89_HW_RATE_OFDM6` (`core.h:349`): legacy indices below it are CCK.
 const HW_RATE_OFDM6: u8 = 4;
 
@@ -70,12 +99,24 @@ pub struct Tag {
     pub channel: u8,
 }
 
-/// A received beacon or probe response. `mpdu` has no FCS. `signal` is
-/// `None` when no PPDU status matched (`RX_FLAG_NO_SIGNAL_VAL`); `chains`
-/// are paths A and B, `Some` exactly when a status matched. The rate
-/// fields are the descriptor's raw `RX_DATARATE`, `RX_GI_LTF` and `BW`;
-/// `free_run` is `FREERUN_CNT`. `fcs_error` is `CRC32_ERR || ICV_ERR`
-/// (`RX_FLAG_FAILED_FCS_CRC`, `core.c:4396-4397`).
+/// Which WIFI frames a [`Receiver`] keeps (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Beacons and probe responses only, M2c's scan receiver.
+    Scan,
+    /// Every frame an associating or associated station receives.
+    Station,
+}
+
+/// A received frame. `mpdu` has no FCS. `signal` is `None` when no PPDU
+/// status matched (`RX_FLAG_NO_SIGNAL_VAL`); `chains` are paths A and B,
+/// `Some` exactly when a status matched. The rate fields are the
+/// descriptor's raw `RX_DATARATE`, `RX_GI_LTF` and `BW`; `free_run` is
+/// `FREERUN_CNT`. `fcs_error` is `CRC32_ERR || ICV_ERR`
+/// (`RX_FLAG_FAILED_FCS_CRC`, `core.c:4396-4397`); `decrypted` is
+/// `HW_DEC && !(SW_DEC || ICV_ERR)` (`RX_FLAG_DECRYPTED`, `core.c:4399-4401`)
+/// and `icv_error` is `ICV_ERR`. In [`Mode::Station`] a delivered frame
+/// never has `fcs_error` or `icv_error`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub mpdu: Vec<u8>,
@@ -83,6 +124,8 @@ pub struct Received {
     pub signal: Option<i8>,
     pub chains: [Option<i8>; 2],
     pub fcs_error: bool,
+    pub decrypted: bool,
+    pub icv_error: bool,
     pub data_rate: u16,
     pub gi_ltf: u8,
     pub bw: u8,
@@ -98,20 +141,26 @@ pub enum Event<'a> {
 }
 
 /// What was dropped or seen, all saturating. `segments`: multi-buffer
-/// frames, not assembled. `other_frames`: WIFI frames that are not beacons
-/// or probe responses. `short_frames`: beacons and probe responses shorter
-/// than a header and an FCS (or WIFI payloads without a frame-control
-/// byte). `ppdu`: PPDU statuses processed (`curr` ≤ 8), including those
-/// that found the queue empty. `ppdu_ignored`: PPDU statuses that came
-/// before any WIFI frame (`curr` above `RTW89_MAX_PPDU_CNT`). `overflow`: frames delivered without a signal
-/// because the queue was full; such a frame goes out ahead of the older
-/// frames still waiting. `c2h_skipped`: C2Hs too short to parse.
+/// frames, not assembled. `other_frames`: in [`Mode::Scan`], WIFI frames
+/// that are not beacons or probe responses; in [`Mode::Station`], control
+/// frames other than PS-Poll and BlockAckReq. `short_frames`: WIFI payloads
+/// without a frame-control field, and frames shorter than their header
+/// and an FCS (in [`Mode::Scan`], beacons and probe responses under 24
+/// bytes and the FCS; in [`Mode::Station`], any frame under 16 bytes or its
+/// `ieee80211_hdrlen`, and the FCS). `dropped_fcs`: in [`Mode::Station`],
+/// WIFI frames failing their FCS or ICV. `ppdu`: PPDU statuses processed
+/// (`curr` ≤ 8), including those that found the queue empty.
+/// `ppdu_ignored`: PPDU statuses that came before any WIFI frame (`curr`
+/// above `RTW89_MAX_PPDU_CNT`). `overflow`: frames delivered without a
+/// signal because the queue was full; such a frame goes out ahead of the
+/// older frames still waiting. `c2h_skipped`: C2Hs too short to parse.
 /// Other packet types are dropped uncounted, as Linux drops them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RxCounts {
     pub segments: u16,
     pub other_frames: u16,
     pub short_frames: u16,
+    pub dropped_fcs: u16,
     pub ppdu: u16,
     pub ppdu_ignored: u16,
     pub overflow: u16,
@@ -123,11 +172,13 @@ struct Pending {
     key: RateKey,
 }
 
-/// The dispatcher's state: the current and previous channel tag (Linux's
-/// channel context and its `rtw89_chan_rcd`), `curr_rx_ppdu_cnt` for PHY 0
-/// and the frames waiting for their status, oldest first.
+/// The dispatcher's state: what it keeps, the current and previous channel
+/// tag (Linux's channel context and its `rtw89_chan_rcd`),
+/// `curr_rx_ppdu_cnt` for PHY 0 and the frames waiting for their status,
+/// oldest first.
 pub struct Receiver {
     pub counts: RxCounts,
+    mode: Mode,
     cur: Tag,
     prev: Tag,
     curr_ppdu: u8,
@@ -166,16 +217,34 @@ fn query_ppdu(phy: &PhyPpdu, frame: &mut Received) {
 }
 
 impl Receiver {
-    /// A receiver tagging frames with `tag` (spec S6's channel) until the
-    /// first ENTER_CH, with no PPDU seen yet.
+    /// A [`Mode::Scan`] receiver tagging frames with `tag` (spec S6's
+    /// channel) until the first ENTER_CH, with no PPDU seen yet.
     pub fn new(tag: Tag) -> Self {
         Self {
             counts: RxCounts::default(),
+            mode: Mode::Scan,
             cur: tag,
             prev: tag,
             curr_ppdu: NO_PPDU,
             pending: VecDeque::with_capacity(MAX_PENDING),
         }
+    }
+
+    /// Keep the frames `mode` keeps from the next buffer on. The frames
+    /// already waiting, the tag and the counts are untouched.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    /// Tag the next WIFI frames with `tag`, the channel the radio was tuned
+    /// to, as `rtw89_assign_entity_chan` (`chan.c:199-215`) records a
+    /// channel switch: the current tag becomes the previous one (the CCK
+    /// correction's) and `tag` the current. A scan's ENTER_CH still moves
+    /// the tag, so the caller sets it again once the scan's channel is left.
+    /// Frames already waiting keep the tag they arrived with.
+    pub fn set_tag(&mut self, tag: Tag) {
+        self.prev = self.cur;
+        self.cur = tag;
     }
 
     /// The channel the next WIFI frame is tagged with.
@@ -187,6 +256,12 @@ impl Receiver {
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Which frames are kept (tests only).
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Route one RXQ buffer (spec S11.4). A buffer `rx::parse` refuses is
@@ -247,18 +322,49 @@ impl Receiver {
             self.flush(sink);
             self.curr_ppdu = desc.ppdu_cnt;
         }
+        let fcs_error = desc.crc32_err || desc.icv_err;
+        // mac80211's `should_drop_frame` drops `RX_FLAG_FAILED_FCS_CRC`
+        // before it reads the frame.
+        if self.mode == Mode::Station && fcs_error {
+            bump(&mut self.counts.dropped_fcs);
+            return;
+        }
         let Some(&fc0) = payload.first() else {
             bump(&mut self.counts.short_frames);
             return;
         };
-        if !matches!(fc0 & FC0_TYPE_SUBTYPE, FC0_BEACON | FC0_PROBE_RESP) {
-            bump(&mut self.counts.other_frames);
-            return;
-        }
+        let scanned = matches!(fc0 & FC0_TYPE_SUBTYPE, FC0_BEACON | FC0_PROBE_RESP);
+        let header = match self.mode {
+            Mode::Scan if !scanned => {
+                bump(&mut self.counts.other_frames);
+                return;
+            }
+            Mode::Scan => HDR_LEN,
+            // mac80211's `should_drop_frame`, after the FCS: under 16 bytes,
+            // or a control frame other than PS-Poll and BlockAckReq.
+            Mode::Station if payload.len() < MIN_FRAME_LEN + FCS_LEN => {
+                bump(&mut self.counts.short_frames);
+                return;
+            }
+            Mode::Station
+                if fc0 & FC0_TYPE == FC0_TYPE_CTL
+                    && !matches!(fc0 & FC0_TYPE_SUBTYPE, FC0_PSPOLL | FC0_BACK_REQ) =>
+            {
+                bump(&mut self.counts.other_frames);
+                return;
+            }
+            Mode::Station => match payload.get(..2) {
+                Some(&[fc0, fc1]) => header_len(u16::from_le_bytes([fc0, fc1])),
+                _ => {
+                    bump(&mut self.counts.short_frames);
+                    return;
+                }
+            },
+        };
         let Some(len) = payload
             .len()
             .checked_sub(FCS_LEN)
-            .filter(|&len| len >= HDR_LEN)
+            .filter(|&len| len >= header)
         else {
             bump(&mut self.counts.short_frames);
             return;
@@ -268,13 +374,16 @@ impl Receiver {
             tag: self.cur,
             signal: None,
             chains: [None; 2],
-            fcs_error: desc.crc32_err || desc.icv_err,
+            fcs_error,
+            decrypted: desc.hw_dec && !(desc.sw_dec || desc.icv_err),
+            icv_error: desc.icv_err,
             data_rate: desc.data_rate,
             gi_ltf: desc.gi_ltf,
             bw: desc.bw,
             free_run: desc.free_run,
         };
-        if !(desc.long && matches!(desc.frame_type, Some(FRAME_MGNT | FRAME_DATA))) {
+        // Only a beacon or a probe response waits for its status.
+        if !(scanned && desc.long && matches!(desc.frame_type, Some(FRAME_MGNT | FRAME_DATA))) {
             sink(Event::Frame(frame));
             return;
         }

@@ -7,7 +7,10 @@
 //!
 //! 1. `rtw89_mac_port_update` (`mac.c:5104-5135`) with its `port_cfg_*`
 //!    helpers (`mac.c:4557-4975`), port 0 on MAC 0 so no port or band offset
-//!    applies ([`port_update`]).
+//!    applies ([`port_update`], [`PortConfig::NO_LINK`]). The association
+//!    runs it again for the infrastructure BSS joined
+//!    ([`PortConfig::infra`], M3 spec S10.7, from
+//!    [`super::assoc::associate`]).
 //! 2. `rtw89_mac_dmac_tbl_init` and `rtw89_mac_cmac_tbl_init`
 //!    (`mac.c:4403-4435`) by indirect access ([`tbl_init`]). Both return
 //!    early under secure boot; the bring-up refuses secure-boot firmware
@@ -30,10 +33,12 @@
 //!
 //! This module grants no register access beyond port 0's registers of spec
 //! S7.1, 0x0C04, 0x40000-0x4001C and the CMAC check's read of 0xC000; no
-//! H2C beyond these five; no wait beyond `func_sw`'s 1 ms and the 20 µs
-//! before the beacon early time; no AP, mesh or associated-station path
-//! (beacon drop, TSF sync, BSSID match), and no frame delivery: frames
-//! drained during it are dropped.
+//! H2C beyond these five; no wait beyond `func_sw`'s `beacon_int + 1` ms
+//! and the 20 µs before the beacon early time; no AP, ad hoc or mesh path
+//! (beacon drop, beacon TX, the high queue window), and no frame delivery:
+//! frames drained during it are dropped. The associated station's port
+//! (INFRA: TSF sync and BSSID match on) is [`port_update`]'s only other
+//! branch.
 use super::cmac;
 use super::command::Session;
 use super::io::{AxError, AxIo, clear32, field16, field32, set8, set32};
@@ -113,16 +118,52 @@ const TBTT_AGG_DEF: u16 = 1;
 /// `BCN_ERLY_SET_DLY` (`10 * 2`), in µs as `fsleep` takes it.
 const BCN_ERLY_SET_DLY_US: u64 = 10 * 2;
 
-/// The fresh vif's `bss_conf`: `beacon_int`, `dtim_period`, `he_bss_color`
-/// and, not being nontransmitted, `bssid_index` are all 0 (spec S16.7).
-const BEACON_INT: u32 = 0;
-const DTIM_PERIOD: u16 = 0;
+/// The vif's `bss_conf` `he_bss_color` and, not being nontransmitted,
+/// `bssid_index`: 0 for a fresh vif (spec S16.7), and for an HT or legacy
+/// BSS (M3 spec S1.7) that is no nontransmitted BSSID profile, the only
+/// BSSes a station joins here.
 const BSS_COLOR: u32 = 0;
 const BSSID_INDEX: u32 = 0;
-/// `RTW89_NET_TYPE_NO_LINK` (`core.h:250`).
-const NET_TYPE_NO_LINK: u32 = 0;
+/// `RTW89_NET_TYPE_NO_LINK` and `RTW89_NET_TYPE_INFRA` (`core.h:250-255`).
+pub const NET_TYPE_NO_LINK: u8 = 0;
+pub const NET_TYPE_INFRA: u8 = 2;
 /// `RTW89_ROLE_CREATE`, the first `enum rtw89_upd_mode` (`core.h:272-273`).
 const RTW89_ROLE_CREATE: u8 = 0;
+
+/// What `rtw89_mac_port_update` reads of the vif: its `net_type` and its
+/// `bss_conf` `beacon_int` and `dtim_period`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortConfig {
+    /// `RTW89_NET_TYPE_*`: [`NET_TYPE_NO_LINK`] or [`NET_TYPE_INFRA`] (the
+    /// AD_HOC and AP branches are not ported).
+    pub net_type: u8,
+    /// `bss_conf->beacon_int`, in TU.
+    pub beacon_int: u16,
+    /// `bss_conf->dtim_period`.
+    pub dtim: u8,
+}
+
+impl PortConfig {
+    /// The fresh, unassociated station vif of M2c (spec S7.1): NO_LINK,
+    /// `beacon_int` and `dtim_period` 0.
+    pub const NO_LINK: Self = Self {
+        net_type: NET_TYPE_NO_LINK,
+        beacon_int: 0,
+        dtim: 0,
+    };
+
+    /// An associated station (M3 spec S10.7): INFRA with the BSS's beacon
+    /// interval and DTIM period, as mac80211 set them before
+    /// BSS_CHANGED_ASSOC (`mlme.c:7038-7042`; `dtim_period` is at least 1
+    /// there).
+    pub const fn infra(beacon_int: u16, dtim: u8) -> Self {
+        Self {
+            net_type: NET_TYPE_INFRA,
+            beacon_int,
+            dtim,
+        }
+    }
+}
 
 /// `R_AX_FILTER_MODEL_ADDR` (`reg.h:357`) selects the table word that
 /// `R_AX_INDIR_ACCESS_ENTRY` (`mac.h:302`) then reaches.
@@ -140,25 +181,39 @@ const CMAC_TBL_DEFAULT: [u32; 8] = [0x4, 0x400A_0004, 0, 0, 0, 0x0E43_000B, 0, 0
 /// vif: nothing unless the port function is on; then, after
 /// `msleep(beacon_int + 1)`, the port function and BRK_SETUP off, the TSF
 /// reset and the beacon counter timer cleared.
-fn cfg_func_sw<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+fn cfg_func_sw<I: AxIo + ?Sized>(io: &mut I, beacon_int: u16) -> Result<(), AxError> {
     if io.read32(R_AX_PORT_CFG_P0)? & B_AX_PORT_FUNC_EN == 0 {
         return Ok(());
     }
-    io.delay_us(u64::from(BEACON_INT + 1) * 1000);
+    io.delay_us((u64::from(beacon_int) + 1) * 1000);
     clear32(io, R_AX_PORT_CFG_P0, B_AX_PORT_FUNC_EN | B_AX_BRK_SETUP)?;
     set32(io, R_AX_PORT_CFG_P0, B_AX_TSFTR_RST)?;
     io.write32(R_AX_BCN_CNT_TMR_P0, 0)
 }
 
-/// `rtw89_mac_port_update` for port 0 of a NO_LINK station (spec S7.1), in
-/// Linux's order:
+/// `rtw89_mac_port_cfg_*`'s `rtw89_write32_port_set` or `_clr` of `bits` in
+/// 0xC400, as `on` asks.
+fn port_cfg_bits<I: AxIo + ?Sized>(io: &mut I, bits: u32, on: bool) -> Result<(), AxError> {
+    if on {
+        set32(io, R_AX_PORT_CFG_P0, bits)
+    } else {
+        clear32(io, R_AX_PORT_CFG_P0, bits)
+    }
+}
+
+/// `rtw89_mac_port_update` for port 0 of a station vif as `port` describes
+/// it, NO_LINK (spec S7.1) or INFRA (M3 spec S10.7), in Linux's order:
 ///
-/// - `cfg_func_sw`; then, with every net-type test false for NO_LINK,
-///   `cfg_tx_rpt(false)`, `cfg_rx_rpt(false)`, `cfg_net_type` (0),
-///   `cfg_bcn_prct`, `cfg_rx_sw`, `cfg_rx_sync_by_nettype` and
-///   `cfg_tx_sw_by_nettype`, each clearing its 0xC400 bits.
-/// - `cfg_bcn_intv` (`BCN_INTERVAL` 100, `beacon_int` being 0),
-///   `cfg_hiq_win` (0, not AP), `cfg_hiq_dtim`, `cfg_hiq_drop`.
+/// - `cfg_func_sw`, sleeping `beacon_int + 1` ms when the port function is
+///   on; `cfg_tx_rpt(false)` and `cfg_rx_rpt(false)`; `cfg_net_type`; then
+///   the net-type tests: `cfg_bcn_prct` sets TBTT_PROHIB_EN and BRK_SETUP for
+///   any linked type, `cfg_rx_sw` RX_BSSID_FIT_EN and
+///   `cfg_rx_sync_by_nettype` TSF_UDT_EN for INFRA, and
+///   `cfg_tx_sw_by_nettype` clears BCNTX_EN (no AP or ad hoc), each clearing
+///   its 0xC400 bits otherwise.
+/// - `cfg_bcn_intv` (the beacon interval, `BCN_INTERVAL` 100 for 0),
+///   `cfg_hiq_win` (0, not AP), `cfg_hiq_dtim` (the DTIM period),
+///   `cfg_hiq_drop`.
 /// - The beacon setup and hold times, the mask area, the TBTT early time
 ///   and aggregation, the BSS color, `cfg_mbssid` (port 0, not AP).
 /// - The port function on; `tsf_resync_all` does nothing without an AP vif
@@ -166,25 +221,45 @@ fn cfg_func_sw<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 ///   BSSID index.
 ///
 /// Every masked write is the `rtw89_write*_mask`, `_set` or `_clr`
-/// read-modify-write at Linux's width.
-pub fn port_update<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    cfg_func_sw(io)?;
+/// read-modify-write at Linux's width. Any other net type is refused with
+/// `Mac` before any access: AD_HOC and AP mode are not ported.
+pub fn port_update<I: AxIo + ?Sized>(io: &mut I, port: &PortConfig) -> Result<(), AxError> {
+    let infra = match port.net_type {
+        NET_TYPE_NO_LINK => false,
+        NET_TYPE_INFRA => true,
+        _ => {
+            return Err(AxError::Mac(
+                "port update for a net type other than NO_LINK or INFRA",
+            ));
+        }
+    };
+    cfg_func_sw(io, port.beacon_int)?;
     clear32(io, R_AX_PORT_CFG_P0, B_AX_TXBCN_RPT_EN)?;
     clear32(io, R_AX_PORT_CFG_P0, B_AX_RXBCN_RPT_EN)?;
-    field32(io, R_AX_PORT_CFG_P0, B_AX_NET_TYPE_MASK, NET_TYPE_NO_LINK)?;
-    clear32(io, R_AX_PORT_CFG_P0, B_AX_TBTT_PROHIB_EN | B_AX_BRK_SETUP)?;
-    clear32(io, R_AX_PORT_CFG_P0, B_AX_RX_BSSID_FIT_EN)?;
-    clear32(io, R_AX_PORT_CFG_P0, B_AX_TSF_UDT_EN)?;
+    field32(
+        io,
+        R_AX_PORT_CFG_P0,
+        B_AX_NET_TYPE_MASK,
+        u32::from(port.net_type),
+    )?;
+    port_cfg_bits(io, B_AX_TBTT_PROHIB_EN | B_AX_BRK_SETUP, infra)?;
+    port_cfg_bits(io, B_AX_RX_BSSID_FIT_EN, infra)?;
+    port_cfg_bits(io, B_AX_TSF_UDT_EN, infra)?;
     clear32(io, R_AX_PORT_CFG_P0, B_AX_BCNTX_EN)?;
-    let bcn_int = if BEACON_INT != 0 {
-        BEACON_INT
+    let bcn_int = if port.beacon_int != 0 {
+        u32::from(port.beacon_int)
     } else {
         BCN_INTERVAL
     };
     field32(io, R_AX_BCN_SPACE_CFG_P0, B_AX_BCN_SPACE_MASK, bcn_int)?;
     io.write8(R_AX_P0MB_HGQ_WINDOW_CFG_0, 0)?;
     set8(io, R_AX_MD_TSFT_STMP_CTL, B_AX_UPD_HGQMD | B_AX_UPD_TIMIE)?;
-    field16(io, R_AX_DTIM_CTRL_P0, B_AX_DTIM_NUM_MASK, DTIM_PERIOD)?;
+    field16(
+        io,
+        R_AX_DTIM_CTRL_P0,
+        B_AX_DTIM_NUM_MASK,
+        u16::from(port.dtim),
+    )?;
     // `cfg_hiq_drop`: port 0's PORT_DROP bit and bit 0, one read and one
     // plain write.
     let drop = io.read32(R_AX_MBSSID_DROP_0)?;
@@ -255,7 +330,7 @@ pub unsafe fn init<I: AxIo + ?Sized>(
     session: &mut Session<'_>,
     mac: [u8; 6],
 ) -> Result<(), AxError> {
-    port_update(io)?;
+    port_update(io, &PortConfig::NO_LINK)?;
     tbl_init(io, MAC_ID)?;
     // `rtw89_mac_set_macid_pause`: the H2C only if CMAC 0 is on
     // (`mac.c:4450-4452`).

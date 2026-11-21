@@ -108,6 +108,12 @@ pub enum AxError {
     /// The firmware scan offload could not be built, started or finished;
     /// the message says why.
     Scan(&'static str),
+    /// The firmware file's TX power or regulatory elements are missing or
+    /// unusable; the message says which.
+    TxPower(&'static str),
+    /// A TX queue, its WD pages or RPQ refused a frame or a report; the
+    /// message says why.
+    Tx(&'static str),
 }
 
 impl fmt::Display for AxError {
@@ -165,6 +171,8 @@ impl fmt::Display for AxError {
                  {ret:#04x})"
             ),
             Self::Scan(what) => write!(f, "scan: {what}"),
+            Self::TxPower(what) => write!(f, "tx power: {what}"),
+            Self::Tx(what) => write!(f, "tx: {what}"),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),
@@ -194,6 +202,35 @@ pub trait AxIo {
     fn delay_us(&mut self, us: u64);
     /// Monotonic microseconds from the same clock `delay_us` waits on.
     fn now_us(&mut self) -> Result<u64, AxError>;
+}
+
+/// A borrowed window is the window: every access goes to `T` unchanged, so
+/// an owner of `I` (the live chip) can run on a caller's `&mut I` too.
+impl<T: AxIo + ?Sized> AxIo for &mut T {
+    fn read8(&mut self, reg: u32) -> Result<u8, AxError> {
+        (**self).read8(reg)
+    }
+    fn read16(&mut self, reg: u32) -> Result<u16, AxError> {
+        (**self).read16(reg)
+    }
+    fn read32(&mut self, reg: u32) -> Result<u32, AxError> {
+        (**self).read32(reg)
+    }
+    fn write8(&mut self, reg: u32, v: u8) -> Result<(), AxError> {
+        (**self).write8(reg, v)
+    }
+    fn write16(&mut self, reg: u32, v: u16) -> Result<(), AxError> {
+        (**self).write16(reg, v)
+    }
+    fn write32(&mut self, reg: u32, v: u32) -> Result<(), AxError> {
+        (**self).write32(reg, v)
+    }
+    fn delay_us(&mut self, us: u64) {
+        (**self).delay_us(us)
+    }
+    fn now_us(&mut self) -> Result<u64, AxError> {
+        (**self).now_us()
+    }
 }
 
 macro_rules! masked {

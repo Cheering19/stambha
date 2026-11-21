@@ -1,14 +1,29 @@
 extern crate std;
 use super::*;
 use crate::wifi::realtek::ax::bb::BbGain;
+use crate::wifi::realtek::ax::bringup::FirmwareFile;
+use crate::wifi::realtek::ax::bringup::tests::{
+    BOTH, NO_LTR, chip_hearing, efuse_with_mac, never, same_access, tables_file, trace_sha256,
+    txpwr_window,
+};
+use crate::wifi::realtek::ax::chan::Chan;
+use crate::wifi::realtek::ax::channel::{ChannelInputs, TxPower};
 use crate::wifi::realtek::ax::efuse::RxGain;
+use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
+use crate::wifi::realtek::ax::h2c::H2c;
+use crate::wifi::realtek::ax::live::{self, BOOT_CHANNEL, Live, StartError, leave_ips};
 use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read, running};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings, TX_ENTRIES};
+use crate::wifi::realtek::ax::receive::{Mode, Tag};
+use crate::wifi::realtek::ax::regd::{Regd, Regds};
 use crate::wifi::realtek::ax::tests::firmware::{
     Firmware, frame_with_status, mgnt_frame, ppdu_status, rx_buffer, scanofld,
 };
 use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
-use crate::wifi::realtek::beacon::tests::Model;
+use crate::wifi::realtek::ax::txpwr::set_txpwr;
+use crate::wifi::realtek::ax::txpwr_tables::TxPowerTables;
+use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
+use crate::wifi::realtek::firmware::{Ce, Rtw89};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -45,8 +60,17 @@ fn chip() -> (Arc<Mutex<Model>>, Rings, RegisterModel) {
     (m, rings, io)
 }
 
-/// `run` from M2b's H2C sequence (3) with firmware version `firmware`, the
-/// test MAC, a default BB gain table and no valid efuse RX gain offsets.
+/// The world regd on both bands.
+const WW: Regds = Regds {
+    g2: Regd::Ww,
+    g5: Regd::Ww,
+};
+
+/// M2c's `run` from M2b's H2C sequence (3) with firmware version
+/// `firmware`, the test MAC, a default BB gain table, no valid efuse RX gain
+/// offsets and zeroed TX power tables at the world regd: on one session,
+/// the live chip's [`leave_ips`] steps on 2.4 GHz channel 1, then the
+/// passive scan.
 fn scan_on(
     rings: &mut Rings,
     io: &mut RegisterModel,
@@ -57,21 +81,31 @@ fn scan_on(
         valid: false,
         offset: [[-1; 13]; 2],
     };
+    let channel = ChannelInputs {
+        gain: &gain,
+        rx_gain: &rx,
+        offset_base: 0,
+        cut: 1,
+    };
+    let tables = TxPowerTables::default();
+    let power = TxPower {
+        tables: &tables,
+        regds: WW,
+    };
     let inputs = ScanInputs {
         mac: TEST_MAC,
         firmware,
-        channel: ChannelInputs {
-            gain: &gain,
-            rx_gain: &rx,
-            offset_base: 0,
-            cut: 1,
-        },
     };
+    let boot = Chan::new20(BOOT_CHANNEL.band, BOOT_CHANNEL.channel).unwrap();
     let mut h2c = H2c::at(3);
+    let mut session = Session::new(rings, &mut h2c, BOOT_CHANNEL);
     // SAFETY: `io` is the modeled requester that `running` programmed with
     // these rings through `pre_init`; the model domain lets no real device
     // reach the published IOVAs, and this test is the only worker.
-    let got = unsafe { run(io, rings, &mut h2c, &inputs) };
+    let got = unsafe { leave_ips(io, &mut session, TEST_MAC, &boot, &channel, power) }
+        // SAFETY: as above.
+        .and_then(|()| unsafe { passive(io, &mut session, &inputs) });
+    drop(session);
     (got, h2c)
 }
 
@@ -166,13 +200,71 @@ fn network(bssid: [u8; 6], band: HwBand, channel: u8, signal: Option<i8>, ssid: 
     }
 }
 
+/// What a live chip started on `bringup::tests::chip_hearing` with BOTH acks
+/// and `script` scanned with [`run_once`], with the receiver's mode and tag
+/// once `then` ran on it, and the trace once stopped.
+struct Ran {
+    got: Result<ScanReport, ScanError>,
+    h2c: H2c,
+    mode: Mode,
+    tag: Tag,
+    io: RegisterModel,
+}
+
+fn run_once_hearing(script: &dyn Fn(&mut Firmware)) -> Ran {
+    run_once_then(script, &|_| {})
+}
+
+fn run_once_then(script: &dyn Fn(&mut Firmware), then: &dyn Fn(&mut Live<RegisterModel>)) -> Ran {
+    let c = chip_hearing(efuse_with_mac(), 7, never, BOTH, script);
+    let bytes = image_bytes();
+    let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
+    let file = tables_file();
+    let firmware = FirmwareFile {
+        image: &fw.image,
+        file: &file,
+    };
+    // SAFETY: the model domain isolates only the modeled requester behind
+    // this test's `RegisterModel`; its pages are plain kept test RAM that no
+    // real device can reach, and this test is the only worker.
+    let started = unsafe {
+        live::start(
+            c.io,
+            &Source,
+            Arc::new(Domain(c.m.clone())),
+            2,
+            firmware,
+            NO_LTR,
+            None,
+        )
+    };
+    let mut live: Live<RegisterModel> = match started {
+        Ok(live) => live,
+        Err(StartError { error, .. }) => panic!("{error}"),
+    };
+    // SAFETY: as above; the live chip is this test's alone.
+    let got = unsafe { run_once(&mut live) };
+    then(&mut live);
+    let (h2c, mode, tag) = (live.h2c(), live.receiver().mode(), live.receiver().tag());
+    // SAFETY: as above.
+    let (io, _rings, _pools) = unsafe { live.stop() };
+    Ran {
+        got,
+        h2c,
+        mode,
+        tag,
+        io,
+    }
+}
+
 #[test]
 fn scan_runs_linux_order_and_reports() {
-    let s = scan(|fw| {
+    // M2c's scan through the live chip: start, run_once, stop.
+    let s = run_once_hearing(&|fw| {
         fw.beacon(CH6, HOME, b"Home", 0x70);
         fw.beacon(CH36, OFFICE, b"Office", 0x50);
     });
-    let r = s.report();
+    let r = s.got.unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!((r.channels, r.entered, r.end), (38, 38, ScanEnd::Ok));
     assert_eq!((r.frames, r.without_rssi, r.dropped), (2, 0, 0));
     assert_eq!((r.rxq_full, r.refused, r.networks_total), (0, None, 2));
@@ -202,17 +294,126 @@ fn scan_runs_linux_order_and_reports() {
     // Seq 3 to 19: core start, vif init, then the CAM, ADD_SCANOFLD_CH and
     // SCANOFLD of the scan start; no stop.
     assert_eq!(s.h2c, H2c::at(20));
-    // Linux order: core start, then set channel (RF 0x18 on both paths),
-    // then vif init (port 0), then the scan start.
+    // Linux order after the calibration (dm tail's cfg_txrx_path): core
+    // start, then set channel (RF 0x18 on both paths), then vif init (port
+    // 0), then the scan start.
     let t = &s.io.trace;
-    let k = kicks(t);
+    let dm_tail = t.iter().position(|o| *o == Op::W32(0x14978, 3)).unwrap();
+    let k: Vec<usize> = kicks(t).into_iter().filter(|&i| i > dm_tail).collect();
     assert_eq!(k.len(), 17);
-    let ppdu = first_after(t, 0, |o| *o == Op::W32(0xCE40, 0x2B));
-    let rf = first_after(t, 0, |o| matches!(o, Op::RfW(_, 0x18, ..)));
-    let port = first_after(t, 0, |o| *o == Op::R32(0xC400));
+    let ppdu = first_after(t, dm_tail, |o| *o == Op::W32(0xCE40, 0x2B));
+    let rf = first_after(t, dm_tail, |o| matches!(o, Op::RfW(_, 0x18, ..)));
+    let port = first_after(t, dm_tail, |o| *o == Op::R32(0xC400));
     assert!(ppdu < k[0] && k[8] < rf && rf < port && port < k[9]);
     assert_eq!(s.io.get_rf(0, 0x18), 0x01C01);
     assert_eq!(s.io.get_rf(1, 0x18), 0x01C01);
+}
+
+/// The trace of M2c's `scan_runs_linux_order_and_reports` at `b4b9ab57e`
+/// (its `run` from core start on this module's [`chip`]), as the SHA-256 of
+/// one `{op:?}` line per access.
+const M2C_SCAN_TRACE: &str = "caaf79f2cce9186e63ad11e992ba6aaeeed01d9577f8f418d1daa9ca794938fd";
+
+#[test]
+fn the_scan_steps_are_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
+    let s = scan(|fw| {
+        fw.beacon(CH6, HOME, b"Home", 0x70);
+        fw.beacon(CH36, OFFICE, b"Office", 0x50);
+    });
+    s.report();
+    let t = &s.io.trace;
+    let mut alone = RegisterModel::new();
+    let ch1 = Chan::new20(HwBand::G2, 1).unwrap();
+    set_txpwr(&mut alone, &TxPowerTables::default(), WW, &ch1).unwrap();
+    let window = txpwr_window(t, 0);
+    assert_eq!(window.len(), 119);
+    assert!(same_access(&alone.trace, &t[window.clone()]));
+    assert_eq!(
+        t[window.end..window.end + 2],
+        [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
+    );
+    assert_eq!(
+        trace_sha256(t[..window.start].iter().chain(&t[window.end..])),
+        M2C_SCAN_TRACE
+    );
+}
+
+/// A data frame on channel 6 during the scan: M2c's scan receiver counts it
+/// among its other frames, where a station receiver would deliver it and
+/// the scanner refuse it as dropped.
+fn home_and_data(fw: &mut Firmware) {
+    fw.beacon(CH6, HOME, b"Home", 0x70);
+    fw.buffers(
+        CH6,
+        vec![mgnt_frame(0x08, BROADCAST, HOME, b"data", None, 9)],
+    );
+}
+
+#[test]
+fn run_once_scans_with_the_scan_receiver_and_leaves_the_restore_to_end_scan() {
+    let s = run_once_hearing(&home_and_data);
+    let r = s.got.unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((r.frames, r.dropped, r.networks_total), (1, 0, 1));
+    // run_once runs none of rtw89_hw_scan_complete's restores: the scan's RX
+    // filter is still on, so the scan's receiver stays, tagging with the
+    // channel the firmware left the radio on, the last ENTER_CH (5 GHz
+    // 165).
+    assert_eq!(s.mode, Mode::Scan);
+    assert_eq!(
+        s.tag,
+        Tag {
+            band: HwBand::G5,
+            channel: 165
+        }
+    );
+}
+
+#[test]
+fn end_scan_after_run_once_restores_the_operating_channel_and_the_station_receiver() {
+    let s = run_once_then(&home_and_data, &|live| {
+        assert_eq!(live.scan_state(), Some(ScanEnd::Ok));
+        assert_eq!(live.io().get32(0xCE20), 0x0317_4438);
+        // SAFETY: the live chip is this test's alone, as in
+        // `run_once_then`.
+        unsafe { live.end_scan() }.unwrap();
+        assert_eq!(live.scan_state(), None);
+        // The station's RX filter again.
+        assert_eq!(live.io().get32(0xCE20), 0x0317_44BE);
+    });
+    s.got.unwrap_or_else(|e| panic!("{e:?}"));
+    // The address CAM of the restore took seq 20.
+    assert_eq!(s.h2c, H2c::at(21));
+    assert_eq!(s.mode, Mode::Station);
+    assert_eq!(s.tag, BOOT_CHANNEL);
+}
+
+#[test]
+fn scan_list_and_budget_follow_m2cs_rules() {
+    // Spec S8.1: 2 * n * 105 ms + 1 s; M2c's 38 channels give its 8 980 ms,
+    // the keeper's largest list (14 + 28) 9 820 ms.
+    assert_eq!(scan_budget_us(SCAN_CHANNELS.len()), SCAN_WAIT_US);
+    assert_eq!(SCAN_WAIT_US, 8_980_000);
+    assert_eq!(scan_budget_us(3), 1_630_000);
+    assert_eq!(scan_budget_us(42), 9_820_000);
+    // Each channel passive, as M2c's list has it.
+    let list = scan_list(&[(HwBand::G2, 1), (HwBand::G5, 36), (HwBand::G5, 165)]).unwrap();
+    assert_eq!(
+        list,
+        [SCAN_CHANNELS[0], SCAN_CHANNELS[13], SCAN_CHANNELS[37]]
+    );
+    let all: Vec<(HwBand, u8)> = SCAN_CHANNELS.iter().map(|c| (c.band, c.channel)).collect();
+    assert_eq!(scan_list(&all).unwrap(), SCAN_CHANNELS);
+    // Nothing to scan, and channels no 20 MHz switch here could tune.
+    assert_eq!(scan_list(&[]), Err(AxError::Scan("empty scan list")));
+    for bad in [(HwBand::G6, 37), (HwBand::G2, 15), (HwBand::G5, 32)] {
+        assert_eq!(
+            scan_list(&[(HwBand::G2, 1), bad]),
+            Err(AxError::Scan(
+                "scan channel not a 20 MHz 2.4 or 5 GHz channel"
+            )),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]

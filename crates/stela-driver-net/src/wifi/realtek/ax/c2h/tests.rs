@@ -144,3 +144,72 @@ fn short_scanofld_rsp_is_none() {
     o[1] = 0x0A;
     assert!(matches!(parse(&o), Some(C2h::Other { .. })));
 }
+
+/// A BCNFLTR_RPT (cat 1, class 1, func 0xD) carrying `w2`, 12 bytes.
+fn bcnfltr(w2: u32) -> Vec<u8> {
+    c2h(0x0000_0D05, w2)
+}
+
+#[test]
+fn bcnfltr_rpt_decodes_w2() {
+    assert_eq!(
+        parse(&bcnfltr(0x0028_0000)),
+        Some(C2h::BeaconFilter(BcnFltr {
+            macid: 0,
+            kind: 0,
+            event: 0,
+            ma: 0x28
+        }))
+    );
+    assert_eq!(BCNFLTR_BEACON_LOSS, 0);
+    // MACID [7:0], TYPE [9:8], EVENT [11:10], MA [23:16] (fw.h:4011-4014).
+    assert_eq!(
+        parse(&bcnfltr(0x0050_0605)),
+        Some(C2h::BeaconFilter(BcnFltr {
+            macid: 5,
+            kind: 2,
+            event: 1,
+            ma: 0x50
+        }))
+    );
+    assert_eq!(
+        parse(&bcnfltr(0xFFFF_FFFF)),
+        Some(C2h::BeaconFilter(BcnFltr {
+            macid: 0xFF,
+            kind: 3,
+            event: 3,
+            ma: 0xFF
+        }))
+    );
+    // Bits outside the fields change nothing.
+    assert_eq!(
+        parse(&bcnfltr(0xFF00_F000)),
+        Some(C2h::BeaconFilter(BcnFltr {
+            macid: 0,
+            kind: 0,
+            event: 0,
+            ma: 0
+        }))
+    );
+}
+
+#[test]
+fn short_bcnfltr_rpt_is_none_and_other_categories_stay_other() {
+    let v = bcnfltr(0x0028_0000);
+    for n in 0..12 {
+        assert_eq!(parse(&v[..n]), None, "{n} bytes");
+    }
+    // A longer report reads only w2.
+    let mut long = v.clone();
+    long.extend_from_slice(&[0xFF; 8]);
+    assert_eq!(parse(&long), parse(&v));
+    // cat 2 (not MAC) with class 1 func 0xD is not a beacon filter report.
+    assert_eq!(
+        parse(&c2h(0x0000_0D06, 0x0028_0000)),
+        Some(C2h::Other {
+            cat: 2,
+            class: 1,
+            func: 0xD
+        })
+    );
+}

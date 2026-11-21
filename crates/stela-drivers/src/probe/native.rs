@@ -28,10 +28,8 @@ use crate::{
             realtek::{
                 self as realtek_wifi,
                 ax::{
-                    AxError, AxIo, BringUpError, Host, NativeAxIo, Rings, Running, bring_up,
-                    elements::{PhyTables, phy_tables},
-                    phy::check_tables,
-                    quiesce,
+                    AxError, AxIo, BringUpError, FirmwareFile, Host, NativeAxIo, Rings, Running,
+                    bring_up, elements::phy_tables, phy::check_tables, quiesce,
                 },
             },
         },
@@ -1011,7 +1009,9 @@ impl Rtw89Device for Rtw89Native {
 /// 2. [`quiesce`] the chip through BAR2, powering off a MAC left on;
 /// 3. acknowledge its quiescence and bind its own domain;
 /// 4. set Bus Master;
-/// 5. [`bring_up`] on that domain, with the file's PHY tables.
+/// 5. [`bring_up`] on that domain, with the file, whose PHY and TX power
+///    tables it reads again (a file without TX power tables fails there, at
+///    `"tx power"`, after the efuse its RFE type comes from).
 ///
 /// Returns the report, the rings DMA ran on, and whether the MAC was on;
 /// a failure is returned with whether the MAC was on as well, since a MAC
@@ -1057,8 +1057,9 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     })?;
     check_tables(&tables).map_err(|error| fail("phy tables", error))?;
     let was_on = quiesce(device.io()).map_err(|error| fail("quiesce", error))?;
+    let file = staged.image.bytes();
     // SAFETY: this function's contract, with the chip just quiesced.
-    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, &tables, pages) } {
+    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, file, pages) } {
         Ok((running, rings)) => Ok((running, rings, was_on)),
         Err(error) => Err((error, was_on)),
     }
@@ -1077,7 +1078,7 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     device: &mut D,
     cut: u8,
     image: &realtek_wifi::firmware::AxImage<'_>,
-    tables: &PhyTables<'_>,
+    file: &[u8],
     pages: &dyn PageSource,
 ) -> Result<(Running, Rings), Error> {
     // SAFETY: `device.finalize()` acknowledges the quiescence
@@ -1114,6 +1115,7 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     device.master()?;
     // The DEVCTL2 LTR_EN read while the function was prepared.
     let host = device.host();
+    let firmware = FirmwareFile { image, file };
     // SAFETY: `bring_up`'s contract:
     // - `device.io()` is the exclusive register window of exactly the
     //   requester whose own domain `finalize` just bound: the receipt
@@ -1125,11 +1127,10 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     //   Bus Master, memory decode and INTx Disable).
     // - One worker: the probe drives this function alone, with no
     //   interrupt handler, reset or other engine reaching it.
-    // `host` and `tables` are no part of that contract: one decides whether
-    // the chip's own LTR registers are programmed, the other what the BB
-    // and RF registers are set to.
-    unsafe { bring_up(device.io(), pages, domain, cut, image, host, tables) }
-        .map_err(Error::Rtw89Wifi)
+    // `host` and `firmware` are no part of that contract: one decides
+    // whether the chip's own LTR registers are programmed, the other what
+    // is downloaded and what the BB, RF and TX power registers are set to.
+    unsafe { bring_up(device.io(), pages, domain, cut, firmware, host) }.map_err(Error::Rtw89Wifi)
 }
 
 /// The RTL8852C profile of `observed`, and its firmware staged from
@@ -2372,7 +2373,23 @@ mod tests {
     /// PHY table the bring-up requires: BB, BB gain, radio B in slot 0, radio
     /// A in slot 1 and NCTL.
     fn empty_image() -> crate::firmware::Catalog {
-        catalog(container(&[(2, 0), (3, 0), (5, 0), (4, 1), (8, 0)]))
+        // Then an empty table for each TX power and REGD element the
+        // bring-up reads after the efuse (by rate, the 2.4 and 5 GHz limits
+        // and RU limits, the TX shape, REGD): rfe 0, no entries.
+        catalog(container(&[
+            (2, 0),
+            (3, 0),
+            (5, 0),
+            (4, 1),
+            (8, 0),
+            (9, 0),
+            (10, 0),
+            (11, 0),
+            (13, 0),
+            (14, 0),
+            (16, 0),
+            (20, 0),
+        ]))
     }
 
     /// An MFW container (fw.c:668-691) whose one entry, cut 0 and type

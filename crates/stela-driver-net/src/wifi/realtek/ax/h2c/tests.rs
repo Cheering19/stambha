@@ -476,3 +476,226 @@ fn m2c_class_and_func_constants_are_linuxs() {
         (9, 8, 0x16, 0x17)
     );
 }
+
+/// The plan's test addresses: the local MAC and the AP's BSSID.
+const LOCAL: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+const AP: [u8; 6] = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+
+/// The payload words of a CH12 packet, after its descriptor and its 8-byte
+/// H2C header.
+fn payload_words(p: &[u8]) -> Vec<u32> {
+    let b = body(p).1;
+    (0..(b.len() - 8) / 4).map(|i| word(&b[8..], i)).collect()
+}
+
+#[test]
+fn addr_cam_pre_auth_and_connected_match_spec() {
+    use crate::wifi::realtek::ax::assoc::{AddrCam, CamKeys};
+    // sma_hash: the XOR of 02 11 22 33 44 55 is 0x13; tma_hash, the XOR of
+    // 02 03 04 05 06 07, is 0x01 (rtw89_cam_addr_hash, cam.c:803-812).
+    // Spec S9.2: the BSSID set before authentication, NO_LINK, TMA and BSSID
+    // CAM both the BSSID.
+    let (seq, p) = H2c::at(17).addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0);
+    assert_eq!(seq, 17);
+    let (len, b) = body(&p);
+    assert_eq!(len, 68);
+    assert_eq!(&b[..8], &[0x19, 0x00, 0x00, 0x11, 0x44, 0x80, 0x00, 0x00]);
+    let pre_auth = [
+        0,
+        0x0020_0000,
+        0x0113_0001,
+        0,
+        0x3322_1102,
+        0x0302_5544,
+        0x0706_0504,
+        0,
+        0,
+        0x0002_0000,
+        0,
+        0,
+        0x0008_0000,
+        0x0302_00FD,
+        0x0706_0504,
+    ];
+    assert_eq!(payload_words(&p), pre_auth);
+    // Spec S10.3: connected, NET_TYPE INFRA [2:1] and the AID in w9 [11:0].
+    let (_, p) = H2c::at(17).addr_cam_with(&AddrCam::connected(LOCAL, AP, 5), 0, 0);
+    let mut connected = pre_auth;
+    connected[2] = 0x0113_0005;
+    connected[9] = 0x0002_0005;
+    assert_eq!(payload_words(&p), connected);
+    // AID12 keeps 12 bits; the key IDs are w9 [31:18] (cam.h:81-95), and
+    // w10 and w11 the security entries (cam.h:96-103).
+    let mut cam = AddrCam::connected(LOCAL, AP, 0xF005);
+    cam.keys = CamKeys {
+        keyids: 0xFFFF_FFFF,
+        valid_and_ents: 0x0100_0005,
+        ents_hi: 0x0403_0201,
+    };
+    let w = payload_words(&H2c::at(1).addr_cam_with(&cam, 0, 0).1);
+    assert_eq!(w[9], 0xFFFC_0000 | 0x0002_0000 | 0x005);
+    assert_eq!((w[10], w[11]), (0x0100_0005, 0x0403_0201));
+    // Without INFRA no AID is carried (cam.c:901-904).
+    let mut cam = AddrCam::with_bssid(LOCAL, AP);
+    cam.aid = 5;
+    assert_eq!(
+        payload_words(&H2c::at(1).addr_cam_with(&cam, 0, 0).1)[9],
+        0x0002_0000
+    );
+    // M2c's builder is the unassociated CAM: zero BSSID, NO_LINK.
+    assert_eq!(
+        H2c::at(15).addr_cam(LOCAL, 0, 0),
+        H2c::at(15).addr_cam_with(&AddrCam::unassociated(LOCAL), 0, 0)
+    );
+}
+
+#[test]
+fn assoc_cmac_tbl_is_byte_exact() {
+    // Spec S10.1 (fw.c:3889-3976): the RTS lowest rate CCK1 (0) on 2.4 GHz,
+    // OFDM6 (4) elsewhere, in d2 [31:28].
+    for (band, d2) in [
+        (HwBand::G2, 0),
+        (HwBand::G5, 0x4000_0000),
+        (HwBand::G6, 0x4000_0000),
+    ] {
+        let (seq, p) = H2c::at(18).assoc_cmac_tbl(0, 0, band);
+        assert_eq!(seq, 18);
+        let (len, b) = body(&p);
+        assert_eq!(len, 76);
+        assert_eq!(&b[..8], &[0x15, 0x0A, 0x00, 0x12, 0x4C, 0x80, 0x00, 0x00]);
+        let want = [
+            0x80,
+            0x0600_0000,
+            d2,
+            0,
+            0,
+            0,
+            0,
+            0x0002_0000,
+            0,
+            0x0600_0000,
+            0xF000_0800,
+            0x0000_0040,
+            0,
+            0x0000_0007,
+            0x0000_2000,
+            0x0002_00FF,
+            0,
+        ];
+        assert_eq!(payload_words(&p), want, "{band:?}");
+    }
+    // MACID [6:0] and MULTI_PORT_ID d5 [2:0] (fw.h:734-737, :1024-1029).
+    let w = payload_words(&H2c::at(1).assoc_cmac_tbl(0x85, 3, HwBand::G2).1);
+    assert_eq!((w[0], w[5]), (0x05 | 0x80, 3));
+}
+
+#[test]
+fn join_info_connect_and_disconnect() {
+    // Spec S10.2 and S11.4 (fw.c:5045-5143): connect is OP 0, INFRA (2) at
+    // [25:24], STATION (1) at [29:26]; disconnect OP 1, NO_LINK.
+    let (seq, p) = H2c::at(19).join_info(0, 0, true);
+    assert_eq!(seq, 19);
+    let (len, b) = body(&p);
+    assert_eq!(len, 12);
+    assert_eq!(&b[..8], &[0x21, 0x00, 0x00, 0x13, 0x0C, 0x80, 0x00, 0x00]);
+    assert_eq!(payload_words(&p), [0x0600_0000]);
+    let (_, p) = H2c::at(1).join_info(0, 0, false);
+    assert_eq!(payload_words(&p), [0x0400_0100]);
+    // vif init's disconnect is the same H2C.
+    assert_eq!(
+        H2c::at(14).join_info(0, 0, false),
+        H2c::at(14).join_info_disconnect(0, 0)
+    );
+    assert_eq!(
+        payload_words(&H2c::at(1).join_info(5, 3, true).1),
+        [5 | 3 << 21 | 2 << 24 | 1 << 26]
+    );
+}
+
+#[test]
+fn ra_packet_is_cat2_class1_func0_without_acks() {
+    use crate::wifi::realtek::ax::assoc::RaInfo;
+    let ra = RaInfo {
+        mode: 0x6,
+        ra_mask: 0x7FFF_FFFF_FF0F_F010,
+        sgi: true,
+        ldpc: true,
+        stbc: true,
+        ss_num: 1,
+        init_rate_lv: 2,
+    };
+    // Seq 21: no REC_ACK; RA asks for no DONE_ACK (fw.c:5633-5636).
+    let (seq, p) = H2c::at(21).ra(0, &ra);
+    assert_eq!(seq, 21);
+    let (len, b) = body(&p);
+    assert_eq!(len, 24);
+    assert_eq!(&b[..8], &[0x06, 0x00, 0x00, 0x15, 0x18, 0x00, 0x00, 0x00]);
+    // w0: MODE [5:1], MACID [15:8], INIT_RATE_LV [19:18], UPD_ALL b20, SGI
+    // b21, LDPC b22, STBC b23, SS_NUM [26:24] (fw.h:427-441); w2 is
+    // RAMASK_HI32 [30:0]; w3 0 with no fixed GI-LTF and no CSI.
+    let w = payload_words(&p);
+    assert_eq!(w, [0x01F8_000C, 0xFF0F_F010, 0x7FFF_FFFF, 0]);
+    let w = payload_words(&H2c::at(1).ra(7, &ra).1);
+    assert_eq!((w[0] >> 8) & 0xFF, 7);
+}
+
+#[test]
+fn bcn_fltr_connect_and_disconnect() {
+    // Spec S10.5 (fw.c:5397-5470): MON_RSSI, MON_BCN, MON_EN; mode 0; loss
+    // count 60 as H3 3 [7:5] and L4 12 [11:8]; hysteresis 4 [15:12]; the
+    // threshold -70 + 110 = 40 [23:16]; MACID [31:24].
+    let (seq, p) = H2c::at(22).bcn_fltr(0, true, true);
+    assert_eq!(seq, 22);
+    let (len, b) = body(&p);
+    assert_eq!(len, 12);
+    assert_eq!(&b[..8], &[0x25, 0x1E, 0x00, 0x16, 0x0C, 0x80, 0x00, 0x00]);
+    assert_eq!(payload_words(&p), [0x0028_4C67]);
+    assert_eq!(
+        payload_words(&H2c::at(1).bcn_fltr(0, false, true).1),
+        [0x0028_4C60]
+    );
+    // Before BEACON_LOSS_COUNT_V1 the count is capped at 15: H3 0, L4 15.
+    assert_eq!(
+        payload_words(&H2c::at(1).bcn_fltr(0, true, false).1),
+        [0x0028_4F07]
+    );
+    assert_eq!(
+        payload_words(&H2c::at(1).bcn_fltr(0, false, false).1),
+        [0x0028_4F00]
+    );
+    assert_eq!(
+        payload_words(&H2c::at(1).bcn_fltr(9, true, true).1),
+        [0x0928_4C67]
+    );
+}
+
+#[test]
+fn edca_packet_carries_the_ac_and_the_parameter() {
+    // fw.c:5241-5276: SEL 0 [1:0], BAND 0 b3, WMM 0 b4, AC [6:5]; w1 the
+    // parameter; 12 bytes, DONE_ACK.
+    let (seq, p) = H2c::at(23).edca(0, 0x0000_A42B);
+    assert_eq!(seq, 23);
+    let (len, b) = body(&p);
+    assert_eq!(len, 20);
+    assert_eq!(&b[..8], &[0x25, 0x0F, 0x00, 0x17, 0x14, 0x80, 0x00, 0x00]);
+    assert_eq!(payload_words(&p), [0, 0x0000_A42B, 0]);
+    for ac in 0..4u8 {
+        let w = payload_words(&H2c::at(1).edca(ac, 0x002F_3222).1);
+        assert_eq!(w, [u32::from(ac) << 5, 0x002F_3222, 0]);
+    }
+}
+
+#[test]
+fn m3_association_class_and_func_constants_are_linuxs() {
+    // fw.h:4769, :4777 and :4879-4880.
+    assert_eq!((H2C_CL_MAC_FW_OFLD, H2C_FUNC_USR_EDCA), (9, 0xF));
+    assert_eq!(H2C_FUNC_CFG_BCNFLTR, 0x1E);
+    assert_eq!(
+        (
+            H2C_CAT_OUTSRC,
+            H2C_CL_OUTSRC_RA,
+            H2C_FUNC_OUTSRC_RA_MACIDCFG
+        ),
+        (2, 1, 0)
+    );
+}

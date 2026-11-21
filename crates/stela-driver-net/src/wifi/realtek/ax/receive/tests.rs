@@ -165,6 +165,7 @@ fn feed(rx: &mut Receiver, buffers: &[Vec<u8>]) -> Vec<Seen> {
                 }
                 Event::C2h(C2h::Log(_)) => Seen::C2h(C2h::Log(&[])),
                 Event::C2h(C2h::FormattedLog) => Seen::C2h(C2h::FormattedLog),
+                Event::C2h(C2h::BeaconFilter(b)) => Seen::C2h(C2h::BeaconFilter(b)),
                 Event::Frame(f) => Seen::Frame(f),
             })
         })
@@ -206,6 +207,8 @@ fn matched_beacon_gets_signal_and_chains() {
             signal: Some(-54),
             chains: [Some(-54), Some(-62)],
             fcs_error: false,
+            decrypted: false,
+            icv_error: false,
             data_rate: 4,
             gi_ltf: 0,
             bw: 0,
@@ -1001,5 +1004,446 @@ fn every_truncation_and_byte_pattern_never_panics() {
             let _ = rx.buffer(&b, &mut |_| {});
         }
         rx.flush(&mut |_| {});
+    }
+}
+
+// The station receiver (M3 spec S7).
+
+/// A receiver in [`Mode::Station`] tagging frames with `tag`.
+fn station(tag: Tag) -> Receiver {
+    let mut rx = Receiver::new(tag);
+    rx.set_mode(Mode::Station);
+    rx
+}
+
+/// A long DATA WIFI descriptor at `ppdu_cnt`, otherwise `mgnt`'s.
+fn data(ppdu_cnt: u8) -> Desc {
+    Desc {
+        frame_type: 2,
+        ..mgnt(ppdu_cnt)
+    }
+}
+
+/// `RX_DESC` dword 3: SW_DEC b1, HW_DEC b2, CRC32_ERR b9, ICV_ERR b10.
+const SW_DEC: u32 = 1 << 1;
+const HW_DEC: u32 = 1 << 2;
+const CRC32_ERR: u32 = 1 << 9;
+const ICV_ERR: u32 = 1 << 10;
+
+const G5_36: Tag = Tag {
+    band: HwBand::G5,
+    channel: 36,
+};
+
+#[test]
+fn station_mode_delivers_auth_and_data_at_once() {
+    let mut rx = station(G2_1);
+    let auth = frame(0xB0, 1);
+    let seen = feed(&mut rx, &[rx_buffer(&mgnt(1), &auth)]);
+    assert_eq!(
+        seen,
+        [Seen::Frame(Received {
+            mpdu: auth[..auth.len() - 4].to_vec(),
+            tag: G2_1,
+            signal: None,
+            chains: [None, None],
+            fcs_error: false,
+            decrypted: false,
+            icv_error: false,
+            data_rate: 4,
+            gi_ltf: 0,
+            bw: 0,
+            free_run: 0x1234_5678,
+        })]
+    );
+    let data_frame = frame(0x08, 2);
+    let seen = feed(&mut rx, &[rx_buffer(&data(1), &data_frame)]);
+    let f = frames(&seen);
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].mpdu, data_frame[..data_frame.len() - 4]);
+    assert_eq!((f[0].signal, f[0].chains), (None, [None, None]));
+    assert_eq!(rx.pending(), 0);
+    // Their status pairs nothing: each was delivered once.
+    let seen = feed(&mut rx, &[rx_buffer(&stat(1), &phy_status(0x70, 0x60, 0))]);
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.other_frames, 0);
+    // Back in scan mode they are discarded again, as M2c's receiver does.
+    rx.set_mode(Mode::Scan);
+    let seen = feed(
+        &mut rx,
+        &[rx_buffer(&mgnt(2), &auth), rx_buffer(&data(2), &data_frame)],
+    );
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.other_frames, 2);
+}
+
+#[test]
+fn station_mode_still_pairs_beacons() {
+    let mut rx = station(G2_1);
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(&mgnt(1), &beacon(1)),
+            rx_buffer(&mgnt(1), &frame(0xB0, 2)),
+            rx_buffer(&data(1), &frame(0x08, 3)),
+            rx_buffer(&mgnt(1), &frame(0x50, 4)),
+            rx_buffer(&stat(1), &phy_status(0x70, 0x60, 0)),
+        ],
+    );
+    let f = frames(&seen);
+    // The auth and data frames go at once, ahead of the beacon and the
+    // probe response waiting for their status.
+    let order: Vec<(u8, Option<i8>)> = f.iter().map(|f| (f.mpdu[0], f.signal)).collect();
+    assert_eq!(
+        order,
+        [
+            (0xB0, None),
+            (0x08, None),
+            (0x80, Some(-54)),
+            (0x50, Some(-54))
+        ]
+    );
+    assert_eq!(f[2].chains, [Some(-54), Some(-62)]);
+    assert_eq!(rx.pending(), 0);
+}
+
+#[test]
+fn station_mode_queues_only_beacons_and_probe_responses() {
+    let mut rx = station(G2_1);
+    let beacons: Vec<_> = (0..MAX_PENDING as u8)
+        .map(|i| rx_buffer(&mgnt(1), &beacon(i)))
+        .collect();
+    assert!(feed(&mut rx, &beacons).is_empty());
+    // A full queue does not hold back the frames that never wait.
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(&data(1), &frame(0x08, 1)),
+            rx_buffer(&mgnt(1), &frame(0xD0, 2)),
+        ],
+    );
+    assert_eq!(frames(&seen).len(), 2);
+    assert_eq!(rx.counts.overflow, 0);
+    assert_eq!(rx.pending(), MAX_PENDING);
+    // One more beacon overflows, as M2c's rule.
+    let seen = feed(&mut rx, &[rx_buffer(&mgnt(1), &beacon(0xEE))]);
+    assert_eq!(frames(&seen)[0].mpdu[15], 0xEE);
+    assert_eq!(rx.counts.overflow, 1);
+}
+
+#[test]
+fn fcs_error_frames_are_dropped_and_counted() {
+    let mut rx = station(G2_1);
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(&mgnt(1), &beacon(1)),
+            // PPDU 2: still flushes the waiting beacon, then is dropped.
+            rx_buffer(
+                &Desc {
+                    d3: CRC32_ERR,
+                    ..mgnt(2)
+                },
+                &beacon(2),
+            ),
+        ],
+    );
+    let f = frames(&seen);
+    assert_eq!(f.len(), 1, "{seen:?}");
+    assert_eq!((f[0].mpdu[15], f[0].signal), (1, None));
+    assert_eq!(rx.pending(), 0);
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(
+                &Desc {
+                    d3: ICV_ERR | HW_DEC,
+                    ..data(2)
+                },
+                &frame(0x08, 3),
+            ),
+            rx_buffer(
+                &Desc {
+                    d3: CRC32_ERR | ICV_ERR,
+                    long: false,
+                    ..mgnt(2)
+                },
+                &frame(0xB0, 4),
+            ),
+            // Too short for anything, but failed first.
+            rx_buffer(
+                &Desc {
+                    d3: CRC32_ERR,
+                    ..mgnt(2)
+                },
+                &[],
+            ),
+            rx_buffer(&stat(2), &phy_status(0x70, 0x60, 0)),
+        ],
+    );
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.dropped_fcs, 4);
+    assert_eq!(rx.counts.short_frames, 0);
+    assert_eq!(rx.pending(), 0);
+    // The scan keeps M2c's rule: flagged and delivered, nothing dropped.
+    let mut scan = Receiver::new(G2_1);
+    let seen = feed(
+        &mut scan,
+        &[rx_buffer(
+            &Desc {
+                d3: CRC32_ERR,
+                long: false,
+                ..mgnt(1)
+            },
+            &beacon(1),
+        )],
+    );
+    assert!(frames(&seen)[0].fcs_error);
+    assert_eq!(scan.counts.dropped_fcs, 0);
+}
+
+#[test]
+fn decrypted_needs_hw_dec_without_sw_dec_or_icv() {
+    for (d3, decrypted) in [
+        (HW_DEC, true),
+        (HW_DEC | SW_DEC, false),
+        (HW_DEC | ICV_ERR, false),
+        (0, false),
+        (SW_DEC, false),
+        (ICV_ERR, false),
+    ] {
+        let icv = d3 & ICV_ERR != 0;
+        // The scan delivers every beacon with its flags.
+        let mut rx = Receiver::new(G2_1);
+        let seen = feed(
+            &mut rx,
+            &[rx_buffer(
+                &Desc {
+                    d3,
+                    long: false,
+                    ..mgnt(1)
+                },
+                &beacon(1),
+            )],
+        );
+        let f = frames(&seen);
+        assert_eq!(
+            (f[0].decrypted, f[0].icv_error, f[0].fcs_error),
+            (decrypted, icv, icv),
+            "d3 {d3:#x}"
+        );
+        // The station: a protected data frame, an ICV failure dropped.
+        let mut protected = frame(0x08, 1);
+        protected[1] = 0x40;
+        let mut rx = station(G2_1);
+        let seen = feed(&mut rx, &[rx_buffer(&Desc { d3, ..data(1) }, &protected)]);
+        let f = frames(&seen);
+        if icv {
+            assert!(f.is_empty(), "d3 {d3:#x}");
+            assert_eq!(rx.counts.dropped_fcs, 1);
+        } else {
+            assert_eq!(
+                (f[0].decrypted, f[0].icv_error),
+                (decrypted, false),
+                "d3 {d3:#x}"
+            );
+            assert_eq!(f[0].mpdu, protected[..protected.len() - 4]);
+        }
+    }
+}
+
+#[test]
+fn station_mode_counts_frames_shorter_than_their_header() {
+    let mut rx = station(G2_1);
+    let plain = frame(0x08, 1);
+    let mut qos = frame(0x88, 1);
+    qos.splice(24..24, [0, 0]);
+    // ACK: frame control, duration, RA; then the FCS.
+    let ack = [0xD4, 0, 0, 0, 2, 0x11, 0x22, 0x33, 0x44, 0x55, 1, 2, 3, 4];
+    let short = |p: &[u8]| {
+        rx_buffer(
+            &Desc {
+                long: false,
+                ..mgnt(1)
+            },
+            p,
+        )
+    };
+    let seen = feed(
+        &mut rx,
+        &[
+            short(&[]),
+            short(&plain[..1]),
+            short(&plain[..27]),
+            short(&qos[..29]),
+            short(&ack[..13]),
+        ],
+    );
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.short_frames, 5);
+    // Exactly a header and an FCS each: delivered without the FCS. The
+    // ACK's whole 10 bytes are under mac80211's 16 (`should_drop_frame`).
+    let seen = feed(
+        &mut rx,
+        &[short(&plain[..28]), short(&qos[..30]), short(&ack)],
+    );
+    let f = frames(&seen);
+    assert_eq!(f.len(), 2, "{seen:?}");
+    assert_eq!(f[0].mpdu, plain[..24]);
+    assert_eq!(f[1].mpdu, qos[..26]);
+    assert_eq!(rx.counts.short_frames, 6);
+}
+
+/// A control frame with frame-control byte `fc0`, `len` bytes before its
+/// FCS: a 16-byte header (RA, TA), then the BAR control and starting
+/// sequence or zeros.
+fn control(fc0: u8, len: usize) -> Vec<u8> {
+    let mut b = vec![fc0, 0, 0x05, 0xC0];
+    b.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    b.extend_from_slice(&[0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    b.resize(len, 0);
+    b.extend_from_slice(&FCS);
+    b
+}
+
+#[test]
+fn station_mode_drops_control_frames_but_bar_and_ps_poll() {
+    // mac80211's should_drop_frame: under 16 bytes without the FCS, or a
+    // control frame other than PS-Poll and BlockAckReq.
+    let mut rx = station(G2_1);
+    let short = |p: &[u8]| {
+        rx_buffer(
+            &Desc {
+                long: false,
+                ..mgnt(1)
+            },
+            p,
+        )
+    };
+    let seen = feed(
+        &mut rx,
+        &[
+            // RTS, Block Ack, CTS-to-self padded to 16, a control wrapper.
+            short(&control(0xB4, 16)),
+            short(&control(0x94, 24)),
+            short(&control(0xC4, 16)),
+            short(&control(0x74, 24)),
+            // PS-Poll and BlockAckReq go on.
+            short(&control(0xA4, 16)),
+            short(&control(0x84, 20)),
+        ],
+    );
+    let kept: Vec<u8> = frames(&seen).iter().map(|f| f.mpdu[0]).collect();
+    assert_eq!(kept, [0xA4, 0x84], "{seen:?}");
+    assert_eq!(rx.counts.other_frames, 4);
+    assert_eq!(rx.counts.short_frames, 0);
+    // Under 16 bytes: a CTS (10) and an extension frame (12), counted short.
+    let mut cts = control(0xC4, 10);
+    cts.truncate(10);
+    cts.extend_from_slice(&FCS);
+    let mut extension = vec![0x0C, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    extension.extend_from_slice(&FCS);
+    let seen = feed(&mut rx, &[short(&cts), short(&extension)]);
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.short_frames, 2);
+    assert_eq!(rx.counts.other_frames, 4);
+    // A scan still counts every control frame as another frame, as M2c.
+    let mut scan = Receiver::new(G2_1);
+    assert!(feed(&mut scan, &[short(&control(0xA4, 16))]).is_empty());
+    assert_eq!(scan.counts.other_frames, 1);
+}
+
+#[test]
+fn set_tag_moves_the_tag_as_a_channel_switch() {
+    let g2_11 = Tag {
+        band: HwBand::G2,
+        channel: 11,
+    };
+    let mut rx = station(G2_1);
+    rx.set_tag(g2_11);
+    rx.set_tag(G5_36);
+    assert_eq!(rx.tag(), G5_36);
+    let seen = feed(&mut rx, &[rx_buffer(&mgnt(1), &frame(0xB0, 1))]);
+    assert_eq!(frames(&seen)[0].tag, G5_36);
+    // `rtw89_assign_entity_chan` records the channel it leaves, so a CCK
+    // beacon tagged 5 GHz takes 2.4 GHz channel 11, the last one left.
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(&Desc { rate: 0, ..mgnt(2) }, &beacon(2)),
+            rx_buffer(&Desc { rate: 0, ..stat(2) }, &phy_status(0x70, 0x60, 0)),
+        ],
+    );
+    assert_eq!(frames(&seen)[0].tag, g2_11);
+    // A scan still moves it, and a tune afterwards sets it again.
+    feed(&mut rx, &[scanofld(c2h::SCAN_ENTER_CH, 0, 6)]);
+    assert_eq!(
+        rx.tag(),
+        Tag {
+            band: HwBand::G2,
+            channel: 6
+        }
+    );
+    rx.set_tag(G5_36);
+    let seen = feed(&mut rx, &[rx_buffer(&data(3), &frame(0x08, 3))]);
+    assert_eq!(frames(&seen)[0].tag, G5_36);
+}
+
+#[test]
+fn bcnfltr_rpt_reaches_the_sink() {
+    let c2h_desc = Desc {
+        pkt_type: 10,
+        long: false,
+        ..mgnt(0)
+    };
+    let report: Vec<u8> = [1u32 | 1 << 2 | 0xD << 8, 12, 0x0028_0000]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let mut rx = station(G2_1);
+    let seen = feed(
+        &mut rx,
+        &[
+            rx_buffer(&c2h_desc, &report),
+            rx_buffer(&c2h_desc, &report[..11]),
+        ],
+    );
+    assert_eq!(
+        seen,
+        [Seen::C2h(C2h::BeaconFilter(c2h::BcnFltr {
+            macid: 0,
+            kind: c2h::BCNFLTR_BEACON_LOSS,
+            event: 0,
+            ma: 0x28
+        }))]
+    );
+    assert_eq!(rx.counts.c2h_skipped, 1);
+    assert_eq!(rx.tag(), G2_1);
+}
+
+#[test]
+fn station_mode_never_panics_on_any_truncation() {
+    let mut protected = frame(0x88, 1);
+    protected[1] = 0x40;
+    let samples = [
+        rx_buffer(&mgnt(1), &beacon(1)),
+        rx_buffer(&data(1), &protected),
+        rx_buffer(&stat(1), &phy_status(0x70, 0x60, 0x30)),
+        vec![0xFF; 300],
+    ];
+    for s in &samples {
+        for cut in 0..=s.len() {
+            for b in [&s[..cut], &s[cut..]] {
+                let mut rx = station(G2_1);
+                let _ = rx.buffer(&s[..], &mut |_| {});
+                let mut f = b.to_vec();
+                if f.len() >= 4 {
+                    let write = 0xC000 | (f.len() as u32 & 0x3FFF);
+                    f[..4].copy_from_slice(&write.to_le_bytes());
+                }
+                let _ = rx.buffer(&f, &mut |_| {});
+                assert!(rx.pending() <= MAX_PENDING);
+            }
+        }
     }
 }

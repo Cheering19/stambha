@@ -3,8 +3,20 @@
 // Copyright(c) 2019-2020  Realtek Corporation
 use super::*;
 use crate::wifi::realtek::ax::chan::Subband;
-use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
-use alloc::{vec, vec::Vec};
+use crate::wifi::realtek::ax::regd::Regd;
+use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
+use alloc::{boxed::Box, vec, vec::Vec};
+
+/// Zeroed TX power tables at the world regd.
+fn power() -> TxPower<'static> {
+    TxPower {
+        tables: Box::leak(Box::new(TxPowerTables::default())),
+        regds: Regds {
+            g2: Regd::Ww,
+            g5: Regd::Ww,
+        },
+    }
+}
 
 /// RF 0x18 as M2b's bring-up is expected to leave it (2G ch 1, 20 MHz
 /// bits clear), on both paths, behind SWSI and in the direct window.
@@ -1298,25 +1310,35 @@ fn set_channel_bb_refuses_a_channel_new20_would_not_build() {
         assert!(m.trace.is_empty());
         let mut m = model();
         assert!(matches!(
-            set_channel(&mut m, &chan, &inputs(&g, &rx, 0)),
-            Err(AxError::Phy(_))
+            set_channel(&mut m, &chan, &inputs(&g, &rx, 0), power()),
+            Err(ChannelError {
+                step: "set channel",
+                error: AxError::Phy(_)
+            })
         ));
         assert!(m.trace.is_empty());
     }
 }
 
 #[test]
-fn set_channel_runs_help_mac_bb_rf_help_in_order() {
+fn set_channel_runs_help_mac_bb_rf_txpwr_help_in_order() {
     let g = BbGain::default();
     let rx = rx_gain(true);
     let mut m = model();
     m.set32(0xC398, 0x3FFFF);
-    assert_eq!(set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0)), Ok(()));
+    assert_eq!(
+        set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0), power()),
+        Ok(())
+    );
+    // Ruling R1 (core.c:584-588): set_txpwr's by rate after the RF part,
+    // and help_exit's PPDU status report after set_txpwr.
     let order = [
         first(&m, |op| matches!(op, Op::W32(0xC398, _))),
         first(&m, |op| matches!(op, Op::W8(0xC628, _))),
         first(&m, |op| matches!(op, Op::W32(0x14A1C, _))),
         first(&m, |op| matches!(op, Op::RfW(0, 0x18, ..))),
+        first(&m, |op| matches!(op, Op::W32(0xD2C0, _))),
+        first(&m, |op| *op == Op::W32(0x176CC, 0x7E)),
         first(&m, |op| *op == Op::W32(0xCE40, 0x2B)),
     ];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
@@ -1340,6 +1362,15 @@ fn set_channel_matches_its_parts_in_order() {
     let mut rx = rx_gain(true);
     rx.offset[0][4] = -2;
     let chan = g5(153);
+    let mut tables = TxPowerTables::default();
+    tables.byr[1][0].ofdm[4] = 0x28;
+    let power = TxPower {
+        tables: &tables,
+        regds: Regds {
+            g2: Regd::Fcc,
+            g5: Regd::Etsi,
+        },
+    };
     for cut in [CAV, CBV] {
         let ins = ChannelInputs {
             cut,
@@ -1347,7 +1378,7 @@ fn set_channel_matches_its_parts_in_order() {
         };
         let mut whole = model();
         whole.set32(0xC398, 0x2_5555);
-        set_channel(&mut whole, &chan, &ins).unwrap();
+        set_channel(&mut whole, &chan, &ins, power).unwrap();
 
         let mut parts = model();
         parts.set32(0xC398, 0x2_5555);
@@ -1355,6 +1386,7 @@ fn set_channel_matches_its_parts_in_order() {
         set_channel_mac(&mut parts, &chan).unwrap();
         set_channel_bb(&mut parts, &chan, &ins).unwrap();
         set_channel_rf(&mut parts, &chan, cut).unwrap();
+        txpwr::set_txpwr(&mut parts, &tables, power.regds, &chan).unwrap();
         help_exit(&mut parts, &chan, tx_en).unwrap();
         assert_eq!(whole.trace, parts.trace, "cut {cut}");
     }
@@ -1364,10 +1396,10 @@ fn set_channel_matches_its_parts_in_order() {
         ..inputs(&g, &rx, 0)
     };
     let mut m = model();
-    set_channel(&mut m, &g2(1), &ins).unwrap();
+    set_channel(&mut m, &g2(1), &ins, power).unwrap();
     assert!(m.trace.iter().any(|op| matches!(op, Op::RfW(1, 0x05, ..))));
     let mut m = model();
-    set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0)).unwrap();
+    set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0), power).unwrap();
     assert!(!m.trace.iter().any(|op| matches!(op, Op::RfW(1, 0x05, ..))));
 }
 
@@ -1378,10 +1410,34 @@ fn set_channel_stops_at_a_failed_cmac_check() {
     let mut m = model();
     m.set32(0xC000, 0);
     assert_eq!(
-        set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0)),
-        Err(AxError::Mac("CMAC function is not enabled"))
+        set_channel(&mut m, &g2(1), &inputs(&g, &rx, 0), power()),
+        Err(ChannelError {
+            step: "set channel",
+            error: AxError::Mac("CMAC function is not enabled")
+        })
     );
     assert!(m.writes().is_empty());
+}
+
+#[test]
+fn a_tx_power_failure_is_named_and_leaves_the_help_undone() {
+    // set_txpwr's SAR ceiling of path A cannot be read: the switch stops
+    // there, with the TX scheduler stopped and the BB held in reset.
+    let g = BbGain::default();
+    let rx = rx_gain(true);
+    let mut m = model();
+    m.set32(0xC398, 0x3FFFF);
+    m.fail_reads_of(0x156CC);
+    assert_eq!(
+        set_channel(&mut m, &g5(36), &inputs(&g, &rx, 0), power()),
+        Err(ChannelError {
+            step: "tx power",
+            error: READ_FAILED
+        })
+    );
+    assert_eq!(m.trace.last(), Some(&Op::R32(0x156CC)));
+    assert!(!m.trace.contains(&Op::W32(0xCE40, 0x2B)));
+    assert_eq!(m.get32(0xC398) & 0x3FFFF, 0);
 }
 
 #[test]

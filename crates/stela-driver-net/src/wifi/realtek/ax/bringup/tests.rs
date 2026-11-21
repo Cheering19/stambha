@@ -1,29 +1,46 @@
 extern crate std;
 use super::*;
-use crate::wifi::realtek::ax::chan::HwBand;
+use crate::wifi::realtek::ax::chan::{Chan, HwBand};
 use crate::wifi::realtek::ax::elements::{
-    ID_BB_GAIN, ID_BB_REG, ID_RADIO_A, ID_RADIO_B, ID_RF_NCTL, PhyTables, RfPath, phy_tables,
-    tests::{container, element, pairs},
+    ID_BB_GAIN, ID_BB_REG, ID_RADIO_A, ID_RADIO_B, ID_RF_NCTL, RfPath,
+    tests::{container, element, element_with_head, pairs},
 };
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::pci::tests::{device_write, rxq_buffer};
 use crate::wifi::realtek::ax::radio::RfAt;
+use crate::wifi::realtek::ax::regd::Regds;
 use crate::wifi::realtek::ax::scan::{self, Network, ScanEnd, ScanReport};
 use crate::wifi::realtek::ax::tests::firmware::{Firmware, rx_buffer};
 use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
+use crate::wifi::realtek::ax::txpwr::set_txpwr;
+use crate::wifi::realtek::ax::txpwr_tables::{
+    ID_REGD, ID_TX_SHAPE_LMT, ID_TXPWR_BYRATE, ID_TXPWR_LMT_2G, ID_TXPWR_LMT_5G,
+    ID_TXPWR_LMT_RU_2G, ID_TXPWR_LMT_RU_5G, tx_power_tables,
+};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
-use alloc::{boxed::Box, rc::Rc, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, string::ToString, sync::Arc, vec, vec::Vec};
 use core::cell::Cell;
+use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
 /// A MAC whose bytes need lower-case hex and a leading zero.
-const MAC: [u8; 6] = [0x00, 0xE0, 0x4C, 0x88, 0x52, 0x0C];
+pub(crate) const MAC: [u8; 6] = [0x00, 0xE0, 0x4C, 0x88, 0x52, 0x0C];
 /// The access point [`home`] scripts, and its channel's place in
 /// `scan::SCAN_CHANNELS` (2.4 GHz channel 6).
-const HOME: [u8; 6] = [0x02, 0xAA, 0, 0, 0, 1];
-const CH6: usize = 5;
+pub(crate) const HOME: [u8; 6] = [0x02, 0xAA, 0, 0, 0, 1];
+pub(crate) const CH6: usize = 5;
+/// What a bring-up's TX power sees with no country anywhere: the world
+/// regd, `00`.
+const WW: (Regds, [u8; 2]) = (
+    Regds {
+        g2: crate::wifi::realtek::ax::regd::Regd::Ww,
+        g5: crate::wifi::realtek::ax::regd::Regd::Ww,
+    },
+    *b"00",
+);
 
 /// Spec S10's crafted RXQ buffer: the REC_ACK of OFLD_CFG at seq 0 (RX BD
 /// info FS | LS | WRITE_SIZE 32, a short RX descriptor with RPKT_LEN 12 and
@@ -62,12 +79,21 @@ const OTHER_C2H: [u8; 32] = rec_ack_with(20, 0x05);
 /// An RX packet of type 0 (WIFI, RX descriptor byte 3), not a C2H.
 const NOT_C2H: [u8; 32] = rec_ack_with(7, 0x00);
 /// Both acks, as the firmware may send them.
-const BOTH: &[&[u8]] = &[&REC_ACK, &DONE_ACK];
+pub(crate) const BOTH: &[&[u8]] = &[&REC_ACK, &DONE_ACK];
 
 /// A 2048-byte physical efuse (0xFF = blank) whose logical map holds `MAC`
 /// at 0x400, crystal cap 0x2F at 0x2B9 and RFE type 1 at 0x2CA.
-fn efuse_with_mac() -> Vec<u8> {
+pub(crate) fn efuse_with_mac() -> Vec<u8> {
     efuse_with_rfe(1)
+}
+
+/// As [`efuse_with_mac`], with the country code `country` at 0x2CB-0x2CC:
+/// block 0x59 words 1 and 2 (word enable 0x9) hold the RFE type, then the
+/// two letters, then a blank byte.
+pub(crate) fn efuse_with_country(country: [u8; 2]) -> Vec<u8> {
+    let mut phys = efuse_with_mac();
+    phys[16..22].copy_from_slice(&[0x05, 0x99, 1, country[0], country[1], 0xFF]);
+    phys
 }
 
 /// As [`efuse_with_mac`], with RFE type `rfe`: block 0x80 (words 0-2) holds
@@ -87,23 +113,87 @@ fn efuse_with_rfe(rfe: u8) -> Vec<u8> {
 /// (0x4AE0, 0x40)]`, BB gain `[(0, 1)]`, radio slot 0 path B and slot 1
 /// path A both `[(0x05, 0), (0x10005, 1)]` (one SWSI write, one direct
 /// window write, which alone is stored) behind a headline for RFE 1 at any
-/// cut, and NCTL `[(0x8008, 0)]`.
-fn tables_file() -> Vec<u8> {
+/// cut, and NCTL `[(0x8008, 0)]`; then [`tx_power_elements`].
+pub(crate) fn tables_file() -> Vec<u8> {
+    tables_file_without(None)
+}
+
+/// [`tables_file`] without the element `without`.
+pub(crate) fn tables_file_without(without: Option<u32>) -> Vec<u8> {
     let radio = pairs(&[(0xF001_00FF, 0), (0x05, 0), (0x10005, 1)]);
     let mut b = container(32, 5);
-    element(
+    let add = |b: &mut Vec<u8>, id, idx, body: &[u8]| {
+        if Some(id) != without {
+            element(b, id, [0; 4], 0, idx, body);
+        }
+    };
+    add(
         &mut b,
         ID_BB_REG,
-        [0; 4],
-        0,
         0,
         &pairs(&[(0x4AD4, 0x40), (0x4AE0, 0x40)]),
     );
-    element(&mut b, ID_BB_GAIN, [0; 4], 0, 0, &pairs(&[(0, 1)]));
-    element(&mut b, ID_RADIO_A, [0; 4], 0, 1, &radio);
-    element(&mut b, ID_RADIO_B, [0; 4], 0, 0, &radio);
-    element(&mut b, ID_RF_NCTL, [0; 4], 0, 0, &pairs(&[(0x8008, 0)]));
+    add(&mut b, ID_BB_GAIN, 0, &pairs(&[(0, 1)]));
+    add(&mut b, ID_RADIO_A, 1, &radio);
+    add(&mut b, ID_RADIO_B, 0, &radio);
+    add(&mut b, ID_RF_NCTL, 0, &pairs(&[(0x8008, 0)]));
+    tx_power_elements(&mut b, without);
     b
+}
+
+/// The TX power by rate of 2.4 GHz CCK 1-11M at nss 0, 20 MHz: 15 dBm, 60
+/// in 0.25 dB units, which `rf_to_mac` writes as 30 (0x1E) per rate.
+pub(crate) const CCK_BYRATE: u32 = 0x3C3C_3C3C;
+/// The 2.4 GHz OFDM limit of FCC and of the world regd at channel 1, ntx 0,
+/// beamforming off: 18 dBm.
+pub(crate) const OFDM_LIMIT: i8 = 72;
+
+/// Every TX power element but `without`, all for RFE 0 (which RFE 1 takes
+/// when no element names it, `fw.c:1199-1206`), then a DIAG_MAC element so
+/// the walk reaches the last of them (`fw.c:1584`):
+/// - by rate: [`CCK_BYRATE`] (band 0, nss 0, CCK, shift 0, 4 bytes);
+/// - the 2.4 GHz limit: [`OFDM_LIMIT`] for OFDM at bw 0, ntx 0, bf 0,
+///   channel index 0, under the world regd (0) and FCC (2);
+/// - the 5 GHz, both RU and the TX shape limits empty;
+/// - REGD: `US` on FCC for 2.4, 5 and 6 GHz, `DE` on ETSI.
+pub(crate) fn tx_power_elements(b: &mut Vec<u8>, without: Option<u32>) {
+    let add = |b: &mut Vec<u8>, id: u32, ent_sz: u8, entries: &[&[u8]]| {
+        if Some(id) == without {
+            return;
+        }
+        let mut head = [0, 0, 0, ent_sz, 0, 0, 0, 0];
+        head[4..].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        let body: Vec<u8> = entries.iter().flat_map(|e| e.iter().copied()).collect();
+        element_with_head(b, id, [0, 0x82, 0, 0], 0, head, &body);
+    };
+    let c = CCK_BYRATE.to_le_bytes();
+    add(
+        b,
+        ID_TXPWR_BYRATE,
+        11,
+        &[&[0, 0, 0, 0, 4, c[0], c[1], c[2], c[3], 0, 0]],
+    );
+    let v = OFDM_LIMIT as u8;
+    add(
+        b,
+        ID_TXPWR_LMT_2G,
+        7,
+        &[&[0, 0, 1, 0, 0, 0, v], &[0, 0, 1, 0, 2, 0, v]],
+    );
+    add(b, ID_TXPWR_LMT_5G, 7, &[]);
+    add(b, ID_TXPWR_LMT_RU_2G, 5, &[]);
+    add(b, ID_TXPWR_LMT_RU_5G, 5, &[]);
+    add(b, ID_TX_SHAPE_LMT, 5, &[]);
+    add(
+        b,
+        ID_REGD,
+        9,
+        &[
+            &[b'U', b'S', 2, 2, 2, 0, 0, 0, 0],
+            &[b'D', b'E', 1, 1, 1, 0, 0, 0, 0],
+        ],
+    );
+    element_with_head(b, 28, [0; 4], 0, [0; 8], &[0; 16]);
 }
 
 /// What [`tables_file`] reports through a full bring-up of [`chip`].
@@ -136,13 +226,13 @@ const PHY: &str = ", PHY rfe 1 xtal 0x2f: BB 2, BB gain 1, RF B 2 A 2, RF pages 
 /// deglitch (0x3848); the deinit reads TXBD_RWPTR_CLR1 too, so that is no
 /// longer pre-init's alone. `m`
 /// is the DMA model the RXQ buffers live in.
-struct Chip {
-    io: RegisterModel,
-    pre_inits: Arc<AtomicUsize>,
-    m: Arc<Mutex<Model>>,
+pub(crate) struct Chip {
+    pub(crate) io: RegisterModel,
+    pub(crate) pre_inits: Arc<AtomicUsize>,
+    pub(in crate::wifi::realtek) m: Arc<Mutex<Model>>,
 }
 
-fn chip(
+pub(crate) fn chip(
     phys: Vec<u8>,
     status: u32,
     ch12_holds: fn(usize) -> bool,
@@ -153,7 +243,7 @@ fn chip(
 
 /// The access point every scan of [`chip`] hears: a beacon from [`HOME`]
 /// naming `Home` on 2.4 GHz channel 6 at raw RSSI 0x70 (-54 dBm).
-fn home(fw: &mut Firmware) {
+pub(crate) fn home(fw: &mut Firmware) {
     fw.beacon(CH6, HOME, b"Home", 0x70);
 }
 
@@ -164,7 +254,7 @@ fn home(fw: &mut Firmware) {
 /// the CMAC reads enabled (0xC000 b30), the RX filter is M2a's (0xCE20), and
 /// RF 0x18's direct window (DDV, 0x1E060 and 0x1F060) reads 0x01001 on both
 /// paths, as its SWSI register (DAV) does.
-fn chip_hearing(
+pub(crate) fn chip_hearing(
     phys: Vec<u8>,
     status: u32,
     ch12_holds: fn(usize) -> bool,
@@ -338,12 +428,12 @@ fn xtal_si() -> Box<dyn FnMut(&mut RegisterModel) -> u32> {
     })
 }
 
-fn never(_: usize) -> bool {
+pub(crate) fn never(_: usize) -> bool {
     false
 }
 
 /// The host this bring-up runs on: LTR off unless a test says otherwise.
-const NO_LTR: Host = Host { ltr: false };
+pub(crate) const NO_LTR: Host = Host { ltr: false };
 
 fn run(io: &mut RegisterModel, m: &Arc<Mutex<Model>>) -> Result<(Running, Rings), BringUpError> {
     run_on(io, m, NO_LTR)
@@ -354,18 +444,33 @@ fn run_on(
     m: &Arc<Mutex<Model>>,
     host: Host,
 ) -> Result<(Running, Rings), BringUpError> {
-    let file = tables_file();
-    run_with(io, m, host, &phy_tables(&file, 0).unwrap())
+    run_with(io, m, host, &tables_file())
 }
 
+/// A bring-up whose firmware file's elements are `file`'s.
 fn run_with(
     io: &mut RegisterModel,
     m: &Arc<Mutex<Model>>,
     host: Host,
-    tables: &PhyTables<'_>,
+    file: &[u8],
+) -> Result<(Running, Rings), BringUpError> {
+    run_at_cut(io, m, host, file, 2)
+}
+
+/// [`run_with`] for a chip of cut `cut` (the image stays cut 2's).
+fn run_at_cut(
+    io: &mut RegisterModel,
+    m: &Arc<Mutex<Model>>,
+    host: Host,
+    file: &[u8],
+    cut: u8,
 ) -> Result<(Running, Rings), BringUpError> {
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
+    let firmware = FirmwareFile {
+        image: &fw.image,
+        file,
+    };
     // SAFETY: the model domain isolates only the modeled requester behind
     // this test's `RegisterModel`; its pages are plain kept test RAM that no
     // real device can reach, and this test is the only worker.
@@ -374,10 +479,9 @@ fn run_with(
             io,
             &Source,
             Arc::new(Domain(m.clone())),
-            2,
-            &fw.image,
+            cut,
+            firmware,
             host,
-            tables,
         )
     }
 }
@@ -415,13 +519,13 @@ fn failed(result: Result<(Running, Rings), BringUpError>) -> BringUpError {
 
 /// `rtw89_mac_disable_cpu_ax` starts every download attempt by selecting
 /// the WDT control word through the indirect window.
-const ATTEMPT: Op = Op::W32(0x0C04, 0x1800_3040);
+pub(crate) const ATTEMPT: Op = Op::W32(0x0C04, 0x1800_3040);
 
-fn count(io: &RegisterModel, op: Op) -> usize {
+pub(crate) fn count(io: &RegisterModel, op: Op) -> usize {
     io.trace.iter().filter(|o| **o == op).count()
 }
 
-fn xtal(offset: u32, value: u32, mask: u32) -> Op {
+pub(crate) fn xtal(offset: u32, value: u32, mask: u32) -> Op {
     Op::W32(0x0270, 1 << 31 | mask << 16 | value << 8 | offset)
 }
 
@@ -429,7 +533,7 @@ fn xtal(offset: u32, value: u32, mask: u32) -> Op {
 /// (`rtw8852c.c:453-529`), then `rtw89_mac_update_scoreboard(
 /// MAC_AX_NOTIFY_PWR_MAJOR)` (`mac.c:1580`). `None` values are
 /// read-modify-writes whose value depends on earlier state.
-fn power_off_tail() -> Vec<(Op, bool)> {
+pub(crate) fn power_off_tail() -> Vec<(Op, bool)> {
     let exact = |op| (op, true);
     let at = |reg| (Op::W32(reg, 0), false);
     vec![
@@ -463,7 +567,7 @@ fn power_off_tail() -> Vec<(Op, bool)> {
 /// STOP_WPDMA (0x1010 bit 19) set, then `rtw89_pci_ctrl_dma_all(false)`:
 /// STOP_AXI_MST (0x1000 bit 17) set and TXHCI_EN/RXHCI_EN (bits 7, 15)
 /// cleared.
-fn assert_dma_stopped_before_power_off(io: &RegisterModel) {
+pub(crate) fn assert_dma_stopped_before_power_off(io: &RegisterModel) {
     let writes = io.writes();
     let start = writes.len() - power_off_tail().len();
     let stop = &writes[start - 3..start];
@@ -477,7 +581,7 @@ fn assert_dma_stopped_before_power_off(io: &RegisterModel) {
 
 /// No `pci::stop_dma` and no deinit: no write to 0x1010 or 0x1000 at all,
 /// which only the MAC pre-init and later steps make.
-fn assert_no_dma_writes(io: &RegisterModel) {
+pub(crate) fn assert_no_dma_writes(io: &RegisterModel) {
     assert!(
         !io.writes()
             .iter()
@@ -487,7 +591,7 @@ fn assert_no_dma_writes(io: &RegisterModel) {
     );
 }
 
-fn assert_ends_with_power_off(io: &RegisterModel) {
+pub(crate) fn assert_ends_with_power_off(io: &RegisterModel) {
     let writes = io.writes();
     let tail = power_off_tail();
     assert!(writes.len() >= tail.len());
@@ -506,7 +610,7 @@ fn assert_ends_with_power_off(io: &RegisterModel) {
 }
 
 /// What a full bring-up of [`chip`] with [`tables_file`] applies and reads.
-const REPORT: PhyReport = PhyReport {
+pub(crate) const REPORT: PhyReport = PhyReport {
     rfe: 1,
     xtal: 0x2F,
     bb: 2,
@@ -521,7 +625,7 @@ const REPORT: PhyReport = PhyReport {
 };
 
 /// What a full bring-up of [`chip`] calibrates and reads back.
-const RFK: RfkReport = RfkReport {
+pub(crate) const RFK: RfkReport = RfkReport {
     thermal: [30, 31],
     xtal: (0x2F, 0x2F),
     rck: [0x0F, 0x10],
@@ -541,14 +645,14 @@ const CALIBRATED: &str = ", calibrated: thermal A 30 B 31, xtal 0x2f/0x2f, RCK A
                           DRCK 0x0d, ADDCK A 0x201/0x1ff B 0x200/0x201, RX DCK rewrites A 0 B 0";
 
 /// RF 0x18 through both windows as [`chip`] presets it.
-const RF18: Rf18 = Rf18 {
+pub(crate) const RF18: Rf18 = Rf18 {
     dav: [0x01001; 2],
     ddv: [0x01001; 2],
 };
 
 /// What a full bring-up of [`chip`] scans, `elapsed_ms` aside: the 38
 /// channels entered, END_SCAN with SUCCESS, and [`home`]'s beacon.
-fn scanned(elapsed_ms: u32) -> ScanReport {
+pub(crate) fn scanned(elapsed_ms: u32) -> ScanReport {
     let mut ssid = [0; 32];
     ssid[..4].copy_from_slice(b"Home");
     let mut networks = [None; scan::MAX_LISTED];
@@ -579,7 +683,7 @@ fn scanned(elapsed_ms: u32) -> ScanReport {
 }
 
 /// The scan suffix of [`scanned`].
-fn scan_line(elapsed_ms: u32) -> alloc::string::String {
+pub(crate) fn scan_line(elapsed_ms: u32) -> alloc::string::String {
     alloc::format!(
         ", scan 38/38 channels in {elapsed_ms} ms, end ok: 1 networks from 1 frames (0 without \
          RSSI)"
@@ -682,7 +786,7 @@ fn happy_path_reports_running() {
 
 /// The CH12 kicks after `from`, each with the H2C seq and func of the slot
 /// it filled.
-fn kicks_after(c: &Chip, from: usize) -> Vec<(usize, u8, u8)> {
+pub(crate) fn kicks_after(c: &Chip, from: usize) -> Vec<(usize, u8, u8)> {
     c.io.trace
         .iter()
         .enumerate()
@@ -716,8 +820,26 @@ fn scan_steps_run_after_calibration_in_linux_order() {
     let core_start = after(dm_tail, &|o| *o == Op::W32(0xCE40, 0x2B));
     // set channel: help_enter's first write, the TX scheduler stop.
     let set_channel = after(core_start, &|o| matches!(o, Op::W32(0xC398, _)));
+    // tx power (ruling R1, core.c:584-588): set_txpwr's 119 accesses on
+    // 2.4 GHz, from by rate's first word to the SAR ceiling of path B, right
+    // after set_channel_rf's last access (path B's TIA bandwidth) and right
+    // before help_exit's first two (its CMAC check, then the PPDU status
+    // report).
+    let txpwr = after(set_channel, &|o| matches!(o, Op::W32(0xD2C0, _)));
+    let sar = after(txpwr, &|o| *o == Op::W32(0x176CC, 0x7E));
+    assert_eq!(sar + 1 - txpwr, 119);
+    assert!(
+        matches!(t[txpwr - 1], Op::RfW(1, 0x8F, 0x60, _)),
+        "{:x?}",
+        t[txpwr - 1]
+    );
+    assert_eq!(
+        t[sar + 1..sar + 3],
+        [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
+    );
+    let help_exit = sar + 1;
     // vif init: port 0's beacon interval.
-    let vif = after(set_channel, &|o| *o == Op::W32(0xC414, 0x64));
+    let vif = after(help_exit, &|o| *o == Op::W32(0xC414, 0x64));
     // scan start: the scan's RX filter.
     let filter = after(vif, &|o| matches!(o, Op::W32(0xCE20, _)));
     // Seventeen H2Cs after the calibration, seq 3 to 19: core start, vif
@@ -737,6 +859,9 @@ fn scan_steps_run_after_calibration_in_linux_order() {
         dm_tail,
         core_start,
         set_channel,
+        txpwr,
+        sar,
+        help_exit,
         vif,
         filter,
         scanofld,
@@ -747,6 +872,11 @@ fn scan_steps_run_after_calibration_in_linux_order() {
     assert_radio_off_before_deinit(&c.io);
     assert_eq!(deinit_writes(&c.io), DEINIT);
     assert_ends_with_power_off(&c.io);
+    // The firmware's tables reached the TX power: CCK by rate at 30 (15 dBm
+    // in 0.5 dB), and the world regd's OFDM limit at 36 for ntx 0, bf 0
+    // (byte 0 of the page's second word, phy.h:504-516).
+    assert_eq!(t[txpwr], Op::W32(0xD2C0, 0x1E1E_1E1E));
+    assert_eq!(c.io.get32(0xD2F0) & 0xFF, (OFDM_LIMIT / 2) as u32);
     // The channel inputs reached the RF: RF 0x18 is 2.4 GHz channel 1 at
     // 20 MHz on both paths and both windows.
     assert_eq!(
@@ -762,6 +892,136 @@ fn scan_steps_run_after_calibration_in_linux_order() {
     );
     assert_eq!(running.scan, Some(scanned(elapsed(&running))));
     drop(rings);
+}
+
+/// The whole trace of [`ran`]`(BOTH, host)` at `b4b9ab57e`, the last M2c
+/// bring-up before the live chip, as the SHA-256 of one `{op:?}` line per
+/// access: without LTR, then with.
+const M2C_TRACES: [(Host, &str); 2] = [
+    (
+        NO_LTR,
+        "33fab45bf66f8cddecf4adf0f4db6544c7045849ba32fc9ea2737fda5aff5f70",
+    ),
+    (
+        Host { ltr: true },
+        "e724f8cb1e21d7ef1d71c66369282392f1aa107705ccd0a43e96d523b25f337a",
+    ),
+];
+
+/// The SHA-256 of one `{op:?}` line per access, in lower-case hex.
+pub(crate) fn trace_sha256<'a>(trace: impl IntoIterator<Item = &'a Op>) -> String {
+    let mut hash = Sha256::new();
+    for op in trace {
+        hash.update(alloc::format!("{op:?}\n").as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|b| alloc::format!("{b:02x}"))
+        .collect()
+}
+
+/// `set_txpwr`'s accesses in a trace, from `from` on: by rate's first word
+/// (W32 0xD2C0) through path B's SAR ceiling (the RMW of BB 0x76CC).
+pub(crate) fn txpwr_window(t: &[Op], from: usize) -> Range<usize> {
+    let start = from
+        + t[from..]
+            .iter()
+            .position(|o| matches!(o, Op::W32(0xD2C0, _)))
+            .unwrap();
+    let last = start
+        + t[start..]
+            .iter()
+            .position(|o| matches!(o, Op::W32(0x176CC, _)))
+            .unwrap();
+    start..last + 1
+}
+
+/// Whether `got` is the access `want` is, a read-modify-write's write
+/// (one right after a read of its register in `want`'s trace) with any
+/// value, as the bits it keeps are the register file's.
+pub(crate) fn same_access(want: &[Op], got: &[Op]) -> bool {
+    want.len() == got.len()
+        && want
+            .iter()
+            .zip(got)
+            .enumerate()
+            .all(|(i, (w, g))| match (w, g) {
+                (Op::W32(a, _), Op::W32(b, _)) if i > 0 && want[i - 1] == Op::R32(*a) => a == b,
+                _ => w == g,
+            })
+}
+
+/// `set_txpwr` for `chan` with [`tables_file`]'s tables at RFE 1 and the
+/// world regd, on a register file of zeros.
+pub(crate) fn txpwr_alone(chan: Chan) -> Vec<Op> {
+    let tables = tx_power_tables(&tables_file(), 0, 1).unwrap();
+    let mut alone = RegisterModel::new();
+    set_txpwr(&mut alone, &tables, WW.0, &chan).unwrap();
+    alone.trace
+}
+
+#[test]
+fn the_bring_up_is_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
+    // Ruling R1: Linux's __rtw89_set_channel runs set_txpwr between
+    // set_channel_rf and help_exit (core.c:584-588). Take its 119 accesses
+    // out of the trace and what is left is M2c's bring-up, access for
+    // access, through the scan, the deinit and the power-off.
+    let alone = txpwr_alone(Chan::new20(HwBand::G2, 1).unwrap());
+    assert_eq!(alone.len(), 119);
+    for (host, m2c) in M2C_TRACES {
+        let (c, result) = ran(BOTH, host);
+        let (_, rings) = result.unwrap();
+        let t = &c.io.trace;
+        let dm_tail = first_of(t, |o| *o == Op::W32(0x14978, 3));
+        let window = txpwr_window(t, dm_tail);
+        assert!(same_access(&alone, &t[window.clone()]), "{host:?}");
+        // Right after set_channel_rf's last access (path B's TIA bandwidth)
+        // and right before help_exit's first two (its CMAC check, then the
+        // PPDU status report).
+        assert!(matches!(t[window.start - 1], Op::RfW(1, 0x8F, 0x60, _)));
+        assert_eq!(
+            t[window.end..window.end + 2],
+            [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
+        );
+        assert_eq!(
+            trace_sha256(t[..window.start].iter().chain(&t[window.end..])),
+            m2c,
+            "{host:?}"
+        );
+        drop(rings);
+    }
+}
+
+#[test]
+fn set_channel_takes_the_chip_cut() {
+    // `_ctrl_bw`'s CAV workaround (`cav_copy_path_b`, `rtw8852c_rfk.c:
+    // 3888-3895`) writes path B's RR_APK [5:4] = 3 during set channel on cut
+    // 0 only.
+    let apk = |o: &Op| matches!(o, Op::RfW(1, 0x19, 0x30, 0x30));
+    let file = tables_file();
+    for (cut, copies) in [(0, true), (2, false)] {
+        let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+        let m = c.m.clone();
+        let (running, rings) = run_at_cut(&mut c.io, &m, NO_LTR, &file, cut).unwrap();
+        assert_eq!(running.cut, cut);
+        let t = &c.io.trace;
+        // help_enter's TX scheduler stop, the first after the calibration,
+        // through the end of set channel (vif init's beacon interval).
+        let dm_tail = first_of(t, |o| *o == Op::W32(0x14978, 3));
+        let set_channel = dm_tail
+            + t[dm_tail..]
+                .iter()
+                .position(|o| matches!(o, Op::W32(0xC398, _)))
+                .unwrap();
+        let vif = set_channel
+            + t[set_channel..]
+                .iter()
+                .position(|o| *o == Op::W32(0xC414, 0x64))
+                .unwrap();
+        let copied = t[set_channel..vif].iter().any(apk);
+        assert_eq!(copied, copies, "cut {cut}");
+        drop(rings);
+    }
 }
 
 #[test]
@@ -803,7 +1063,7 @@ const SCAN_STEPS: [&str; 5] = [
 /// The CMAC reads disabled (0xC000 b30 clear) at its first read once
 /// `after` is in the trace, and enabled again from the next, so the
 /// teardown's coex half (whose PLT write checks it too) runs whole.
-fn cmac_off_after(io: &mut RegisterModel, after: Op) {
+pub(crate) fn cmac_off_after(io: &mut RegisterModel, after: Op) {
     let mut done = false;
     io.on_read(
         0xC000,
@@ -828,7 +1088,7 @@ fn scan_failure_names_step_and_powers_off() {
     let (err, c) = fails_hearing(&|fw| fw.refuse(9, 0x16, 1), |_| ());
     assert_eq!(
         err,
-        BringUpError::new(
+        after_rf18(
             "scan start",
             AxError::H2cRejected {
                 class: 9,
@@ -837,6 +1097,15 @@ fn scan_failure_names_step_and_powers_off() {
                 ret: 1
             }
         )
+    );
+    // RF 0x18 survives the failure, for the host check's own lines.
+    let rf18: Vec<alloc::string::String> = err.rf18_lines().map(|l| l.to_string()).collect();
+    assert_eq!(
+        rf18,
+        [
+            "WIFI RF18 A: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+            "WIFI RF18 B: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+        ]
     );
     assert_eq!(
         err.to_string(),
@@ -853,17 +1122,23 @@ fn scan_failure_names_step_and_powers_off() {
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0x14978, 3)));
     assert_eq!(
         err,
-        BringUpError::new("core start", AxError::Mac("CMAC function is not enabled"))
+        after_rf18("core start", AxError::Mac("CMAC function is not enabled"))
     );
 
     // set channel: the CMAC reads off once help_enter read its scheduler.
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::R32(0xC398)));
-    assert_eq!(err.step, "set channel");
+    assert_eq!(
+        err,
+        after_rf18("set channel", AxError::Mac("CMAC function is not enabled"))
+    );
 
     // vif init: the CMAC reads off once port 0's beacon interval is set, so
     // the macid pause's check refuses.
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0xC414, 0x64)));
-    assert_eq!(err.step, "vif init");
+    assert_eq!(
+        err,
+        after_rf18("vif init", AxError::Mac("CMAC function is not enabled"))
+    );
 
     // scan: a malformed RXQ buffer (WRITE_SIZE 4, no room for its RX
     // descriptor) on channel 6, while the scan waits for END_SCAN.
@@ -876,6 +1151,16 @@ fn scan_failure_names_step_and_powers_off() {
         |_| (),
     );
     assert_eq!(err.step, "scan");
+    assert_eq!(err.rf18, Some(RF18));
+}
+
+/// A failure of `step` with `error` after RF 0x18 was read, so it carries
+/// [`chip`]'s [`RF18`].
+pub(crate) fn after_rf18(step: &'static str, error: AxError) -> BringUpError {
+    BringUpError {
+        rf18: Some(RF18),
+        ..BringUpError::new(step, error)
+    }
 }
 
 /// A full bring-up of [`chip_hearing`] with BOTH acks and `script`,
@@ -891,6 +1176,7 @@ fn fails_hearing(
     let m = c.m.clone();
     let err = failed(run_on(&mut c.io, &m, NO_LTR));
     assert!(SCAN_STEPS.contains(&err.step), "{err}");
+    assert_eq!(err.rf18, Some(RF18), "{err}");
     // The scan ran after the whole calibration.
     assert!(c.io.trace.contains(&Op::W32(0x14978, 3)), "{err}");
     assert_radio_off_before_deinit(&c.io);
@@ -1026,7 +1312,7 @@ fn happy_path_runs_the_steps_in_linux_order() {
 }
 
 /// The first trace entry `want` accepts.
-fn first_of(t: &[Op], want: fn(&Op) -> bool) -> usize {
+pub(crate) fn first_of(t: &[Op], want: fn(&Op) -> bool) -> usize {
     t.iter().position(want).unwrap()
 }
 
@@ -1095,9 +1381,9 @@ fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
 
 /// The registers of `rtw89_pci_ops_deinit` (`pci.c:3053`) without LTR:
 /// `power_wake(false)`, `ctrl_dma_all(false)` (two writes), `clr_idx_all`.
-const DEINIT: [u32; 6] = [0x0074, 0x1000, 0x1000, 0x1014, 0x11C4, 0x1200];
+pub(crate) const DEINIT: [u32; 6] = [0x0074, 0x1000, 0x1000, 0x1014, 0x11C4, 0x1200];
 /// The same with `ltr_set_v1(false)` between the wake and the DMA stop.
-const DEINIT_LTR: [u32; 12] = [
+pub(crate) const DEINIT_LTR: [u32; 12] = [
     0x0074, 0x8410, 0x8414, 0x8414, 0x1600, 0x1610, 0x1604, 0x1000, 0x1000, 0x1014, 0x11C4, 0x1200,
 ];
 
@@ -1111,7 +1397,7 @@ const DEINIT_LTR: [u32; 12] = [
 /// steps write the PPDU status forwarding (0x9C18), the indirect table
 /// window's address (0x0C04, its data at 0x40000 up) and the RX interrupt
 /// mitigation (0x1184). The deinit writes none of them.
-fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
+pub(crate) fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
     deinit_and_radio_writes(io)
         .into_iter()
         .filter(|reg| {
@@ -1127,7 +1413,7 @@ fn deinit_writes(io: &RegisterModel) -> Vec<u32> {
 
 /// Every 32-bit write between the post-init's PCI IO release and the
 /// power-off's first XTAL SI command.
-fn deinit_and_radio_writes(io: &RegisterModel) -> Vec<u32> {
+pub(crate) fn deinit_and_radio_writes(io: &RegisterModel) -> Vec<u32> {
     let t = &io.trace;
     let release = t
         .iter()
@@ -1224,18 +1510,21 @@ fn fails_traced(
             "{err}"
         );
     }
+    // RF 0x18 is kept exactly when it was read before the failure.
+    let read = CALIBRATION_STEPS.contains(&err.step) || SCAN_STEPS.contains(&err.step);
+    assert_eq!(err.rf18, read.then_some(RF18), "{err}");
     assert_ends_with_power_off(&c.io);
     (err, c.io)
 }
 
 /// `coex::GNT_WL_OFF`.
-const GNT_WL_OFF: u32 = 0x0007_D775;
+pub(crate) const GNT_WL_OFF: u32 = 0x0007_D775;
 
 /// The coex half of `rtw89_core_stop` after the coex init: the WL-off grant,
 /// the PLT, then the scoreboard with every driver bit clear (0x8100_0000
 /// after the init's 0x8100_4003), all after the init's scoreboard and
 /// before the deinit's first write (PCI wake, 0x0074).
-fn assert_radio_off_before_deinit(io: &RegisterModel) {
+pub(crate) fn assert_radio_off_before_deinit(io: &RegisterModel) {
     let t = &io.trace;
     let on = t
         .iter()
@@ -1611,6 +1900,7 @@ fn download_failure_names_the_first_attempt_when_it_differs() {
                 },
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -1659,6 +1949,7 @@ fn a_failed_pci_re_init_keeps_the_download_error_that_stopped_ch12() {
                 first: None,
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -1686,6 +1977,7 @@ fn a_ch12_stop_after_a_different_first_failure_names_both() {
             }),
         },
         rf: None,
+        rf18: None,
     };
     assert_eq!(
         err.to_string(),
@@ -1731,6 +2023,7 @@ fn power_on_failure_keeps_both_errors_and_ends_powered_off() {
                 error: AxError::AlreadyPowered,
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -2010,7 +2303,11 @@ fn first_of_dyn(t: &[Op], want: &dyn Fn(&Op) -> bool) -> usize {
 }
 
 /// CH12 slot `slot`'s first `len` bytes, as the device would read them.
-fn ch12_packet(m: &Arc<Mutex<Model>>, slot: usize, len: usize) -> Vec<u8> {
+pub(in crate::wifi::realtek) fn ch12_packet(
+    m: &Arc<Mutex<Model>>,
+    slot: usize,
+    len: usize,
+) -> Vec<u8> {
     use crate::wifi::realtek::ax::pci::{
         FWCMD_SLOT_BYTES,
         tests::{FWCMD, device_read},
@@ -2136,6 +2433,7 @@ fn phy_failure_names_step_and_powers_off() {
                 path: RfPath::B,
                 page: None
             }),
+            rf18: None,
         }
     );
     assert_eq!(
@@ -2195,6 +2493,7 @@ fn phy_failure_names_step_and_powers_off() {
                 path: RfPath::B,
                 page: Some(0)
             }),
+            rf18: None,
         }
     );
     assert!(
@@ -2435,7 +2734,7 @@ fn calibration_failure_names_step_and_powers_off() {
 
     // nctl init: the NCTL poll register cannot be read.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0x18080));
-    assert_eq!(err, BringUpError::new("nctl init", READ_FAILED));
+    assert_eq!(err, after_rf18("nctl init", READ_FAILED));
 
     // rfk init: SWSI stays write-busy once the NCTL poll has run, so RCK's
     // first RF access fails.
@@ -2466,7 +2765,7 @@ fn calibration_failure_names_step_and_powers_off() {
     let (err, io) = fails_traced(efuse_with_mac(), BOTH, NO_LTR, |io| {
         io.fail_reads_of(0x1C0C8)
     });
-    assert_eq!(err, BringUpError::new("rfk init", READ_FAILED));
+    assert_eq!(err, after_rf18("rfk init", READ_FAILED));
     let t = &io.trace;
     let start = t
         .iter()
@@ -2504,20 +2803,33 @@ fn calibration_failure_names_step_and_powers_off() {
 
     // dm tail: the TX power rate control word cannot be read.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xD200));
-    assert_eq!(err, BringUpError::new("dm tail", READ_FAILED));
+    assert_eq!(err, after_rf18("dm tail", READ_FAILED));
 }
 
 #[test]
 fn tables_missing_one_are_refused_before_power_on() {
     let mut c = chip(efuse_with_mac(), 7, never, BOTH);
     let m = c.m.clone();
-    let file = tables_file();
-    let mut tables = phy_tables(&file, 0).unwrap();
-    tables.nctl = None;
-    let err = failed(run_with(&mut c.io, &m, NO_LTR, &tables));
+    let file = tables_file_without(Some(ID_RF_NCTL));
+    let err = failed(run_with(&mut c.io, &m, NO_LTR, &file));
     assert_eq!(
         err,
         BringUpError::new("phy tables", AxError::Phy("firmware carries no NCTL table"))
+    );
+    assert!(c.io.trace.is_empty(), "{:x?}", c.io.trace);
+}
+
+#[test]
+fn a_file_without_elements_is_refused_before_power_on() {
+    let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+    let m = c.m.clone();
+    let err = failed(run_with(&mut c.io, &m, NO_LTR, &[0; 64]));
+    assert_eq!(
+        err,
+        BringUpError::new(
+            "phy tables",
+            AxError::FirmwareFile("firmware elements are unreadable")
+        )
     );
     assert!(c.io.trace.is_empty(), "{:x?}", c.io.trace);
 }

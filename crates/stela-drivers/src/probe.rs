@@ -4333,6 +4333,7 @@ mod tests {
                     },
                 },
                 rf: None,
+                rf18: None,
             }),
             was_on: true,
             kept: Some(Box::new(())),

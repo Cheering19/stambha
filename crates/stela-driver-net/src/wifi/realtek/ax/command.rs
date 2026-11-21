@@ -17,14 +17,23 @@
 //!
 //! Every H2C after `rtw89_phy_dm_init` goes through one [`Session`] (M2c
 //! spec S9.1): `rtw89_h2c_tx`'s CH12 submit, then RXQ drained through the
-//! scan's [`Receiver`], so acks, scan reports and frames are taken in RXQ
-//! order whatever wait is running, and none is dropped. Its acks are
-//! decoded as `rtw89_mac_c2h_rec_ack` and `rtw89_mac_c2h_done_ack` do
-//! (`mac.c:5459-5554`): [`Session::send_and_wait`] waits for a FW_OFLD
-//! DONE_ACK matched on cat, class and func but not seq, as Linux's
-//! `rtw89_complete_cond` does for ADD_SCANOFLD_CH and SCANOFLD (spec
-//! S1.13); every other DONE_ACK, which Linux ignores, is recorded in the
-//! [`Ledger`], the first non-zero return as its refusal (spec S1.14).
+//! session's [`Receiver`], so acks, scan reports, beacon filter reports
+//! and frames are taken in RXQ order whatever wait is running, and none is
+//! dropped. Its acks are decoded as `rtw89_mac_c2h_rec_ack` and
+//! `rtw89_mac_c2h_done_ack` do (`mac.c:5459-5554`).
+//! [`Session::send_and_wait_for`] waits for one of two things ([`Wait`]):
+//!
+//! - a DONE_ACK matched on cat, class and func but not seq, as Linux's
+//!   `rtw89_complete_cond` does for ADD_SCANOFLD_CH and SCANOFLD (M2c spec
+//!   S1.13); [`Session::send_and_wait`] is that wait on FW_OFLD. The same
+//!   wait on another class (the address CAM's, M3 spec S12.5) is Stela's
+//!   own: Linux waits for no other DONE_ACK.
+//! - the H2C's REC_ACK, matched on cat, class, func and seq (M3 spec S1.12,
+//!   S12.5). Also Stela's own: Linux's REC_ACK handler only counts SCANOFLD
+//!   receipts (`mac.c:5459-5492`).
+//!
+//! Every other DONE_ACK, which Linux ignores, is recorded in the [`Ledger`],
+//! the first non-zero return as its refusal (M2c spec S1.14).
 //!
 //! This module grants no interrupts, no C2H handler beyond the ack
 //! decoding, no H2C it builds itself past OFLD_CFG (the session sends what
@@ -150,9 +159,13 @@ impl Seen {
                 ack.unmatched_ack = ack.unmatched_ack.saturating_add(1)
             }
             Some(C2h::Log(text)) if ack.log.is_none() => ack.log = Some(LogText::new(text)),
-            Some(C2h::Log(_) | C2h::FormattedLog | C2h::ScanOfld(_) | C2h::Other { .. }) => {
-                ack.other_c2h = ack.other_c2h.saturating_add(1)
-            }
+            Some(
+                C2h::Log(_)
+                | C2h::FormattedLog
+                | C2h::ScanOfld(_)
+                | C2h::BeaconFilter(_)
+                | C2h::Other { .. },
+            ) => ack.other_c2h = ack.other_c2h.saturating_add(1),
         }
         Ok(())
     }
@@ -275,9 +288,10 @@ pub struct Refused {
 }
 
 /// Every C2H a [`Session`] has drained, counted by kind (saturating), and
-/// the first refusal. A DONE_ACK a wait consumed is counted in `done_acks`
-/// but never becomes `refused`. SCANOFLD_RSPs are not counted here: they go
-/// on to the sink, as frames do.
+/// the first refusal. An ack a wait consumed is counted in `rec_acks` or
+/// `done_acks`, and a consumed DONE_ACK never becomes `refused`.
+/// SCANOFLD_RSPs and BCNFLTR_RPTs are not counted here: they go on to the
+/// sink, as frames do.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ledger {
     pub rec_acks: u16,
@@ -289,27 +303,58 @@ pub struct Ledger {
     pub refused: Option<Refused>,
 }
 
-/// The DONE_ACK a running [`Session::send_and_wait`] waits for, and what
+/// What [`Session::send_and_wait_for`] waits for after the submit, within
+/// `ACK_WAIT_US`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// A DONE_ACK for H2C cat 1 (`H2C_CAT_MAC`) / `class` / `func`, whatever
+    /// its seq, as `rtw89_complete_cond` completes a wait. It fails the
+    /// command when `ret & mask` is not 0 (0x3F is
+    /// `RTW89_C2H_SCAN_DONE_ACK_RETURN`, `mac.c:5537-5539`; 0xFF the whole
+    /// return).
+    Done { class: u8, func: u8, mask: u8 },
+    /// The REC_ACK naming the packet itself: the cat, class and func of its
+    /// FWCMD header and its seq.
+    Received,
+}
+
+/// The ack a running [`Session::send_and_wait_for`] waits for, and what
 /// else arrived meanwhile (saturating, for `NoAck`).
 struct Awaited {
+    cat: u8,
+    class: u8,
     func: u8,
-    /// The matching DONE_ACK's raw `H2C_RETURN`, once it arrived.
-    ret: Option<u8>,
-    /// C2Hs that were not acks, scan reports included.
+    /// `Some` for a REC_ACK wait: the seq it must name.
+    receipt: Option<u8>,
+    /// The waited-for ack, once it arrived: a DONE_ACK's raw `H2C_RETURN`,
+    /// or 0 for a REC_ACK.
+    met: Option<u8>,
+    /// C2Hs that were not acks, scan and beacon filter reports included.
     other_c2h: u8,
-    /// Acks for another cat, class or func.
+    /// Acks for another H2C.
     unmatched_ack: u8,
 }
 
 impl Awaited {
-    fn new(func: u8) -> Self {
-        Self {
-            func,
-            ret: None,
-            other_c2h: 0,
-            unmatched_ack: 0,
-        }
+    /// Whether an ack names the awaited H2C: its cat, class and func, and
+    /// for a REC_ACK wait its seq. A REC_ACK naming the H2C a DONE_ACK wait
+    /// waits for is that H2C's own receipt, so it is not unmatched.
+    fn names(&self, cat: u8, class: u8, func: u8, seq: u8) -> bool {
+        (cat, class, func) == (self.cat, self.class, self.func)
+            && self.receipt.is_none_or(|s| s == seq)
     }
+}
+
+/// `H2C_HDR_CAT` [1:0], `H2C_HDR_CLASS` [7:2] and `H2C_HDR_FUNC` [15:8] of
+/// the FWCMD header after a CH12 packet's 16-byte descriptor
+/// (`fw.h:4673-4676`), as `H2c::packet_with` lays it out.
+fn h2c_header(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let hdr0 = u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?);
+    Some((
+        (hdr0 & 0x3) as u8,
+        ((hdr0 >> 2) & 0x3F) as u8,
+        ((hdr0 >> 8) & 0xFF) as u8,
+    ))
 }
 
 fn bump(counter: &mut u16) {
@@ -321,27 +366,31 @@ fn bump8(counter: &mut u8) {
 }
 
 /// One event from the receiver: C2Hs pass the ledger (and the running wait)
-/// first; SCANOFLD_RSPs and frames go on to `sink`.
+/// first; SCANOFLD_RSPs, BCNFLTR_RPTs and frames go on to `sink`.
 fn account(
     ledger: &mut Ledger,
     awaited: &mut Option<Awaited>,
     event: Event<'_>,
     sink: &mut dyn FnMut(Event<'_>),
 ) {
-    let ofld = |cat, class| (cat, class) == (H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD);
     let c2h = match event {
         Event::Frame(_) => return sink(event),
         Event::C2h(c2h) => c2h,
     };
     match c2h {
         C2h::RecAck {
-            cat, class, func, ..
+            cat,
+            class,
+            func,
+            seq,
         } => {
             bump(&mut ledger.rec_acks);
-            if let Some(a) = awaited
-                && !(ofld(cat, class) && func == a.func)
-            {
-                bump8(&mut a.unmatched_ack);
+            if let Some(a) = awaited {
+                if !a.names(cat, class, func, seq) {
+                    bump8(&mut a.unmatched_ack);
+                } else if a.receipt.is_some() && a.met.is_none() {
+                    a.met = Some(0);
+                }
             }
         }
         C2h::DoneAck {
@@ -353,8 +402,8 @@ fn account(
         } => {
             bump(&mut ledger.done_acks);
             if let Some(a) = awaited {
-                if a.ret.is_none() && ofld(cat, class) && func == a.func {
-                    a.ret = Some(ret);
+                if a.receipt.is_none() && a.met.is_none() && a.names(cat, class, func, seq) {
+                    a.met = Some(ret);
                     return;
                 }
                 bump8(&mut a.unmatched_ack);
@@ -380,13 +429,22 @@ fn account(
                 bump8(&mut a.other_c2h);
             }
         }
-        C2h::ScanOfld(_) => {
+        C2h::ScanOfld(_) | C2h::BeaconFilter(_) => {
             if let Some(a) = awaited {
                 bump8(&mut a.other_c2h);
             }
             sink(Event::C2h(c2h));
         }
     }
+}
+
+/// A [`Session`]'s own state between two sessions on the same rings and H2C
+/// sequence ([`Session::park`], [`Session::resume`]): the receiver, the
+/// ledger, and the last in-range RXQ hardware index a drain read.
+pub struct Parked {
+    pub rx: Receiver,
+    pub ledger: Ledger,
+    rxq_hw: u16,
 }
 
 /// The command channel after `rtw89_phy_dm_init`: CH12 for every H2C, RXQ
@@ -415,6 +473,31 @@ impl<'r> Session<'r> {
             ledger: Ledger::default(),
             awaited: None,
             rxq_hw: 0,
+        }
+    }
+
+    /// A session on the same rings and H2C sequence as the one `parked`
+    /// ended: its receiver (with the frames still waiting for their PPDU
+    /// status), its ledger and its last RXQ hardware index go on.
+    pub fn resume(rings: &'r mut Rings, h2c: &'r mut H2c, parked: Parked) -> Self {
+        let Parked { rx, ledger, rxq_hw } = parked;
+        Self {
+            rings,
+            h2c,
+            rx,
+            ledger,
+            awaited: None,
+            rxq_hw,
+        }
+    }
+
+    /// End the session, keeping what [`Session::resume`] goes on from. No
+    /// wait runs between two calls, so nothing is awaited.
+    pub fn park(self) -> Parked {
+        Parked {
+            rx: self.rx,
+            ledger: self.ledger,
+            rxq_hw: self.rxq_hw,
         }
     }
 
@@ -515,23 +598,12 @@ impl<'r> Session<'r> {
         Ok(met)
     }
 
-    /// Send `packet`, then drain RXQ every `ACK_POLL_US` for up to
-    /// `ACK_WAIT_US` until a DONE_ACK for cat 1 / FW_OFLD (class 9) /
-    /// `func` arrives, whatever its seq, as `rtw89_mac_c2h_done_ack`
-    /// completes the wait for ADD_SCANOFLD_CH and SCANOFLD (`mac.c:5532-5554`,
-    /// spec S1.13). Returns the seq.
-    ///
-    /// - The H2C not sent: `Submit` with the submit's error; RXQ untouched.
-    /// - `ret & ret_mask != 0` (0x3F for ADD_SCANOFLD_CH,
-    ///   `RTW89_C2H_SCAN_DONE_ACK_RETURN`; 0xFF for SCANOFLD):
-    ///   `Submit(H2cRejected)` with the raw return. The wait consumed that
-    ///   DONE_ACK, so it never becomes the ledger's refusal.
-    /// - No matching DONE_ACK in time: `Wait(NoAck)` with the C2Hs that were
-    ///   not acks, the unmatched acks and the skipped buffers of this wait,
-    ///   and the last RXQ hardware index.
-    /// - A drain or clock failure: `Wait` with it.
-    ///
-    /// Frames and scan reports drained meanwhile reach `sink`.
+    /// [`Session::send_and_wait_for`] waiting for a DONE_ACK for cat 1 /
+    /// FW_OFLD (class 9) / `func` whatever its seq, as
+    /// `rtw89_mac_c2h_done_ack` completes the wait for ADD_SCANOFLD_CH and
+    /// SCANOFLD (`mac.c:5532-5554`, M2c spec S1.13), failing on
+    /// `ret & ret_mask` (0x3F for ADD_SCANOFLD_CH,
+    /// `RTW89_C2H_SCAN_DONE_ACK_RETURN`; 0xFF for SCANOFLD).
     ///
     /// # Safety
     /// As [`Session::send`].
@@ -543,14 +615,70 @@ impl<'r> Session<'r> {
         ret_mask: u8,
         sink: &mut dyn FnMut(Event<'_>),
     ) -> Result<u8, CommandError> {
+        let wait = Wait::Done {
+            class: H2C_CL_MAC_FW_OFLD,
+            func,
+            mask: ret_mask,
+        };
+        // SAFETY: the caller's contract is `send_and_wait_for`'s.
+        unsafe { self.send_and_wait_for(io, packet, wait, sink) }
+    }
+
+    /// Send `packet`, then drain RXQ every `ACK_POLL_US` for up to
+    /// `ACK_WAIT_US` until what `wait` names arrives (M2c spec S1.13, M3
+    /// spec S12.5). Returns the seq.
+    ///
+    /// - [`Wait::Received`] for a packet too short for its FWCMD header:
+    ///   `Submit(Dma)`, before anything is sent.
+    /// - The H2C not sent: `Submit` with the submit's error; RXQ untouched.
+    /// - [`Wait::Done`] and `ret & mask != 0`: `Submit(H2cRejected)` with
+    ///   the wait's class and func and the raw return. The wait consumed that
+    ///   DONE_ACK, so it never becomes the ledger's refusal.
+    /// - Nothing matching in time: `Wait(NoAck)` with the class and func
+    ///   waited for, the C2Hs that were not acks, the unmatched acks and the
+    ///   skipped buffers of this wait, and the last RXQ hardware index. A
+    ///   DONE_ACK never ends a [`Wait::Received`], nor a REC_ACK a
+    ///   [`Wait::Done`].
+    /// - A drain or clock failure: `Wait` with it.
+    ///
+    /// Frames, scan reports and beacon filter reports drained meanwhile
+    /// reach `sink`.
+    ///
+    /// # Safety
+    /// As [`Session::send`].
+    pub unsafe fn send_and_wait_for<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        packet: (u8, Vec<u8>),
+        wait: Wait,
+        sink: &mut dyn FnMut(Event<'_>),
+    ) -> Result<u8, CommandError> {
         let (seq, bytes) = packet;
+        let (cat, class, func, receipt, mask) = match wait {
+            Wait::Done { class, func, mask } => (H2C_CAT_MAC, class, func, None, mask),
+            Wait::Received => {
+                let (cat, class, func) = h2c_header(&bytes).ok_or(CommandError::Submit(
+                    AxError::Dma("CH12 packet without an H2C header"),
+                ))?;
+                (cat, class, func, Some(seq), 0)
+            }
+        };
+        let fresh = || Awaited {
+            cat,
+            class,
+            func,
+            receipt,
+            met: None,
+            other_c2h: 0,
+            unmatched_ack: 0,
+        };
         // SAFETY: the caller's contract is `submit`'s, word for word.
         unsafe { self.rings.ch12().submit(io, &bytes) }.map_err(CommandError::Submit)?;
         let skipped = |rx: &Receiver| {
             u32::from(rx.counts.segments).saturating_add(u32::from(rx.counts.c2h_skipped))
         };
         let skipped_before = skipped(&self.rx);
-        self.awaited = Some(Awaited::new(func));
+        self.awaited = Some(fresh());
         let waited = poll_sample(
             io,
             ACK_POLL_US,
@@ -559,23 +687,23 @@ impl<'r> Session<'r> {
                 // SAFETY: the caller's contract is `drain`'s; the submit
                 // succeeded, which only a successful `pre_init` allows.
                 unsafe { self.drain(io, sink) }?;
-                Ok(self.awaited.as_ref().is_some_and(|a| a.ret.is_some()))
+                Ok(self.awaited.as_ref().is_some_and(|a| a.met.is_some()))
             },
             |acked| acked,
         );
         // Set above and taken only here: the default is never used.
-        let awaited = self.awaited.take().unwrap_or_else(|| Awaited::new(func));
+        let awaited = self.awaited.take().unwrap_or_else(fresh);
         waited.map_err(CommandError::Wait)?;
-        match awaited.ret {
-            Some(ret) if ret & ret_mask != 0 => Err(CommandError::Submit(AxError::H2cRejected {
-                class: H2C_CL_MAC_FW_OFLD,
+        match awaited.met {
+            Some(ret) if ret & mask != 0 => Err(CommandError::Submit(AxError::H2cRejected {
+                class,
                 func,
                 seq,
                 ret,
             })),
             Some(_) => Ok(seq),
             None => Err(CommandError::Wait(AxError::NoAck {
-                class: H2C_CL_MAC_FW_OFLD,
+                class,
                 func,
                 seq,
                 other_c2h: awaited.other_c2h,

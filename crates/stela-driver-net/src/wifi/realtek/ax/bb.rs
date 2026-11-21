@@ -12,8 +12,9 @@
 //! On top of the accessors, [`init_bb_reg`] is `rtw89_phy_init_bb_reg`
 //! (phy.c:1885-1911) for an RTL8852C's PHY 0 without DBCC: the firmware's
 //! BB table through [`config_bb_reg`] (`rtw89_phy_config_bb_reg`,
-//! phy.c:1347-1376), `rtw8852c_init_txpwr_unit` (rtw8852c.c:2293-2316),
-//! the BB gain table decoded into [`BbGain`] (`rtw89_phy_config_bb_gain_ax`,
+//! phy.c:1347-1376), `rtw8852c_init_txpwr_unit` (rtw8852c.c:2293-2316)
+//! with its TSSI bandedge step ([`tssi_ctrl_set_bandedge_cfg`], which
+//! [`super::txpwr`] also runs), the BB gain table decoded into [`BbGain`] (`rtw89_phy_config_bb_gain_ax`,
 //! phy.c:1577-1621, and its helpers from phy.c:1394) and
 //! `rtw8852c_bb_reset_all` (rtw8852c.c:1648-1671). `io_pack`/`unpack` do
 //! nothing on PCIe (fw.c:12682-12692) and are not ported.
@@ -142,6 +143,24 @@ const TSSI_BANDEDGE_FLAT: [(u32, u32); 15] = [
     (0xD91C, 0x0000_FF00),
     (0xD91C, 0x00FF_0000),
 ];
+/// `rtw89_tssi_bandedge_regs_level` (phy.c:8518-8534), in order.
+const TSSI_BANDEDGE_LEVEL: [(u32, u32); 15] = [
+    (0xD910, 0x0000_00FF),
+    (0xD910, 0x0000_FF00),
+    (0xD910, 0x00FF_0000),
+    (0xD910, 0xFF00_0000),
+    (0xD914, 0x0000_00FF),
+    (0xD914, 0x0000_FF00),
+    (0xD914, 0x00FF_0000),
+    (0xD908, 0x0000_00FF),
+    (0xD908, 0x0000_FF00),
+    (0xD908, 0x00FF_0000),
+    (0xD908, 0xFF00_0000),
+    (0xD90C, 0x0000_00FF),
+    (0xD90C, 0x0000_FF00),
+    (0xD90C, 0x00FF_0000),
+    (0xD90C, 0xFF00_0000),
+];
 /// `rtw89_tssi_fastmode_regs_flat` (phy.c:8465-8470), in order.
 const TSSI_FAST_MODE_FLAT: [(u32, u32); 4] = [
     (0xD934, 0x00FF_0000),
@@ -149,10 +168,32 @@ const TSSI_FAST_MODE_FLAT: [(u32, u32); 4] = [
     (0xD938, 0x0000_00FF),
     (0xD934, 0x0000_FF00),
 ];
-/// `RTW89_TSSI_BANDEDGE_FLAT` (phy.h:319), whose `rtw89_8852c_tssi_dbw_table`
-/// row is all zeros (rtw8852c_table.c:57133).
-const TSSI_BANDEDGE_FLAT_CFG: u32 = 0;
-const TSSI_DBW_FLAT: u32 = 0;
+/// `rtw89_tssi_fastmode_regs_level` (phy.c:8472-8477), in order.
+const TSSI_FAST_MODE_LEVEL: [(u32, u32); 4] = [
+    (0xD930, 0x00FF_0000),
+    (0xD930, 0xFF00_0000),
+    (0xD934, 0x0000_00FF),
+    (0xD930, 0x0000_FF00),
+];
+/// `RTW89_TSSI_BANDEDGE_FLAT` and `RTW89_TSSI_CFG_NUM` (phy.h:318-325).
+const TSSI_BANDEDGE_FLAT_CFG: u8 = 0;
+const TSSI_CFG_NUM: u8 = 4;
+/// `RTW89_TSSI_SBW20` (phy.h:327-328).
+const TSSI_SBW20: usize = 0;
+/// `rtw89_8852c_tssi_dbw_table.data` by bandedge config: FLAT (all zeros),
+/// LOW, MID and HIGH (rtw8852c_table.c:57132-57140).
+const TSSI_DBW: [[u32; 15]; TSSI_CFG_NUM as usize] = [
+    [0; 15],
+    [
+        0x1d, 0x1d, 0x1d, 0x2f, 0xf, 0xf, 0x2f, 0x38, 0x28, 0x18, 0x8, 0x8, 0x18, 0x28, 0x38,
+    ],
+    [
+        0x24, 0x24, 0x24, 0x3b, 0x13, 0x13, 0x3b, 0x46, 0x32, 0x1e, 0xa, 0xa, 0x1e, 0x32, 0x46,
+    ],
+    [
+        0x2a, 0x2a, 0x2a, 0x46, 0x17, 0x17, 0x46, 0x53, 0x3b, 0x24, 0xc, 0xc, 0x24, 0x3b, 0x53,
+    ],
+];
 /// The `pw_ofst` `rtw8852c_init_txpwr_unit` passes (rtw8852c.c:2310).
 const UL_TB_PW_OFST: i8 = 0;
 
@@ -189,18 +230,40 @@ pub(super) fn init_txpwr_unit<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxErro
     for (addr, data) in TSSI_CTRL_INI {
         io.write32(addr, data)?;
     }
-    for (addr, mask) in TSSI_BANDEDGE_FLAT {
-        io::field32(io, addr, mask, TSSI_DBW_FLAT)?;
+    tssi_ctrl_set_bandedge_cfg(io, TSSI_BANDEDGE_FLAT_CFG)
+}
+
+/// `rtw89_phy_tssi_ctrl_set_bandedge_cfg` (phy.c:8536-8566) on MAC 0 with
+/// the RTL8852C's `tssi_dbw_table`: a config past `RTW89_TSSI_CFG_NUM`
+/// writes nothing; otherwise the flat (config 0) or level registers take
+/// the config's row, 0xD94C [31:30] the config, and
+/// `rtw89_phy_tssi_ctrl_set_fast_mode_cfg` (phy.c:8479-8498) writes the
+/// row's SBW20 value to the flat or level fast-mode registers. Every write
+/// is a read-modify-write.
+pub(super) fn tssi_ctrl_set_bandedge_cfg<I: AxIo + ?Sized>(
+    io: &mut I,
+    cfg: u8,
+) -> Result<(), AxError> {
+    if cfg >= TSSI_CFG_NUM {
+        return Ok(());
+    }
+    let (regs, fast_mode) = if cfg == TSSI_BANDEDGE_FLAT_CFG {
+        (&TSSI_BANDEDGE_FLAT, &TSSI_FAST_MODE_FLAT)
+    } else {
+        (&TSSI_BANDEDGE_LEVEL, &TSSI_FAST_MODE_LEVEL)
+    };
+    let data = &TSSI_DBW[usize::from(cfg)];
+    for (&(addr, mask), &v) in regs.iter().zip(data) {
+        io::field32(io, addr, mask, v)?;
     }
     io::field32(
         io,
         R_AX_BANDEDGE_CFG,
         B_AX_BANDEDGE_CFG_IDX_MASK,
-        TSSI_BANDEDGE_FLAT_CFG,
+        u32::from(cfg),
     )?;
-    // `rtw89_phy_tssi_ctrl_set_fast_mode_cfg` with data[RTW89_TSSI_SBW20].
-    for (addr, mask) in TSSI_FAST_MODE_FLAT {
-        io::field32(io, addr, mask, TSSI_DBW_FLAT)?;
+    for &(addr, mask) in fast_mode {
+        io::field32(io, addr, mask, data[TSSI_SBW20])?;
     }
     Ok(())
 }

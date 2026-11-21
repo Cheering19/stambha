@@ -2274,6 +2274,36 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_carries_every_tx_power_table",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/txpwr_tables/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware; at rfe 1 the rfe 0 elements are taken, SHA-256 of each whole element: TXPWR_BYRATE 59c46c280a48222bd79e86ab96608c3827f246fef192eaca93cbede120113f6c, TXPWR_LMT_2GHZ ca94e02ee21e84b1fd4f71a533d3d399fe4623d569deaaa834e85e90b89b3748, TXPWR_LMT_5GHZ 617c97db33eeeab95c0027a4f611bbe7db3f12b4bea2d4aa09904a34d5c952f9, TXPWR_LMT_RU_2GHZ dd4ba55f5843aab8d151ff64e06f3875d42936288ad53390880e270faac21e8d, TXPWR_LMT_RU_5GHZ 9ec4faebaf1a61e9d1c5960e405f03d25f482e66eb70fa902f7824aafa39c6ca, TX_SHAPE_LMT 68532463e4a3b001573dd478eea2daf883fa6f06a8d96efbe5d755cf186edc7e, REGD cd9a0310c638c4d1cdb483aebbe5fbd6a62583404f0d94b8fa67f2d8a9611886"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_regd_map_selects_as_linux_does",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/regd/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware; the REGD element of SHA-256 cd9a0310c638c4d1cdb483aebbe5fbd6a62583404f0d94b8fa67f2d8a9611886 gives US FCC, DE and IN ETSI, GB UK (ETSI for TX power), and an unknown country or none WW"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_txpwr_2g_ch1_us",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/txpwr/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware; rtw8852c_set_txpwr at rfe 1 (rfe 0 elements), US = FCC, 2.4 GHz channel 1, 20 MHz, from zeroed registers: 119 accesses, one line each ('R32 0x%08X' or 'W32 0x%08X 0x%08X'), SHA-256 82f54cc1bc88773b6ef8a6da68b2f5bc6078c47614e5797109ee13d153ad9772; the 43 MAC by-rate, limit and RU limit words, the zero offset field and TX shape CCK 1 (sharp DFIR) / OFDM 3 (HIGH bandedge) were recomputed from the raw element bytes by a script independent of the crate, which also reproduced the trace digest"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "real_8852c_fw_2_tables_select_as_linux_does",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy_table/tests.rs",
     "kind": "oracle",

@@ -45,7 +45,7 @@ fn port_update_from_zero() -> Vec<Op> {
 #[test]
 fn port_update_from_reset_matches_linux_sequence() {
     let mut io = RegisterModel::new();
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     assert_eq!(io.trace[0], Op::R32(0xC400));
     assert_eq!(io.writes(), port_update_from_zero());
     assert!(!io.trace.contains(&Op::Delay(1000)));
@@ -54,7 +54,7 @@ fn port_update_from_reset_matches_linux_sequence() {
 #[test]
 fn port_update_reads_each_register_at_linuxs_width() {
     let mut io = RegisterModel::new();
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     let reads: Vec<Op> = io
         .trace
         .iter()
@@ -87,7 +87,7 @@ fn port_update_reads_each_register_at_linuxs_width() {
 fn port_update_with_port_on_runs_func_sw() {
     let mut io = RegisterModel::new();
     io.set32(0xC400, 0x0001_0004);
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     // `msleep(beacon_int + 1)` with beacon_int 0, then PORT_FUNC_EN and
     // BRK_SETUP off, TSFTR_RST on and the beacon counter timer cleared.
     assert_eq!(
@@ -130,7 +130,7 @@ fn port_update_clears_only_the_port_cfg_bits_linux_names() {
     let kept = 0xFFFE_C3C0;
     let mut io = RegisterModel::new();
     io.set32(0xC400, kept | 0x0001_3C1B);
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     // PORT_FUNC_EN was off, so func_sw left TSFTR_RST alone.
     assert_eq!(io.get32(0xC400), kept | 0x4);
 }
@@ -144,7 +144,7 @@ fn port_update_keeps_the_neighbouring_fields() {
         io.set32(reg, 0xFFFF_FFFF);
     }
     io.set32(0xC568, 0xFFFF_FFFF);
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     // TBTT_SETUP [7:0] = 2 and TBTT_HOLD [27:16] = 200.
     assert_eq!(io.get32(0xC404), 0xF0C8_FF02);
     // BCN_MSK_AREA [27:16] = 0.
@@ -169,7 +169,7 @@ fn port_update_keeps_the_neighbouring_fields() {
 fn hiq_drop_clears_port0_bits_only() {
     let mut io = RegisterModel::new();
     io.set32(0xC63C, 0x001F_0003);
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     assert!(io.trace.contains(&Op::W32(0xC63C, 0x001E_0002)));
 }
 
@@ -177,8 +177,103 @@ fn hiq_drop_clears_port0_bits_only() {
 fn hiq_dtim_sets_the_update_bits_and_keeps_the_rest() {
     let mut io = RegisterModel::new();
     io.set32(0xCA08, 0x0000_00F4);
-    port_update(&mut io).unwrap();
+    port_update(&mut io, &PortConfig::NO_LINK).unwrap();
     assert!(io.trace.contains(&Op::W8(0xCA08, 0xF7)));
+}
+
+/// Spec S10.7: `rtw89_mac_port_update` for the associated station (INFRA)
+/// on a port vif init left on (0xC400 b2), with the AP's beacon interval
+/// 100 and DTIM period 1: writes and delays only.
+#[test]
+fn port_update_infra_changes_only_the_listed_steps() {
+    let mut io = RegisterModel::new();
+    io.set32(0xC400, 0x4);
+    port_update(&mut io, &PortConfig::infra(100, 1)).unwrap();
+    let want = [
+        // 1: func_sw with the port on: msleep(beacon_int + 1), then
+        // PORT_FUNC_EN and BRK_SETUP off, TSFTR_RST on, the counter cleared.
+        Op::Delay(101_000),
+        Op::W32(0xC400, 0),
+        Op::W32(0xC400, 0x20),
+        Op::W32(0xC434, 0),
+        // 2-3: tx_rpt and rx_rpt off; 4: NET_TYPE [11:10] = INFRA (2).
+        Op::W32(0xC400, 0x20),
+        Op::W32(0xC400, 0x20),
+        Op::W32(0xC400, 0x820),
+        // 5: bcn_prct sets TBTT_PROHIB_EN | BRK_SETUP; 6: rx_sw sets
+        // RX_BSSID_FIT_EN; 7: rx_sync sets TSF_UDT_EN; 8: tx_sw clears
+        // BCNTX_EN.
+        Op::W32(0xC400, 0x0001_2820),
+        Op::W32(0xC400, 0x0001_2830),
+        Op::W32(0xC400, 0x0001_2838),
+        Op::W32(0xC400, 0x0001_2838),
+        // 9: BCN_SPACE = the beacon interval.
+        Op::W32(0xC414, 100),
+        Op::W8(0xC590, 0),
+        // 11: DTIM_NUM [15:8] = the DTIM period.
+        Op::W8(0xCA08, 3),
+        Op::W16(0xC426, 0x100),
+        Op::W32(0xC63C, 0),
+        Op::W32(0xC404, 2),
+        Op::W32(0xC404, 0x00C8_0002),
+        Op::W32(0xC408, 0),
+        Op::W16(0xC40E, 5),
+        Op::W16(0xC412, 0x100),
+        Op::W32(0xC6A0, 0),
+        Op::W32(0xC568, 0),
+        Op::W32(0xC400, 0x0001_283C),
+        Op::Delay(20),
+        Op::W32(0xC40C, 0x0005_00A0),
+        // 24: BCAID_P0 = 0, the BSS not being nontransmitted.
+        Op::W32(0xCE84, 0),
+    ];
+    assert_eq!(io.writes(), want);
+    // Every other write is NO_LINK's from the same state.
+    let mut no_link = RegisterModel::new();
+    no_link.set32(0xC400, 0x4);
+    port_update(&mut no_link, &PortConfig::NO_LINK).unwrap();
+    let theirs = no_link.writes();
+    assert_eq!(theirs.len(), want.len());
+    let differ: Vec<usize> = (0..want.len()).filter(|&i| theirs[i] != want[i]).collect();
+    // The sleep, NET_TYPE, the four net-type enables, DTIM_NUM, and the
+    // port function's write, which carries those bits. A zero beacon
+    // interval spaces beacons by 100 too.
+    assert_eq!(differ, [0, 6, 7, 8, 9, 10, 14, 23]);
+    assert_eq!(theirs[0], Op::Delay(1000));
+    assert_eq!(theirs[11], Op::W32(0xC414, 100));
+    assert_eq!(io.get32(0xC400), 0x0001_283C);
+}
+
+#[test]
+fn port_update_infra_takes_100_for_a_zero_beacon_interval() {
+    let mut io = RegisterModel::new();
+    io.set32(0xC400, 0x4);
+    port_update(&mut io, &PortConfig::infra(0, 3)).unwrap();
+    let writes = io.writes();
+    // msleep(0 + 1): Linux sleeps on the raw beacon interval.
+    assert_eq!(writes[0], Op::Delay(1000));
+    assert!(writes.contains(&Op::W32(0xC414, 100)));
+    assert!(writes.contains(&Op::W16(0xC426, 0x300)));
+    // A beacon interval of 200 sleeps 201 ms and spaces beacons by 200.
+    let mut io = RegisterModel::new();
+    io.set32(0xC400, 0x4);
+    port_update(&mut io, &PortConfig::infra(200, 1)).unwrap();
+    assert_eq!(io.writes()[0], Op::Delay(201_000));
+    assert!(io.writes().contains(&Op::W32(0xC414, 200)));
+}
+
+#[test]
+fn port_update_refuses_ad_hoc_and_ap_before_any_access() {
+    for net_type in [1, 3, 4] {
+        let mut io = RegisterModel::new();
+        let port = PortConfig {
+            net_type,
+            beacon_int: 100,
+            dtim: 1,
+        };
+        assert!(matches!(port_update(&mut io, &port), Err(AxError::Mac(_))));
+        assert!(io.trace.is_empty());
+    }
 }
 
 #[test]
