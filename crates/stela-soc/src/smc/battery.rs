@@ -36,8 +36,10 @@
 //! size: `BPCC` (one pack, no charger: no `AppleChargerData` key is here),
 //! `AC-N` adapters connected and `AC-W` the active one's port, 1-based, as
 //! `readAdapterInfo` reads them (1 byte each). For the registry's
-//! `BatteryData`: `BUIC` the percentage, `B0RM` remaining (big-endian, which
-//! Asahi swaps back), `B0FC` full charge and `B0DC` design capacity, mAh.
+//! `BatteryData`: `BUIC` the percentage, `B0RM` remaining, `B0FC` full charge
+//! and `B0DC` design capacity, mAh. `B0RM` is little-endian like the rest:
+//! Linux's `macsmc-power` swaps it only on firmware older than macOS 27's,
+//! which it tells by a 4-byte `BCF0`, and this `BCF0` is macOS 27's 1 byte.
 //! Latches the battery driver and powerd write at these confirmed sizes,
 //! kept and read back, changing nothing on the host: `CH0C`/`CH0I` charge
 //! and connect inhibit, `D0IG`, `UB0C`, `BSCL` the shipping charge limit (1
@@ -172,8 +174,8 @@ pub(super) fn keys(snapshot: &PowerSnapshot) -> Vec<(u32, Key)> {
 }
 
 /// The reading's keys' values, in [`READINGS`]' order: integers
-/// little-endian and held at their type's ends, `B0RM` big-endian, unknown
-/// values 0, and no time estimate [`NO_TIME`].
+/// little-endian and held at their type's ends, unknown values 0, and no
+/// time estimate [`NO_TIME`].
 fn values(shown: &PowerSnapshot) -> [Vec<u8>; READINGS.len()] {
     let battery = shown.battery.as_ref();
     let unsigned = |field: fn(&BatteryState) -> Option<u32>| {
@@ -229,7 +231,7 @@ fn values(shown: &PowerSnapshot) -> [Vec<u8>; READINGS.len()] {
                 .unwrap_or(0)
                 .min(100),
         ],
-        remaining.to_be_bytes().to_vec(),
+        remaining.to_le_bytes().to_vec(),
         full.to_le_bytes().to_vec(),
         unsigned(|battery| battery.design_mah)
             .to_le_bytes()

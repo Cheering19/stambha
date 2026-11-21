@@ -287,8 +287,10 @@ fn values_encode_the_snapshot_in_each_keys_type_and_byte_order() {
             (b"AC-N", vec![0]),
             (b"AC-W", vec![0]),
             (b"BUIC", vec![73]),
-            // Big-endian, as Asahi swaps it back.
-            (b"B0RM", 3_650u16.to_be_bytes().to_vec()),
+            // Little-endian with a 1-byte BCF0: Linux macsmc-power swaps
+            // B0RM only on firmware older than macOS 27's, which it tells by
+            // a 4-byte BCF0.
+            (b"B0RM", le16(3_650)),
             (b"B0FC", le16(5_000)),
             (b"B0DC", le16(5_200)),
             (b"MSLD", vec![0]),
@@ -333,7 +335,7 @@ fn values_encode_the_snapshot_in_each_keys_type_and_byte_order() {
             (b"B0AC", le16(0)),
             (b"BUIC", vec![100]),
             (b"B0UC", le16(5_000)),
-            (b"B0RM", 5_000u16.to_be_bytes().to_vec()),
+            (b"B0RM", le16(5_000)),
         ],
     );
     // Critical, and values past each type's range held at its ends.
@@ -355,7 +357,7 @@ fn values_encode_the_snapshot_in_each_keys_type_and_byte_order() {
         &[
             (b"BCF0", vec![1]),
             (b"B0UC", le16(0xffff)),
-            (b"B0RM", vec![0xff, 0xff]),
+            (b"B0RM", le16(0xffff)),
             (b"B0AV", le16(0xffff)),
             (b"B0AC", i16::MIN.to_le_bytes().to_vec()),
             (b"B0CT", le16(0xffff)),
