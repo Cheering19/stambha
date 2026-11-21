@@ -141,6 +141,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// required. Codec-specific failures are held even on partial success.
     /// Each retry delays, then fully reinitializes the link and command rings;
     /// timed-out/ambiguous responses are never followed by another unsafe verb.
+    /// A retry follows only while a codec is reported and answers its vendor
+    /// ID, so a controller with no codec costs one attempt and no delay.
     /// This adapts the bounded retry in Linux intel.c::azx_probe_continue and
     /// common/controller.c::azx_codec_configure; vendor/OEM codec configuration
     /// and analog route success remain separate explicit operations.
@@ -221,7 +223,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                     failures,
                 });
             }
-            if attempt == limit {
+            // azx_probe_continue retries azx_codec_configure only while
+            // bus->codec_mask names a codec: none reported, or none left
+            // once the silent ones were dropped, is final at once.
+            if attempt == limit || self.codec_mask == 0 {
                 return Err(DiscoveryFailure {
                     attempts: attempt,
                     error,
