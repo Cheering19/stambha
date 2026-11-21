@@ -118,13 +118,15 @@ enum Call {
     Authenticated,
     /// A management frame and the basic rates it went with.
     Management(Vec<u8>, u16),
-    /// A data frame, with the CAM entry, key ID and PN it went under.
+    /// A data frame, with the CAM entry, key ID and PN it went under, and
+    /// the A-MPDU it went in.
     Data {
         bytes: Vec<u8>,
         tid: u8,
         eapol: bool,
         supported: u16,
         key: FrameKey,
+        aggregate: Option<txd::Aggregate>,
     },
     Associate(Joined),
     Disassociate,
@@ -145,6 +147,12 @@ enum Call {
         window: u16,
     },
     StopBa(u8),
+    /// `rtw89_ops_ampdu_action`'s TX_OPERATIONAL with its window, and
+    /// TX_STOP (`None`).
+    Aggregation {
+        tid: u8,
+        window: Option<u16>,
+    },
 }
 
 /// What the chip was told, and what it holds for the host.
@@ -221,6 +229,13 @@ struct Air {
     /// handed any over (M4 spec S9.1): only a kicked frame reaches the AP.
     unkicked: Vec<(Token, Vec<u8>)>,
     kicks: usize,
+    /// The AP has no HT: it carries neither HT element.
+    no_ht: bool,
+    /// The AP answers the station's unprotected ADDBA Requests with success
+    /// at the request's window, or at `addba_window` when set; it never
+    /// answers when `addba_silent`.
+    addba_window: Option<u16>,
+    addba_silent: bool,
 }
 
 impl Air {
@@ -279,7 +294,9 @@ impl Air {
                     // HT Operation's primary channel, as the beacon's.
                     let mut ht = HT;
                     ht[30] = self.channel.unwrap().number as u8;
-                    body.extend(ht);
+                    if !self.no_ht {
+                        body.extend(ht);
+                    }
                     if !self.no_wmm {
                         body.extend(WMM);
                     }
@@ -287,6 +304,9 @@ impl Air {
                     if self.addba_with_assoc {
                         self.hear(addba(1, 0, 64, 0));
                     }
+                }
+                0xd0 if bytes[1] & 0x40 == 0 && bytes[24..26] == [3, 0] && !self.addba_silent => {
+                    self.hear(addba_response(&bytes, self.addba_window));
                 }
                 _ => {}
             }
@@ -500,6 +520,7 @@ impl Chip for Model {
             eapol: frame.eapol,
             supported: frame.supported_rates,
             key: frame.key,
+            aggregate: frame.aggregate,
         });
         let token = air.token();
         air.unkicked.push((token, frame.bytes.to_vec()));
@@ -579,6 +600,13 @@ impl Chip for Model {
     }
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String> {
         self.0.borrow_mut().calls.push(Call::StopBa(tid));
+        Ok(())
+    }
+    fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), String> {
+        self.0
+            .borrow_mut()
+            .calls
+            .push(Call::Aggregation { tid, window });
         Ok(())
     }
     fn diagnostic(&self) -> String {
@@ -670,10 +698,12 @@ fn beacon(air: &Air) -> Vec<u8> {
     } else {
         RSN
     });
-    frame.extend(HT);
-    // HT Operation's primary channel.
-    let at = frame.len() - 22;
-    frame[at] = channel;
+    if !air.no_ht {
+        frame.extend(HT);
+        // HT Operation's primary channel.
+        let at = frame.len() - 22;
+        frame[at] = channel;
+    }
     frame.extend(&air.beacon_extra);
     if !air.no_wmm {
         frame.extend(WMM);
@@ -1103,6 +1133,7 @@ fn eapol_flows_both_ways_before_any_key() {
                 eapol: is_eapol,
                 supported,
                 key,
+                ..
             } if eapol(bytes).is_some() => Some((*tid, *is_eapol, *supported, *key)),
             _ => None,
         })
@@ -1570,6 +1601,8 @@ fn data_goes_with_its_pn_and_without_iv() {
     let before = model.0.borrow().data().len();
     wifi.transmit(&ip(1)).unwrap();
     wifi.transmit(&ip(2)).unwrap();
+    // The second waits for TID 0's agreement (M4 spec S10.1).
+    assert!(run(&mut wifi, &model, |_, air| air.data().len() == before + 2));
     let air = model.0.borrow();
     let sent = &air.data()[before..];
     // The PTK's CAM entry and key ID 0, under PNs 1 and 2: its
@@ -1746,10 +1779,15 @@ fn the_progress_line_counts_data_both_ways() {
     assert_eq!(delivered(&mut wifi), [0x45]);
     wifi.transmit(&ip(1)).unwrap();
     wifi.transmit(&ip(2)).unwrap();
+    // The second waits for TID 0's agreement (M4 spec S10.1), which the AP
+    // accepts.
+    assert!(run(&mut wifi, &model, |wifi, _| progress(wifi)
+        .contains("tx data 2;")));
+    let link = LINK_CH1.replace("addba 0/0, agg -", "addba 1/1, agg 0");
     let line = progress(&mut wifi);
     assert!(
         line.contains(&alloc::format!(
-            ", port open, {LINK_CH1}, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "
+            ", port open, {link}, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "
         )),
         "{line}"
     );
@@ -1921,6 +1959,7 @@ fn leaving(air: &Air, from: usize) -> Vec<String> {
             Call::Disassociate => Some(String::from("leave")),
             Call::AddKey { .. } => Some(String::from("add")),
             Call::StopBa(tid) => Some(alloc::format!("stop {tid}")),
+            Call::Aggregation { tid, window: None } => Some(alloc::format!("agg stop {tid}")),
             _ => None,
         })
         .collect()
@@ -2323,6 +2362,18 @@ fn addba(dialog: u8, tid: u8, window: u16, ssn: u16) -> Vec<u8> {
     body.extend(parameters.to_le_bytes());
     body.extend(0u16.to_le_bytes());
     body.extend((ssn << 4).to_le_bytes());
+    management(0xd0, &body)
+}
+
+/// The AP's ADDBA Response to the station's ADDBA Request `request`, in the
+/// clear: its dialog, success, its parameters at a window of `window` (the
+/// request's own when `None`), and its timeout.
+fn addba_response(request: &[u8], window: Option<u16>) -> Vec<u8> {
+    let asked = u16::from_le_bytes([request[27], request[28]]);
+    let parameters = window.map_or(asked, |window| asked & 0x3f | window << 6);
+    let mut body = vec![3, 1, request[26], 0, 0];
+    body.extend(parameters.to_le_bytes());
+    body.extend_from_slice(&request[29..31]);
     management(0xd0, &body)
 }
 
@@ -3218,8 +3269,13 @@ fn in_keeps_149_to_165() {
 fn kick_once_per_pass_covers_every_submitted_frame() {
     // M4 spec S9.1: the frames the network hands over go to the chip as they
     // come (`rtw89_pci_tx_write`), and the radio's service pass kicks once
-    // (`rtw89_core_txq_schedule`'s `rtw89_core_tx_kick_off`).
+    // (`rtw89_core_txq_schedule`'s `rtw89_core_tx_kick_off`). TID 0's
+    // agreement is made first, as data waits while it is made (spec S10.1).
     let (mut wifi, model) = connected();
+    wifi.transmit(&ip(9)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| wifi.radio().aggregating
+        [0]
+    .is_some()));
     let (before, kicks) = {
         let air = model.0.borrow();
         assert!(air.unkicked.is_empty());
@@ -3245,4 +3301,402 @@ fn kick_once_per_pass_covers_every_submitted_frame() {
         .collect();
     assert_eq!(fills, [0, 1, 2, 3, 4]);
     assert_eq!(air.data().len(), before + 5);
+}
+
+// TX Block Ack (M4 Task 8, spec S10).
+
+/// An IPv4 frame from the station to the AP of type of service `tos`, its
+/// body `fill`: by RFC 8325, 0xb8 (EF) is TID 6 and 0xc0 (CS6) TID 7.
+fn ip_tos(tos: u8, fill: u8) -> Vec<u8> {
+    let mut ethernet = ip(fill);
+    ethernet[15] = tos;
+    ethernet
+}
+
+/// The station's Block Ack action frames of action `action` (0 the ADDBA
+/// Request, 2 the DELBA), unprotected.
+fn block_acks(air: &Air, action: u8) -> Vec<Vec<u8>> {
+    air.management(0xd0)
+        .into_iter()
+        .filter(|frame| frame[24..26] == [3, action])
+        .collect()
+}
+
+/// The chip's TX Block Ack calls from call `from` on.
+fn aggregations(air: &Air, from: usize) -> Vec<(u8, Option<u16>)> {
+    air.calls[from..]
+        .iter()
+        .filter_map(|c| match c {
+            Call::Aggregation { tid, window } => Some((*tid, *window)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The data frames but EAPOL from call `from` on: each one's first payload
+/// byte past its IPv4 type of service, its TID and its A-MPDU.
+fn aggregates(air: &Air, from: usize) -> Vec<(u8, u8, Option<txd::Aggregate>)> {
+    air.calls[from..]
+        .iter()
+        .filter_map(|c| match c {
+            Call::Data {
+                bytes,
+                tid,
+                aggregate,
+                ..
+            } if eapol(bytes).is_none() => Some((bytes[36], *tid, *aggregate)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A data frame's sequence number.
+fn sequence(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[22], bytes[23]]) >> 4
+}
+
+/// The A-MPDU of an agreement of 64 with the model's AP, whose HT A-MPDU
+/// parameters (`HT[4]`, 0x17) are the length exponent 3 and the spacing 5.
+const AGGREGATE_64: Option<txd::Aggregate> = Some(txd::Aggregate {
+    agg_num: 64,
+    factor: 3,
+    density: 5,
+});
+
+/// Whether the radio's agreement on `tid` is operational.
+fn agreed(wifi: &Wifi<Model>, tid: usize) -> bool {
+    wifi.radio().aggregating[tid].is_some()
+}
+
+#[test]
+fn first_qos_data_starts_an_agreement() {
+    // rtw89_core_txq_check_agg (core.c:4707-4741): the first QoS data on a
+    // TID with no agreement queues ba_work, whose
+    // ieee80211_start_tx_ba_session sends an ADDBA Request (agg-tx.c), 64
+    // for an HT peer (M4 spec S10.1), immediate, from the TID's next
+    // sequence number. The AP's success is TX_OPERATIONAL
+    // (Chip::aggregation), and the TID's next frames go in A-MPDUs of the
+    // agreement's window at the AP's spacing.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    wifi.transmit(&ip(1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    {
+        let air = model.0.borrow();
+        let [request] = &block_acks(&air, 0)[..] else {
+            panic!("{} requests", block_acks(&air, 0).len())
+        };
+        assert_eq!(request[4..10], AP);
+        // Immediate (b1) on TID 0 (b2-5), a window of 64 (b6-15), no
+        // timeout, from the sequence number after the first frame's.
+        let parameters = u16::from_le_bytes([request[27], request[28]]);
+        assert_eq!(parameters & 0x3e, 0x02);
+        assert_eq!(parameters >> 6, 64);
+        assert_eq!(request[29..31], [0, 0]);
+        let first = air.calls[from..]
+            .iter()
+            .find_map(|c| match c {
+                Call::Data { bytes, .. } => Some(sequence(bytes)),
+                _ => None,
+            })
+            .unwrap();
+        let ssn = u16::from_le_bytes([request[31], request[32]]) >> 4;
+        assert_eq!(ssn, (first + 1) & 0xfff);
+        assert_eq!(aggregations(&air, from), [(0, Some(64))]);
+    }
+    for fill in 2..5 {
+        wifi.transmit(&ip(fill)).unwrap();
+    }
+    assert_eq!(
+        aggregates(&model.0.borrow(), from),
+        [
+            (1, 0, None),
+            (2, 0, AGGREGATE_64),
+            (3, 0, AGGREGATE_64),
+            (4, 0, AGGREGATE_64)
+        ]
+    );
+    let line = progress(&mut wifi);
+    assert!(line.contains(", addba 1/1, agg 0, rx data"), "{line}");
+}
+
+#[test]
+fn an_agreement_takes_the_responses_window_up_to_128() {
+    // __ieee80211_start_tx_ba_session's agreement takes min(the response's
+    // window, the 128 of TRANSMIT_WINDOW) (agg-tx.c:992-1000), and
+    // TX_OPERATIONAL carries it; a smaller answer is kept as it is.
+    for (answer, window) in [(256, 128), (32, 32)] {
+        let (mut wifi, model) = connected();
+        model.0.borrow_mut().addba_window = Some(answer);
+        let from = model.0.borrow().calls.len();
+        wifi.transmit(&ip(1)).unwrap();
+        assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+        wifi.transmit(&ip(2)).unwrap();
+        let air = model.0.borrow();
+        assert_eq!(aggregations(&air, from), [(0, Some(window))]);
+        let aggregate = aggregates(&air, from)[1].2.unwrap();
+        assert_eq!(aggregate.agg_num, window);
+    }
+}
+
+#[test]
+fn parked_frames_keep_their_order_and_pns() {
+    // ieee80211_agg_stop_txq: while the agreement is made, the TID's data
+    // waits in its TXQ unnumbered, then leaves in order behind the ADDBA
+    // Request (ieee80211_agg_start_txq), each frame taking its sequence
+    // number and PN as it leaves.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    for fill in 1..=6 {
+        wifi.transmit(&ip(fill)).unwrap();
+    }
+    assert_eq!(aggregates(&model.0.borrow(), from).len(), 1);
+    assert!(run(&mut wifi, &model, |_, air| {
+        aggregates(air, from).len() == 6
+    }));
+    let air = model.0.borrow();
+    let request = air
+        .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0xd0 && b[24..26] == [3, 0]))
+        .unwrap();
+    let data: Vec<usize> = (from..air.calls.len())
+        .filter(|&at| matches!(air.calls[at], Call::Data { .. }))
+        .collect();
+    assert!(data[0] < request && request < data[1]);
+    let sent: Vec<(u8, u64, u16)> = data
+        .iter()
+        .map(|&at| match &air.calls[at] {
+            Call::Data { bytes, key, .. } => (bytes[36], key.unwrap().2, sequence(bytes)),
+            _ => unreachable!(),
+        })
+        .collect();
+    let fills: Vec<u8> = sent.iter().map(|s| s.0).collect();
+    assert_eq!(fills, [1, 2, 3, 4, 5, 6]);
+    let pns: Vec<u64> = sent.iter().map(|s| s.1).collect();
+    assert_eq!(pns, [1, 2, 3, 4, 5, 6]);
+    assert!(sent.windows(2).all(|w| w[1].2 == (w[0].2 + 1) & 0xfff));
+    // The request's SSN is the second frame's.
+    let request = &block_acks(&air, 0)[0];
+    assert_eq!(
+        u16::from_le_bytes([request[31], request[32]]) >> 4,
+        sent[1].2
+    );
+    let aggregated: Vec<bool> = aggregates(&air, from)
+        .iter()
+        .map(|(_, _, aggregate)| aggregate.is_some())
+        .collect();
+    assert_eq!(aggregated, [false, true, true, true, true, true]);
+}
+
+#[test]
+fn eapol_stops_the_session_and_forbids_it_for_4_s() {
+    // rtw89_core_stop_tx_ba_session (core.c:4682-4705): EAPOL on a TID whose
+    // agreement is operational stops it with a DELBA
+    // (ieee80211_stop_tx_ba_session: TX_STOP, then the DELBA from
+    // ieee80211_stop_tx_ba_cb) and forbids the TID for
+    // RTW89_FORBID_BA_TIMER, 4 s (core.h:56), until rtw89_forbid_ba_work
+    // (core.c:4900-4912).
+    let (mut wifi, model) = associated();
+    let mut ap = authenticator();
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
+    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    ap.message_2(&model.0.borrow().eapol()[0]);
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.eapol().len() > 1 && progress(wifi).contains("acked 2")
+    }));
+    assert!(wifi.carrier());
+    wifi.transmit(&ip_tos(0xc0, 1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 7)));
+    // The AP's group rekey: the station's answer is EAPOL on TID 7.
+    let from = model.0.borrow().calls.len();
+    let group = protected_as(LOCAL, 2, 0, 1, [0x88, 0x8e], &ap.group_message_1());
+    model.0.borrow_mut().hear_as(group, true, false);
+    assert!(run(&mut wifi, &model, |_, air| !block_acks(air, 2).is_empty()));
+    {
+        let air = model.0.borrow();
+        let answer = air.calls[from..].iter().find_map(|c| match c {
+            Call::Data {
+                bytes,
+                tid,
+                aggregate,
+                ..
+            } if eapol(bytes).is_some() => Some((*tid, *aggregate)),
+            _ => None,
+        });
+        assert_eq!(answer, Some((7, None)));
+        assert_eq!(aggregations(&air, from), [(7, None)]);
+        let stop = air
+            .position(|c| {
+                *c == Call::Aggregation {
+                    tid: 7,
+                    window: None,
+                }
+            })
+            .unwrap();
+        let delete = air
+            .position(
+                |c| matches!(c, Call::Management(b, _) if b[0] == 0xd0 && b[24..26] == [3, 2]),
+            )
+            .unwrap();
+        assert!(stop < delete);
+        // The initiator's (b11) on TID 7, WLAN_REASON_QSTA_NOT_USE.
+        let [frame] = &block_acks(&air, 2)[..] else {
+            panic!("{} DELBAs", block_acks(&air, 2).len())
+        };
+        assert_eq!(frame[4..10], AP);
+        assert_eq!(
+            u16::from_le_bytes([frame[26], frame[27]]),
+            7 << 12 | 1 << 11
+        );
+        assert_eq!(frame[28..30], 37u16.to_le_bytes());
+    }
+    // Within the 4 s, TID 7's data starts nothing and goes singly.
+    let from = model.0.borrow().calls.len();
+    wifi.transmit(&ip_tos(0xc0, 2)).unwrap();
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    {
+        let air = model.0.borrow();
+        assert_eq!(aggregates(&air, from), [(2, 7, None)]);
+        assert_eq!(block_acks(&air, 0).len(), 1);
+    }
+    // Past them, the next frame asks again.
+    crate::test_clock::advance(CLOCK, 4_000_000);
+    wifi.carrier();
+    wifi.transmit(&ip_tos(0xc0, 3)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        block_acks(air, 0).len() == 2 && agreed(wifi, 7)
+    }));
+}
+
+#[test]
+fn vo_aggregates_as_rtw89_does() {
+    // rtw89_core_txq_check_agg has no exception for the voice queue, where
+    // rtw88's rtw_txq_check_agg has one: TID 6 data starts an agreement.
+    let (mut wifi, model) = connected();
+    wifi.transmit(&ip_tos(0xb8, 1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 6)));
+    let air = model.0.borrow();
+    let [request] = &block_acks(&air, 0)[..] else {
+        panic!("{} requests", block_acks(&air, 0).len())
+    };
+    assert_eq!(u16::from_le_bytes([request[27], request[28]]) >> 2 & 0xf, 6);
+}
+
+#[test]
+fn a_refused_start_blocks_the_tid() {
+    // rtw89_core_ba_work (core.c:4626-4632): ieee80211_start_tx_ba_session's
+    // -EINVAL, here for an AP without HT, sets RTW89_TXQ_F_BLOCK_BA, and the
+    // TID is not tried again in the association.
+    let (mut wifi, model) = wifi_with(|air| air.no_ht = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    shake(&mut wifi, &model, &RSN, &[]);
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
+    let from = model.0.borrow().calls.len();
+    wifi.transmit(&ip(1)).unwrap();
+    let mut blocked = [false; 8];
+    blocked[0] = true;
+    assert_eq!(wifi.radio().blocked, blocked);
+    wifi.transmit(&ip(2)).unwrap();
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    let air = model.0.borrow();
+    assert!(block_acks(&air, 0).is_empty());
+    assert_eq!(aggregates(&air, from), [(1, 0, None), (2, 0, None)]);
+}
+
+#[test]
+fn pmf_addba_goes_under_the_ptk() {
+    // Block Ack action frames are robust: under PMF the ADDBA Request leaves
+    // sealed under the PTK (rtw88's send_agreement_frame), at the PN after
+    // the data's, as one key's tx_pn counts both, and the AP's protected
+    // response makes the agreement.
+    let (mut wifi, model) = connected_with_pmf();
+    let ptk = model.0.borrow().ptk();
+    let from = model.0.borrow().calls.len();
+    wifi.transmit(&ip(1)).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| !air
+        .management(0xd0)
+        .is_empty()));
+    let opened = {
+        let air = model.0.borrow();
+        let [request] = &air.management(0xd0)[..] else {
+            panic!("{} action frames", air.management(0xd0).len())
+        };
+        assert_eq!(request[1] & 0x40, 0x40);
+        let h = &request[24..32];
+        let pn = u64::from_le_bytes([h[0], h[1], h[4], h[5], h[6], h[7], 0, 0]);
+        assert_eq!(pn, 2);
+        ccmp::open(&ptk, request, PacketNumber::new(pn).unwrap()).unwrap()
+    };
+    assert_eq!(opened[32..34], [3, 0]);
+    // The request as the AP reads it: no CCMP header or MIC.
+    let mut clear = opened[..24].to_vec();
+    clear.extend_from_slice(&opened[32..opened.len() - 8]);
+    clear[1] &= !0x40;
+    model
+        .0
+        .borrow_mut()
+        .hear_as(sealed(addba_response(&clear, None), 1), true, false);
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    assert_eq!(aggregations(&model.0.borrow(), from), [(0, Some(64))]);
+}
+
+#[test]
+fn departure_stops_every_agreement_without_a_frame() {
+    // __sta_info_destroy_part1's ieee80211_sta_tear_down_BA_sessions
+    // (AGG_STOP_DESTROY_STA): each RX agreement's RX_STOP, then each TX
+    // agreement's TX_STOP_FLUSH, no DELBA, before _part2's key deletes. The
+    // next association configures its own.
+    let (mut wifi, model) = aggregating();
+    wifi.transmit(&ip(1)).unwrap();
+    wifi.transmit(&ip_tos(0xb8, 2)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)
+        && agreed(wifi, 6)));
+    let line = progress(&mut wifi);
+    assert!(line.contains(", addba 2/2, agg 0 6, "), "{line}");
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "mgmt c0",
+            "flush false",
+            "stop 0",
+            "agg stop 0",
+            "agg stop 6",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert!(wifi.radio().aggregating.iter().all(Option::is_none));
+    let from = model.0.borrow().calls.len();
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.count(|c| matches!(c, Call::Associate(_))) == 2
+            && wifi.radio().station().phase() == Peering::Associated
+    }));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert!(aggregations(&model.0.borrow(), from).is_empty());
+    let line = progress(&mut wifi);
+    assert!(!line.contains("Block Ack limits"), "{line}");
+    assert!(line.contains(", addba 2/2, agg -, "), "{line}");
 }
