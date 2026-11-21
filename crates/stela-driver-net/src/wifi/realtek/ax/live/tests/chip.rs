@@ -10,7 +10,7 @@ use crate::wifi::realtek::ax::station::chip::{
     Association, Chip, Data, HardwareKey, Incoming, Management, Received as Heard, Token,
 };
 use crate::wifi::realtek::ax::tests::firmware::{Air, Sent, rx_buffer};
-use crate::wifi::realtek::ax::txd::{self, RateCaps};
+use crate::wifi::realtek::ax::txd::{self, RateCaps, TxSec};
 use crate::wifi::{Band, Channel};
 use alloc::string::{String, ToString};
 
@@ -62,6 +62,22 @@ fn data_frame(seq: u16, n: u8) -> Vec<u8> {
     f.extend_from_slice(&AP);
     f.extend_from_slice(&(seq << 4).to_le_bytes());
     f.extend_from_slice(&[n; 20]);
+    f
+}
+
+/// [`data_frame`] as QoS data of `tid`, its QoS control after the header.
+fn qos_frame(seq: u16, tid: u8, n: u8) -> Vec<u8> {
+    let mut f = data_frame(seq, n);
+    f[0] = 0x88;
+    f.splice(24..24, [tid, 0]);
+    f
+}
+
+/// [`qos_frame`] as the CCMP strip leaves a frame under a key: Protected,
+/// no CCMP header.
+fn protected_frame(seq: u16, tid: u8, n: u8) -> Vec<u8> {
+    let mut f = qos_frame(seq, tid, n);
+    f[1] |= 0x40;
     f
 }
 
@@ -185,7 +201,7 @@ fn transmit_management_kicks_ch8_and_reports_the_ack() {
 fn transmit_data_maps_tid_to_its_channel() {
     let (mut live, _m, air) = on_air(&|_| {});
     for (tid, ch, idx) in [(0, TxChannel::Ach0, 0x1058), (7, TxChannel::Ach3, 0x1064)] {
-        let frame = data_frame(u16::from(tid), tid);
+        let frame = qos_frame(u16::from(tid), tid, tid);
         let before = live.io().trace.len();
         let sent = Chip::transmit_data(&mut live, &data(&frame, tid));
         assert_eq!(sent, Ok(Some(token(ch, 0))));
@@ -193,7 +209,7 @@ fn transmit_data_maps_tid_to_its_channel() {
     }
     // EAPOL goes with BK on the queue of its TID, the unassociated peer
     // with neither STBC nor LDPC.
-    let eapol = data_frame(9, 0x88);
+    let eapol = qos_frame(9, 7, 0x88);
     let frame = Data {
         eapol: true,
         ..data(&eapol, 7)
@@ -344,9 +360,9 @@ fn associate_takes_the_negotiated_ht() {
 
 #[test]
 fn an_association_without_wmm_programs_the_qos_defaults() {
-    // mac80211 still enables QoS without WMM (`mlme.c:6255-6270`):
+    // mac80211 still enables QoS without WMM (`mlme.c:6308-6323`):
     // `ieee80211_set_wmm_default(.., true)` hands rtw89 802.11's defaults,
-    // as it does for a set it finds invalid (`mlme.c:4230-4247`).
+    // as it does for a set it finds invalid (`mlme.c:4228-4245`).
     let mut invalid = qos_defaults(false);
     invalid[2].ecw_min = 0;
     for edca in [None, Some(invalid)] {
@@ -839,7 +855,7 @@ fn silent_rpq_runs_the_pages_out_without_reusing_one() {
     air.silent_rpq();
     let mut tokens = Vec::new();
     for n in 0..40u16 {
-        let frame = data_frame(n, n as u8);
+        let frame = qos_frame(n, 5, n as u8);
         if let Some(token) = Chip::transmit_data(&mut live, &data(&frame, 5)).unwrap() {
             tokens.push(token);
         }
@@ -859,7 +875,7 @@ fn silent_rpq_runs_the_pages_out_without_reusing_one() {
     );
     air.ack_all();
     assert_eq!(poll(&mut live).len(), 16);
-    let frame = data_frame(40, 40);
+    let frame = qos_frame(40, 5, 40);
     assert!(
         Chip::transmit_data(&mut live, &data(&frame, 5))
             .unwrap()
@@ -900,29 +916,205 @@ fn skipped_and_stale_reports_are_counted_not_reported() {
 }
 
 #[test]
-fn keys_and_block_ack_wait_for_m3b() {
+fn the_chip_installs_and_removes_keys() {
     let (mut live, _m, _air) = on_air(&|_| {});
-    let before = live.io().trace.len();
-    let material = [0x11; 16];
-    let key = HardwareKey {
+    // An obvious test key.
+    let material: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let key = |pairwise: bool, index: u8| HardwareKey {
+        pairwise,
+        index,
+        material: &material,
+    };
+    let unassociated = Chip::add_key(&mut live, &key(true, 0));
+    assert_eq!(
+        unassociated,
+        Err(String::from("a key without an association"))
+    );
+    let ch1 = channel(HwBand::G2, 1);
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    // The security CAM entries, the first free each time (spec S12.1).
+    assert_eq!(Chip::add_key(&mut live, &key(true, 0)), Ok(0));
+    assert_eq!(Chip::add_key(&mut live, &key(false, 1)), Ok(1));
+    assert_eq!(Chip::remove_key(&mut live, 0), Ok(()));
+    assert_eq!(
+        Chip::remove_key(&mut live, 0),
+        Err(String::from("no key in that security CAM entry"))
+    );
+    assert_eq!(Chip::add_key(&mut live, &key(true, 0)), Ok(0));
+    // The disassociation deletes what is left first.
+    Chip::disassociate(&mut live).unwrap();
+    assert!(!live.key_installed(0) && !live.key_installed(1));
+}
+
+#[test]
+fn keyed_data_goes_under_its_cam_entry_and_pn() {
+    let (mut live, _m, air) = on_air(&|_| {});
+    let material: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let ch1 = channel(HwBand::G2, 1);
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    let ptk = HardwareKey {
         pairwise: true,
         index: 0,
         material: &material,
     };
-    let m3b = Err(String::from("keys before M3b"));
-    assert_eq!(Chip::add_key(&mut live, &key), m3b.clone().map(|()| 0));
-    assert_eq!(Chip::remove_key(&mut live, 0), m3b.clone());
-    let frame = data_frame(1, 1);
+    assert_eq!(Chip::add_key(&mut live, &ptk), Ok(0));
+    // rtw89_core_tx_update_sec_key: the frame names CAM entry 0, key ID 0
+    // and its PN in BODY4/5 (spec S5.3).
+    let frame = protected_frame(5, 0, 0x5A);
     let keyed = Data {
-        key: Some((0, 0, 1)),
+        key: Some((0, 0, 0x0605_0403_0201)),
         ..data(&frame, 0)
     };
-    assert_eq!(Chip::transmit_data(&mut live, &keyed), m3b.map(|()| None));
-    // RX Block Ack is accepted without the BA CAM (Task 16).
-    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0x123), Ok(()));
-    assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Ok(()));
+    assert_eq!(
+        Chip::transmit_data(&mut live, &keyed),
+        Ok(Some(token(TxChannel::Ach0, 0)))
+    );
+    poll(&mut live);
+    let sent = air.sent();
+    let caps = RateCaps {
+        stbc: false,
+        ldpc: false,
+    };
+    let sec = TxSec {
+        keyid: 0,
+        cam: 0,
+        pn: 0x0605_0403_0201,
+    };
+    let (_, head) = txd::data(&frame, 0, false, HwBand::G2, 0xFFF, caps, Some(sec)).unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].head, head);
+    assert_eq!(sent[0].bytes, frame);
+    // A key the security CAM does not hold is refused before any access:
+    // entry 1 holds nothing, and entry 0 is gone once removed.
+    let before = live.io().trace.len();
+    let unheld = Err(String::from("a key not in the security CAM"));
+    let other = Data {
+        key: Some((1, 0, 1)),
+        ..data(&frame, 0)
+    };
+    assert_eq!(Chip::transmit_data(&mut live, &other), unheld.clone());
     assert_eq!(live.io().trace.len(), before);
+    Chip::remove_key(&mut live, 0).unwrap();
+    assert_eq!(Chip::transmit_data(&mut live, &keyed), unheld);
+    // RX Block Ack programs the BA CAM's entry and frees it (M3 Task 16).
+    let before = live.io().trace.len();
+    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0x123, 64), Ok(()));
+    assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Ok(()));
+    assert_eq!(kicks(&live.io().trace[before..]), 2);
     assert_eq!(Chip::mac(&live), Mac(MAC));
+}
+
+/// The TX rings `rtw89_pci_ops_flush_queues` waits on: every one but CH12,
+/// ACH0-7, CH8, CH9, CH10 and CH11 (`pci.h:556-569`), in ring order.
+const FLUSHED: [u32; 12] = [
+    0x1058, 0x105C, 0x1060, 0x1064, 0x1068, 0x106C, 0x1070, 0x1074, 0x1078, 0x107C, 0x11D0, 0x11D4,
+];
+/// `R_AX_DLE_EMPTY0` and the queues `dle_is_txq_empty` wants empty
+/// (`mac.c:2388-2412`, `reg.h:631-651`).
+const DLE_EMPTY0: u32 = 0x8430;
+const TXQ_EMPTY: u32 = 0x07FF_079F;
+
+/// The 32-bit reads of a trace.
+fn reads32(t: &[Op]) -> Vec<u32> {
+    t.iter()
+        .filter_map(|o| match o {
+            Op::R32(r) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_flush_without_drop_waits_on_the_rings_then_the_mac() {
+    let (mut live, _m, _air) = on_air(&|_| {});
+    live.io_mut().set32(DLE_EMPTY0, TXQ_EMPTY);
+    let before = live.io().trace.len();
+    assert_eq!(Chip::flush(&mut live, false), Ok(()));
+    let t = &live.io().trace[before..];
+    // __pci_flush_txch: each ring's index already at its host's, so one
+    // read each; then rtw89_mac_flush_txq's first sample, already empty.
+    let mut want = FLUSHED.to_vec();
+    want.push(DLE_EMPTY0);
+    assert_eq!(reads32(t), want);
+    assert_eq!(delays(t), 0);
+    assert_eq!(kicks(t), 0);
+    // The MAC's queues never empty: read_poll_timeout every 10 ms for
+    // 200 ms, one last sample after it, and the flush ends without error
+    // as Linux's only logs.
+    live.io_mut().set32(DLE_EMPTY0, TXQ_EMPTY & !1);
+    let before = live.io().trace.len();
+    assert_eq!(Chip::flush(&mut live, false), Ok(()));
+    let t = &live.io().trace[before..];
+    let samples = reads32(t).iter().filter(|&&r| r == DLE_EMPTY0).count();
+    assert!((21..=22).contains(&samples), "{samples}");
+    assert!((200_000..=210_000).contains(&delays(t)), "{}", delays(t));
+}
+
+#[test]
+fn a_flush_waits_60_us_on_a_ring_the_dma_engine_left() {
+    // No Air: nothing reads the TXBD, so ACH0's hardware index stays 0
+    // behind its host index of 1.
+    let (mut live, _m) = live_hearing(&|_| {});
+    live.io_mut().set32(DLE_EMPTY0, TXQ_EMPTY);
+    let frame = qos_frame(1, 0, 1);
+    assert!(matches!(
+        Chip::transmit_data(&mut live, &data(&frame, 0)),
+        Ok(Some(_))
+    ));
+    let before = live.io().trace.len();
+    assert_eq!(Chip::flush(&mut live, true), Ok(()));
+    let t = &live.io().trace[before..];
+    let reads = reads32(t);
+    assert_eq!(reads.iter().filter(|&&r| r == 0x1058).count(), 60);
+    assert!(FLUSHED[1..].iter().all(|r| reads.contains(r)));
+    // 60 waits of 1 us between them, then on (pci.c:1401-1407).
+    let ach0: u64 = t
+        .iter()
+        .filter_map(|o| match o {
+            Op::Delay(us) => Some(*us),
+            _ => None,
+        })
+        .take(60)
+        .sum();
+    assert_eq!(ach0, 60);
+    // With drop and no AP's station, no PKT_DROP and no MAC wait.
+    assert_eq!(kicks(t), 0);
+    assert!(!reads.contains(&DLE_EMPTY0));
+}
+
+#[test]
+fn a_flush_with_drop_drops_the_stations_four_queues() {
+    let (mut live, m, _air) = on_air(&|_| {});
+    let ch1 = channel(HwBand::G2, 1);
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    let seq = live.h2c();
+    let before = live.io().trace.len();
+    assert_eq!(Chip::flush(&mut live, true), Ok(()));
+    let t = &live.io().trace[before..];
+    // __rtw89_drop_packets for the AP's station: PKT_DROP of BE, BK, VI
+    // and VO once for macid 0 (rtw89_mac_pkt_drop_sta, mac.c:7255-7278),
+    // as the 8852C's firmware lacks NO_PACKET_DROP (fw.c:870); no wait for
+    // the MAC's queues (mac80211.c:1132-1135).
+    assert_eq!(kicks(t), 4);
+    for sel in 0..4u8 {
+        let mut h2c = seq;
+        for _ in 0..sel {
+            h2c.pkt_drop(0, 0, 0);
+        }
+        let (at, want) = h2c.pkt_drop(sel, 0, 0);
+        assert_eq!(h2c_of(&m, 1, 9, 0x1B, at), want);
+    }
+    assert!(!reads32(t).contains(&DLE_EMPTY0));
+    // A flush is refused while a scan has not ended, and on a chip off.
+    Chip::disassociate(&mut live).unwrap();
+    Chip::begin_scan(&mut live, &[ch1]).unwrap();
+    assert_eq!(
+        Chip::flush(&mut live, false),
+        Err(SCAN_NOT_ENDED.to_string())
+    );
 }
 
 #[test]
@@ -957,7 +1149,20 @@ fn a_powered_off_chip_refuses_every_call() {
         Err(dead.clone())
     );
     assert_eq!(Chip::disassociate(&mut live), Err(dead.clone()));
-    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0), Err(dead.clone()));
+    let material = [0; 16];
+    let key = HardwareKey {
+        pairwise: true,
+        index: 0,
+        material: &material,
+    };
+    assert_eq!(Chip::add_key(&mut live, &key), Err(dead.clone()));
+    assert_eq!(Chip::remove_key(&mut live, 0), Err(dead.clone()));
+    assert_eq!(Chip::flush(&mut live, true), Err(dead.clone()));
+    assert_eq!(Chip::flush(&mut live, false), Err(dead.clone()));
+    assert_eq!(
+        Chip::start_rx_block_ack(&mut live, 0, 0, 64),
+        Err(dead.clone())
+    );
     assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Err(dead));
     assert_eq!(live.io().trace.len(), off);
     assert!(Chip::diagnostic(&live).ends_with(", powered off"));

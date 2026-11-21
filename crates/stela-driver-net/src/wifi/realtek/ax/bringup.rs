@@ -285,7 +285,7 @@ impl fmt::Display for Running {
 pub struct BringUpError {
     /// One of `"phy tables"`, `"power on"`, `"secure boot"`, `"dma rings"`,
     /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`,
-    /// `"phycap"`, `"tx power"` (the file's TX power tables),
+    /// `"phycap"`, `"firmware elements"` (the file's TX power tables),
     /// `"bb rf enable"`, `"sys init"`, `"dmac init"`, `"cmac init"`,
     /// `"imr"`, `"pci post-init"`, `"h2c"`, `"c2h"`, `"bb rf reset"`,
     /// `"bb init"`, `"rf init"`, `"rf h2c"`, `"coex init"`, `"phy report"`,
@@ -431,11 +431,12 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 ///    1216-byte map does not reach; with the logical map it gives the RFE
 ///    type, crystal cap and trims (`efuse::phy_efuse`, `"efuse"` if a map
 ///    is short).
-///    `"tx power"`: the file's TX power and REGD tables for that RFE type
-///    ([`txpwr_tables::tx_power_tables`]), as `rtw89_chip_info_setup`
-///    recognizes the firmware elements right after the efuse
-///    (`core.c:7409-7417`). A file without them fails here, before the MAC
-///    init and before any of its PHY tables reach the chip: Stela has no
+///    `"firmware elements"`: the file's TX power and REGD tables for that
+///    RFE type ([`txpwr_tables::tx_power_tables`]), as
+///    `rtw89_chip_info_setup` recognizes the firmware elements right after
+///    the efuse (`core.c:7409-7417`); its error is a `"tx power: …"` one. A
+///    file without them fails here, before the MAC init and before any of
+///    its PHY tables reach the chip: Stela has no
 ///    built-in tables to fall back on (M3 spec S1.8), and Linux takes no
 ///    element once one fails (`fw.c:1604-1605`), so neither set is used
 ///    without the other. The regulatory index is chosen from the efuse
@@ -812,7 +813,7 @@ unsafe fn init_mac<I: AxIo + ?Sized>(
     // regulatory index: the efuse country first (rtw8852c.c:641-642,
     // regd.c:738-768), else the network's, else the world's.
     let tables = txpwr_tables::tx_power_tables(firmware.file, 0, phy_efuse.rfe_type)
-        .map_err(at("tx power"))?;
+        .map_err(at("firmware elements"))?;
     let regds = regd::select(
         tables.regd_map(),
         efuse::country_code(&logical),

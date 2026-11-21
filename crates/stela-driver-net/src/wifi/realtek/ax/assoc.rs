@@ -10,14 +10,14 @@
 //!   with the BSSID, `cam.c:734-739`), then the AP's station added
 //!   (`rtw89_core_sta_link_add`, `core.c:5735-5797`, whose only chip access
 //!   on this chip is `rtw89_phy_dig_suspend`), the order mac80211's
-//!   `ieee80211_prep_connection` gives them (`mlme.c:9721-9737`).
+//!   `ieee80211_prep_connection` gives them (`mlme.c:9773-9789`).
 //! - [`associate`], at the association response: mac80211's
 //!   `ieee80211_assoc_config_link` programs the AP's WMM parameters first,
-//!   or 802.11's QoS defaults without valid ones (`mlme.c:6255-6270`)
+//!   or 802.11's QoS defaults without valid ones (`mlme.c:6308-6323`)
 //!   (`rtw89_ops_conf_tx`, `mac80211.c:912-937`, for VO, VI, BE and BK,
-//!   `mlme.c:4096-4116`, `:6257`) with the long slot, which every
+//!   `mlme.c:4094-4114`, `:6310`) with the long slot, which every
 //!   disassociation resets (`ieee80211_reset_erp_info`, `main.c:430-438`);
-//!   then `BSS_CHANGED_ASSOC` (`mlme.c:4394-4463`):
+//!   then `BSS_CHANGED_ASSOC` (`mlme.c:4392-4461`):
 //!   `rtw89_station_mode_sta_assoc` (`mac80211.c:661-676`) with
 //!   `rtw89_vif_type_mapping` to INFRA and `rtw89_core_sta_link_assoc`
 //!   (`core.c:5878-5979`: the CMAC table, join info, the address CAM with
@@ -25,10 +25,10 @@
 //!   `rtw89_phy_dig_resume(false)`), then `__rtw89_ops_bss_link_assoc`
 //!   (`mac80211.c:678-686`: [`vif::port_update`] for INFRA); then, on the
 //!   same notify, `BSS_CHANGED_ERP_SLOT` when the slot turned short
-//!   (`mlme.c:4325-4328`, always on 5 GHz): `rtw89_conf_tx` again
+//!   (`mlme.c:4323-4326`, always on 5 GHz): `rtw89_conf_tx` again
 //!   (`mac80211.c:781-782`).
 //! - [`leave`], from an association: mac80211's `ieee80211_set_disassoc`
-//!   (`mlme.c:4508-4720`) moves the AP's station down (`sta_info.c:
+//!   (`mlme.c:4506-4718`) moves the AP's station down (`sta_info.c:
 //!   1572-1606`): ASSOC to AUTH, `rtw89_core_sta_link_disassoc`
 //!   (`core.c:5799-5816`: the beacon filter off); AUTH to NONE,
 //!   `rtw89_core_sta_link_disconnect` (`core.c:5818-5859`: the beamformee
@@ -71,15 +71,15 @@
 //! `rtw89_sta_link_can_er` sets `er_cap` (`core.c:5935-5947`), so the RA
 //! H2C carries the zeroed new station's ER bit, 0.
 //!
-//! The rtw89 references are to the donor tree (`a804c5742bff`); the
+//! The rtw89 references are to the donor tree (`a804c5742bff`), and the
 //! mac80211 ones (`mlme.c`, `main.c`, `util.c`, `sta_info.c`, all under
-//! `net/mac80211/`), which the donor tree does not carry, are to Linux
-//! 7.2.12, whose `rtw89/mac80211.c` is the donor's byte for byte.
+//! `net/mac80211/`) to the same Linux commit's `net/mac80211/`.
 //!
 //! This module does not grant (spec S1.15): `rtw89_fw_h2c_general_pkt` and
 //! its templates, the BTC role notifies, `rtw89_chip_rfk_channel`, LPS, the
-//! watchdog, keys (M3b: the key deletes before the beacon filter goes off,
-//! `sta_info.c:1577-1578`), RX block ack teardown, TX flushes, and any
+//! watchdog, keys (the deletes that come before [`leave`]'s beacon filter,
+//! `sta_info.c:1577-1578`, are [`super::keys::delete`]'s; [`leave`] carries
+//! the key fields they leave), RX block ack teardown, TX flushes, and any
 //! channel switch. Nor `ieee80211_regulatory_limit_wmm_params` on the
 //! defaults [`associate`] and [`leave`] program: the station layer limits
 //! the AP's parameters, which [`associate`] takes as given.
@@ -94,8 +94,8 @@ use crate::wifi::station::phy::AccessCategory;
 pub use super::vif::PortConfig;
 
 /// The address CAM's security fields (`cam.c:906-927`): the key IDs of
-/// w9 [31:18] in place, and w10 and w11 whole. M3b's key installs fill
-/// them; until then they are 0.
+/// w9 [31:18] in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
+/// holds them; 0 before any key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CamKeys {
     /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 [31:18]; other bits are
@@ -263,7 +263,7 @@ fn recover(mut ra_mask: u64, bak: u64) -> u64 {
 ///
 /// - HT: mode HT, the RX MCS bytes at bits 12, 24, 36 and 48, STBC, LDPC and
 ///   SGI-20 as negotiated; the stream count is mac80211's, the number of
-///   non-zero RX mask bytes (`sta_info.c:3528-3537`), at least 1.
+///   non-zero RX mask bytes (`sta_info.c:3570-3579`), at least 1.
 /// - 2.4 GHz adds the legacy rates, CCK mode for any of bits 0-3, OFDM for
 ///   any of 4-11; elsewhere OFDM mode, the rates shifted up by 4.
 /// - HT keeps the first `tx_nss` (2) streams' rates, SUBOFDM with OFDM and
@@ -396,17 +396,17 @@ pub struct AssocInputs {
     pub band: HwBand,
     /// `bss_conf->beacon_int`, in TU.
     pub beacon_int: u16,
-    /// `bss_conf->dtim_period`, at least 1 (`mlme.c:7042`).
+    /// `bss_conf->dtim_period`, at least 1 (`mlme.c:7095`).
     pub dtim: u8,
     pub peer: RaPeer,
     /// The AP's EDCA parameters in ACI order (BE, BK, VI, VO), as mac80211
     /// hands them to `conf_tx`. `None`, the AP without WMM, and a set
     /// mac80211 finds invalid both program 802.11's QoS defaults, as
-    /// `ieee80211_assoc_config_link` does (`mlme.c:6255-6270`,
+    /// `ieee80211_assoc_config_link` does (`mlme.c:6308-6323`,
     /// [`qos_defaults`]; see [`AssocInputs::params`]).
     pub edca: Option<[AccessCategory; 4]>,
     /// `bss_conf->use_short_slot` from the AP's capability; 5 GHz is always
-    /// short (`mlme.c:4310-4313`).
+    /// short (`mlme.c:4308-4311`).
     pub short_slot: bool,
 }
 
@@ -418,16 +418,16 @@ impl AssocInputs {
 
     /// `use_11b` of `ieee80211_set_wmm_default` (`util.c:1047-1049`): a 2.4
     /// GHz BSS that is not `operating_11g_mode`, which has no rate above 11
-    /// Mbps (`mlme.c:6352-6353`).
+    /// Mbps (`mlme.c:6405-6406`).
     fn use_11b(&self) -> bool {
         self.band == HwBand::G2 && self.peer.legacy & RATES_ABOVE_11M == 0
     }
 
     /// The EDCA parameters `conf_tx` gets at the association, in ACI order:
     /// the AP's, each AIFSN under 2 taken as 2, as
-    /// `_ieee80211_sta_wmm_params` takes them (`mlme.c:4218-4224`); or, with
+    /// `_ieee80211_sta_wmm_params` takes them (`mlme.c:4214-4226`); or, with
     /// no WMM or a set it finds invalid (an AC missing, here one out of ACI
-    /// order, CWmin 0 or CWmin above CWmax, `mlme.c:4230-4247`), the QoS
+    /// order, CWmin 0 or CWmin above CWmax, `mlme.c:4228-4245`), the QoS
     /// defaults ([`qos_defaults`]).
     pub fn params(&self) -> [AccessCategory; 4] {
         let valid = |edca: &[AccessCategory; 4]| {
@@ -517,7 +517,7 @@ pub fn qos_defaults(use_11b: bool) -> [AccessCategory; 4] {
 
 /// `ieee80211_set_wmm_default(enable_qos = false)` (`util.c:1025-1135`):
 /// every AC AIFSN 2, CWmax 1023, CWmin 31 when `use_11b` (a 2.4 GHz BSS
-/// without a rate above 11 Mbps, `mlme.c:6352-6353`), else 15, no TXOP.
+/// without a rate above 11 Mbps, `mlme.c:6405-6406`), else 15, no TXOP.
 fn wmm_defaults(use_11b: bool) -> [AccessCategory; 4] {
     let ecw_min = if use_11b { 5 } else { 4 };
     core::array::from_fn(|aci| AccessCategory {
@@ -609,13 +609,17 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 }
 
 /// Leaving the association `assoc` made (M3 spec S11; see the module
-/// documentation), in Linux's order: the beacon filter off when the
-/// firmware has it; the beamformee's NDPA off on MAC 0; the CMAC table,
-/// join info disconnected, the address CAM with NO_LINK; the address CAM
-/// with the BSSID cleared; the association's EDCA parameters
-/// ([`AssocInputs::params`]) with the long slot (`BSS_CHANGED_ERP_SLOT`,
-/// which `ieee80211_reset_erp_info` always raises), the GID table cleared,
-/// then [`wmm_defaults`] with the long slot. Nothing of the port or DIG.
+/// documentation), in Linux's order, after the keys were deleted
+/// ([`super::keys::delete`], which mac80211 runs first,
+/// `sta_info.c:1577-1578`): the beacon filter off when the firmware has
+/// it; the beamformee's NDPA off on MAC 0; the CMAC table, join info
+/// disconnected, the address CAM with NO_LINK; the address CAM with the
+/// BSSID cleared, both CAMs with the key fields `keys` the deletes left
+/// (`rtw89_cam_fill_addr_cam_info` reads the vif's entry, `cam.c:906-927`);
+/// the association's EDCA parameters ([`AssocInputs::params`]) with the
+/// long slot (`BSS_CHANGED_ERP_SLOT`, which `ieee80211_reset_erp_info`
+/// always raises), the GID table cleared, then [`wmm_defaults`] with the
+/// long slot. Nothing of the port or DIG.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -624,6 +628,7 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
     session: &mut Session<'_>,
     assoc: &AssocInputs,
     features: Features,
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
     let band = assoc.band;
@@ -633,13 +638,13 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
         unsafe { session.send(io, packet, sink) }?;
     }
     // SAFETY: as above, `disconnect`'s.
-    unsafe { disconnect(io, session, assoc.mac, assoc.bssid, band, sink) }?;
+    unsafe { disconnect(io, session, assoc.mac, assoc.bssid, band, keys, sink) }?;
     // SAFETY: as above, `clear_bssid`'s.
-    unsafe { clear_bssid(io, session, assoc.mac, sink) }?;
+    unsafe { clear_bssid(io, session, assoc.mac, keys, sink) }?;
     // SAFETY: as above, `conf_tx`'s.
     unsafe { conf_tx(io, session, &assoc.params(), false, band, sink) }?;
     // The membership and position tables, zeroed before the notify
-    // (`mlme.c:4654-4657`), as plain writes.
+    // (`mlme.c:4652-4655`), as plain writes.
     for reg in GID_TABLE {
         io.write32(reg, 0)?;
     }
@@ -653,10 +658,10 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
 /// `rtw89_core_sta_link_disconnect` (`core.c:5818-5859`), on `band`: the
 /// beamformee's NDPA off on MAC 0 (`rtw89_mac_bf_disassoc`), the CMAC
 /// table, join info disconnected, and the address CAM of `mac` with the
-/// BSSID and NO_LINK. [`leave`] runs it after the beacon filter; a join
-/// whose station authenticated and never associated runs it alone, before
-/// [`clear_bssid`], as `ieee80211_destroy_assoc_data` destroys that station
-/// before clearing the BSSID.
+/// BSSID, NO_LINK and the key fields `keys`. [`leave`] runs it after the
+/// beacon filter; a join whose station authenticated and never associated
+/// runs it alone, before [`clear_bssid`], as `ieee80211_destroy_assoc_data`
+/// destroys that station before clearing the BSSID.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -666,6 +671,7 @@ pub unsafe fn disconnect<I: AxIo + ?Sized>(
     mac: [u8; 6],
     bssid: [u8; 6],
     band: HwBand,
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
     // `rtw89_mac_bf_disassoc`: `rtw89_mac_bfee_ctrl(false)`.
@@ -676,14 +682,18 @@ pub unsafe fn disconnect<I: AxIo + ?Sized>(
     let packet = session.h2c.join_info(MAC_ID, PORT, false);
     // SAFETY: as above.
     unsafe { session.send(io, packet, sink) }?;
-    let cam = AddrCam::with_bssid(mac, bssid);
+    let cam = AddrCam {
+        keys,
+        ..AddrCam::with_bssid(mac, bssid)
+    };
     let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
     // SAFETY: as above.
     unsafe { session.send(io, packet, sink) }.map(|_| ())
 }
 
 /// The BSSID cleared on a station that is not associated: the address CAM
-/// of [`AddrCam::unassociated`], the bytes of vif init's.
+/// of [`AddrCam::unassociated`] with the key fields `keys`, which without a
+/// key ever installed are vif init's bytes.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -691,9 +701,14 @@ pub unsafe fn clear_bssid<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
     mac: [u8; 6],
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
-    let packet = session.h2c.addr_cam(mac, MAC_ID, PORT);
+    let cam = AddrCam {
+        keys,
+        ..AddrCam::unassociated(mac)
+    };
+    let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
     // SAFETY: the caller's contract is `send`'s, word for word.
     unsafe { session.send(io, packet, sink) }.map(|_| ())
 }

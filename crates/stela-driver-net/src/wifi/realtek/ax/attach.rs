@@ -27,13 +27,20 @@
 //! scans and joins under that country's rules with the efuse country's TX
 //! power limits.
 //!
+//! [`attach_reporting`] hands back the bring-up's report beside the
+//! station, for the normal boot's probe (M3 spec S16.2, `stela-drivers`'
+//! `probe::native::rtw89_keep`), which also refuses a missing regulatory
+//! database ([`AttachError::NoRegulatoryDatabase`]) before it claims the
+//! chip; the host check's station check (`--wifi-check --wifi`) runs
+//! [`attach`].
+//!
 //! This grants what [`live::start`] and [`Rtl8852c`] grant and nothing
-//! more: no key (M3b), no normal-boot probe (M3 spec S16.2), no interrupt,
-//! and no teardown on drop. A kept station that is dropped leaves its chip
-//! running with its rings and pools quarantined, as [`Live`] documents; the
-//! caller stops it through [`crate::wifi::connection::keeper::Keeper::into_radio`],
+//! more: no interrupt, and no teardown on drop. A kept station that is
+//! dropped leaves its chip running with its rings and pools quarantined, as
+//! [`Live`] documents; the caller stops it through
+//! [`crate::wifi::connection::keeper::Keeper::into_radio`],
 //! [`Rtl8852c::into_chip`] and [`Live::stop`].
-use super::bringup::{BringUpError, FirmwareFile, Host};
+use super::bringup::{BringUpError, FirmwareFile, Host, Running};
 use super::io::AxIo;
 use super::live::{self, Live, StartError};
 use super::pci::Rings;
@@ -64,6 +71,10 @@ pub struct Inputs {
 /// Why the chip did not reach a station.
 #[derive(Debug)]
 pub enum AttachError {
+    /// No regulatory database loaded, so the radio may not transmit: the
+    /// probe's refusal, as rtw88's (`realtek::attach`), before the chip is
+    /// claimed. [`attach`] itself is always given one.
+    NoRegulatoryDatabase,
     /// regulatory.db holds no usable rules for the network's country (or
     /// `00`); refused before any register access.
     Country([u8; 2], database::Error),
@@ -76,6 +87,7 @@ pub enum AttachError {
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NoRegulatoryDatabase => f.write_str("RTL8852CE: no regulatory database"),
             Self::Country(alpha2, error) => write!(
                 f,
                 "RTL8852CE: regulatory.db country {}: {error:?}",
@@ -93,6 +105,9 @@ impl fmt::Display for AttachError {
 /// the DMA stopped. `None` only if the chip went with a radio that could not
 /// be made, which the address check before it rules out.
 pub type Returned<I> = Option<(I, Option<Rings>)>;
+
+/// A kept station and what its bring-up reported ([`attach_reporting`]).
+pub type Reported<I> = (Wifi<Live<I>>, Running);
 
 /// The address [`Rtl8852c::new`] would refuse, checked while the chip can
 /// still be stopped: `Station::new`'s and `Scanner::new`'s check.
@@ -133,6 +148,31 @@ pub unsafe fn attach<I: AxIo>(
     host: Host,
     inputs: Inputs,
 ) -> Result<Wifi<Live<I>>, (AttachError, Returned<I>)> {
+    // SAFETY: the caller's contract is `attach_reporting`'s, word for word.
+    unsafe { attach_reporting(io, source, domain, cut, firmware, host, inputs) }
+        .map(|(wifi, _)| wifi)
+}
+
+/// [`attach`], with what the bring-up reported ([`Live::running`]) beside
+/// the station: the keeper keeps its radio, and with it the live chip, to
+/// itself, so a caller that reports the bring-up, as a normal boot's probe
+/// does, takes the report here.
+///
+/// # Safety
+/// As for [`attach`].
+#[expect(
+    clippy::result_large_err,
+    reason = "A failure hands the window and the rings back by value: the rings are never freed, as nothing proves the DMA stopped."
+)]
+pub unsafe fn attach_reporting<I: AxIo>(
+    io: I,
+    source: &dyn PageSource,
+    domain: Arc<dyn DmaDomain>,
+    cut: u8,
+    firmware: FirmwareFile<'_>,
+    host: Host,
+    inputs: Inputs,
+) -> Result<Reported<I>, (AttachError, Returned<I>)> {
     let Inputs {
         clock,
         database,
@@ -158,8 +198,9 @@ pub unsafe fn attach<I: AxIo>(
         let (io, rings, _pools) = unsafe { live.stop() };
         return Err((AttachError::Station(error), Some((io, Some(rings)))));
     }
+    let running = *live.running();
     match Rtl8852c::new(live, address, country, clock) {
-        Ok(radio) => Ok(radio.keep(network, entropy)),
+        Ok(radio) => Ok((radio.keep(network, entropy), running)),
         Err(error) => Err((AttachError::Station(error), None)),
     }
 }

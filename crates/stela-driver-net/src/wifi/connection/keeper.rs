@@ -490,6 +490,11 @@ impl<R: Radio> Keeper<R> {
     }
 
     /// Stop keeping the connection and hand the radio back, as it stands.
+    /// The keeper's own state goes with it: the PMK, the handshake and its
+    /// keys, the failure count, and a failure [`Link::receive`] has not
+    /// reported yet. A scan or departure the radio runs is not retired, and
+    /// nothing is sent, so the caller leaves the network and stops the radio
+    /// itself.
     pub fn into_radio(self) -> R {
         self.link
     }

@@ -699,3 +699,137 @@ fn m3_association_class_and_func_constants_are_linuxs() {
         (2, 1, 0)
     );
 }
+
+// The security CAM (M3 spec S12).
+
+#[test]
+fn sec_upd_is_byte_exact() {
+    // rtw89_cam_get_sec_key_cmd and rtw89_cam_send_sec_key_cmd
+    // (cam.c:11-99): MAC / SEC_CAM / SEC_UPD with REC_ACK and no DONE_ACK,
+    // 24 bytes: w0 = sec CAM index [7:0] | offset 0 [15:8] | LEN 20
+    // [23:16]; w1 = CCMP128 (6) [3:0], EXT_KEY b4 0, SPP b5 0; w2..w5 the
+    // key, byte 4i in bits [7:0] of word i (fw.h:496-544).
+    let key: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let (seq, p) = H2c::at(17).sec_upd(0, &key);
+    assert_eq!(seq, 17);
+    let (len, b) = body(&p);
+    assert_eq!(len, 32);
+    assert_eq!(&b[..8], &[0x29, 0x01, 0x00, 0x11, 0x20, 0x40, 0x00, 0x00]);
+    let mut payload = vec![0x00, 0x00, 0x14, 0x00, 0x06, 0x00, 0x00, 0x00];
+    payload.extend(0u8..16);
+    assert_eq!(&b[8..], &payload[..]);
+    assert_eq!(word(&b[8..], 2), 0x0302_0100);
+    // REC_ACK is asked for at every seq, not only every fourth.
+    for seq in 18..22u8 {
+        let (_, p) = H2c::at(seq).sec_upd(0x7F, &[0xA5; 16]);
+        let b = body(&p).1;
+        assert_eq!(word(b, 1) & 0xC000, 0x4000, "seq {seq}");
+        assert_eq!(word(&b[8..], 0), 0x0014_007F);
+    }
+}
+
+#[test]
+fn dctl_places_w4_w5_w6_and_masks() {
+    use crate::wifi::realtek::ax::assoc::CamKeys;
+    // rtw89_fw_h2c_dctl_sec_cam_v1 (fw.c:2346-2382) with
+    // rtw89_cam_fill_dctl_sec_cam_info_v1 (cam.c:930-1009, layout
+    // cam.h:119-186): MAC / FR_EXCHG / DCTLINFO_UD_V1, rack 0, dack 0, 68
+    // bytes. c0 = macid [6:0] | OP b7; w4 (byte 20) the key IDs [31:18];
+    // w5 (24) valid map and entries 0-2; w6 (28) entries 3-6; their masks
+    // m4 (52), m5 (56), m6 (60); every other byte 0 (no WoWLAN key).
+    let keys = CamKeys {
+        // Bits below 18 are the address CAM's own (AID, mode): not carried.
+        keyids: 0x0040_0000 | 0x0002_0005,
+        valid_and_ents: 0x0100_0005,
+        ents_hi: 0x0403_0201,
+    };
+    let (seq, p) = H2c::at(18).dctl_sec(0, &keys);
+    assert_eq!(seq, 18);
+    let (len, b) = body(&p);
+    assert_eq!(len, 76);
+    assert_eq!(&b[..8], &[0x15, 0x09, 0x00, 0x12, 0x4C, 0x00, 0x00, 0x00]);
+    let mut want = [0u8; 68];
+    want[0] = 0x80;
+    want[20..24].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    want[24..28].copy_from_slice(&0x0100_0005u32.to_le_bytes());
+    want[28..32].copy_from_slice(&0x0403_0201u32.to_le_bytes());
+    want[52..56].copy_from_slice(&0xFFFC_0000u32.to_le_bytes());
+    want[56..60].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    want[60..64].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    assert_eq!(&b[8..], &want[..]);
+    // The macid is c0 [6:0]; seq 20 asks for a REC_ACK only by the
+    // every-fourth rule, and never for a DONE_ACK.
+    let (_, p) = H2c::at(20).dctl_sec(5, &CamKeys::default());
+    let b = body(&p).1;
+    assert_eq!(word(b, 1) & 0xC000, 0x4000);
+    assert_eq!(b[8], 0x85);
+    assert!(b[9..].iter().take(19).all(|&x| x == 0));
+    assert_eq!(word(&b[8..], 13), 0xFFFC_0000);
+    let (_, p) = H2c::at(21).dctl_sec(0, &CamKeys::default());
+    assert_eq!(word(body(&p).1, 1) & 0xC000, 0);
+}
+
+#[test]
+fn security_cam_class_and_func_constants_are_linuxs() {
+    // fw.h:4747, :4804-4805; cam.h:10; core.h:321.
+    assert_eq!((H2C_CL_MAC_SEC_CAM, H2C_FUNC_MAC_SEC_UPD), (0xA, 1));
+    assert_eq!((H2C_CL_MAC_FR_EXCHG, H2C_FUNC_MAC_DCTLINFO_UD_V1), (5, 9));
+    assert_eq!((SEC_CAM_LEN, SEC_KEY_TYPE_CCMP128), (20, 6));
+}
+
+#[test]
+fn pkt_drop_is_byte_exact() {
+    // rtw89_fw_h2c_pkt_drop (fw.c:10621-10676) for rtw89_mac_pkt_drop_sta's
+    // station (mac.c:7255-7278): MAC / FW_OFLD / PKT_DROP (0x1b), rack 0,
+    // dack 0, H2C_PKT_DROP_LEN 24: w0 = sel [7:0] | macid [15:8] | band 0
+    // [23:16] | port [31:24]; w1 = mbssid 0 [7:0] | tf_trs 0 [15:8] (no HE
+    // association, core.c:5718-5722); w2..w5 = macid_band_sel 0
+    // (fw.h:2110-2158).
+    for (sel, seq) in [(0u8, 17u8), (1, 18), (2, 19), (3, 20)] {
+        let (got, p) = H2c::at(seq).pkt_drop(sel, 0, 0);
+        assert_eq!(got, seq);
+        let (len, b) = body(&p);
+        assert_eq!(len, 32);
+        // REC_ACK only by the every-fourth-sequence rule.
+        let rack = if seq % 4 == 0 { 0x40 } else { 0 };
+        assert_eq!(&b[..8], &[0x25, 0x1B, 0x00, seq, 0x20, rack, 0x00, 0x00]);
+        let mut payload = [0u8; 24];
+        payload[0] = sel;
+        assert_eq!(&b[8..], &payload[..]);
+    }
+    let (_, p) = H2c::at(1).pkt_drop(3, 0x7F, 2);
+    assert_eq!(word(&body(&p).1[8..], 0), 0x0200_7F03);
+}
+
+#[test]
+fn ba_cam_start_and_stop_bytes() {
+    // rtw89_fw_h2c_ba_cam (fw.c:2574-2651), 8852C's V0_EXT: MAC / BA_CAM
+    // (0xC) / BA_CAM (0), rack 0, dack 1, 8 bytes (spec S13.2).
+    let (seq, p) = H2c::at(17).ba_cam(0, 0, 0x123, 64, 0, true);
+    assert_eq!(seq, 17);
+    let (len, b) = body(&p);
+    assert_eq!(len, 16);
+    assert_eq!(&b[..8], &[0x31, 0x00, 0x00, 17, 0x10, 0x80, 0x00, 0x00]);
+    // w0 = VALID | INIT_REQ | TID 0 << 4 | BMAP 0 | SSN << 20; w1 = STD_EN
+    // b8 | band 0 | entry 0 << 28.
+    assert_eq!(&b[8..], &[0x03, 0x00, 0x30, 0x12, 0x00, 0x01, 0x00, 0x00]);
+    // Stopping: macid and entry alone.
+    let (_, p) = H2c::at(18).ba_cam(0, 0, 0x123, 64, 0, false);
+    assert_eq!(&body(&p).1[8..], &[0; 8]);
+    // Every field placed and masked: macid [15:8], TID [7:4], a window past
+    // 64 is BMAP_SIZE 4 [19:16], the SSN's 12 bits [31:20], entry [31:28].
+    let (_, p) = H2c::at(19).ba_cam(0x7F, 5, 0xFFF, 65, 7, true);
+    let b = body(&p).1;
+    assert_eq!(
+        (word(&b[8..], 0), word(&b[8..], 1)),
+        (0xFFF4_7F53, 0x7000_0100)
+    );
+    let (_, p) = H2c::at(20).ba_cam(3, 5, 0xFFF, 65, 7, false);
+    let b = body(&p).1;
+    // Seq 20 takes the every-fourth REC_ACK.
+    assert_eq!(&b[..8], &[0x31, 0x00, 0x00, 20, 0x10, 0xC0, 0x00, 0x00]);
+    assert_eq!(
+        (word(&b[8..], 0), word(&b[8..], 1)),
+        (0x0000_0300, 0x7000_0000)
+    );
+}

@@ -2,9 +2,10 @@
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020 Realtek Corporation
 //! Native Realtek PCIe Wi-Fi: RTL8822C stations by rtw88, RTL8852B's
-//! firmware layout from rtw89, and the RTL8852CE's rtw89 bring-up to running
-//! firmware ([`ax`]), with no station for it yet. Pinned rtw88/rtw89 are
-//! hardware references, not a Linux kernel interface.
+//! firmware layout from rtw89, and RTL8852CE stations by rtw89, from its
+//! bring-up to running firmware to a kept connection with its keys in the
+//! hardware ([`ax`]). Pinned rtw88/rtw89 are hardware references, not a
+//! Linux kernel interface.
 pub mod attach;
 pub mod ax;
 pub mod beacon;

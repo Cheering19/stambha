@@ -208,6 +208,8 @@ pub struct Firmware {
     raw: Vec<(usize, Vec<Vec<u8>>)>,
     /// Batches released after END_SCAN.
     after_end: Vec<Vec<Vec<u8>>>,
+    /// Every H2C read, once [`Firmware::record`] asked for them.
+    log: Option<Rc<RefCell<Vec<Vec<u8>>>>>,
 }
 
 impl Firmware {
@@ -226,7 +228,17 @@ impl Firmware {
             after: Vec::new(),
             raw: Vec::new(),
             after_end: Vec::new(),
+            log: None,
         }
+    }
+
+    /// Every H2C the firmware reads from now on, its 8-byte header and
+    /// payload without the descriptor, in the order read, silent ones
+    /// included: the CH12 ring's 16 slots hold only the last 16.
+    pub fn record(&mut self) -> Rc<RefCell<Vec<Vec<u8>>>> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        self.log = Some(log.clone());
+        log
     }
 
     /// Each time H2C cat 1 / `class` / `func` is answered, `batch` follows
@@ -408,6 +420,9 @@ impl State {
 
     /// One H2C: its 8-byte header and payload.
     fn h2c(&mut self, h2c: &[u8]) {
+        if let Some(log) = &self.fw.log {
+            log.borrow_mut().push(h2c.to_vec());
+        }
         let hdr0 = u32::from_le_bytes(h2c[..4].try_into().unwrap());
         let hdr1 = u32::from_le_bytes(h2c[4..8].try_into().unwrap());
         let (cat, class, func, seq) = (

@@ -28,8 +28,9 @@ use crate::{
             realtek::{
                 self as realtek_wifi,
                 ax::{
-                    AxError, AxIo, BringUpError, FirmwareFile, Host, NativeAxIo, Rings, Running,
-                    bring_up, elements::phy_tables, phy::check_tables, quiesce,
+                    AttachError, AxError, AxIo, BringUpError, FirmwareFile, Host, Live, NativeAxIo,
+                    Rings, Running, Wifi, bring_up, elements::phy_tables, phy::check_tables,
+                    quiesce,
                 },
             },
         },
@@ -71,6 +72,11 @@ impl<L: Link> Link for Located<L> {
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.link.receive()
     }
+    /// The driver's own state line, which the adapter reports only for the
+    /// drivers it names (`probe.rs` `Adapter::diagnostic`).
+    fn diagnostic(&mut self) -> Option<String> {
+        self.link.diagnostic()
+    }
 }
 
 /// The drivers here that attach through [`NativeServices`].
@@ -89,8 +95,8 @@ pub(super) enum Kind {
     MediatekWifi,
     /// A Realtek Wi-Fi function; only RTL8822C attaches.
     RealtekWifi,
-    /// An RTL8852CE, which is brought up to running firmware and powered
-    /// off again; no station runs on it.
+    /// An RTL8852CE, attached as a station kept connected to the `--wifi`
+    /// network.
     Rtw89Wifi,
     /// An Intel PCIe Bluetooth function, as `btintel_pcie_table` lists them.
     IntelBluetooth,
@@ -672,14 +678,24 @@ pub(super) unsafe fn realtek_wifi(
 /// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
 const RTL8852CE_DEVICE: u16 = 0xc852;
 
-/// What an RTL8852CE bring-up needs of the machine around it.
+/// An RTL8852CE station on its hardware: the live chip over its BAR2 window,
+/// kept connected to the `--wifi` network.
+pub type Rtw89Wifi = Wifi<Live<NativeAxIo>>;
+
+/// What an RTL8852CE station needs of the machine around it.
 pub struct Rtw89Inputs {
     pub firmware: &'static dyn crate::firmware::Provider,
     pub pages: &'static dyn PageSource,
     pub clock: Clock,
+    /// regulatory.db, which holds the network's country, or the world's
+    /// `00` when it names none.
+    pub database: crate::net::wifi::regulatory::database::Database,
+    pub network: crate::net::wifi::network::Network,
+    /// The source of the station's handshake nonces.
+    pub entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
-/// An RTL8852CE whose bring-up failed.
+/// An RTL8852CE whose station attach failed.
 pub struct Rtw89Down {
     pub error: Error,
     /// As [`Rtw89Up::was_on`]: whether its MAC had been left on, and so was
@@ -688,6 +704,9 @@ pub struct Rtw89Down {
     /// Whatever must outlive the device once claimed: its requester and
     /// domain, its BAR2 mapping and register window, and any rings.
     pub kept: Option<Box<dyn Any>>,
+    /// Why Bus Master could not be cleared again after the failure, when
+    /// it could not (`Rtw89Keep::unmaster`).
+    pub bus_master: Option<Error>,
 }
 
 impl From<Failure> for Rtw89Down {
@@ -696,30 +715,35 @@ impl From<Failure> for Rtw89Down {
             error,
             was_on: false,
             kept,
+            bus_master: None,
         }
     }
 }
 
-/// An RTL8852CE whose firmware ran, powered off again.
+/// An RTL8852CE whose station runs.
 pub struct Rtw89Up {
+    /// The station, kept connected to the network, and where it was found.
+    pub station: Located<Rtw89Wifi>,
+    /// What its bring-up reported.
     pub running: Running,
     /// Whether firmware or an earlier driver had left its MAC on, so it was
     /// powered off before its requester was taken over.
     pub was_on: bool,
-    /// Its requester and bound domain, its BAR2 mapping and register window,
-    /// and the rings its firmware download, OFLD_CFG H2C (CH12) and C2H
-    /// wait (the RXQ buffers the device wrote) ran on: kept for the rest of
-    /// the boot.
+    /// Its requester and bound domain, kept for the rest of the boot; the
+    /// station owns the register window (and with it BAR2's mapping), the
+    /// rings and the TX pools.
     pub kept: Box<dyn Any>,
 }
 
-/// Bring an RTL8852CE up to running firmware, initialize its MAC and have
-/// its firmware acknowledge one H2C, then power it off again
-/// ([`bring_up`]); `rtw89_pci_setup_mapping` finds its registers
-/// in BAR2. The requester is taken through the mount's cold preparation and
-/// brought to D0 there ([`rtw89_wake`]), so
-/// Bus Master stays sealed off until the chip is quiesced and its own
-/// domain is bound ([`rtw89_attach`]).
+/// Attach an RTL8852CE as a station kept connected to `inputs.network`
+/// (M3 spec S16.2): `rtw89_pci_setup_mapping` finds its registers in BAR2,
+/// and [`rtw89_keep`] runs the station's attach where M2c's bring-up ran.
+/// The requester is taken through the mount's cold preparation and brought
+/// to D0 there ([`rtw89_wake`]), so Bus Master stays sealed off until the
+/// chip is quiesced and its own domain is bound ([`rtw89_attach_with`]).
+/// Every failure leaves Bus Master clear and the chip either untouched
+/// (before its quiescence, or in LPS or an undefined state) or powered off,
+/// and keeps whatever DMA could still reach.
 ///
 /// # Safety
 /// As for [`tg3`].
@@ -805,30 +829,233 @@ pub(super) unsafe fn rtw89_wifi(
     };
     let mut device = Rtw89Native {
         claim: Rtw89Claim::Preparing(preparing),
-        io,
+        io: Rtw89Window::Held(io),
         host,
     };
-    // SAFETY: `rtw89_attach`'s contract: `device.io` is the exclusive UC BAR2
-    // window of the original requester `device.claim` prepares, which the
-    // mount parked with Bus Master clear (sealed since) and its outstanding
-    // requests drained, under the cold grant that excludes earlier firmware,
-    // IRQ and work users and competing writers (`NativeServices`). Its
-    // `finalize` is `QuiescenceReceipt::finalize` of that requester, and it
-    // keeps BAR2 and every owner of the receipt through each outcome.
-    // `inputs.pages` is the mount's coherent write-back page source, and the
-    // probe drives nothing else meanwhile.
-    match unsafe { rtw89_attach(&mut device, observed, inputs.firmware, inputs.pages) } {
-        Ok((running, rings, was_on)) => Ok(Rtw89Up {
+    let Rtw89Inputs {
+        firmware,
+        pages,
+        clock,
+        database,
+        network,
+        entropy,
+    } = inputs;
+    let station = realtek_wifi::ax::attach::Inputs {
+        clock,
+        database,
+        network,
+        entropy,
+    };
+    // SAFETY: `rtw89_keep`'s contract, which is `rtw89_attach_with`'s:
+    // `device.io` is the exclusive UC BAR2 window of the original requester
+    // `device.claim` prepares, which the mount parked with Bus Master clear
+    // (sealed since) and its outstanding requests drained, under the cold
+    // grant that excludes earlier firmware, IRQ and work users and
+    // competing writers (`NativeServices`). Its `finalize` is
+    // `QuiescenceReceipt::finalize` of that requester, and it keeps BAR2 and
+    // every owner of the receipt through each outcome. `pages` is the
+    // mount's coherent write-back page source, and the probe drives nothing
+    // else meanwhile, nor anything on this function once it returns but
+    // the station.
+    match unsafe { rtw89_keep(&mut device, observed, firmware, pages, station) } {
+        Ok((station, running, was_on)) => Ok(Rtw89Up {
+            station: Located {
+                location: alloc::format!("{address}"),
+                link: station,
+            },
             running,
             was_on,
-            kept: Box::new((device, rings)),
+            kept: Box::new(device),
         }),
         // A failure after the rings were programmed left them quarantined;
         // the requester, its domain and BAR2 stay kept.
-        Err((error, was_on)) => Err(Rtw89Down {
+        Err(Rtw89Refused {
             error,
             was_on,
-            kept: Some(Box::new(device)),
+            rings,
+            bus_master,
+        }) => Err(Rtw89Down {
+            error,
+            was_on,
+            kept: Some(Box::new((device, rings))),
+            bus_master,
+        }),
+    }
+}
+
+/// The register window of an RTL8852CE a station can take
+/// ([`rtw89_keep`]): the attach runs on it while it is held, and once taken
+/// every access is refused as outside the window and no time passes.
+pub(super) enum Rtw89Window<I> {
+    Held(I),
+    Taken,
+}
+
+impl<I> Rtw89Window<I> {
+    /// The window, which stays taken until [`Self::put`].
+    pub(super) fn take(&mut self) -> Option<I> {
+        match core::mem::replace(self, Self::Taken) {
+            Self::Held(io) => Some(io),
+            Self::Taken => None,
+        }
+    }
+
+    /// The window handed back.
+    pub(super) fn put(&mut self, io: I) {
+        *self = Self::Held(io);
+    }
+
+    fn held(&mut self, register: u32) -> Result<&mut I, AxError> {
+        match self {
+            Self::Held(io) => Ok(io),
+            Self::Taken => Err(AxError::OutOfWindow { register }),
+        }
+    }
+}
+
+impl<I: AxIo> AxIo for Rtw89Window<I> {
+    fn read8(&mut self, reg: u32) -> Result<u8, AxError> {
+        self.held(reg)?.read8(reg)
+    }
+    fn read16(&mut self, reg: u32) -> Result<u16, AxError> {
+        self.held(reg)?.read16(reg)
+    }
+    fn read32(&mut self, reg: u32) -> Result<u32, AxError> {
+        self.held(reg)?.read32(reg)
+    }
+    fn write8(&mut self, reg: u32, v: u8) -> Result<(), AxError> {
+        self.held(reg)?.write8(reg, v)
+    }
+    fn write16(&mut self, reg: u32, v: u16) -> Result<(), AxError> {
+        self.held(reg)?.write16(reg, v)
+    }
+    fn write32(&mut self, reg: u32, v: u32) -> Result<(), AxError> {
+        self.held(reg)?.write32(reg, v)
+    }
+    fn delay_us(&mut self, us: u64) {
+        if let Self::Held(io) = self {
+            io.delay_us(us);
+        }
+    }
+    fn now_us(&mut self) -> Result<u64, AxError> {
+        match self {
+            Self::Held(io) => io.now_us(),
+            Self::Taken => Err(AxError::Clock),
+        }
+    }
+}
+
+/// An [`Rtw89Device`] a normal boot attaches a station on
+/// ([`rtw89_keep`]), which clears Bus Master again when the attach fails.
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+pub(super) trait Rtw89Keep: Rtw89Device {
+    /// Bus Master off. A requester never bound is held clear by its
+    /// preparation's seal, or by the refused finalization, already.
+    fn unmaster(&mut self) -> Result<(), Error>;
+}
+
+impl Rtw89Keep for Rtw89Native {
+    fn unmaster(&mut self) -> Result<(), Error> {
+        match &mut self.claim {
+            Rtw89Claim::Bound { function, .. } => Ok(function.set_bus_master(false)?),
+            Rtw89Claim::Preparing(_) | Rtw89Claim::Refused { .. } | Rtw89Claim::Finalizing => {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Why [`rtw89_keep`] attached no station: the failure, whether the MAC
+/// had been on, the rings once they were installed, which DMA may still
+/// reach and so are kept, and why Bus Master could not be cleared again,
+/// if it could not.
+pub(super) struct Rtw89Refused {
+    pub error: Error,
+    pub was_on: bool,
+    pub rings: Option<Rings>,
+    pub bus_master: Option<Error>,
+}
+
+/// [`rtw89_attach_with`] for a normal boot's `--wifi` network: at step 5
+/// the window is taken from `device` and [`realtek_wifi::ax::attach`] runs
+/// on it, so the chip stays up as a station kept connected to
+/// `inputs.network` (M3 spec S16.1-S16.2). Returns the station, what its
+/// bring-up reported ([`realtek_wifi::ax::attach::attach_reporting`]) and
+/// whether the MAC was on.
+///
+/// A failure is the step's, as [`rtw89_attach_with`]'s are: before step 5
+/// the chip was never powered on, or a MAC left on was powered off; at
+/// step 5 the attach either refused before any register access, powered
+/// the chip off after a failed start, or stopped it after it started. A
+/// bring-up step's failure stays an `Error::Rtw89Wifi`, and the station's
+/// own an `Error::Rtw89Station`. The window goes back to `device`, the rings
+/// are returned, and then Bus Master is cleared ([`Rtw89Keep::unmaster`]),
+/// whatever failed, so the function issues nothing after.
+///
+/// # Safety
+/// As for [`rtw89_attach`], for as long as the station runs: nothing but the
+/// station drives the function once this returns it.
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+pub(super) unsafe fn rtw89_keep<D, I>(
+    device: &mut D,
+    observed: realtek_wifi::identity::Observed,
+    firmware: &dyn crate::firmware::Provider,
+    pages: &dyn PageSource,
+    inputs: realtek_wifi::ax::attach::Inputs,
+) -> Result<(Wifi<Live<I>>, Running, bool), Rtw89Refused>
+where
+    D: Rtw89Keep<Io = Rtw89Window<I>> + ?Sized,
+    I: AxIo,
+{
+    let mut quarantined = None;
+    #[expect(
+        clippy::result_large_err,
+        reason = "rtw89_attach_with's step 5 returns the probe's own error, as bring_up's does."
+    )]
+    let station = |window: &mut Rtw89Window<I>,
+                   pages: &dyn PageSource,
+                   domain: Arc<dyn DmaDomain>,
+                   cut: u8,
+                   file: FirmwareFile<'_>,
+                   host: Host| {
+        let io = window.take().ok_or(Error::Rtw89Wifi(BringUpError::new(
+            "register window",
+            AxError::OutOfWindow { register: 0 },
+        )))?;
+        // SAFETY: `rtw89_attach_with` runs this at step 5 with `bring_up`'s
+        // contract holding for the window, `pages` and `domain`, and
+        // `attach_reporting`'s contract is that one (`live::start`'s); this
+        // function's caller keeps it for as long as the station runs, whose
+        // window this is from here on.
+        let attached = unsafe {
+            realtek_wifi::ax::attach::attach_reporting(io, pages, domain, cut, file, host, inputs)
+        };
+        attached.map_err(|(error, returned)| {
+            if let Some((io, rings)) = returned {
+                window.put(io);
+                quarantined = rings;
+            }
+            match error {
+                AttachError::Start(error) => Error::Rtw89Wifi(error),
+                error => Error::Rtw89Station(error),
+            }
+        })
+    };
+    // SAFETY: this function's contract is `rtw89_attach_with`'s.
+    let attached = unsafe { rtw89_attach_with(device, observed, firmware, pages, station) };
+    match attached {
+        Ok(((wifi, running), was_on)) => Ok((wifi, running, was_on)),
+        Err((error, was_on)) => Err(Rtw89Refused {
+            error,
+            was_on,
+            rings: quarantined,
+            bus_master: device.unmaster().err(),
         }),
     }
 }
@@ -933,11 +1160,11 @@ pub trait Rtw89Device {
 }
 
 /// One RTL8852CE through its attach: its requester as preparation hands it
-/// on, the register window over its BAR2, and the host input
-/// [`rtw89_decode`] read. Every outcome keeps it whole.
+/// on, the register window over its BAR2 until a station takes it, and the
+/// host input [`rtw89_decode`] read. Every outcome keeps it whole.
 struct Rtw89Native {
     claim: Rtw89Claim,
-    io: NativeAxIo,
+    io: Rtw89Window<NativeAxIo>,
     host: Host,
 }
 
@@ -956,8 +1183,8 @@ enum Rtw89Claim {
 }
 
 impl Rtw89Device for Rtw89Native {
-    type Io = NativeAxIo;
-    fn io(&mut self) -> &mut NativeAxIo {
+    type Io = Rtw89Window<NativeAxIo>;
+    fn io(&mut self) -> &mut Rtw89Window<NativeAxIo> {
         &mut self.io
     }
     fn host(&self) -> Host {
@@ -1011,7 +1238,7 @@ impl Rtw89Device for Rtw89Native {
 /// 4. set Bus Master;
 /// 5. [`bring_up`] on that domain, with the file, whose PHY and TX power
 ///    tables it reads again (a file without TX power tables fails there, at
-///    `"tx power"`, after the efuse its RFE type comes from).
+///    `"firmware elements"`, after the efuse its RFE type comes from).
 ///
 /// Returns the report, the rings DMA ran on, and whether the MAC was on;
 /// a failure is returned with whether the MAC was on as well, since a MAC
@@ -2230,12 +2457,19 @@ mod tests {
     #[test]
     fn a_refused_rtw89_claim_keeps_no_owner() {
         let services = Refusing::minimum_only();
+        let realtek_wifi::ax::attach::Inputs {
+            clock,
+            database,
+            network,
+            entropy,
+        } = station_inputs(None);
         let inputs = Rtw89Inputs {
             firmware: Box::leak(Box::new(crate::firmware::HandoffProvider::new(None))),
             pages: services.pages(),
-            clock: Clock {
-                ticks_per_microsecond: 1000,
-            },
+            clock,
+            database,
+            network,
+            entropy,
         };
         // SAFETY: the refusing services transfer no owner.
         let result = unsafe { rtw89_wifi(&services, address(), inputs) };
@@ -2245,6 +2479,7 @@ mod tests {
                 error: Error::Native(ServiceError::Unavailable),
                 was_on: false,
                 kept: None,
+                bus_master: None,
             })
         ));
         // Through the cold preparation, never the sealed stopped claim.
@@ -2258,6 +2493,8 @@ mod tests {
         Write(u32, u32),
         Finalize,
         Master,
+        /// Bus Master cleared after a failed station attach.
+        Unmaster,
     }
 
     /// An RTL8852CE register window: R_AX_IC_PWR_STATE reads `mac` until
@@ -3197,6 +3434,362 @@ mod tests {
         assert_eq!(Kind::of_identity(&identity(0xc852, [2, 0, 0])), None);
         // RTL8852BE still has no driver here.
         assert_eq!(Kind::of_identity(&identity(0xb852, [2, 0x80, 0])), None);
+    }
+
+    /// The register accesses a model window has seen.
+    trait Accesses {
+        fn accesses(&self) -> usize;
+    }
+    impl Accesses for Chip {
+        fn accesses(&self) -> usize {
+            self.events.len()
+        }
+    }
+    impl Accesses for Live {
+        fn accesses(&self) -> usize {
+            self.writes.len()
+        }
+    }
+
+    /// The device side of a normal boot's station attach over a model
+    /// window: finalization binds `domain`, and finalization, Bus Master and
+    /// its clearing are recorded with the window's accesses before each.
+    struct KeptDevice<I> {
+        window: Rtw89Window<I>,
+        domain: fn() -> Arc<dyn DmaDomain>,
+        steps: Vec<(Event, usize)>,
+    }
+    impl<I: AxIo + Accesses> KeptDevice<I> {
+        fn new(io: I, domain: fn() -> Arc<dyn DmaDomain>) -> Self {
+            Self {
+                window: Rtw89Window::Held(io),
+                domain,
+                steps: Vec::new(),
+            }
+        }
+        fn step(&mut self, event: Event) {
+            let accesses = match &self.window {
+                Rtw89Window::Held(io) => io.accesses(),
+                Rtw89Window::Taken => usize::MAX,
+            };
+            self.steps.push((event, accesses));
+        }
+        fn held(&self) -> &I {
+            match &self.window {
+                Rtw89Window::Held(io) => io,
+                Rtw89Window::Taken => panic!("the station kept the window"),
+            }
+        }
+    }
+    impl<I: AxIo + Accesses> Rtw89Device for KeptDevice<I> {
+        type Io = Rtw89Window<I>;
+        fn io(&mut self) -> &mut Rtw89Window<I> {
+            &mut self.window
+        }
+        fn host(&self) -> Host {
+            Host { ltr: false }
+        }
+        unsafe fn finalize(&mut self) -> Result<Arc<dyn DmaDomain>, Error> {
+            self.step(Event::Finalize);
+            Ok((self.domain)())
+        }
+        fn master(&mut self) -> Result<(), Error> {
+            self.step(Event::Master);
+            Ok(())
+        }
+    }
+    impl<I: AxIo + Accesses> Rtw89Keep for KeptDevice<I> {
+        fn unmaster(&mut self) -> Result<(), Error> {
+            self.step(Event::Unmaster);
+            Ok(())
+        }
+    }
+
+    fn no_domain() -> Arc<dyn DmaDomain> {
+        Arc::new(NoDomain)
+    }
+    fn counting() -> Arc<dyn DmaDomain> {
+        Arc::new(Counting::default())
+    }
+
+    /// The plan's test network, in `country`, its secret a PSK so no
+    /// passphrase is hashed.
+    fn test_network(country: Option<[u8; 2]>) -> crate::net::wifi::network::Network {
+        crate::net::wifi::network::Network {
+            ssid: b"test".to_vec(),
+            secret: crate::net::wifi::network::Secret::parse(&[b'0'; 64]).unwrap(),
+            country,
+        }
+    }
+
+    /// A station's inputs for `country`, regulatory.db holding `00` and
+    /// `US` ([`crate::probe::tests::regulatory_database`]).
+    fn station_inputs(country: Option<[u8; 2]>) -> realtek_wifi::ax::attach::Inputs {
+        realtek_wifi::ax::attach::Inputs {
+            clock: Clock {
+                ticks_per_microsecond: 1000,
+            },
+            database: crate::probe::tests::regulatory_database(),
+            network: test_network(country),
+            entropy: Arc::new(crate::probe::services::tests::NoEntropy),
+        }
+    }
+
+    /// What [`rtw89_keep`] returns over a model window `I`.
+    type KeptOn<I> = Result<
+        (
+            realtek_wifi::ax::Wifi<realtek_wifi::ax::Live<I>>,
+            Running,
+            bool,
+        ),
+        Rtw89Refused,
+    >;
+
+    /// Run [`rtw89_keep`] on `device` with `firmware` and `inputs`.
+    #[expect(clippy::result_large_err, reason = "rtw89_keep's own result")]
+    fn keep_on<I: AxIo + Accesses>(
+        device: &mut KeptDevice<I>,
+        firmware: &dyn crate::firmware::Provider,
+        inputs: realtek_wifi::ax::attach::Inputs,
+    ) -> KeptOn<I> {
+        // SAFETY: `KeptDevice` is a model, not a device: `NoDomain` maps
+        // nothing, `Counting` keeps every pin and no device reaches the
+        // addresses it hands out, and `Heap` is plain test memory.
+        unsafe { rtw89_keep(device, rtl8852ce(), firmware, &Heap, inputs) }
+    }
+
+    fn refused_station<I: AxIo>(kept: KeptOn<I>) -> Rtw89Refused {
+        match kept {
+            Ok(_) => panic!("a model chip became a station"),
+            Err(refused) => refused,
+        }
+    }
+
+    /// A normal boot's station attach that fails before Bus Master was set
+    /// touches no register and still clears Bus Master, last; the window
+    /// stays with the device.
+    #[test]
+    fn a_station_attach_without_firmware_clears_bus_master_untouched() {
+        let mut device = KeptDevice::new(
+            Chip {
+                events: Vec::new(),
+                mac: 0,
+                now: 0,
+            },
+            no_domain,
+        );
+        let refused = refused_station(keep_on(
+            &mut device,
+            &crate::firmware::HandoffProvider::new(None),
+            station_inputs(None),
+        ));
+        assert!(matches!(
+            refused.error,
+            Error::Rtw89Wifi(BringUpError {
+                step: "firmware",
+                ..
+            })
+        ));
+        assert!(!refused.was_on);
+        assert!(refused.rings.is_none());
+        assert!(refused.bus_master.is_none());
+        assert_eq!(device.steps, [(Event::Unmaster, 0)]);
+        assert!(device.held().events.is_empty());
+    }
+
+    /// A network whose country regulatory.db lacks fails the station's own
+    /// check after the take-over, before any register write: the chip
+    /// stays off as `quiesce` left it, and Bus Master is cleared again.
+    #[test]
+    fn a_station_refused_for_its_country_clears_bus_master() {
+        let catalog = empty_image();
+        let mut device = KeptDevice::new(
+            Chip {
+                events: Vec::new(),
+                mac: 0,
+                now: 0,
+            },
+            no_domain,
+        );
+        let refused = refused_station(keep_on(
+            &mut device,
+            &crate::firmware::HandoffProvider::new(Some(&catalog)),
+            station_inputs(Some(*b"ZZ")),
+        ));
+        assert_eq!(
+            alloc::format!("{}", refused.error),
+            "rtw89: RTL8852CE: regulatory.db country ZZ: Country"
+        );
+        assert!(refused.rings.is_none());
+        // `quiesce` read the MAC off; nothing was written.
+        assert_eq!(device.held().events, [Event::Read(0x03F0)]);
+        let steps: Vec<Event> = device.steps.iter().map(|(event, _)| *event).collect();
+        assert_eq!(steps, [Event::Finalize, Event::Master, Event::Unmaster]);
+        assert_eq!(device.steps[2].1, 1);
+    }
+
+    /// A station whose start fails past the power-on (the model's RXQ never
+    /// answers OFLD_CFG) powers the chip off, hands the window back to the
+    /// device with the rings, and only then is Bus Master cleared: nothing
+    /// is written after it.
+    #[test]
+    fn a_station_whose_start_fails_is_powered_off_before_bus_master_clears() {
+        let catalog = empty_image();
+        let mut device = KeptDevice::new(Live::new(), counting);
+        let refused = refused_station(keep_on(
+            &mut device,
+            &crate::firmware::HandoffProvider::new(Some(&catalog)),
+            station_inputs(None),
+        ));
+        let Error::Rtw89Wifi(BringUpError { step, .. }) = refused.error else {
+            panic!("{}", refused.error)
+        };
+        assert_eq!(step, "c2h");
+        assert!(refused.rings.is_some());
+        assert!(refused.bus_master.is_none());
+        let writes = &device.held().writes;
+        // rtw8852c_pwr_off_func's APFM_SWLPS, then the coex scoreboard, last.
+        assert_eq!(writes.last(), Some(&(0x00AF, 0x80)));
+        let swlps = writes
+            .iter()
+            .rposition(|&(reg, value)| reg == 0x0004 && value & 1 << 10 != 0);
+        assert!(swlps.is_some_and(|at| at + 1 < writes.len()), "{swlps:?}");
+        let steps: Vec<Event> = device.steps.iter().map(|(event, _)| *event).collect();
+        assert_eq!(steps, [Event::Finalize, Event::Master, Event::Unmaster]);
+        assert_eq!(device.steps[2].1, writes.len());
+    }
+
+    /// A taken window refuses every access, and answers again once put
+    /// back.
+    #[test]
+    fn a_taken_window_refuses_access_until_put_back() {
+        let mut window = Rtw89Window::Held(Chip {
+            events: Vec::new(),
+            mac: 0x100,
+            now: 0,
+        });
+        let chip = window.take().unwrap();
+        assert!(window.take().is_none());
+        assert!(matches!(
+            window.read32(0x03F0),
+            Err(AxError::OutOfWindow { register: 0x03F0 })
+        ));
+        assert!(matches!(
+            window.write8(0x00AF, 0x80),
+            Err(AxError::OutOfWindow { register: 0x00AF })
+        ));
+        assert!(matches!(window.now_us(), Err(AxError::Clock)));
+        window.put(chip);
+        assert_eq!(window.read32(0x03F0).unwrap(), 0x100);
+    }
+
+    /// A chip that answers nothing, for a station that is only looked at.
+    struct Idle;
+    impl realtek_wifi::ax::station::chip::Chip for Idle {
+        fn mac(&self) -> Mac {
+            Mac([0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+        }
+        fn poll(
+            &mut self,
+            _: &mut dyn FnMut(realtek_wifi::ax::station::chip::Incoming),
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn tune(&mut self, _: crate::net::wifi::Channel) -> Result<(), String> {
+            Err(String::from("idle"))
+        }
+        fn begin_scan(&mut self, _: &[crate::net::wifi::Channel]) -> Result<(), String> {
+            Err(String::from("idle"))
+        }
+        fn end_scan(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_bssid(&mut self, _: Mac) -> Result<(), String> {
+            Err(String::from("idle"))
+        }
+        fn authenticated(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn transmit_management(
+            &mut self,
+            _: &realtek_wifi::ax::station::chip::Management<'_>,
+        ) -> Result<Option<realtek_wifi::ax::station::chip::Token>, String> {
+            Ok(None)
+        }
+        fn transmit_data(
+            &mut self,
+            _: &realtek_wifi::ax::station::chip::Data<'_>,
+        ) -> Result<Option<realtek_wifi::ax::station::chip::Token>, String> {
+            Ok(None)
+        }
+        fn associate(
+            &mut self,
+            _: &realtek_wifi::ax::station::chip::Association,
+        ) -> Result<(), String> {
+            Err(String::from("idle"))
+        }
+        fn disassociate(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_key(
+            &mut self,
+            _: &realtek_wifi::ax::station::chip::HardwareKey<'_>,
+        ) -> Result<u8, String> {
+            Err(String::from("idle"))
+        }
+        fn remove_key(&mut self, _: u8) -> Result<(), String> {
+            Ok(())
+        }
+        fn flush(&mut self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn start_rx_block_ack(&mut self, _: u8, _: u16, _: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop_rx_block_ack(&mut self, _: u8) -> Result<(), String> {
+            Ok(())
+        }
+        fn diagnostic(&self) -> String {
+            String::from("idle chip")
+        }
+    }
+
+    /// A located rtw89 station gives the stack its radio's 30 s carrier
+    /// wait (M3 spec S1.5) and its progress line, as the adapter forwards
+    /// them (`native.rs` `Located`, `probe.rs` `Adapter`).
+    #[test]
+    fn a_located_rtw89_station_forwards_its_carrier_wait_and_progress() {
+        let country = crate::probe::tests::regulatory_database()
+            .select(*b"US")
+            .unwrap();
+        let radio = realtek_wifi::ax::Rtl8852c::new(
+            Idle,
+            Mac([0x02, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            country,
+            Clock {
+                ticks_per_microsecond: 1000,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let mut located = Located {
+            location: alloc::format!("{}", address()),
+            link: radio.keep(
+                test_network(Some(*b"US")),
+                Arc::new(crate::probe::services::tests::NoEntropy),
+            ),
+        };
+        assert_eq!(
+            located.carrier_wait_us(),
+            realtek_wifi::ax::WIFI_CARRIER_WAIT_US
+        );
+        assert_eq!(located.carrier_wait_us(), 30_000_000);
+        let progress = located.diagnostic().unwrap();
+        assert!(
+            progress.starts_with("scans 0 (0 networks, target -)"),
+            "{progress}"
+        );
+        assert!(!progress.contains("02:11:22"), "{progress}");
+        assert!(!located.signals());
     }
 
     #[test]

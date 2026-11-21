@@ -28,7 +28,10 @@ use crate::wifi::station::phy::AccessCategory;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
+mod ba;
+mod beacon;
 mod chip;
+mod keys;
 
 type Started = Result<Live<RegisterModel>, StartError<RegisterModel>>;
 
@@ -238,7 +241,7 @@ fn start_failure_powers_off_and_hands_back_io() {
 }
 
 #[test]
-fn missing_tx_power_element_fails_tx_power() {
+fn missing_tx_power_element_fails_the_firmware_elements() {
     let (started, _m) = start_on(
         chip(efuse_with_mac(), 7, never, BOTH),
         &tables_file_without(Some(ID_TXPWR_LMT_5G)),
@@ -248,9 +251,14 @@ fn missing_tx_power_element_fails_tx_power() {
     assert_eq!(
         error,
         BringUpError::new(
-            "tx power",
+            "firmware elements",
             AxError::TxPower("firmware lacks TXPWR_LMT_5GHZ")
         )
+    );
+    // The step and the error each name what they are, once.
+    assert_eq!(
+        error.to_string(),
+        "RTL8852CE bring-up: firmware elements: tx power: firmware lacks TXPWR_LMT_5GHZ"
     );
     // As rtw89_chip_info_setup fails at rtw89_fw_recognize_elements
     // (core.c:7413): after the efuse, which the RFE type comes from, and

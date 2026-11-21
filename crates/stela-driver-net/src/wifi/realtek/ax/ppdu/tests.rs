@@ -26,6 +26,8 @@ fn desc() -> RxDesc {
         crc32_err: false,
         icv_err: false,
         frame_type: None,
+        mac_id: 0,
+        sec_type: 0,
     }
 }
 

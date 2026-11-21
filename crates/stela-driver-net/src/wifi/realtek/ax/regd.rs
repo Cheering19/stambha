@@ -14,6 +14,15 @@
 //! PCIe without ACPI (regd.c:681-707). The index values are
 //! `enum rtw89_regulation_type` (core.h:774-792).
 //!
+//! The country the stack would hint is the configured network's alone.
+//! Without an efuse country Linux leaves cfg80211 free to follow the
+//! associated AP's country element (`regulatory_hint_country_ie`, which
+//! `REGULATORY_STRICT_REG` stops only for a programmed chip,
+//! regd.c:747-757), and its notifier then moves the index to that country;
+//! Stela follows no AP's country element, so on a chip without an efuse
+//! country the index of a network configured without one stays the
+//! world's, `WW`, whatever the AP announces.
+//!
 //! This module does not grant any channel, the channel rules a country
 //! allows (Stela's regulatory database owns those), UNII-4 or 6 GHz policy,
 //! TAS or antenna-gain policy, or any register write; it only names the

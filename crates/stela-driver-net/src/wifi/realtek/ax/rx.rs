@@ -8,10 +8,12 @@
 //! the offset; capping the payload at `RPKT_LEN` as well is a deliberate
 //! narrowing of Linux, so a buffer whose descriptor claims fewer bytes than
 //! the BD wrote yields only those. The descriptor fields are those of
-//! `rtw89_core_query_rxdesc` (`core.c:4107-4160`, `txrx.h:345-410`) for the
-//! RTL8852C (`BW` is the `_v1` mask, d1 [31:29]); the fields Stela does not
-//! use are not read. Only FS && LS single-segment buffers are
-//! framed. It reads no register and grants no DMA.
+//! `rtw89_core_query_rxdesc` (`core.c:4107-4160`, `txrx.h:345-424`) for the
+//! RTL8852C (`BW` is the `_v1` mask, d1 [31:29]); of a long descriptor's
+//! d5 and d7 only the MAC ID [23:16] and the security type [20:17], which
+//! `rtw89_core_skb_pn_valid` reads; the fields Stela does not use are not
+//! read. Only FS && LS single-segment buffers are framed. It reads no
+//! register and grants no DMA.
 use super::io::AxError;
 
 const RXBD_FS: u32 = 1 << 15;
@@ -35,7 +37,9 @@ const LONG_RXD: usize = 32;
 const TOO_SHORT: AxError = AxError::Rx("RX buffer shorter than its descriptor");
 
 /// The fields `rtw89_core_query_rxdesc` reads that Stela uses (spec S11.1).
-/// `frame_type` is `Some` only for a long descriptor.
+/// `frame_type` is `Some` only for a long descriptor; `mac_id` and
+/// `sec_type` are 0 for a short one, as Linux's zeroed `desc_info` leaves
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RxDesc {
     pub pkt_type: u8,
@@ -55,6 +59,10 @@ pub struct RxDesc {
     pub crc32_err: bool,
     pub icv_err: bool,
     pub frame_type: Option<u8>,
+    /// `AX_RXD_MAC_ID_MASK`.
+    pub mac_id: u8,
+    /// `AX_RXD_SEC_TYPE_MASK`, an `enum rtw89_sec_key_type`.
+    pub sec_type: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,10 +96,15 @@ pub fn parse(buffer: &[u8]) -> Result<RxBuffer<'_>, AxError> {
     let rxd_len = if long { LONG_RXD } else { SHORT_RXD };
     let word = |n: usize| le32(buffer, BD_INFO_BYTES + n * 4).ok_or(TOO_SHORT);
     let (d1, d2, d3) = (word(1)?, word(2)?, word(3)?);
-    let frame_type = if long {
-        Some((word(4)? & 0x3) as u8)
+    let (frame_type, mac_id, sec_type) = if long {
+        let (d4, d5, d7) = (word(4)?, word(5)?, word(7)?);
+        (
+            Some((d4 & 0x3) as u8),
+            ((d5 >> 16) & 0xFF) as u8,
+            ((d7 >> 17) & 0xF) as u8,
+        )
     } else {
-        None
+        (None, 0, 0)
     };
     let pkt_type = ((d0 >> RXD_RPKT_TYPE_SHIFT) & 0xF) as u8;
     let desc = RxDesc {
@@ -112,6 +125,8 @@ pub fn parse(buffer: &[u8]) -> Result<RxBuffer<'_>, AxError> {
         crc32_err: d3 & (1 << 9) != 0,
         icv_err: d3 & (1 << 10) != 0,
         frame_type,
+        mac_id,
+        sec_type,
     };
     let drv_info = ((d0 >> RXD_DRV_INFO_SHIFT) & 0x7) as usize * 8;
     let offset = BD_INFO_BYTES + rxd_len + drv_info;

@@ -90,6 +90,8 @@ const RTW89_PCI_TXBD_OPT_LS: u16 = 1 << 14;
 const BD_OPT_DMA_HI_SHIFT: u32 = 6;
 /// `TXBD_HW_IDX_MASK` (`pci.h:558`): the hardware read index of a TX ring.
 const TXBD_HW_IDX_MASK: u32 = 0x0FFF_0000;
+/// `__pci_flush_txch`'s reads of one ring (`pci.c:1401`).
+const FLUSH_TRIES: usize = 60;
 
 /// `enum rtw89_cv` (`core.h:201`).
 const CHIP_CAV: u8 = 0;
@@ -456,6 +458,34 @@ impl Rings {
             pools,
             ch,
         }
+    }
+
+    /// `rtw89_pci_ops_flush_queues` (`pci.c:1432-1436`): for every TX ring
+    /// but CH12, which `__rtw89_pci_ops_flush_txchs` skips (`pci.c:1414-1430`;
+    /// the 8852CE masks no other, `tx_dma_ch_mask` 0, `rtw8852ce.c:63`), in
+    /// ring order, `__pci_flush_txch` (`pci.c:1388-1410`): up to 60 reads of
+    /// the ring's IDX, each not yet showing the hardware index ([27:16]) at
+    /// the host's (`bd_ring->wp`: a data or management channel's, 0 for a
+    /// ring nothing is queued on) followed by a 1 us delay. A ring still
+    /// behind after them is passed over, as Linux only logs it. Nothing is
+    /// written and no TXBD is taken back; only a failed read is an error.
+    pub fn flush_tx<I: AxIo + ?Sized>(&self, io: &mut I) -> Result<(), AxError> {
+        for (ring, entry) in TX_TABLE.iter().enumerate().take(CH12) {
+            let wp = match ring {
+                0..=3 => self.data_host[ring].get(),
+                8 => self.data_host[TxChannel::Ch8.slot()].get(),
+                _ => 0,
+            };
+            for _ in 0..FLUSH_TRIES {
+                let value = io.read32(entry.idx)?;
+                let rp = (value & TXBD_HW_IDX_MASK) >> TXBD_HW_IDX_MASK.trailing_zeros();
+                if rp == u32::from(wp) {
+                    break;
+                }
+                io.delay_us(1);
+            }
+        }
+        Ok(())
     }
 
     /// The RPQ ring, read by polling as RXQ is. `pre_init` must have

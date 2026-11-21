@@ -4,13 +4,19 @@
 //! the AP, shaped as rtw88's `station/tests.rs` `Air`: a firmware scan
 //! hears the AP's beacon on its channel and ends, the AP answers
 //! authentication and association, and EAPOL runs against the supplicant
-//! tests' `Authenticator`.
+//! tests' `Authenticator`. The model decrypts nothing: it records the keys
+//! the station installs and the key each data frame names, and hands back
+//! the AP's protected frames as the hardware leaves them, marked decrypted
+//! with their CCMP header and MIC in place.
 use super::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
 use super::*;
 use crate::LinkError;
 use crate::wifi::connection::security::Security;
 use crate::wifi::intel::policy::tests::regdb;
 use crate::wifi::network::{Network, Secret};
+use crate::wifi::realtek::ccmp;
+use crate::wifi::sae::{self, Derivation, Exchange};
+use crate::wifi::station::multi_link::Mld;
 use crate::wifi::station::phy::AccessCategory;
 use crate::wifi::supplicant::tests::Authenticator;
 use alloc::{rc::Rc, vec};
@@ -29,6 +35,23 @@ const SSID: &[u8] = b"test";
 const RSN: [u8; 22] = [
     48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
 ];
+/// [`RSN`] with management frame protection capable (MFPC, b7), so the
+/// station protects its management frames (`ieee80211w=1`).
+const RSN_PMF: [u8; 22] = [
+    48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0x80, 0,
+];
+/// The IGTK KDE a PMF message 3 carries: key ID 4, IPN 9, the key 0x77s.
+const IGTK_KDE: [u8; 30] = [
+    0xdd, 28, 0, 0x0f, 0xac, 9, 4, 0, 9, 0, 0, 0, 0, 0, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+    0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+];
+/// [`RSN`] of a WPA3-Personal AP: SAE (00-0F-AC:8), management frame
+/// protection required and capable (MFPR b6, MFPC b7).
+const RSN_SAE: [u8; 22] = [
+    48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xc0, 0,
+];
+/// An SAE network's passphrase.
+const PASSPHRASE: &[u8] = b"correct horse battery";
 /// An AP's HT capabilities (SGI 20, one RX STBC stream, SM power save
 /// static) and operation, one stream at 20 MHz.
 const HT: [u8; 52] = [
@@ -75,6 +98,9 @@ struct Joined {
     short_slot: bool,
 }
 
+/// The CAM entry, key ID and PN a data frame goes under, if any.
+type FrameKey = Option<(u8, u8, u64)>;
+
 /// One call the chip took, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
@@ -85,15 +111,33 @@ enum Call {
     Authenticated,
     /// A management frame and the basic rates it went with.
     Management(Vec<u8>, u16),
+    /// A data frame, with the CAM entry, key ID and PN it went under.
     Data {
         bytes: Vec<u8>,
         tid: u8,
         eapol: bool,
         supported: u16,
-        keyed: bool,
+        key: FrameKey,
     },
     Associate(Joined),
     Disassociate,
+    /// A key the chip installed, in CAM entry `cam`.
+    AddKey {
+        pairwise: bool,
+        index: u8,
+        material: Vec<u8>,
+        cam: u8,
+    },
+    RemoveKey(u8),
+    /// mac80211's flush, with drop or without.
+    Flush(bool),
+    /// `rtw89_ops_ampdu_action`'s RX_START and RX_STOP.
+    StartBa {
+        tid: u8,
+        ssn: u16,
+        window: u16,
+    },
+    StopBa(u8),
 }
 
 /// What the chip was told, and what it holds for the host.
@@ -121,18 +165,58 @@ struct Air {
     full_data: bool,
     /// Frames refused for no room.
     refused: usize,
+    /// The AP protects management frames (beacons [`RSN_PMF`]).
+    pmf: bool,
+    /// The firmware never acknowledges a key.
+    refuse_keys: bool,
+    /// The CAM entries holding a key.
+    cam: Vec<u8>,
+    /// An authentication's report comes only after the association
+    /// request has been taken, as the M3a boot saw it.
+    late_auth_report: bool,
+    /// Reports held for [`Air::late_auth_report`].
+    late: Vec<Incoming>,
+    /// The AP asks for a Block Ack agreement right after its association
+    /// response, heard in the same poll.
+    addba_with_assoc: bool,
+    /// The chip cannot send its BA CAM H2C.
+    ba_fails: bool,
+    /// The AP is WPA3-Personal (beacons [`RSN_SAE`]) and answers SAE under
+    /// [`PASSPHRASE`]: a station's commit gets its commit, the station's
+    /// confirm its confirm ([`Air::sae_confirm`] until then).
+    sae: bool,
+    /// The AP's half of the last exchange, and its confirm, held.
+    sae_ap: Option<Exchange>,
+    sae_confirm: Option<sae::Frame>,
+    /// The AP sends its confirm with its commit, before the station's.
+    sae_eager: bool,
+    /// The AP sends a deauthentication before its answer to a commit.
+    sae_deauth: bool,
+    /// The AP's commit to another station comes before its answer to the
+    /// station's commit.
+    sae_stray: bool,
+    /// The AP's confirm does not verify, as under another passphrase.
+    sae_wrong_confirm: bool,
+    /// The chip reports beacon loss during a scan, before the beacon it
+    /// hears, and with the AP's answer to an authentication.
+    lost_unassociated: bool,
 }
 
 impl Air {
     fn hear(&mut self, bytes: Vec<u8>) {
+        self.hear_as(bytes, false, false);
+    }
+
+    /// A frame the hardware `decrypted`, or found failing its ICV.
+    fn hear_as(&mut self, bytes: Vec<u8>, decrypted: bool, icv_error: bool) {
         let channel = self.channel.unwrap();
         self.incoming.push_back(Incoming::Frame(Received {
             bytes,
             channel,
             signal_dbm: None,
             tsf: 0,
-            decrypted: false,
-            icv_error: false,
+            decrypted,
+            icv_error,
             fcs_error: false,
         }));
     }
@@ -141,15 +225,30 @@ impl Air {
     fn serve(&mut self) {
         while let Some((token, bytes)) = self.unanswered.pop_front() {
             let deaf = bytes[0] == 0xb0 && self.deaf_to_auth;
-            self.incoming.push_back(Incoming::Transmitted {
+            let report = Incoming::Transmitted {
                 token,
                 acknowledged: !deaf,
-            });
+            };
+            if bytes[0] == 0x00 {
+                let late = core::mem::take(&mut self.late);
+                self.incoming.extend(late);
+            }
+            if bytes[0] == 0xb0 && self.late_auth_report {
+                self.late.push(report);
+            } else {
+                self.incoming.push_back(report);
+            }
             if deaf {
                 continue;
             }
             match bytes[0] {
-                0xb0 => self.hear(management(0xb0, &[0, 0, 2, 0, 0, 0])),
+                0xb0 if self.sae => self.answer_sae(&bytes),
+                0xb0 => {
+                    self.hear(management(0xb0, &[0, 0, 2, 0, 0, 0]));
+                    if self.lost_unassociated {
+                        self.incoming.push_back(Incoming::BeaconLost);
+                    }
+                }
                 0x00 if !self.mute_on_assoc => {
                     let mut body = vec![0x11, 0, 0, 0, 1, 0xc0];
                     body.extend(RATES);
@@ -158,9 +257,54 @@ impl Air {
                         body.extend(WMM);
                     }
                     self.hear(management(0x10, &body));
+                    if self.addba_with_assoc {
+                        self.hear(addba(1, 0, 64, 0));
+                    }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// The AP's side of SAE (algorithm 3) for the station's frame `bytes`:
+    /// each commit begins a new exchange, as hostapd's for a new attempt.
+    fn answer_sae(&mut self, bytes: &[u8]) {
+        let field = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        assert_eq!(field(24), 3, "not SAE");
+        let (transaction, status, data) = (field(26), field(28), &bytes[30..]);
+        match transaction {
+            1 => {
+                if self.sae_deauth {
+                    self.hear(management(0xc0, &[1, 0]));
+                }
+                if self.sae_stray {
+                    let mut stray = sae_frame(&sae_ap_for(OTHER_STATION).commit());
+                    stray[4..10].copy_from_slice(&OTHER_STATION);
+                    self.hear(stray);
+                }
+                let mut ap = sae_ap();
+                let mut confirm = ap.receive(1, status, data).unwrap().unwrap();
+                if self.sae_wrong_confirm {
+                    // The confirm field, past the send-confirm counter.
+                    confirm.data[2] ^= 1;
+                }
+                self.hear(sae_frame(&ap.commit()));
+                if self.sae_eager {
+                    self.hear(sae_frame(&confirm));
+                } else {
+                    self.sae_confirm = Some(confirm);
+                }
+                self.sae_ap = Some(ap);
+            }
+            2 => {
+                let ap = self.sae_ap.as_mut().unwrap();
+                assert_eq!(ap.receive(2, status, data), Ok(None));
+                assert!(ap.accepted());
+                if let Some(confirm) = self.sae_confirm.take() {
+                    self.hear(sae_frame(&confirm));
+                }
+            }
+            _ => panic!("SAE transaction {transaction}"),
         }
     }
 
@@ -182,6 +326,48 @@ impl Air {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The data frames the chip took, with the key each named.
+    fn data(&self) -> Vec<(Vec<u8>, FrameKey)> {
+        self.calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Data { bytes, key, .. } => Some((bytes.clone(), *key)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The keys installed, as (pairwise, index, CAM entry).
+    fn keys(&self) -> Vec<(bool, u8, u8)> {
+        self.calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::AddKey {
+                    pairwise,
+                    index,
+                    cam,
+                    ..
+                } => Some((*pairwise, *index, *cam)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The pairwise key's material.
+    fn ptk(&self) -> [u8; 16] {
+        self.calls
+            .iter()
+            .find_map(|c| match c {
+                Call::AddKey {
+                    pairwise: true,
+                    material,
+                    ..
+                } => material[..].try_into().ok(),
+                _ => None,
+            })
+            .unwrap()
     }
 
     /// The management frames of subtype `fc0` the chip took.
@@ -211,6 +397,9 @@ impl Chip for Model {
         let mut air = self.0.borrow_mut();
         if let Some(channels) = air.scanning.take() {
             let channel = air.channel.unwrap();
+            if air.lost_unassociated {
+                air.incoming.push_back(Incoming::BeaconLost);
+            }
             if channels.contains(&channel) {
                 let bad = air.bad_fcs;
                 let bytes = beacon(&air);
@@ -270,12 +459,17 @@ impl Chip for Model {
             air.refused += 1;
             return Ok(None);
         }
+        if let Some((cam, _, _)) = frame.key
+            && !air.cam.contains(&cam)
+        {
+            return Err("a key the CAM does not hold".into());
+        }
         air.calls.push(Call::Data {
             bytes: frame.bytes.to_vec(),
             tid: frame.tid,
             eapol: frame.eapol,
             supported: frame.supported_rates,
-            keyed: frame.key.is_some(),
+            key: frame.key,
         });
         let token = air.token();
         air.unanswered.push_back((token, frame.bytes.to_vec()));
@@ -295,20 +489,55 @@ impl Chip for Model {
         }));
         Ok(())
     }
+    /// Leaving deletes what keys are left, as `Live::leave` does.
     fn disassociate(&mut self) -> Result<(), String> {
-        self.0.borrow_mut().calls.push(Call::Disassociate);
+        let mut air = self.0.borrow_mut();
+        air.calls.push(Call::Disassociate);
+        air.cam.clear();
         Ok(())
     }
-    fn add_key(&mut self, _: &HardwareKey<'_>) -> Result<u8, String> {
-        Err("the model holds no key".into())
+    /// The lowest free CAM entry, unless the firmware never acknowledges.
+    fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, String> {
+        let mut air = self.0.borrow_mut();
+        if air.refuse_keys {
+            return Err("the firmware never acknowledged the key".into());
+        }
+        let cam = (0..).find(|cam| !air.cam.contains(cam)).unwrap();
+        air.cam.push(cam);
+        air.calls.push(Call::AddKey {
+            pairwise: key.pairwise,
+            index: key.index,
+            material: key.material.to_vec(),
+            cam,
+        });
+        Ok(cam)
     }
-    fn remove_key(&mut self, _: u8) -> Result<(), String> {
-        Err("the model holds no key".into())
-    }
-    fn start_rx_block_ack(&mut self, _: u8, _: u16) -> Result<(), String> {
+    fn remove_key(&mut self, cam: u8) -> Result<(), String> {
+        let mut air = self.0.borrow_mut();
+        air.calls.push(Call::RemoveKey(cam));
+        let at = air
+            .cam
+            .iter()
+            .position(|&held| held == cam)
+            .ok_or("no key in that entry")?;
+        air.cam.remove(at);
         Ok(())
     }
-    fn stop_rx_block_ack(&mut self, _: u8) -> Result<(), String> {
+    fn flush(&mut self, drop: bool) -> Result<(), String> {
+        self.0.borrow_mut().calls.push(Call::Flush(drop));
+        Ok(())
+    }
+    /// Recorded, then refused when the BA CAM H2C cannot be sent.
+    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String> {
+        let mut air = self.0.borrow_mut();
+        air.calls.push(Call::StartBa { tid, ssn, window });
+        if air.ba_fails {
+            return Err("the BA CAM H2C could not be sent".into());
+        }
+        Ok(())
+    }
+    fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String> {
+        self.0.borrow_mut().calls.push(Call::StopBa(tid));
         Ok(())
     }
     fn diagnostic(&self) -> String {
@@ -330,6 +559,42 @@ fn management(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Another station of the AP's BSS.
+const OTHER_STATION: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x99];
+
+/// The AP's half of an SAE exchange with the station under [`PASSPHRASE`].
+fn sae_ap() -> Exchange {
+    sae_ap_for(LOCAL)
+}
+
+/// The AP's half of an SAE exchange with `station` under [`PASSPHRASE`].
+fn sae_ap_for(station: [u8; 6]) -> Exchange {
+    let mut next = 0x30u8;
+    let mut random = || {
+        next += 1;
+        [next; 32]
+    };
+    Exchange::new(
+        Derivation::HuntingAndPecking,
+        PASSPHRASE,
+        None,
+        None,
+        Mac(AP),
+        Mac(station),
+        &mut random,
+    )
+    .unwrap()
+}
+
+/// The AP's SAE authentication frame carrying `frame`.
+fn sae_frame(frame: &sae::Frame) -> Vec<u8> {
+    let mut body = vec![3, 0];
+    body.extend(frame.transaction.to_le_bytes());
+    body.extend(frame.status.to_le_bytes());
+    body.extend(&frame.data);
+    management(0xb0, &body)
+}
+
 /// The AP's beacon on its channel.
 fn beacon(air: &Air) -> Vec<u8> {
     let channel = air.channel.unwrap().number as u8;
@@ -345,7 +610,13 @@ fn beacon(air: &Air) -> Vec<u8> {
     frame.extend(RATES);
     // DS parameter set, then a TIM with DTIM period 2.
     frame.extend([3, 1, channel, 5, 4, 0, 2, 0, 0]);
-    frame.extend(RSN);
+    frame.extend(if air.sae {
+        RSN_SAE
+    } else if air.pmf {
+        RSN_PMF
+    } else {
+        RSN
+    });
     frame.extend(HT);
     // HT Operation's primary channel.
     let at = frame.len() - 22;
@@ -369,6 +640,38 @@ fn data(receiver: [u8; 6], sequence: u16, kind: [u8; 2], body: &[u8]) -> Vec<u8>
     frame.extend(kind);
     frame.extend(body);
     frame
+}
+
+/// [`data`] protected under key ID `keyid` at packet number `pn`, as the
+/// hardware hands it on decrypted: its CCMP header after the MAC header,
+/// the plaintext, then the MIC (zeros here).
+fn protected(receiver: [u8; 6], sequence: u16, keyid: u8, pn: u64, body: &[u8]) -> Vec<u8> {
+    let mut frame = data(receiver, sequence, [8, 0], body);
+    frame[1] |= 0x40;
+    let [p0, p1, p2, p3, p4, p5, _, _] = pn.to_le_bytes();
+    let header = [p0, p1, 0, 0x20 | keyid << 6, p2, p3, p4, p5];
+    frame.splice(26..26, header);
+    frame.extend([0; 8]);
+    frame
+}
+
+/// An IPv4 frame from the station to the AP, its body `fill`.
+fn ip(fill: u8) -> Vec<u8> {
+    let mut ethernet = Vec::from(AP);
+    ethernet.extend(LOCAL);
+    ethernet.extend([8, 0, 0x45, 0]);
+    ethernet.extend([fill; 44]);
+    ethernet
+}
+
+/// What the station holds for the network, as each frame's first payload
+/// byte past its IPv4 type.
+fn delivered(wifi: &mut Wifi<Model>) -> Vec<u8> {
+    let mut values = Vec::new();
+    while let Some(ethernet) = wifi.receive().unwrap() {
+        values.push(ethernet[14]);
+    }
+    values
 }
 
 /// What the station sent past `frame`'s header and LLC when it is EAPOL.
@@ -408,11 +711,17 @@ fn wifi_with(set: impl FnOnce(&mut Air)) -> (Wifi<Model>, Model) {
         ..Air::default()
     };
     set(&mut air);
+    // SAE needs the passphrase (`Security::select_on`).
+    let secret = if air.sae {
+        Secret::parse(PASSPHRASE).unwrap()
+    } else {
+        Secret::Psk(Zeroizing::new([0; 32]))
+    };
     let model = Model(Rc::new(RefCell::new(air)));
     let country = database.select(*b"US").unwrap();
     let network = Network {
         ssid: SSID.to_vec(),
-        secret: Secret::Psk(Zeroizing::new([0; 32])),
+        secret,
         country: None,
     };
     let radio = Rtl8852c::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
@@ -455,7 +764,12 @@ fn associated() -> (Wifi<Model>, Model) {
 
 /// The AP's half of the 4-way handshake.
 fn authenticator() -> Authenticator {
-    let security = Security::select(&RSN, true).unwrap();
+    authenticator_for(&RSN)
+}
+
+/// The AP's half of the 4-way handshake under `rsn`.
+fn authenticator_for(rsn: &[u8]) -> Authenticator {
+    let security = Security::select(rsn, true).unwrap();
     Authenticator::between(
         security.suites(),
         Zeroizing::new([0; 32]),
@@ -469,20 +783,56 @@ fn authenticator() -> Authenticator {
 /// release report included.
 fn handshaken() -> (Wifi<Model>, Model) {
     let (mut wifi, model) = associated();
-    let mut ap = authenticator();
+    shake(&mut wifi, &model, &RSN, &[]);
+    (wifi, model)
+}
+
+/// Messages 1 to 4 of the 4-way handshake under `rsn`, message 3 carrying
+/// `extra` KDEs, m4's release report included.
+fn shake(wifi: &mut Wifi<Model>, model: &Model, rsn: &[u8], extra: &[u8]) {
+    shake_with(wifi, model, authenticator_for(rsn), rsn, extra);
+}
+
+/// [`shake`] with `ap` as the AP's half.
+fn shake_with(
+    wifi: &mut Wifi<Model>,
+    model: &Model,
+    mut ap: Authenticator,
+    rsn: &[u8],
+    extra: &[u8],
+) {
     model
         .0
         .borrow_mut()
         .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
-    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    assert!(run(wifi, model, |_, air| !air.eapol().is_empty()));
     ap.message_2(&model.0.borrow().eapol()[0]);
     model
         .0
         .borrow_mut()
-        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
-    assert!(run(&mut wifi, &model, |wifi, air| {
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3_with(rsn, extra)));
+    assert!(run(wifi, model, |wifi, air| {
         air.eapol().len() > 1 && progress(wifi).contains("acked 2")
     }));
+}
+
+/// [`handshaken`], the port open.
+fn connected() -> (Wifi<Model>, Model) {
+    let (mut wifi, model) = handshaken();
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
+    (wifi, model)
+}
+
+/// A join to an AP protecting management frames, through its handshake
+/// with an IGTK to an open port.
+fn connected_with_pmf() -> (Wifi<Model>, Model) {
+    let (mut wifi, model) = wifi_with(|air| air.pmf = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert!(wifi.radio().station().requires_protected_management());
+    shake(&mut wifi, &model, &RSN_PMF, &IGTK_KDE);
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
     (wifi, model)
 }
 
@@ -639,11 +989,12 @@ fn an_ap_without_wmm_leaves_its_edca_to_the_chip() {
 }
 
 #[test]
-fn eapol_flows_both_ways_and_m3a_stops_at_the_key() {
+fn eapol_flows_both_ways_before_any_key() {
     let (mut wifi, model) = handshaken();
     let air = model.0.borrow();
-    // m2 and m4 went as EAPOL on TID 7, without a key, at the peer's rates.
-    let sent: Vec<(u8, bool, u16, bool)> = air
+    // m2 and m4 went as EAPOL on TID 7, without a key, at the peer's rates:
+    // m4 was handed to the chip before wpa_supplicant installs the PTK.
+    let sent: Vec<(u8, bool, u16, FrameKey)> = air
         .calls
         .iter()
         .filter_map(|c| match c {
@@ -652,23 +1003,41 @@ fn eapol_flows_both_ways_and_m3a_stops_at_the_key() {
                 tid,
                 eapol: is_eapol,
                 supported,
-                keyed,
-            } if eapol(bytes).is_some() => Some((*tid, *is_eapol, *supported, *keyed)),
+                key,
+            } if eapol(bytes).is_some() => Some((*tid, *is_eapol, *supported, *key)),
             _ => None,
         })
         .collect();
-    assert_eq!(sent, [(7, true, 0x011, false), (7, true, 0x011, false)]);
+    assert_eq!(sent, [(7, true, 0x011, None), (7, true, 0x011, None)]);
+    let data: Vec<usize> = (0..air.calls.len())
+        .filter(|&at| matches!(air.calls[at], Call::Data { .. }))
+        .collect();
+    let m4 = data[1];
+    let ptk = air.position(|c| matches!(c, Call::AddKey { .. })).unwrap();
+    assert!(m4 < ptk);
     drop(air);
     let line = progress(&mut wifi);
     assert!(line.contains("eapol rx 2 tx 2 acked 2"), "{line}");
-    assert!(line.contains("keys 0, port closed"), "{line}");
-    assert!(line.contains("last \"keys before M3b\""), "{line}");
-    // The keeper reports the refusal and the port stays closed.
-    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
-        panic!("no failure")
-    };
-    assert!(failure.contains("keys before M3b"), "{failure}");
-    assert!(!wifi.carrier());
+}
+
+#[test]
+fn the_handshake_installs_ptk_then_gtk_and_opens_the_port() {
+    let (mut wifi, model) = connected();
+    // `rtw89_ops_set_key` for the PTK (entry 0), then the GTK of key ID 1
+    // (entry 1), each with its own material (spec S12).
+    let air = model.0.borrow();
+    assert_eq!(air.keys(), [(true, 0, 0), (false, 1, 1)]);
+    let gtk: Vec<u8> = (0x50..0x60).collect();
+    assert!(air.calls.iter().any(|c| matches!(
+        c,
+        Call::AddKey { pairwise: false, material, .. } if *material == gtk
+    )));
+    drop(air);
+    assert!(wifi.carrier());
+    let line = progress(&mut wifi);
+    assert!(line.contains("keys 2, port open"), "{line}");
+    assert!(!line.contains("last"), "{line}");
+    assert_eq!(wifi.receive(), Ok(None));
 }
 
 #[test]
@@ -752,18 +1121,19 @@ fn progress_reports_each_stage() {
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
-             assoc 1/1 status 0 aid 1, eapol rx 0 tx 0 acked 0, keys -, port closed{chip}"
+             assoc 1/1 status 0 aid 1, eapol rx 0 tx 0 acked 0, keys -, port closed, \
+             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
-    // The handshake, to M3a's planned stop.
+    // The handshake, its two keys and the port (M3b's pass).
     drop((wifi, model));
-    let (mut wifi, _model) = handshaken();
+    let (mut wifi, _model) = connected();
     assert_eq!(
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
-             assoc 1/1 status 0 aid 1, eapol rx 2 tx 2 acked 2, keys 0, port closed, \
-             last \"keys before M3b\"{chip}"
+             assoc 1/1 status 0 aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, \
+             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
 }
@@ -786,6 +1156,13 @@ fn diagnostic_names_no_address() {
         .0
         .borrow_mut()
         .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        let line = progress(wifi);
+        lines.push(line.clone());
+        line.contains("port open")
+    }));
+    // Then the station leaves.
+    wifi.radio_mut().deauthenticate(3).unwrap();
     assert!(run(&mut wifi, &model, |wifi, air| {
         lines.push(progress(wifi));
         air.count(|c| *c == Call::Disassociate) == 1
@@ -924,6 +1301,103 @@ fn the_radio_waits_30_s_for_carrier_and_polls() {
 }
 
 #[test]
+fn beacon_loss_while_associated_reconnects() {
+    // Review Focus 5, spec S15 (ruling R2): the firmware's loss of the AP's
+    // beacons ends the association as `ieee80211_sta_connection_lost` does
+    // with tx false: the flush with drop and no frame of the station's own,
+    // then the keys and the leaving. The keeper reconnects after
+    // RECONNECT_US (100 ms), and the progress line counts the loss.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    let scans = |air: &Air| air.count(|c| matches!(c, Call::BeginScan(_)));
+    let before = scans(&model.0.borrow());
+    model
+        .0
+        .borrow_mut()
+        .incoming
+        .push_back(Incoming::BeaconLost);
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.calls[from..].contains(&Call::Disassociate)
+    }));
+    let left = CLOCK.now_us();
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert_eq!(
+        wifi.receive(),
+        Err(LinkError::Adapter(String::from(
+            "rtw89: the AP ended the association"
+        )))
+    );
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(
+            ", port closed, rx data 0 sealed 0 nokey 0 refused 0, tx data 0, beacon lost 1; "
+        ),
+        "{line}"
+    );
+    assert!(run(&mut wifi, &model, |_, air| scans(air) > before));
+    assert!(CLOCK.now_us() - left >= 90_000);
+    // The keeper joins again; the count stays.
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert_eq!(
+        model.0.borrow().count(|c| matches!(c, Call::Associate(_))),
+        2
+    );
+    assert!(progress(&mut wifi).contains("beacon lost 1"));
+}
+
+#[test]
+fn beacon_loss_while_scanning_is_ignored() {
+    // Linux hands mac80211 a beacon loss only outside a scan
+    // (`rtwdev->scanning`), and mac80211 takes one only while associated:
+    // a loss during the scan, or with the authentication's answer, changes
+    // nothing, and the join goes on.
+    let (mut wifi, model) = wifi_with(|air| air.lost_unassociated = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(air.count(|c| matches!(c, Call::BeginScan(_))), 1);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    drop(air);
+    assert_eq!(wifi.receive(), Ok(None));
+    let line = progress(&mut wifi);
+    assert!(!line.contains("beacon lost"), "{line}");
+}
+
+#[test]
+fn a_beacon_loss_while_leaving_is_not_counted() {
+    // The station already departs: the loss is not the connection's end.
+    let (mut wifi, model) = connected();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    model
+        .0
+        .borrow_mut()
+        .incoming
+        .push_back(Incoming::BeaconLost);
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    let line = progress(&mut wifi);
+    assert!(!line.contains("beacon lost"), "{line}");
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(!failure.contains("the AP ended"), "{failure}");
+}
+
+#[test]
 fn the_advertisement_is_ht20_with_two_streams() {
     let (wifi, _model) = wifi();
     for band in [Band::Ghz2, Band::Ghz5] {
@@ -960,5 +1434,1371 @@ fn a_frame_the_station_refuses_is_reported_but_is_no_refusal() {
     assert_eq!(
         failure,
         "rtw89 unsupported: a management frame the station refuses"
+    );
+}
+
+#[test]
+fn no_frame_leaves_encrypted_before_the_key_is_acked() {
+    // Review Focus 3: the firmware never acknowledges the PTK. The key is
+    // never completed, nothing goes under it, and the keeper fails the
+    // handshake and joins again.
+    let (mut wifi, model) = wifi_with(|air| air.refuse_keys = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    shake(&mut wifi, &model, &RSN, &[]);
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.count(|c| matches!(c, Call::SetBssid(_))) == 2
+    }));
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(failure.contains("never acknowledged"), "{failure}");
+    let air = model.0.borrow();
+    assert!(air.keys().is_empty());
+    assert!(air.data().iter().all(|(_, key)| key.is_none()));
+    assert!(air.count(|c| *c == Call::Disassociate) >= 1);
+    drop(air);
+    assert!(!wifi.carrier());
+    assert!(progress(&mut wifi).contains("keys 0, port closed"));
+}
+
+#[test]
+fn data_goes_with_its_pn_and_without_iv() {
+    let (mut wifi, model) = connected();
+    let before = model.0.borrow().data().len();
+    wifi.transmit(&ip(1)).unwrap();
+    wifi.transmit(&ip(2)).unwrap();
+    let air = model.0.borrow();
+    let sent = &air.data()[before..];
+    // The PTK's CAM entry and key ID 0, under PNs 1 and 2: its
+    // `TransmitSeed::host(0)`, as `atomic64_inc_return` counts from 0.
+    let keys: Vec<FrameKey> = sent.iter().map(|(_, key)| *key).collect();
+    assert_eq!(keys, [Some((0, 0, 1)), Some((0, 0, 2))]);
+    for (bytes, _) in sent {
+        // Protected QoS data whose 26-byte header is followed by the LLC:
+        // the CCMP header is the hardware's to insert (spec S5.4).
+        assert_eq!(bytes[..2], [0x88, 0x41]);
+        assert_eq!(bytes[26..34], [0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        assert_eq!(bytes.len(), 26 + 8 + 46);
+    }
+}
+
+#[test]
+fn pns_strictly_increase_across_a_full_ring() {
+    // Review Focus 4: a frame the chip has no room for waits in `held` with
+    // the PN reserved for it; one dropped from `held` still spent its PN.
+    let (mut wifi, model) = connected();
+    let before = model.0.borrow().data().len();
+    let fill = |bytes: &[u8]| bytes[36];
+    wifi.transmit(&ip(1)).unwrap();
+    model.0.borrow_mut().full_data = true;
+    wifi.transmit(&ip(2)).unwrap();
+    wifi.transmit(&ip(3)).unwrap();
+    assert_eq!(model.0.borrow().data().len(), before + 1);
+    model.0.borrow_mut().full_data = false;
+    assert!(run(&mut wifi, &model, |_, air| air.data().len() == before + 3));
+    let sent: Vec<(u8, u64)> = model.0.borrow().data()[before..]
+        .iter()
+        .map(|(bytes, key)| (fill(bytes), key.unwrap().2))
+        .collect();
+    assert_eq!(sent, [(1, 1), (2, 2), (3, 3)]);
+    // 257 frames wait: the oldest (PN 4) is dropped, the rest leave in
+    // order, and the next frame takes PN 261, never a PN given before.
+    model.0.borrow_mut().full_data = true;
+    for n in 0..257u16 {
+        wifi.transmit(&ip(n as u8)).unwrap();
+    }
+    model.0.borrow_mut().full_data = false;
+    assert!(run(&mut wifi, &model, |_, air| air.data().len() == before + 259));
+    wifi.transmit(&ip(9)).unwrap();
+    let pns: Vec<u64> = model.0.borrow().data()[before + 3..]
+        .iter()
+        .map(|(_, key)| key.unwrap().2)
+        .collect();
+    assert_eq!(pns, (5..=261).collect::<Vec<u64>>());
+}
+
+#[test]
+fn received_data_passes_replay_and_reaches_the_link() {
+    let (mut wifi, model) = connected();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(protected(LOCAL, 10, 0, 1, &[0x45; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+    // Replayed, then the next packet number.
+    hear(protected(LOCAL, 10, 0, 1, &[0x45; 46]));
+    hear(protected(LOCAL, 11, 0, 2, &[0x46; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x46]);
+    // A group frame under the GTK of key ID 1, past its RSC of 7.
+    hear(protected([0xff; 6], 12, 1, 8, &[0x47; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x47]);
+    // Unprotected data is refused once the port is controlled.
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 13, [8, 0], &[0x48; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+}
+
+#[test]
+fn an_undecrypted_protected_frame_is_dropped() {
+    let (mut wifi, model) = connected();
+    let body = [0x45; 46];
+    let mut air = model.0.borrow_mut();
+    // Not decrypted by the hardware, failing its ICV, and under a key ID
+    // no key has (spec S13.3).
+    air.hear_as(protected(LOCAL, 10, 0, 1, &body), false, false);
+    air.hear_as(protected(LOCAL, 11, 0, 2, &body), true, true);
+    air.hear_as(protected(LOCAL, 12, 2, 3, &body), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    // None of them spent a packet number.
+    model
+        .0
+        .borrow_mut()
+        .hear_as(protected(LOCAL, 13, 0, 1, &body), true, false);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+}
+
+#[test]
+fn a_frame_failing_its_icv_or_fcs_leaves_no_sequence_for_its_retry() {
+    // mac80211's `should_drop_frame` drops RX_FLAG_FAILED_FCS_CRC, which
+    // rtw89 sets for a CRC32 or ICV error (core.c:4396-4397), before any
+    // handler: `ieee80211_rx_h_check_dup` never records its sequence
+    // control, so the AP's good retry of it is no duplicate.
+    let (mut wifi, model) = connected();
+    let retried = |sequence: u16, pn: u64, fill: u8| {
+        let mut frame = protected(LOCAL, sequence, 0, pn, &[fill; 46]);
+        frame[1] |= 0x08;
+        frame
+    };
+    let mut air = model.0.borrow_mut();
+    air.hear_as(protected(LOCAL, 10, 0, 1, &[0x45; 46]), true, true);
+    air.hear_as(retried(10, 1, 0x45), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+    // A frame failing its FCS, as the chip hands one on while it scans.
+    let mut air = model.0.borrow_mut();
+    let channel = air.channel.unwrap();
+    air.incoming.push_back(Incoming::Frame(Received {
+        bytes: protected(LOCAL, 11, 0, 2, &[0x46; 46]),
+        channel,
+        signal_dbm: None,
+        tsf: 0,
+        decrypted: true,
+        icv_error: false,
+        fcs_error: true,
+    }));
+    air.hear_as(retried(11, 2, 0x46), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x46]);
+}
+
+#[test]
+fn the_progress_line_counts_data_both_ways() {
+    // M3 Task 20: with keys 2 and the port open but no lease, the line
+    // tells data that never came from data the hardware left sealed, data
+    // under a key ID with no key and data the station's checks refused, and
+    // shows whether the station's own data left. EAPOL counts apart.
+    let (mut wifi, model) = wifi();
+    assert!(!progress(&mut wifi).contains("rx data"));
+    drop((wifi, model));
+    let (mut wifi, model) = connected();
+    assert!(
+        progress(&mut wifi)
+            .contains(", keys 2, port open, rx data 0 sealed 0 nokey 0 refused 0, tx data 0; chip"),
+        "{}",
+        progress(&mut wifi)
+    );
+    let body = [0x45; 46];
+    let keyless = |mut frame: Vec<u8>| {
+        frame[29] = 0x20 | 2 << 6;
+        frame
+    };
+    let mut air = model.0.borrow_mut();
+    // Delivered; left sealed; under key ID 2, which has no key.
+    air.hear_as(protected(LOCAL, 10, 0, 1, &body), true, false);
+    air.hear_as(protected(LOCAL, 11, 0, 2, &body), false, false);
+    air.hear_as(keyless(protected(LOCAL, 12, 0, 3, &body)), true, false);
+    // Unprotected once the port is controlled, then a replay of PN 1: the
+    // station refuses both.
+    air.hear(data(LOCAL, 13, [8, 0], &body));
+    air.hear_as(protected(LOCAL, 14, 0, 1, &body), true, false);
+    // A fragment left sealed, and one under key ID 2; one more left sealed.
+    air.hear_as(fragment(15, 0, true, 4, &body), false, false);
+    air.hear_as(keyless(fragment(16, 0, true, 5, &body)), true, false);
+    air.hear_as(protected(LOCAL, 17, 0, 6, &body), false, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+    wifi.transmit(&ip(1)).unwrap();
+    wifi.transmit(&ip(2)).unwrap();
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", port open, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_robust_management_frame_is_sealed_on_the_host() {
+    // Spec S1.2: sealed under the PTK with `realtek::ccmp`, handed to the
+    // chip as any management frame (no hardware key).
+    let (mut wifi, model) = connected_with_pmf();
+    let ptk = model.0.borrow().ptk();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    let air = model.0.borrow();
+    let deauth = air.management(0xc0);
+    let [frame] = &deauth[..] else {
+        panic!("{} deauthentications", deauth.len())
+    };
+    // Protected, under the PTK's next PN (nothing went under it before),
+    // its reason sealed and its MIC appended.
+    assert_eq!(frame[1] & 0x40, 0x40);
+    assert_eq!(frame[24..32], [1, 0, 0, 0x20, 0, 0, 0, 0]);
+    assert_eq!(frame.len(), 24 + 8 + 2 + 8);
+    let opened = ccmp::open(&ptk, frame, PacketNumber::new(1).unwrap()).unwrap();
+    assert_eq!(opened[32..34], [3, 0]);
+}
+
+#[test]
+fn under_pmf_an_unprotected_departure_is_ignored() {
+    // `ieee80211_drop_unencrypted_mgmt`: neither a unicast nor a group
+    // deauthentication without its protection ends a PMF association.
+    let (mut wifi, model) = connected_with_pmf();
+    let mut group = management(0xc0, &[7, 0]);
+    group[4..10].fill(0xff);
+    model.0.borrow_mut().hear(management(0xc0, &[7, 0]));
+    model.0.borrow_mut().hear(group);
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(model.0.borrow().count(|c| *c == Call::Disassociate), 0);
+    assert!(wifi.carrier());
+    // No SA Query request follows: starting one is wpa_supplicant's
+    // (`sme_event_unprot_disconnect`), which the shared keeper does not
+    // port (the module documentation's gap).
+    assert!(model.0.borrow().management(0xd0).is_empty());
+}
+
+/// The AP's deauthentication to every station, reason 7, under BIP with
+/// the IGTK of [`IGTK_KDE`] (key ID 4, the 0x77s) at IPN `ipn`, as
+/// `ieee80211_crypto_aes_cmac_encrypt` signs it: the MMIE last, its MIC the
+/// first 8 bytes of the CMAC over the AAD (the frame control without Retry,
+/// PwrMgt and MoreData, then the three addresses) and the body, the MIC
+/// zeroed.
+fn signed_group_deauthentication(ipn: u64) -> Vec<u8> {
+    let mut frame = management(0xc0, &[7, 0]);
+    frame[4..10].fill(0xff);
+    frame.extend([76, 16, 4, 0]);
+    frame.extend(&ipn.to_le_bytes()[..6]);
+    frame.extend([0; 8]);
+    let control = u16::from_le_bytes([frame[0], frame[1]]) & !0x3800;
+    let mut message = control.to_le_bytes().to_vec();
+    message.extend(&frame[4..22]);
+    message.extend(&frame[24..]);
+    let mic =
+        crate::wifi::mediatek::mailbox::key::bip::tests::rotation::cmac(&[0x77; 16], &message);
+    let end = frame.len();
+    frame[end - 8..].copy_from_slice(&mic[..8]);
+    frame
+}
+
+#[test]
+fn under_pmf_a_group_deauthentication_needs_its_mic_and_a_fresh_ipn() {
+    // The host checks a group robust frame's BIP (spec S1.2,
+    // `ieee80211_crypto_aes_cmac_decrypt`) under the IGTK message 3 gave,
+    // key ID 4 from IPN 9: one whose MIC fails, or whose IPN is not past
+    // the last, is dropped; a valid one ends the association as
+    // `ieee80211_rx_mgmt_deauth` does, without a frame of the station's own.
+    let (mut wifi, model) = connected_with_pmf();
+    let mut flipped = signed_group_deauthentication(10);
+    let end = flipped.len();
+    flipped[end - 1] ^= 1;
+    model.0.borrow_mut().hear(flipped);
+    model.0.borrow_mut().hear(signed_group_deauthentication(9));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(model.0.borrow().count(|c| *c == Call::Disassociate), 0);
+    assert!(wifi.carrier());
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(signed_group_deauthentication(10));
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert!(!wifi.carrier());
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("the AP ended the association"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_tkip_or_ccmp256_key_is_unsupported() {
+    let (mut wifi, model) = associated();
+    for (pairwise, index, length) in [(true, 0, 32), (false, 1, 32), (false, 1, 13)] {
+        let got = wifi
+            .radio_mut()
+            .install_key(pairwise, index, &vec![0; length], ReplaySeed::ZERO);
+        assert!(
+            matches!(
+                got,
+                Err(Error::Unsupported(
+                    "a key other than CCMP-128 on an RTL8852C"
+                ))
+            ),
+            "{got:?}"
+        );
+    }
+    assert!(model.0.borrow().keys().is_empty());
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains("last \"a key other than CCMP-128 on an RTL8852C\""),
+        "{line}"
+    );
+}
+
+#[test]
+fn an_authentication_reported_late_still_counts_its_ack() {
+    // The M3a boot read 'auth 1/0' though the chip saw every frame
+    // acknowledged: the authentication's report came after the association
+    // request had replaced it as the frame the station awaits.
+    let (mut wifi, model) = wifi_with(|air| air.late_auth_report = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains("auth 1/1 status 0, assoc 1/1 status 0"),
+        "{line}"
+    );
+}
+
+/// The flushes, management frames, key calls and the leaving among the
+/// chip's calls from `from` to the first disassociation.
+fn leaving(air: &Air, from: usize) -> Vec<String> {
+    let end = from
+        + air.calls[from..]
+            .iter()
+            .position(|c| *c == Call::Disassociate)
+            .unwrap();
+    air.calls[from..=end]
+        .iter()
+        .filter_map(|c| match c {
+            Call::Flush(drop) => Some(alloc::format!("flush {drop}")),
+            Call::Management(bytes, _) => Some(alloc::format!("mgmt {:02x}", bytes[0])),
+            Call::RemoveKey(cam) => Some(alloc::format!("remove {cam}")),
+            Call::Disassociate => Some(String::from("leave")),
+            Call::AddKey { .. } => Some(String::from("add")),
+            Call::StopBa(tid) => Some(alloc::format!("stop {tid}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_deauthentication_flushes_and_deletes_the_keys_before_leaving() {
+    // ieee80211_set_disassoc: a flush with drop, the deauthentication, a
+    // flush without; then sta_info_flush deletes the PTK (DISABLE_KEY:
+    // rtw89_ops_set_key's flushes, then the CAM delete), the GTK after it
+    // (spec S14.5), and the AP's station leaves.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "mgmt c0",
+            "flush false",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert!(!wifi.carrier());
+}
+
+#[test]
+fn a_deauthentication_from_the_ap_drops_what_is_queued_and_deletes_the_keys() {
+    // ieee80211_set_disassoc without a frame of its own: the flush with
+    // drop alone, then the keys and the leaving.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(management(0xc0, &[7, 0]));
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+}
+
+#[test]
+fn a_group_rekey_replaces_the_key_of_its_index() {
+    // ieee80211_key_replace: the old key of the same index goes first
+    // (DISABLE_KEY), then the new one; a key of another index is added.
+    // The port stays open on the PTK and the GTK last installed.
+    let (mut wifi, model) = connected();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut()
+        .install_key(false, 1, &[0x66; 16], ReplaySeed::ZERO)
+        .unwrap();
+    {
+        let air = model.0.borrow();
+        let calls: Vec<&Call> = air.calls[from..].iter().collect();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(*calls[0], Call::Flush(false));
+        assert_eq!(*calls[1], Call::RemoveKey(1));
+        assert!(matches!(
+            calls[2],
+            Call::AddKey {
+                pairwise: false,
+                index: 1,
+                cam: 1,
+                ..
+            }
+        ));
+    }
+    hear(protected([0xff; 6], 20, 1, 1, &[0x51; 46]));
+    hear(protected(LOCAL, 21, 0, 1, &[0x52; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x51, 0x52]);
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut()
+        .install_key(false, 2, &[0x67; 16], ReplaySeed::ZERO)
+        .unwrap();
+    {
+        let air = model.0.borrow();
+        let calls: Vec<&Call> = air.calls[from..].iter().collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(matches!(
+            calls[0],
+            Call::AddKey {
+                pairwise: false,
+                index: 2,
+                cam: 2,
+                ..
+            }
+        ));
+    }
+    hear(protected([0xff; 6], 22, 2, 1, &[0x53; 46]));
+    hear(protected(LOCAL, 23, 0, 2, &[0x54; 46]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x53, 0x54]);
+    assert!(wifi.carrier());
+    // The same key again is no new install (KRACK, ieee80211_key_identical).
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut()
+        .install_key(false, 2, &[0x67; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert_eq!(model.0.borrow().calls.len(), from);
+    assert!(progress(&mut wifi).contains("keys 4"));
+}
+
+#[test]
+fn a_rekey_the_firmware_refuses_closes_the_port_until_its_key_is_installed() {
+    // ieee80211_key_replace deletes the old key first: when the chip then
+    // refuses the new one, no key of that index is left, so the port
+    // closes, and opens again only on an installed key.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(false, 1, &[0x66; 16], ReplaySeed::ZERO);
+    assert!(matches!(got, Err(Error::Chip(_))), "{got:?}");
+    assert!(!wifi.radio_mut().carrier());
+    assert_eq!(wifi.radio_mut().transmit(&ip(1)), Err(LinkError::NoCarrier));
+    model.0.borrow_mut().refuse_keys = false;
+    wifi.radio_mut()
+        .install_key(false, 1, &[0x66; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert!(wifi.radio_mut().carrier());
+    // A key of a new index deletes nothing: refused, the port stays open.
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(false, 2, &[0x67; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(wifi.radio_mut().carrier());
+    // A pairwise rekey alike: the old PTK gone, nothing leaves under it.
+    let got = wifi
+        .radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(!wifi.radio_mut().carrier());
+    model.0.borrow_mut().refuse_keys = false;
+    wifi.radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert!(wifi.radio_mut().carrier());
+    let before = model.0.borrow().data().len();
+    wifi.radio_mut().transmit(&ip(2)).unwrap();
+    assert_eq!(model.0.borrow().data()[before].1, Some((0, 0, 1)));
+}
+
+/// Fragment `number` of frame `sequence` under the PTK at packet number
+/// `pn`, with `more` to follow.
+fn fragment(sequence: u16, number: u8, more: bool, pn: u64, payload: &[u8]) -> Vec<u8> {
+    let mut frame = protected(LOCAL, sequence, 0, pn, &[]);
+    frame.truncate(34);
+    frame.extend_from_slice(payload);
+    frame.extend([0; 8]);
+    frame[1] |= u8::from(more) << 2;
+    frame[22] |= number;
+    frame
+}
+
+#[test]
+fn fragments_under_consecutive_numbers_make_one_frame() {
+    let (mut wifi, model) = connected();
+    let first = [&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0][..], &[0x45; 4]].concat();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(fragment(30, 0, true, 1, &first));
+    hear(fragment(30, 1, false, 2, &[0x46; 4]));
+    wifi.carrier();
+    let ethernet = wifi.receive().unwrap().unwrap();
+    assert_eq!(
+        ethernet[14..],
+        [0x45, 0x45, 0x45, 0x45, 0x46, 0x46, 0x46, 0x46]
+    );
+    // Numbers that skip one are dropped.
+    hear(fragment(31, 0, true, 5, &first));
+    hear(fragment(31, 1, false, 7, &[0x46; 4]));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+}
+
+#[test]
+fn an_a_msdu_gives_up_each_of_its_frames() {
+    let (mut wifi, model) = connected();
+    let mut frame = protected(LOCAL, 20, 0, 1, &[]);
+    frame.truncate(34);
+    frame[24] = 0x80;
+    for value in [0x31, 0x32] {
+        let padding = (4 - frame[34..].len() % 4) % 4;
+        frame.extend(vec![0; padding]);
+        frame.extend(LOCAL);
+        frame.extend(AP);
+        frame.extend(54u16.to_be_bytes());
+        frame.extend([0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        frame.extend([value; 46]);
+    }
+    frame.extend([0; 8]);
+    model.0.borrow_mut().hear_as(frame, true, false);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x31, 0x32]);
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", rx data 2 sealed 0 nokey 0 refused 0, "),
+        "{line}"
+    );
+}
+
+/// An SA Query request at packet number `number` as the hardware leaves
+/// it decrypted, its MIC in place.
+fn sa_query(number: u8) -> Vec<u8> {
+    let mut frame = management(0xd0, &[number, 0, 0, 0x20, 0, 0, 0, 0, 8, 0, 1, 2]);
+    frame[1] = 0x40;
+    frame.extend([0; 8]);
+    frame
+}
+
+#[test]
+fn a_protected_management_frame_is_taken_once_under_its_packet_number() {
+    let (mut wifi, model) = connected();
+    let answers = |air: &Air| air.management(0xd0);
+    model.0.borrow_mut().hear_as(sa_query(5), true, false);
+    assert!(run(&mut wifi, &model, |_, air| answers(air).len() == 1));
+    model.0.borrow_mut().hear_as(sa_query(5), true, false);
+    assert!(!run(&mut wifi, &model, |_, air| answers(air).len() > 1));
+    model.0.borrow_mut().hear_as(sa_query(6), true, false);
+    assert!(run(&mut wifi, &model, |_, air| answers(air).len() == 2));
+    // Each answer is sealed under the PTK and answers its request's ID.
+    let air = model.0.borrow();
+    let ptk = air.ptk();
+    for (n, answer) in answers(&air).iter().enumerate() {
+        let pn = PacketNumber::new(n as u64 + 1).unwrap();
+        let opened = ccmp::open(&ptk, answer, pn).unwrap();
+        assert_eq!(opened[32..36], [8, 1, 1, 2]);
+    }
+}
+
+#[test]
+fn a_pairwise_rekey_drops_what_waits_under_the_old_key() {
+    // The new PTK takes the CAM entry the old one left: a frame held under
+    // the old key and its PN must not leave under the new one.
+    let (mut wifi, model) = connected();
+    let before = model.0.borrow().data().len();
+    model.0.borrow_mut().full_data = true;
+    wifi.transmit(&ip(1)).unwrap();
+    wifi.radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert_eq!(model.0.borrow().keys().last(), Some(&(true, 0, 0)));
+    model.0.borrow_mut().full_data = false;
+    wifi.transmit(&ip(2)).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| air.data().len() > before));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    let sent: Vec<(u8, FrameKey)> = model.0.borrow().data()[before..]
+        .iter()
+        .map(|(bytes, key)| (bytes[36], *key))
+        .collect();
+    assert_eq!(sent, [(2, Some((0, 0, 1)))]);
+}
+
+// RX Block Ack (M3 Task 16, spec S13.2).
+
+/// The AP's ADDBA Request: dialog `dialog`, immediate Block Ack on `tid`
+/// with a window of `window`, no timeout, from `ssn`.
+fn addba(dialog: u8, tid: u8, window: u16, ssn: u16) -> Vec<u8> {
+    let parameters = 2 | u16::from(tid) << 2 | window << 6;
+    let mut body = vec![3, 0, dialog];
+    body.extend(parameters.to_le_bytes());
+    body.extend(0u16.to_le_bytes());
+    body.extend((ssn << 4).to_le_bytes());
+    management(0xd0, &body)
+}
+
+/// The AP's DELBA of its agreement on `tid`, as its originator, reason 37
+/// (any reason does).
+fn delba(tid: u8) -> Vec<u8> {
+    let parameters = u16::from(tid) << 12 | 1 << 11;
+    let mut body = vec![3, 2];
+    body.extend(parameters.to_le_bytes());
+    body.extend(37u16.to_le_bytes());
+    management(0xd0, &body)
+}
+
+/// The AP's compressed single-TID Block Ack Request for `tid` from `ssn`.
+fn bar(tid: u8, ssn: u16) -> Vec<u8> {
+    let mut frame = vec![0x84, 0, 0, 0];
+    frame.extend(LOCAL);
+    frame.extend(AP);
+    frame.extend((u16::from(tid) << 12 | 4).to_le_bytes());
+    frame.extend((ssn << 4).to_le_bytes());
+    frame
+}
+
+/// QoS data of `tid` under the PTK at packet number `pn`, sequence number
+/// `sequence`, its first payload byte past the IPv4 type `fill`.
+fn qos(tid: u8, sequence: u16, pn: u64, fill: u8) -> Vec<u8> {
+    let mut frame = protected(LOCAL, sequence, 0, pn, &[fill; 46]);
+    frame[24] = tid;
+    frame
+}
+
+/// `frame`, a management frame, protected at packet number `pn` as the
+/// hardware leaves it decrypted: its CCMP header in place, its MIC zeros.
+fn sealed(mut frame: Vec<u8>, pn: u8) -> Vec<u8> {
+    frame[1] |= 0x40;
+    frame.splice(24..24, [pn, 0, 0, 0x20, 0, 0, 0, 0]);
+    frame.extend([0; 8]);
+    frame
+}
+
+/// The station's ADDBA Responses (category 3, action 1), unprotected.
+fn responses(air: &Air) -> Vec<Vec<u8>> {
+    air.management(0xd0)
+        .into_iter()
+        .filter(|frame| frame[24..26] == [3, 1])
+        .collect()
+}
+
+/// The chip's RX Block Ack calls from call `from` on.
+fn agreements(air: &Air, from: usize) -> Vec<Call> {
+    air.calls[from..]
+        .iter()
+        .filter(|c| matches!(c, Call::StartBa { .. } | Call::StopBa(_)))
+        .cloned()
+        .collect()
+}
+
+/// [`connected`], then the AP's agreement on TID 0 from SSN 100 accepted.
+fn aggregating() -> (Wifi<Model>, Model) {
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    (wifi, model)
+}
+
+#[test]
+fn an_addba_is_accepted_programmed_and_reorders() {
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| !responses(air).is_empty()));
+    {
+        let air = model.0.borrow();
+        // rtw89_ops_ampdu_action's RX_START programs the BA CAM (spec
+        // S13.2) before mac80211 answers (agg-rx.c's
+        // __ieee80211_start_rx_ba_session).
+        let start = air
+            .position(|c| {
+                *c == Call::StartBa {
+                    tid: 0,
+                    ssn: 100,
+                    window: 64,
+                }
+            })
+            .unwrap();
+        let answer = air
+            .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0xd0))
+            .unwrap();
+        assert!(from <= start && start < answer);
+        let [response] = &responses(&air)[..] else {
+            panic!("{} responses", responses(&air).len())
+        };
+        // To the AP: ADDBA Response, dialog 1, success, A-MSDU | immediate |
+        // TID 0 | a window of 64, no timeout.
+        assert_eq!(response[4..10], AP);
+        assert_eq!(response[24..33], [3, 1, 1, 0, 0, 0x03, 0x10, 0, 0]);
+        assert_eq!(agreements(&air, from).len(), 1);
+    }
+    // Out of order on TID 0, delivered in order: each passes the replay
+    // check, which an earlier packet number delivered last would fail.
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(qos(0, 101, 11, 0x51));
+    hear(qos(0, 100, 10, 0x50));
+    hear(qos(0, 102, 12, 0x52));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x50, 0x51, 0x52]);
+    // A hole holds what follows it until the reorder timeout releases it.
+    hear(qos(0, 104, 14, 0x54));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    let mut got = Vec::new();
+    let mut waited = 0;
+    while got.is_empty() && waited < 200_000 {
+        crate::test_clock::advance(CLOCK, 5_000);
+        waited += 5_000;
+        wifi.carrier();
+        got.extend(delivered(&mut wifi));
+    }
+    assert_eq!(got, [0x54]);
+    // TID 0's 100 ms, as HT_RX_REORDER_BUF_TIMEOUT's, of which the virtual
+    // clock's own reads (100 us each) took some.
+    assert!((80_000..=110_000).contains(&waited), "{waited}");
+    // Another TID is not reordered.
+    hear(qos(6, 7, 1, 0x61));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x61]);
+}
+
+#[test]
+fn a_delba_stops_the_entry() {
+    let (mut wifi, model) = aggregating();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    // SSN 102 waits for 100 and 101.
+    hear(qos(0, 102, 12, 0x52));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(delba(0));
+    wifi.carrier();
+    // RX_STOP frees the BA CAM entry; the AP's own DELBA is not answered.
+    assert_eq!(agreements(&model.0.borrow(), from), [Call::StopBa(0)]);
+    let ours = model.0.borrow().calls[from..]
+        .iter()
+        .filter(|c| matches!(c, Call::Management(b, _) if b[0] == 0xd0))
+        .count();
+    assert_eq!(ours, 0);
+    // What the agreement held went with it (ieee80211_free_tid_rx), past
+    // any reorder timeout.
+    for _ in 0..30 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(delivered(&mut wifi), []);
+    // TID 0 now goes as it comes: the earlier packet number arriving second
+    // fails the replay check.
+    hear(qos(0, 111, 21, 0x61));
+    hear(qos(0, 110, 20, 0x60));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x61]);
+    // A new agreement on the TID is programmed again.
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(addba(2, 0, 32, 200));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    assert_eq!(
+        agreements(&model.0.borrow(), from),
+        [Call::StartBa {
+            tid: 0,
+            ssn: 200,
+            window: 32
+        }]
+    );
+}
+
+#[test]
+fn a_bar_releases_what_waits_before_its_ssn() {
+    let (mut wifi, model) = aggregating();
+    model
+        .0
+        .borrow_mut()
+        .hear_as(qos(0, 102, 12, 0x52), true, false);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    // ieee80211_rx_h_ctrl: the BAR moves the window to its SSN at once.
+    model.0.borrow_mut().hear(bar(0, 102));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
+}
+
+#[test]
+fn the_departure_stops_each_agreement_before_the_keys() {
+    // __sta_info_destroy_part1's ieee80211_sta_tear_down_BA_sessions
+    // (AGG_STOP_DESTROY_STA: RX_STOP for each, no DELBA) before
+    // _part2's key deletes and the AP's station leaving.
+    let (mut wifi, model) = aggregating();
+    model.0.borrow_mut().hear(addba(2, 6, 64, 0));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "mgmt c0",
+            "flush false",
+            "stop 0",
+            "stop 6",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    // The next association starts with none.
+    let from = model.0.borrow().calls.len();
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.count(|c| matches!(c, Call::Associate(_))) == 2
+            && wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert!(agreements(&model.0.borrow(), from).is_empty());
+}
+
+#[test]
+fn an_addba_with_the_association_response_is_answered_once_associated() {
+    // The AP asks in the poll that brings its association response.
+    // mac80211 takes the response, BSS_CHANGED_ASSOC and all, before the
+    // next frame, so the request finds the station associated.
+    let (mut wifi, model) = wifi_with(|air| air.addba_with_assoc = true);
+    assert!(run(&mut wifi, &model, |_, air| !responses(air).is_empty()));
+    let air = model.0.borrow();
+    let associate = air.position(|c| matches!(c, Call::Associate(_))).unwrap();
+    let start = air
+        .position(|c| matches!(c, Call::StartBa { tid: 0, .. }))
+        .unwrap();
+    assert!(associate < start);
+    assert_eq!(responses(&air)[0][27..29], [0, 0]);
+}
+
+#[test]
+fn a_retried_addba_is_dropped_as_a_duplicate() {
+    // ieee80211_rx_h_check_dup: the AP retries the same frame when our ACK
+    // was lost; answering it again would decline the agreement just made.
+    let (mut wifi, model) = connected();
+    let mut request = addba(1, 0, 64, 100);
+    request[22..24].copy_from_slice(&(7u16 << 4).to_le_bytes());
+    model.0.borrow_mut().hear(request.clone());
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    request[1] |= 0x08;
+    model.0.borrow_mut().hear(request);
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(responses(&model.0.borrow()).len(), 1);
+    assert_eq!(
+        model
+            .0
+            .borrow()
+            .count(|c| matches!(c, Call::StartBa { .. })),
+        1
+    );
+    // A retry of another frame is no duplicate.
+    let mut next = addba(2, 6, 64, 0);
+    next[1] |= 0x08;
+    next[22..24].copy_from_slice(&(8u16 << 4).to_le_bytes());
+    model.0.borrow_mut().hear(next);
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    assert_eq!(responses(&model.0.borrow())[1][27..29], [0, 0]);
+}
+
+#[test]
+fn a_chip_that_cannot_program_the_ba_cam_still_accepts() {
+    // rtw89_ops_ampdu_action returns 0 whatever its BA CAM H2C did: the
+    // hardware's dynamic BA CAM covers the agreement (fw.c:2592-2600), and
+    // the host reorders. The chip's error is reported, not fatal.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().ba_fails = true;
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    assert_eq!(responses(&model.0.borrow())[0][27..29], [0, 0]);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("the BA CAM H2C could not be sent"),
+        "{failure}"
+    );
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(qos(0, 101, 11, 0x51));
+    hear(qos(0, 100, 10, 0x50));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x50, 0x51]);
+    assert!(wifi.carrier());
+}
+
+#[test]
+fn under_pmf_the_agreement_comes_and_goes_protected() {
+    // Block Ack action frames are robust: an unprotected request is dropped
+    // (ieee80211_drop_unencrypted_mgmt), a protected one answered sealed
+    // under the PTK.
+    let (mut wifi, model) = connected_with_pmf();
+    let ptk = model.0.borrow().ptk();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert!(model.0.borrow().management(0xd0).is_empty());
+    model
+        .0
+        .borrow_mut()
+        .hear_as(sealed(addba(2, 0, 64, 100), 1), true, false);
+    assert!(run(&mut wifi, &model, |_, air| !air
+        .management(0xd0)
+        .is_empty()));
+    let air = model.0.borrow();
+    let [response] = &air.management(0xd0)[..] else {
+        panic!("{} action frames", air.management(0xd0).len())
+    };
+    assert_eq!(response[1] & 0x40, 0x40);
+    let opened = ccmp::open(&ptk, response, PacketNumber::new(1).unwrap()).unwrap();
+    assert_eq!(opened[32..41], [3, 1, 2, 0, 0, 0x03, 0x10, 0, 0]);
+    assert!(
+        air.position(|c| matches!(c, Call::StartBa { tid: 0, .. }))
+            .is_some()
+    );
+}
+
+#[test]
+fn only_the_aps_acknowledged_qos_data_is_reordered() {
+    // ieee80211_rx_reorder_ampdu: the agreement is the AP's station's (its
+    // TA), and a frame sent with no acknowledgement is no part of it.
+    let (mut wifi, model) = aggregating();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    // SSN 102 waits for 100 and 101.
+    hear(qos(0, 102, 12, 0x52));
+    // Far ahead of the window, from another transmitter: it would flush
+    // the window if it went in; it goes on to the station, which refuses it.
+    let mut foreign = qos(0, 400, 40, 0x70);
+    foreign[10..16].copy_from_slice(&[0x02, 0xAA, 0, 0, 0, 9]);
+    hear(foreign);
+    // Far ahead too, sent without an acknowledgement: on at once.
+    let mut unacked = qos(0, 500, 11, 0x71);
+    unacked[24] |= 0x20;
+    hear(unacked);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x71]);
+    // 102 still waited for its hole, and goes at the BAR.
+    model.0.borrow_mut().hear(bar(0, 102));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
+}
+
+#[test]
+fn a_frame_the_station_cannot_open_still_takes_its_place_in_the_window() {
+    // mac80211 reorders before it decrypts (ieee80211_rx_reorder_ampdu,
+    // then ieee80211_rx_h_decrypt): an agreement's frame the hardware left
+    // encrypted, or one under a key ID with no key, fills its slot and is
+    // dropped as it leaves the buffer, so what follows waits for no hole.
+    let (mut wifi, model) = aggregating();
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 100, 10, 0x50), false, false);
+    let mut keyless = qos(0, 101, 11, 0x51);
+    keyless[29] = 0x20 | 2 << 6;
+    air.hear_as(keyless, true, false);
+    air.hear_as(qos(0, 102, 12, 0x52), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
+    // The window moved past them: 104 waits for 103 alone.
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 104, 14, 0x54), true, false);
+    air.hear_as(qos(0, 103, 13, 0x53), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x53, 0x54]);
+    // A frame failing its ICV is no frame to mac80211 (rtw89's
+    // RX_FLAG_FAILED_FCS_CRC, core.c:4396-4397): it leaves a hole, which
+    // what follows waits behind until the BAR.
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 105, 15, 0x55), true, true);
+    air.hear_as(qos(0, 106, 16, 0x56), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    model.0.borrow_mut().hear(bar(0, 106));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x56]);
+}
+
+/// The (transaction, status) of each SAE frame the station sent.
+fn sae_sent(air: &Air) -> Vec<(u16, u16)> {
+    air.management(0xb0)
+        .iter()
+        .map(|frame| {
+            assert_eq!(frame[24..26], [3, 0], "not SAE");
+            let field = |at: usize| u16::from_le_bytes([frame[at], frame[at + 1]]);
+            (field(26), field(28))
+        })
+        .collect()
+}
+
+/// Where the chip took each authentication frame, in order.
+fn authentications(air: &Air) -> Vec<usize> {
+    (0..air.calls.len())
+        .filter(|&at| matches!(&air.calls[at], Call::Management(b, _) if b[0] == 0xb0))
+        .collect()
+}
+
+#[test]
+fn an_sae_network_authenticates_associates_and_keys() {
+    // wpa_supplicant's SAE through mac80211's external authentication
+    // (spec S1.16): the station's commit, the AP's, the station's confirm,
+    // the AP's; then the association under required PMF, the PTK and GTK
+    // in the CAM and the IGTK on the host (spec S1.2).
+    let (mut wifi, model) = wifi_with(|air| air.sae = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert!(wifi.radio().station().requires_protected_management());
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert!(
+        air.management(0xb0)
+            .iter()
+            .all(|frame| frame[4..10] == AP && frame[16..22] == AP)
+    );
+    // `ieee80211_prep_connection`'s channel and BSSID came first. The AP's
+    // confirm of the station's moved the AP's station to AUTH
+    // (`ieee80211_mark_sta_auth`), once, before the association request.
+    let tune = air.position(|c| *c == Call::Tune(channel(1))).unwrap();
+    let bssid = air.position(|c| *c == Call::SetBssid(Mac(AP))).unwrap();
+    let sent = authentications(&air);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    let request = air
+        .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0x00))
+        .unwrap();
+    assert!(tune < bssid && bssid < sent[0]);
+    assert!(sent[1] < authenticated && authenticated < request);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
+    // The request names SAE, with MFPC.
+    let own = Security::select(&RSN_SAE, true).unwrap().element();
+    assert!(air.management(0x00)[0].windows(own.len()).any(|w| w == own));
+    let pmk = air.sae_ap.as_ref().unwrap().pmk().unwrap();
+    drop(air);
+    // The 4-way handshake under the SAE PMK, with the IGTK.
+    let security = Security::select(&RSN_SAE, true).unwrap();
+    let ap = Authenticator::between(
+        security.suites(),
+        pmk,
+        Mac(AP),
+        Mac(LOCAL),
+        security.element(),
+    );
+    shake_with(&mut wifi, &model, ap, &RSN_SAE, &IGTK_KDE);
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
+    assert_eq!(model.0.borrow().keys(), [(true, 0, 0), (false, 1, 1)]);
+    assert!(wifi.radio().integrity.is_some());
+    let line = progress(&mut wifi);
+    assert!(
+        line.starts_with(
+            "scans 1 (1 networks, target found ch 1 -40 dBm), sae 2/2, assoc 1/1 status 0 \
+             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, rx data 0 sealed 0 nokey 0 \
+             refused 0, tx data 0; "
+        ),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_failed_sae_ends_and_retries() {
+    // An AP that never acknowledges: each commit goes again at once on its
+    // TX status (`ieee80211_sta_work`), three tries
+    // (IEEE80211_AUTH_MAX_TRIES); the exchange then ends, the chip leaves
+    // the BSS it was set to, and the keeper waits wpa_supplicant's 10 s
+    // before it commits again.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.deaf_to_auth = true;
+    });
+    let mut lines = Vec::new();
+    let mut sent = Vec::new();
+    let mut joins = Vec::new();
+    let mut gave_up = None;
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        lines.push(progress(wifi));
+        let now = CLOCK.now_us();
+        while sent.len() < air.management(0xb0).len() {
+            sent.push(now);
+        }
+        let set = air.count(|c| matches!(c, Call::SetBssid(_)));
+        if joins.len() < set {
+            joins.push(now);
+        }
+        if gave_up.is_none() && air.count(|c| *c == Call::Disassociate) == 1 {
+            gave_up = Some(now);
+        }
+        set == 2 && sent.len() == 4
+    }));
+    assert!(lines.iter().any(|l| l.contains(", sae 1/0, ")));
+    assert!(lines.iter().any(|l| l.contains(", sae 3/0, ")));
+    // Unacknowledged, each try left at once, well inside the 500 ms a frame
+    // waits for its TX status (IEEE80211_AUTH_TIMEOUT_LONG).
+    assert!(sent[2] - sent[0] < 100_000, "{sent:?}");
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0); 4]);
+    let first = air.position(|c| matches!(c, Call::SetBssid(_))).unwrap();
+    let left = air.position(|c| *c == Call::Disassociate).unwrap();
+    let commits = authentications(&air);
+    assert!(first < commits[0] && commits[2] < left && left < commits[3]);
+    // The AP's station never authenticated.
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 0);
+    drop(air);
+    assert!(joins[1] - gave_up.unwrap() >= 10_000_000);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("SAE authentication ended: Timeout"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn an_ap_confirming_first_authenticates_the_station_as_it_confirms() {
+    // `ieee80211_mgd_auth`: once the AP confirmed, the station's confirm
+    // completes the exchange, the AP's station AUTH before it leaves.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_eager = true;
+    });
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    let sent = authentications(&air);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    assert!(sent[0] < authenticated && authenticated < sent[1]);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
+}
+
+#[test]
+fn a_deauthentication_during_sae_is_ignored_and_the_exchange_completes() {
+    // `ieee80211_rx_mgmt_deauth` acts only with `ifmgd->associated` or
+    // `assoc_data` (`mlme.c:5646-5690` at the donor's mac80211): with only
+    // `auth_data` it returns, and the exchange runs on.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_deauth = true;
+    });
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
+    drop(air);
+    assert_eq!(wifi.receive(), Ok(None));
+}
+
+#[test]
+fn an_sae_frame_to_another_station_is_not_the_exchanges() {
+    // `ieee80211_accept_frame` hands mlme only frames to the station's own
+    // address or a group address: the AP's commit to another station never
+    // reaches the keeper's exchange, which completes with the AP's answer.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_stray = true;
+    });
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    drop(air);
+    assert_eq!(wifi.receive(), Ok(None));
+}
+
+#[test]
+fn an_sae_exchange_for_an_mld_link_is_unsupported() {
+    // The chip has one address, the one its address CAM holds.
+    let (_, model) = wifi();
+    let database = regdb(&[(*b"US", &US[..])]);
+    let country = database.select(*b"US").unwrap();
+    let mut radio = Rtl8852c::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
+    let peer = Peer {
+        bssid: Mac(AP),
+        channel: channel(1),
+        basic_rates: 1,
+        supported_rates: 0x11,
+        beacon_interval: 100,
+        dtim_period: 2,
+        slot_time: 20,
+    };
+    let affiliation = Affiliation {
+        mld: Mld {
+            local: Mac(LOCAL),
+            ap: Mac(AP),
+        },
+        link_id: 0,
+        local: Mac([0x02, 0x11, 0x22, 0x33, 0x44, 0x66]),
+    };
+    let got = radio.begin_external_authentication(0, peer, Some(affiliation), 10_000_000);
+    assert!(
+        matches!(got, Err(Error::Unsupported("MLO on an RTL8852C"))),
+        "{got:?}"
+    );
+    assert!(model.0.borrow().calls.is_empty());
+}
+
+#[test]
+fn a_wrong_sae_confirm_deauthenticates_and_leaves() {
+    // mac80211 takes the AP's confirm (status 0) as the exchange's end, its
+    // station AUTH; wpa_supplicant's check of it fails, and
+    // `ieee80211_mgd_deauth` aborts the authentication with a
+    // deauthentication to the AP before the chip leaves.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_wrong_confirm = true;
+    });
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.count(|c| *c == Call::Disassociate) == 1
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    let deauth = air
+        .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0xc0))
+        .unwrap();
+    let left = air.position(|c| *c == Call::Disassociate).unwrap();
+    assert!(authenticated < deauth && deauth < left);
+    let Call::Management(frame, _) = &air.calls[deauth] else {
+        unreachable!()
+    };
+    // Unprotected, from the station to the AP, reason 3 (leaving).
+    assert_eq!(frame[1] & 0x40, 0);
+    assert_eq!((&frame[4..10], &frame[10..16]), (&AP[..], &LOCAL[..]));
+    assert_eq!(frame[24..], [3, 0]);
+    assert_eq!(air.management(0x00).len(), 0);
+    drop(air);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(failure.contains("SAE confirm failed"), "{failure}");
+}
+
+#[test]
+fn a_deauthentication_from_another_ap_leaves_the_exchange_running() {
+    // `ieee80211_rx_mgmt_deauth` takes no deauthentication while only
+    // authenticating, and `ieee80211_rx_mgmt_auth` ignores another BSSID's
+    // frame.
+    let (mut wifi, model) = wifi_with(|air| air.sae = true);
+    assert!(run(&mut wifi, &model, |_, air| !air
+        .management(0xb0)
+        .is_empty()));
+    let other = [0x02, 0xaa, 0, 0, 0, 9, 0x02, 0xaa, 0, 0, 0, 9];
+    let mut deauth = management(0xc0, &[1, 0]);
+    deauth[10..22].copy_from_slice(&other);
+    let mut commit = sae_frame(&sae_ap().commit());
+    commit[10..22].copy_from_slice(&other);
+    // And the AP's to another station.
+    let mut elsewhere = management(0xc0, &[1, 0]);
+    elsewhere[4..10].copy_from_slice(&other[..6]);
+    model.0.borrow_mut().hear(deauth);
+    model.0.borrow_mut().hear(commit);
+    model.0.borrow_mut().hear(elsewhere);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    drop(air);
+    // Dropped as mac80211 drops them, nothing reported.
+    assert_eq!(wifi.receive(), Ok(None));
+}
+
+#[test]
+fn the_progress_line_names_the_last_joins_authentication() {
+    // An SAE attempt that failed, then the network's AP offering WPA2 only:
+    // the counts add up, under the open system's name.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.deaf_to_auth = true;
+    });
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.count(|c| *c == Call::Disassociate) == 1
+    }));
+    assert!(progress(&mut wifi).contains(", sae 3/0, "));
+    {
+        let mut air = model.0.borrow_mut();
+        air.sae = false;
+        air.deaf_to_auth = false;
+    }
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", auth 4/1 status 0, assoc 1/1 status 0"),
+        "{line}"
     );
 }

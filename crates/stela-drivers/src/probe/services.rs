@@ -309,6 +309,9 @@ pub(crate) mod tests {
         #[cfg(feature = "native-acpi")]
         firmware: RefCell<Option<(u64, Vec<u8>)>>,
         model_minimum: bool,
+        /// Whether [`NativeServices::entropy`] hands out a source, one that
+        /// never fills: a station's nonces are not reached here.
+        model_entropy: bool,
     }
     impl Refusing {
         /// Isolated timing-only fixture. All physical grants still refuse.
@@ -317,6 +320,23 @@ pub(crate) mod tests {
                 model_minimum: true,
                 ..Self::default()
             }
+        }
+
+        /// [`Self::minimum_only`] with an entropy handle, as a Wi-Fi
+        /// station's attach asks for before its claim.
+        pub(crate) fn minimum_and_entropy() -> Self {
+            Self {
+                model_entropy: true,
+                ..Self::minimum_only()
+            }
+        }
+    }
+
+    /// An entropy source that never fills.
+    pub(crate) struct NoEntropy;
+    impl crate::entropy::Entropy for NoEntropy {
+        fn fill(&self, _: &mut [u8]) -> Result<(), crate::entropy::EntropyError> {
+            Err(crate::entropy::EntropyError::Unavailable)
         }
     }
 
@@ -367,6 +387,13 @@ pub(crate) mod tests {
         }
         fn domain(&self, _: RequesterBinding) -> Result<Arc<dyn DmaDomain>, ServiceError> {
             Err(ServiceError::Refused("requester shares an IOMMU group"))
+        }
+        fn entropy(&self) -> Result<Arc<dyn crate::entropy::Entropy>, ServiceError> {
+            if self.model_entropy {
+                Ok(Arc::new(NoEntropy))
+            } else {
+                Err(ServiceError::Unavailable)
+            }
         }
         fn interrupts(&self) -> Result<&'static dyn IrqController, ServiceError> {
             Err(ServiceError::Unavailable)

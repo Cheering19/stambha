@@ -145,6 +145,51 @@ fn attach_starts_and_keeps() {
 }
 
 #[test]
+fn attach_reporting_hands_back_what_the_bring_up_reported() {
+    // The keeper keeps its radio to itself, so the bring-up's report comes
+    // back beside it, as the live chip holds it.
+    let Chip { io, m, .. } = chip(efuse_with_mac(), 7, never, BOTH);
+    let bytes = image_bytes();
+    let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
+    let file = tables_file();
+    let inputs = Inputs {
+        clock: CLOCK,
+        database: regdb(&[(*b"US", &G2[..])]),
+        network: network(Some(*b"US")),
+        entropy: Arc::new(NoEntropy),
+    };
+    // SAFETY: as in `attach_on`.
+    let reported = unsafe {
+        attach_reporting(
+            io,
+            &Source,
+            Arc::new(Domain(m)),
+            2,
+            FirmwareFile {
+                image: &fw.image,
+                file: &file,
+            },
+            NO_LTR,
+            inputs,
+        )
+    };
+    let (wifi, running) = reported.unwrap_or_else(|(error, _)| panic!("{error}"));
+    let live = wifi.into_radio().into_chip();
+    assert_eq!(running, *live.running());
+    assert_eq!(running.mac, MAC);
+    assert!(running.mac_init);
+}
+
+#[test]
+fn a_missing_regulatory_database_is_named_as_rtw88_names_it() {
+    // The probe's refusal, before anything is touched.
+    assert_eq!(
+        AttachError::NoRegulatoryDatabase.to_string(),
+        "RTL8852CE: no regulatory database"
+    );
+}
+
+#[test]
 fn channel_rules_follow_the_network_and_tx_power_the_efuse() {
     // regulatory.db has only DE, so the channel rules can only be the
     // network's. The TX power is the efuse's US (FCC), which the firmware's

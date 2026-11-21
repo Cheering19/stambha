@@ -116,7 +116,10 @@ pub enum Mode {
 /// (`RX_FLAG_FAILED_FCS_CRC`, `core.c:4396-4397`); `decrypted` is
 /// `HW_DEC && !(SW_DEC || ICV_ERR)` (`RX_FLAG_DECRYPTED`, `core.c:4399-4401`)
 /// and `icv_error` is `ICV_ERR`. In [`Mode::Station`] a delivered frame
-/// never has `fcs_error` or `icv_error`.
+/// never has `fcs_error` or `icv_error`. `hw_dec`, `a1_match`, `mac_id` and
+/// `sec_type` are the descriptor's own, which `rtw89_core_skb_pn_valid`
+/// reads (`core.c:3943-4006`): `HW_DEC`, `A1_MATCH`, and of a long
+/// descriptor the MAC ID and security type (0 for a short one).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub mpdu: Vec<u8>,
@@ -130,6 +133,10 @@ pub struct Received {
     pub gi_ltf: u8,
     pub bw: u8,
     pub free_run: u32,
+    pub hw_dec: bool,
+    pub a1_match: bool,
+    pub mac_id: u8,
+    pub sec_type: u8,
 }
 
 /// What [`Receiver::buffer`] hands on: every parsed C2H, and every kept
@@ -381,6 +388,10 @@ impl Receiver {
             gi_ltf: desc.gi_ltf,
             bw: desc.bw,
             free_run: desc.free_run,
+            hw_dec: desc.hw_dec,
+            a1_match: desc.a1_match,
+            mac_id: desc.mac_id,
+            sec_type: desc.sec_type,
         };
         // Only a beacon or a probe response waits for its status.
         if !(scanned && desc.long && matches!(desc.frame_type, Some(FRAME_MGNT | FRAME_DATA))) {

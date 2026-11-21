@@ -702,11 +702,12 @@ crates/stela-driver-net/src/wifi/realtek/: Realtek RTL8822C station
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     net/mac80211/scan.c, net/mac80211/wpa.c, net/wireless/reg.c
 crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
-  PCIe power, efuse, DMA, firmware download, MAC init, H2C/C2H command
-  channel, BB/RF table, RF register page, coex Wi-Fi grant, calibration,
-  channel, station interface and firmware passive scan slice
-    Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0 OR BSD-3-Clause ;
-    GPL-2.0-only
+  PCIe power, efuse, DMA, firmware download, MAC init, H2C/C2H command channel,
+  BB/RF table, RF register page, coex Wi-Fi grant, calibration, channel, TX
+  power, firmware scan, and station with its TX and RX path, association, keys
+  and RX Block Ack
+    Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0 ; GPL-2.0 OR
+    BSD-3-Clause ; GPL-2.0-only
     drivers/net/wireless/realtek/rtw89/cam.c,
     drivers/net/wireless/realtek/rtw89/cam.h,
     drivers/net/wireless/realtek/rtw89/chan.c,
@@ -724,15 +725,24 @@ crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
     drivers/net/wireless/realtek/rtw89/pci.h,
     drivers/net/wireless/realtek/rtw89/phy.c,
     drivers/net/wireless/realtek/rtw89/phy.h,
+    drivers/net/wireless/realtek/rtw89/ps.c,
     drivers/net/wireless/realtek/rtw89/reg.h,
+    drivers/net/wireless/realtek/rtw89/regd.c,
     drivers/net/wireless/realtek/rtw89/rtw8852c.c,
     drivers/net/wireless/realtek/rtw89/rtw8852c.h,
     drivers/net/wireless/realtek/rtw89/rtw8852c_rfk.c,
     drivers/net/wireless/realtek/rtw89/rtw8852c_rfk_table.c,
     drivers/net/wireless/realtek/rtw89/rtw8852c_table.c,
     drivers/net/wireless/realtek/rtw89/rtw8852ce.c,
+    drivers/net/wireless/realtek/rtw89/sar.c,
+    drivers/net/wireless/realtek/rtw89/sar.h,
     drivers/net/wireless/realtek/rtw89/txrx.h,
-    drivers/net/wireless/realtek/rtw89/util.h, include/linux/iopoll.h
+    drivers/net/wireless/realtek/rtw89/util.h,
+    include/linux/ieee80211.h, include/linux/iopoll.h, net/mac80211/agg-rx.c,
+    net/mac80211/cfg.c, net/mac80211/ht.c, net/mac80211/key.c,
+    net/mac80211/main.c, net/mac80211/mlme.c, net/mac80211/rx.c,
+    net/mac80211/sta_info.c, net/mac80211/util.c, net/mac80211/wme.c,
+    net/mac80211/wpa.c, net/wireless/sme.c, net/wireless/util.c
 crates/stela-driver-storage/src/: Genesys Logic GL9750 native SDHCI
     Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
     drivers/mmc/host/sdhci-pci-gli.c, drivers/pci/setup-res.c

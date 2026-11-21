@@ -7,9 +7,9 @@
 //! `rtw89_mac_c2h_scanofld_rsp` reads (`mac.c:5283`, `fw.h:4093`), and the
 //! class 1 BCNFLTR_RPT fields `rtw89_mac_bcn_fltr_rpt` reads (`mac.c:5390-5405`,
 //! `fw.h:4005-4014`). Formatted logs are not rendered (the firmware's format
-//! table is not ported), and nothing is acted on: a beacon filter report is
-//! decoded, not matched to a link or turned into a beacon loss. It grants no
-//! I/O.
+//! table is not ported), and nothing is acted on here: a beacon filter
+//! report is decoded raw, and the live chip matches it to its vif and turns
+//! a loss into a beacon loss (`Live::service`). It grants no I/O.
 
 const C2H_HEADER_LEN: usize = 8;
 const ACK_LEN: usize = 12;

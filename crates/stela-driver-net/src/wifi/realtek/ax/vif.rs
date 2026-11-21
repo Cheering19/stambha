@@ -154,7 +154,7 @@ impl PortConfig {
 
     /// An associated station (M3 spec S10.7): INFRA with the BSS's beacon
     /// interval and DTIM period, as mac80211 set them before
-    /// BSS_CHANGED_ASSOC (`mlme.c:7038-7042`; `dtim_period` is at least 1
+    /// BSS_CHANGED_ASSOC (`mlme.c:7091-7095`; `dtim_period` is at least 1
     /// there).
     pub const fn infra(beacon_int: u16, dtim: u8) -> Self {
         Self {

@@ -127,7 +127,9 @@ pub trait Link {
     }
     /// How long after its start the link may take to report carrier before
     /// a missing one means no cable or no network. The default is a wired
-    /// PHY's, and every link here keeps it.
+    /// PHY's, and every link here keeps it but the RTL8852CE station, whose
+    /// radio waits [`wifi::realtek::ax::WIFI_CARRIER_WAIT_US`] for a scan,
+    /// an SAE exchange and the 4-way handshake, through its keeper.
     fn carrier_wait_us(&self) -> u64 {
         WIRED_CARRIER_WAIT_US
     }

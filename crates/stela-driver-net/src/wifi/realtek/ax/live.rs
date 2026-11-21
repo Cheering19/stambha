@@ -13,9 +13,9 @@
 //! `rtw89_pci_alloc_tx_wd_ring` (`pci.c:3539`) allocates them at probe
 //! ([`TxPools`]). The result, [`Live`], owns the register window, the rings,
 //! the pools, the H2C sequence, the command session's receiver and ledger,
-//! the bring-up's report, the inputs of every channel switch, and the TX
-//! power tables with their regulatory index. [`Live::tune`] switches
-//! channel as `__rtw89_set_channel` does, TX power included;
+//! the bring-up's report, the inputs of every channel switch, the TX power
+//! tables with their regulatory index, and the security CAM. [`Live::tune`]
+//! switches channel as `__rtw89_set_channel` does, TX power included;
 //! [`Live::stop`] is `rtw89_core_stop` (`core.c:6727-6767`): the coex half,
 //! `rtw89_pci_ops_deinit` (`pci.c:3053`), then `rtw89_mac_pwr_off`
 //! (`mac.c:1603`).
@@ -96,16 +96,52 @@
 //! a qsel without a channel, a page not in flight) is counted, never
 //! reported. The live chip is the station's [`Chip`] (M3 spec S14.1).
 //!
-//! This module grants no key yet (M3b), and no TX status beyond RPQ's: a
-//! report says the MAC is done with a frame, acknowledged or not, nothing
-//! more. It runs no IQK, DPK, TSSI, watchdog, interrupts, probe request or
-//! idle power save, and processes no beacon filter report (M3 Task 18). It
-//! has no `Drop`: a live chip that is dropped keeps running, its rings and
-//! pools quarantined, as rtw88's `Hardware` keeps running for the boot.
-use super::assoc::{self, AssocInputs, Features, RaPeer};
+//! The associated station's keys are operations too (M3 spec S12, each step
+//! from [`keys`]): [`Live::add_key`] installs one in the security CAM and
+//! points the address CAM at it, waiting for the firmware's receipt and
+//! acknowledgement, and [`Live::remove_key`] deletes one; [`Live::leave`]
+//! deletes what is left first. A refused key leaves the chip on. A data
+//! frame goes under a key as its TX descriptor names the key's CAM entry,
+//! key ID and host PN ([`Live::queue_data`]), only an entry
+//! [`Live::add_key`] installed ([`Chip::transmit_data`]). [`Live::flush`]
+//! is `rtw89_ops_flush`: the TX rings' wait, then with drop the PKT_DROP
+//! H2Cs for the AP's station, without it the wait for the MAC's TX queues.
+//!
+//! The associated station's RX Block Ack agreements are operations too (M3
+//! spec S13.2, each step from [`ba`]): [`Live::start_rx_block_ack`] and
+//! [`Live::stop_rx_block_ack`] are `rtw89_ops_ampdu_action`'s RX_START and
+//! RX_STOP, a static BA CAM entry and its H2C, sent without a wait as
+//! Linux's, and the TID's PN check started or stopped; [`Live::leave`]
+//! stops what is left before the key deletes, as mac80211 tears the
+//! agreements down first. Every frame the chip drains passes
+//! `rtw89_core_skb_pn_valid` as it is drained, by [`Live::drain`] or by an
+//! operation that holds it, as `rtw89_core_rx` runs it on reception before
+//! mac80211 (`core.c:4551`), and is not checked again when handed on; so a
+//! pairwise key's install starts the started TIDs' checks over
+//! (`mac80211.c:1007-1008`) after the frames its own waits drained.
+//!
+//! The beacon filter the association arms reports the AP's beacons lost
+//! (M3 spec S15, ruling R2): [`Live::service`] takes each BCNFLTR_RPT as
+//! `rtw89_mac_bcn_fltr_rpt` does, a report an operation drained held for
+//! the next poll as its frames are. A loss for the associated vif's MAC ID
+//! re-arms the filter, and, unless a scan has not been ended, is handed on
+//! as [`Incoming::BeaconLost`]; anything else is ignored.
+//!
+//! This module grants no TX status beyond RPQ's: a report says the MAC is
+//! done with a frame, acknowledged or not, nothing more; a flush grants no
+//! empty queue either, as Linux's waits only log their timeouts. It
+//! encrypts no management frame (a robust one is sealed on the host, spec
+//! S1.2). It runs no IQK, DPK, TSSI, watchdog, interrupts, probe
+//! request or idle power save, and no CQM: the beacon filter's RSSI reports
+//! are ignored, and a beacon loss is the AP gone, not a reason to probe it
+//! (`ieee80211_mgd_probe_ap`). It has no `Drop`: a live chip that is
+//! dropped keeps running, its rings and pools quarantined, as rtw88's
+//! `Hardware` keeps running for the boot.
+use super::assoc::{self, AddrCam, AssocInputs, Features, RaPeer};
+use super::ba::{self, BaCam, RxStats};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
-use super::c2h::{C2h, SCAN_END};
+use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, SCAN_END};
 use super::chan::{Chan, frequency};
 use super::channel::{self, ChannelError, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
@@ -113,7 +149,8 @@ use super::core_tail;
 use super::dm::Dig;
 use super::efuse::RxGain;
 use super::h2c::{H2c, ScanChannel};
-use super::io::{AxError, AxIo};
+use super::io::{AxError, AxIo, poll32};
+use super::keys::{self, KeyCam};
 use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
 use super::regd::Regds;
@@ -121,7 +158,7 @@ use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
 use super::station::chip::{
     self, Association, Chip, Data, HardwareKey, Incoming, Management, Token,
 };
-use super::txd::{self, RateCaps};
+use super::txd::{self, RateCaps, TxSec};
 use super::txpwr_tables::TxPowerTables;
 use super::vif;
 use crate::Mac;
@@ -154,13 +191,26 @@ pub const SCAN_NOT_ENDED: AxError = AxError::Scan("the last scan has not been en
 pub const CONNECTED: AxError =
     AxError::Scan("a BSSID is set: the station is connecting or connected");
 
-/// The most frames a [`Live`] holds for the next [`Live::drain`], as the
-/// receiver's own queue is bounded; past it they are dropped and counted
-/// ([`Live::held_dropped`]).
+/// The most frames, and the most beacon filter reports, a [`Live`] holds
+/// for the next [`Live::drain`], as the receiver's own queue is bounded;
+/// past it they are dropped and counted ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
-/// What every key call and every keyed frame gets in M3a (spec S14.5).
-pub const KEYS_BEFORE_M3B: &str = "keys before M3b";
+/// What [`Chip::transmit_data`] gets for a frame naming a security CAM
+/// entry that holds no key [`Live::add_key`] installed.
+pub const KEY_NOT_IN_CAM: &str = "a key not in the security CAM";
+
+/// `R_AX_DLE_EMPTY0` (`reg.h:631`), and the queues `dle_is_txq_empty`
+/// wants empty in it (`mac.c:2393-2405`, bits `reg.h:632-651`).
+const R_AX_DLE_EMPTY0: u32 = 0x8430;
+const DLE_TXQ_EMPTY: u32 = 0x07FF_079F;
+/// `rtw89_mac_flush_txq`'s `read_poll_timeout`: every 10 ms for up to
+/// 200 ms (`mac.c:6360-6361`).
+const FLUSH_TXQ_STEP_US: u64 = 10_000;
+const FLUSH_TXQ_WAIT_US: u64 = 200_000;
+/// `rtw89_mac_pkt_drop_sta`'s selections (`mac.c:7259-7264`),
+/// `RTW89_PKT_DROP_SEL_MACID_BE_ONCE` to `_VO_ONCE` (`core.h:6485-6488`).
+const PKT_DROP_SELS: [u8; 4] = [0, 1, 2, 3];
 
 /// The data and management channels, in the order the reclaim reads them.
 const TX_CHANNELS: [TxChannel; 5] = [
@@ -185,9 +235,21 @@ struct TxCounts {
     stale: u32,
 }
 
+/// The RX Block Ack starts and stops the chip took, saturating, for
+/// [`Chip::diagnostic`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BaCounts {
+    started: u32,
+    stopped: u32,
+}
+
 fn bump(counter: &mut u32) {
     *counter = counter.saturating_add(1);
 }
+
+/// What [`Live::start_rx_block_ack`] gets while not associated.
+pub const BA_WITHOUT_ASSOCIATION: AxError =
+    AxError::Mac("a Block Ack agreement without an association");
 
 /// An RTL8852CE that [`start`] left running (M3 spec S3.1).
 pub struct Live<I: AxIo> {
@@ -224,7 +286,15 @@ pub struct Live<I: AxIo> {
     associated: Option<AssocInputs>,
     /// DIG's pause.
     dig: Dig,
+    /// The security CAM and the station's address CAM key fields, empty
+    /// unless associated with keys installed.
+    keys: KeyCam,
+    /// The static BA CAM entries the associated station's agreements hold.
+    ba: BaCam,
+    /// The AP's station's `tid_rx_stats`, for the PN check.
+    rx_stats: RxStats,
     tx: TxCounts,
+    ba_counts: BaCounts,
     /// A failure powered the chip off.
     off: bool,
 }
@@ -257,24 +327,51 @@ impl LiveScan {
     }
 }
 
-/// Frames a scan start or restore drained, oldest first, for the next
-/// [`Live::drain`] to hand out. C2Hs other than the scan's own are not
-/// held: the ledger counts them.
+/// What [`Held`] keeps: a frame, or a beacon filter report.
+enum Kept {
+    Frame(Received),
+    Report(BcnFltr),
+}
+
+/// Frames and beacon filter reports drained outside [`Live::drain`] and
+/// [`Live::expire_scan`], oldest first, for the next [`Live::drain`] to hand
+/// out, at most [`MAX_HELD`] of each; past it they are dropped and counted.
+/// Other C2Hs are not held: the ledger counts them.
 #[derive(Default)]
 struct Held {
-    frames: VecDeque<Received>,
+    kept: VecDeque<Kept>,
+    frames: usize,
+    reports: usize,
     dropped: u16,
 }
 
 impl Held {
     fn keep(&mut self, event: Event<'_>) {
-        if let Event::Frame(frame) = event {
-            if self.frames.len() < MAX_HELD {
-                self.frames.push_back(frame);
-            } else {
-                self.dropped = self.dropped.saturating_add(1);
-            }
+        let (kept, count) = match event {
+            Event::Frame(frame) => (Kept::Frame(frame), &mut self.frames),
+            Event::C2h(C2h::BeaconFilter(report)) => (Kept::Report(report), &mut self.reports),
+            Event::C2h(_) => return,
+        };
+        if *count < MAX_HELD {
+            *count += 1;
+            self.kept.push_back(kept);
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
+    }
+
+    /// The oldest kept, as the event it was.
+    fn next(&mut self) -> Option<Event<'static>> {
+        Some(match self.kept.pop_front()? {
+            Kept::Frame(frame) => {
+                self.frames -= 1;
+                Event::Frame(frame)
+            }
+            Kept::Report(report) => {
+                self.reports -= 1;
+                Event::C2h(C2h::BeaconFilter(report))
+            }
+        })
     }
 }
 
@@ -456,7 +553,11 @@ pub unsafe fn start<I: AxIo>(
         authenticated: false,
         associated: None,
         dig: Dig::default(),
+        keys: KeyCam::default(),
+        ba: BaCam::default(),
+        rx_stats: RxStats::default(),
         tx: TxCounts::default(),
+        ba_counts: BaCounts::default(),
         off: false,
     })
 }
@@ -518,6 +619,19 @@ fn failed(step: &str, error: AxError) -> String {
     format!("{step}: {error}")
 }
 
+/// Whether `event` goes on from the drain that brought it: a frame only
+/// when `rtw89_core_skb_pn_valid` passes it ([`RxStats::valid`] under
+/// `stats`, `associated` saying whether MAC ID 0 is the associated
+/// station's), as `rtw89_core_rx` runs it on reception (`core.c:4551`),
+/// whichever drain brought it and whatever the operation then changes;
+/// every C2H.
+fn checked(stats: &mut RxStats, associated: bool, event: &Event<'_>) -> bool {
+    match event {
+        Event::Frame(frame) => stats.valid(associated, frame),
+        Event::C2h(_) => true,
+    }
+}
+
 impl<I: AxIo> Live<I> {
     /// What the bring-up reported (M2b2's report, no scan).
     pub fn running(&self) -> &Running {
@@ -555,8 +669,9 @@ impl<I: AxIo> Live<I> {
         self.scan.as_ref().and_then(|scan| scan.end)
     }
 
-    /// The frames a scan start or restore drained past the 64 it
-    /// holds for the next [`Live::drain`], which were dropped (saturating).
+    /// The frames, and the beacon filter reports, drained outside
+    /// [`Live::drain`] and [`Live::expire_scan`] past the 64 of each it holds
+    /// for the next [`Live::drain`], which were dropped (saturating).
     pub fn held_dropped(&self) -> u16 {
         self.held.dropped
     }
@@ -685,15 +800,13 @@ impl<I: AxIo> Live<I> {
         scan::check_firmware(self.running.firmware)?;
         let mac = self.running.mac;
         let budget_us = scan::scan_budget_us(list.len());
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let started = self.session(|io, session| {
+        let started = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which
             // `hw_scan_start`'s is, for the live chip's own window and rings.
-            let edcca =
-                unsafe { scan::hw_scan_start(io, session, mac, &mut dig, &mut |e| held.keep(e)) }?;
+            let edcca = unsafe { scan::hw_scan_start(io, session, mac, &mut dig, held) }?;
             session.rx.set_mode(Mode::Scan);
-            session.rx.flush(&mut |e| held.keep(e));
+            session.rx.flush(held);
             let mut scan = LiveScan {
                 edcca,
                 deadline_us: u64::MAX,
@@ -705,13 +818,12 @@ impl<I: AxIo> Live<I> {
             let offloaded = unsafe {
                 scan::offload(io, session, list, &mut |e| {
                     scan.track(&e);
-                    held.keep(e)
+                    held(e)
                 })
             }
             .and_then(|()| io.now_us());
             Ok((scan, offloaded))
         });
-        self.held = held;
         self.dig = dig;
         let (mut scan, offloaded) = match started {
             Ok(Ok(started)) => started,
@@ -737,9 +849,12 @@ impl<I: AxIo> Live<I> {
     }
 
     /// One RXQ poll for `sink` (the RXQ step of the radio's poll): first the
-    /// frames a scan start or restore held, oldest first, then every RXQ
-    /// entry through the receiver and the session's ledger, as
-    /// `rtw89_pci_poll_rxq_dma` hands them to `rtw89_core_rx`. A running
+    /// frames and beacon filter reports an operation held, oldest first
+    /// (see [`Live::service`]), then every RXQ entry through the receiver,
+    /// the session's ledger and `rtw89_core_skb_pn_valid` ([`checked`]: a
+    /// frame it drops is counted, not handed on), as `rtw89_pci_poll_rxq_dma`
+    /// hands them to `rtw89_core_rx`; a held frame passed that check as it
+    /// was drained. A running
     /// scan's first END_SCAN ends it: the same call then drains what
     /// followed END_SCAN and flushes the receiver into `sink`
     /// ([`scan::tail`]), so every frame the scan heard is handed on before
@@ -755,7 +870,7 @@ impl<I: AxIo> Live<I> {
         }
         self.release(sink);
         let mut scan = self.scan.take();
-        let drained = self.session(|io, session| {
+        let drained = self.passing(sink, |io, session, sink| {
             // SAFETY: the caller's contract is `start`'s, which `drain`'s
             // is, for the live chip's own window and rings.
             unsafe {
@@ -785,8 +900,9 @@ impl<I: AxIo> Live<I> {
     /// The scan budget (the radio poll's last step, M3 spec S8.1): a scan
     /// without END_SCAN at its deadline is stopped as `rtw89_hw_scan_abort`
     /// does ([`scan::stop`]: SCANOFLD stop, then up to `STOP_WAIT_US` for
-    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]), after
-    /// the frames held, and it ends [`ScanEnd::Stopped`], `ended` when
+    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]) as
+    /// [`Live::drain`] drains it, after the frames held, and it ends
+    /// [`ScanEnd::Stopped`], `ended` when
     /// END_SCAN came in the stop's wait or its tail. A stop or tail that
     /// fails still ends it so, as Linux completes an abort whatever the
     /// stop returned (`fw.c:10502-10510`), and returns its error; the stop
@@ -809,7 +925,7 @@ impl<I: AxIo> Live<I> {
         }
         self.release(sink);
         let mut scan = self.scan.take();
-        let stopped = self.session(|io, session| {
+        let stopped = self.passing(sink, |io, session, sink| {
             let mut track = |e: Event<'_>| {
                 if let Some(scan) = scan.as_mut() {
                     scan.track(&e);
@@ -884,12 +1000,9 @@ impl<I: AxIo> Live<I> {
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     unsafe fn abort(&mut self) {
-        let mut held = core::mem::take(&mut self.held);
         // SAFETY: the caller's contract is `start`'s, which `stop`'s is, for
         // the live chip's own window and rings.
-        let _ =
-            self.session(|io, session| unsafe { scan::stop(io, session, &mut |e| held.keep(e)) });
-        self.held = held;
+        let _ = self.holding(|io, session, held| unsafe { scan::stop(io, session, held) });
         if let Some(scan) = self.scan.take() {
             // SAFETY: as above, `restore`'s.
             let _ = unsafe { self.restore(&scan.edcca) };
@@ -907,16 +1020,12 @@ impl<I: AxIo> Live<I> {
         // SAFETY: the caller's contract is `tune`'s, word for word.
         unsafe { self.tune(&chan) }?;
         let mac = self.running.mac;
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let completed = self.session(|io, session| {
+        let completed = self.holding(|io, session, held| {
             // SAFETY: as above, `hw_scan_complete`'s, for the live chip's own
             // window and rings.
-            unsafe {
-                scan::hw_scan_complete(io, session, mac, edcca, &mut dig, &mut |e| held.keep(e))
-            }
+            unsafe { scan::hw_scan_complete(io, session, mac, edcca, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         match completed {
             Ok(Ok(())) => Ok(()),
@@ -948,14 +1057,12 @@ impl<I: AxIo> Live<I> {
             return Err(AxError::Mac("a new BSSID while associated"));
         }
         let mac = self.running.mac;
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `set_bssid`'s
             // is, for the live chip's own window and rings.
-            unsafe { assoc::set_bssid(io, session, mac, bssid, &mut dig, &mut |e| held.keep(e)) }
+            unsafe { assoc::set_bssid(io, session, mac, bssid, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         self.done(done)?;
         self.bssid = Some(bssid);
@@ -1009,34 +1116,43 @@ impl<I: AxIo> Live<I> {
             return Err(AxError::Mac("an association on a band not tuned"));
         }
         let features = Features::of(self.running.firmware);
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `associate`'s
             // is, for the live chip's own window and rings.
-            unsafe {
-                assoc::associate(io, session, inputs, features, &mut dig, &mut |e| {
-                    held.keep(e)
-                })
-            }
+            unsafe { assoc::associate(io, session, inputs, features, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         self.done(done)?;
         self.associated = Some(*inputs);
         Ok(())
     }
 
-    /// Leave (M3 spec S11): from an association, [`assoc::leave`] for it;
-    /// from a BSSID set without one, [`assoc::clear_bssid`], after
-    /// [`assoc::disconnect`] when the AP's station was
+    /// Leave (M3 spec S11): from an association, first every RX Block Ack
+    /// agreement's static BA CAM entry still held stopped as
+    /// [`Live::stop_rx_block_ack`] stops it, oldest first, as mac80211 tears
+    /// the AP station's agreements down before its keys
+    /// (`__sta_info_destroy_part1`'s `ieee80211_sta_tear_down_BA_sessions`,
+    /// `sta_info.c:1348`), then every key still
+    /// installed deleted as [`Live::remove_key`] deletes it, in Stela's
+    /// order, the group keys first ([`keys::KeyCam::deletion_order`]):
+    /// mac80211 frees the AP station's keys there, before its ASSOC to AUTH
+    /// (`sta_info.c:1577-1578`, `ieee80211_free_sta_keys`), but in station
+    /// mode those are the PTK alone, the GTK being the vif's, and the radio
+    /// deletes every key itself, the PTK first, before it leaves; then
+    /// [`assoc::leave`] for it, whose address CAMs carry the key fields the
+    /// deletes left; from a BSSID set without one, [`assoc::clear_bssid`],
+    /// after [`assoc::disconnect`] when the AP's station was
     /// [`Live::authenticated`] (`ieee80211_destroy_assoc_data` destroys it
     /// from AUTH); with neither, nothing, without I/O. Either way the BSSID,
-    /// the authentication and the association are gone afterwards; DIG is
-    /// left as it is. Refused before any I/O,
-    /// changing nothing, on a chip off ([`POWERED_OFF`]) and while a scan
-    /// has not been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip
-    /// off.
+    /// the authentication, the association, the agreements and the keys are
+    /// gone afterwards, the AP's station's PN checks with them, and the
+    /// address CAM's key fields are a fresh vif's, as
+    /// Linux's idle power-off and its vif init leave them (`ps.c:233-278`,
+    /// `rtw89_cam_init_addr_cam`, `cam.c:646-684`) before the station's next
+    /// scan or join; DIG is left as it is. Refused before any I/O, changing
+    /// nothing, on a chip off ([`POWERED_OFF`]) and while a scan has not
+    /// been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1048,28 +1164,258 @@ impl<I: AxIo> Live<I> {
         let associated = self.associated.take();
         let bssid = self.bssid.take();
         let authenticated = core::mem::take(&mut self.authenticated);
+        let mut cam = core::mem::take(&mut self.keys);
+        let mut agreements = core::mem::take(&mut self.ba);
+        self.rx_stats.forget();
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
         let band = self.chan.band;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
-            let sink = &mut |e: Event<'_>| held.keep(e);
+        let done = self.holding(|io, session, sink| {
             match (&associated, bssid) {
-                // SAFETY: the caller's contract is `start`'s, which `leave`'s
-                // is, for the live chip's own window and rings.
-                (Some(inputs), _) => unsafe { assoc::leave(io, session, inputs, features, sink) },
+                (Some(inputs), _) => {
+                    for tid in agreements.tids() {
+                        // SAFETY: the caller's contract is `start`'s, which
+                        // `ba::stop`'s is, for the live chip's own window and
+                        // rings.
+                        unsafe { ba::stop(io, session, &mut agreements, tid, sink) }?;
+                    }
+                    let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+                    for idx in cam.deletion_order() {
+                        // SAFETY: the caller's contract is `start`'s, which
+                        // `delete`'s is, for the live chip's own window and
+                        // rings.
+                        unsafe { keys::delete(io, session, &mut cam, &addr, idx, sink) }?;
+                    }
+                    let left = cam.keys();
+                    // SAFETY: as above, `leave`'s.
+                    unsafe { assoc::leave(io, session, inputs, features, left, sink) }
+                }
                 (None, Some(bssid)) if authenticated => {
+                    let left = cam.keys();
                     // SAFETY: as above, `disconnect`'s and `clear_bssid`'s.
-                    unsafe { assoc::disconnect(io, session, mac, bssid, band, sink) }?;
+                    unsafe { assoc::disconnect(io, session, mac, bssid, band, left, sink) }?;
                     // SAFETY: as above.
-                    unsafe { assoc::clear_bssid(io, session, mac, sink) }
+                    unsafe { assoc::clear_bssid(io, session, mac, left, sink) }
                 }
                 // SAFETY: as above, `clear_bssid`'s.
-                (None, _) => unsafe { assoc::clear_bssid(io, session, mac, sink) },
+                (None, _) => unsafe { assoc::clear_bssid(io, session, mac, cam.keys(), sink) },
             }
         });
-        self.held = held;
         self.done(done)
+    }
+
+    /// Whether security CAM entry `cam` holds a key [`Live::add_key`]
+    /// installed and nothing has deleted since.
+    pub fn key_installed(&self, cam: u8) -> bool {
+        self.keys.installed(cam)
+    }
+
+    /// Install `key` for the associated station (M3 spec S12.5,
+    /// [`keys::install`]): SEC_UPD into the first free security CAM entry
+    /// and its REC_ACK, then the dctl and the address CAM, connected with the
+    /// association's AID, and that CAM's own DONE_ACK with return 0, each
+    /// wait `ACK_WAIT_US`; frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Returns the entry, which a frame's TX descriptor
+    /// names. Refused before any I/O, changing nothing: on a chip off
+    /// ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), with `Mac` while not associated (mac80211
+    /// refuses a station's key before ASSOC, `ieee80211_add_key`), and as
+    /// [`keys::check`] refuses. Any later failure, a firmware that never
+    /// acknowledged the key included, is returned with nothing installed:
+    /// the entry and the slot are free again, and the chip stays on, for
+    /// the station to leave and join again. An installed pairwise key
+    /// starts the started TIDs' PN checks over
+    /// (`rtw89_core_tid_rx_stats_reset`, `mac80211.c:1007-1008`).
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, AxError> {
+        self.idle()?;
+        let Some(inputs) = &self.associated else {
+            return Err(AxError::Mac("a key without an association"));
+        };
+        let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+        keys::check(&self.keys, key.pairwise, key.index)?;
+        let mut cam = self.keys;
+        let done = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which `install`'s
+            // is, for the live chip's own window and rings.
+            unsafe {
+                keys::install(
+                    io,
+                    session,
+                    &mut cam,
+                    &addr,
+                    key.pairwise,
+                    key.index,
+                    key.material,
+                    held,
+                )
+            }
+        });
+        self.keys = cam;
+        let installed = done.and_then(|done| done)?;
+        if key.pairwise {
+            self.rx_stats.reset();
+        }
+        Ok(installed)
+    }
+
+    /// Delete the key in security CAM entry `cam` (M3 spec S12.6,
+    /// [`keys::delete`]): its slot detached, the dctl and the address CAM,
+    /// neither waited on; the entry is free afterwards whatever they
+    /// returned, as Linux frees it, and their first failure is returned
+    /// with the chip left on. Refused before any I/O, changing nothing, on
+    /// a chip off ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), and for an entry holding no key
+    /// ([`keys::NO_KEY`]).
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn remove_key(&mut self, cam: u8) -> Result<(), AxError> {
+        self.idle()?;
+        // A key is installed only while associated, and leaving deletes it.
+        let (true, Some(inputs)) = (self.keys.installed(cam), &self.associated) else {
+            return Err(keys::NO_KEY);
+        };
+        let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+        let mut state = self.keys;
+        let done = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which `delete`'s
+            // is, for the live chip's own window and rings.
+            unsafe { keys::delete(io, session, &mut state, &addr, cam, held) }
+        });
+        self.keys = state;
+        done.and_then(|done| done)
+    }
+
+    /// `rtw89_ops_ampdu_action`'s RX_START (M3 spec S13.2,
+    /// `mac80211.c:1062-1065`) of the associated station's agreement on
+    /// `tid` from `ssn` with a window of `window`: the TID's PN check
+    /// started over (`rtw89_core_tid_rx_stats_ctrl`), then [`ba::start`], a
+    /// static BA CAM entry and its H2C, sent without a wait; with all eight
+    /// entries taken nothing is sent, the hardware's dynamic BA CAM covering
+    /// the agreement. Frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Refused before any I/O, changing nothing: on a chip
+    /// off ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), for a TID past 15 ([`ba::TID_PAST_15`]), and
+    /// while not associated ([`BA_WITHOUT_ASSOCIATION`]: mac80211 starts
+    /// none before). A failed send is returned with the entry taken, as
+    /// Linux leaves it, and the chip left on.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn start_rx_block_ack(
+        &mut self,
+        tid: u8,
+        ssn: u16,
+        window: u16,
+    ) -> Result<(), AxError> {
+        self.idle()?;
+        if usize::from(tid) >= ba::TIDS {
+            return Err(ba::TID_PAST_15);
+        }
+        if self.associated.is_none() {
+            return Err(BA_WITHOUT_ASSOCIATION);
+        }
+        self.rx_stats.control(tid, true);
+        let mut cam = self.ba;
+        let done = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which
+            // `ba::start`'s is, for the live chip's own window and rings.
+            unsafe { ba::start(io, session, &mut cam, tid, ssn, window, held) }
+        });
+        self.ba = cam;
+        done.and_then(|done| done)?;
+        bump(&mut self.ba_counts.started);
+        Ok(())
+    }
+
+    /// `rtw89_ops_ampdu_action`'s RX_STOP (`mac80211.c:1066-1069`) of the
+    /// agreement on `tid`: its PN check stopped, then [`ba::stop`], the
+    /// oldest entry it holds freed and its stop H2C sent without a wait; an
+    /// agreement holding no entry sends nothing. Frames drained meanwhile
+    /// are held for the next [`Live::drain`]. Refused before any I/O,
+    /// changing nothing, on a chip off ([`POWERED_OFF`]), while a scan has
+    /// not been ended ([`SCAN_NOT_ENDED`]), and for a TID past 15
+    /// ([`ba::TID_PAST_15`]). A failed send is returned with the entry
+    /// already free, as Linux frees it, and the chip left on.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), AxError> {
+        self.idle()?;
+        if usize::from(tid) >= ba::TIDS {
+            return Err(ba::TID_PAST_15);
+        }
+        self.rx_stats.control(tid, false);
+        let mut cam = self.ba;
+        let done = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which `ba::stop`'s
+            // is, for the live chip's own window and rings.
+            unsafe { ba::stop(io, session, &mut cam, tid, held) }
+        });
+        self.ba = cam;
+        done.and_then(|done| done)?;
+        bump(&mut self.ba_counts.stopped);
+        Ok(())
+    }
+
+    /// `rtw89_ops_flush` (`mac80211.c:1122-1136`), as mac80211's
+    /// `ieee80211_flush_queues` and `rtw89_ops_set_key`'s DISABLE_KEY
+    /// (`mac80211.c:1010-1013`) call it: no LPS to leave, then
+    /// `rtw89_hci_flush_queues`, the TX rings' wait of [`Rings::flush_tx`];
+    /// then with `drop`, as the 8852C's firmware lacks `NO_PACKET_DROP`
+    /// (`fw.c:870`), `__rtw89_drop_packets` (`mac80211.c:1109-1120`): for
+    /// the AP's station, which exists while a BSSID is set (mac80211 adds it
+    /// before authentication and iterates it as uploaded), the four
+    /// PKT_DROP H2Cs of `rtw89_mac_pkt_drop_sta` (`mac.c:7255-7278`), BE, BK,
+    /// VI then VO once for macid 0, each sent without a wait and its failure
+    /// passed over as Linux ignores it; without `drop`,
+    /// `rtw89_mac_flush_txq` (`mac.c:6352-6363`): `R_AX_DLE_EMPTY0` sampled
+    /// every 10 ms for up to 200 ms until `dle_is_txq_empty`'s queues are
+    /// all empty (`mac.c:2388-2412`), a timeout passed over as Linux only
+    /// logs it. Frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Refused before any I/O on a chip off
+    /// ([`POWERED_OFF`]) and while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]); a failed register read is returned, the chip
+    /// left on, as is the first PKT_DROP that could not be sent.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn flush(&mut self, drop: bool) -> Result<(), AxError> {
+        self.idle()?;
+        self.rings.flush_tx(&mut self.io)?;
+        if !drop {
+            return match poll32(
+                &mut self.io,
+                R_AX_DLE_EMPTY0,
+                DLE_TXQ_EMPTY,
+                DLE_TXQ_EMPTY,
+                FLUSH_TXQ_STEP_US,
+                FLUSH_TXQ_WAIT_US,
+            ) {
+                Ok(()) | Err(AxError::Timeout { .. }) => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        if self.bssid.is_none() {
+            return Ok(());
+        }
+        let sent = self.holding(|io, session, held| {
+            let mut first = Ok(());
+            for sel in PKT_DROP_SELS {
+                let packet = session.h2c.pkt_drop(sel, vif::MAC_ID, vif::PORT);
+                // SAFETY: the caller's contract is `start`'s, which `send`'s
+                // is, for the live chip's own window and rings.
+                let result = unsafe { session.send(io, packet, held) };
+                if first.is_ok() {
+                    first = result.map(|_| ());
+                }
+            }
+            first
+        });
+        sent.and_then(|sent| sent)
     }
 
     /// The channel context released after the station left (mac80211's
@@ -1122,11 +1468,14 @@ impl<I: AxIo> Live<I> {
         unsafe { self.submit(ch, &head, bytes) }
     }
 
-    /// Queue a data frame without a key, as [`Live::queue_management`]
-    /// queues a management frame: the WD head of [`txd::data`] for the
-    /// queue of `tid`, `eapol`, the tuned band, the peer's `supported`
-    /// rates and, once associated, the STBC and LDPC its RA H2C took
-    /// (`rtwsta_link->ra`, `core.c:1144-1145`; neither before).
+    /// Queue a data frame, as [`Live::queue_management`] queues a
+    /// management frame: the WD head of [`txd::data`] for the queue of
+    /// `tid`, `eapol`, the tuned band, the peer's `supported` rates, once
+    /// associated the STBC and LDPC its RA H2C took (`rtwsta_link->ra`,
+    /// `core.c:1145-1146`; neither before), and `sec`, the hardware key a
+    /// Protected frame goes under (`rtw89_core_tx_update_sec_key`), whose
+    /// CCMP header [`txd::strip_ccmp`] removed. The key's CAM entry is the
+    /// caller's to have installed ([`Chip::transmit_data`] checks it).
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1136,6 +1485,7 @@ impl<I: AxIo> Live<I> {
         tid: u8,
         eapol: bool,
         supported: u16,
+        sec: Option<TxSec>,
     ) -> Result<Option<Token>, AxError> {
         if self.off {
             return Err(POWERED_OFF);
@@ -1156,7 +1506,7 @@ impl<I: AxIo> Live<I> {
                 ldpc: false,
             },
         };
-        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, None)?;
+        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
         unsafe { self.submit(ch, &head, bytes) }
     }
@@ -1196,14 +1546,18 @@ impl<I: AxIo> Live<I> {
     /// each release report returning its page ([`TxPools::release`]) and
     /// handed on as [`Incoming::Transmitted`], acknowledged for
     /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
-    /// outstanding; RXQ ([`Live::drain`]), its frames handed on; the scan
-    /// budget ([`Live::expire_scan`]); then, once, [`Incoming::ScanEnded`]
-    /// when the scan begun has ended, after every frame it heard. Every step
-    /// runs whatever an earlier one returned, and the first error is
-    /// returned. Such an error is not fatal: no step powers the chip off,
-    /// every event before the error was handed on, and the next poll tries
-    /// again. Beacon filter reports are not handed on (M3 Task 18).
-    /// Refused with [`POWERED_OFF`] on a chip off.
+    /// outstanding; RXQ ([`Live::drain`]), its frames handed on, each past
+    /// `rtw89_core_skb_pn_valid` as it was drained ([`RxStats::valid`], a
+    /// drop counted); the scan budget ([`Live::expire_scan`]); then each
+    /// beacon filter report
+    /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
+    /// takes it ([`Live::beacon_filter`]); then, once,
+    /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
+    /// frame it heard. Every step runs whatever an earlier one returned,
+    /// and the first error is returned. Such an error is not fatal: no step
+    /// powers the chip off, every event before the error was handed on, and
+    /// the next poll tries again. Refused with [`POWERED_OFF`] on a chip
+    /// off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1219,15 +1573,20 @@ impl<I: AxIo> Live<I> {
             let reclaimed = unsafe { self.rings.txq(&mut self.pools, ch).reclaim(&mut self.io) };
             keep(&mut first, reclaimed);
         }
-        let mut frames = |e: Event<'_>| {
-            if let Event::Frame(frame) = e {
-                sink(Incoming::Frame(heard(frame)));
-            }
+        let mut filter = Vec::new();
+        let mut frames = |e: Event<'_>| match e {
+            Event::Frame(frame) => sink(Incoming::Frame(heard(frame))),
+            Event::C2h(C2h::BeaconFilter(report)) => filter.push(report),
+            Event::C2h(_) => {}
         };
         // SAFETY: as above, `drain`'s.
         keep(&mut first, unsafe { self.drain(&mut frames) });
         // SAFETY: as above, `expire_scan`'s.
         keep(&mut first, unsafe { self.expire_scan(&mut frames) });
+        for report in filter {
+            // SAFETY: as above, `beacon_filter`'s.
+            keep(&mut first, unsafe { self.beacon_filter(report, sink) });
+        }
         if let Some(scan) = self.scan.as_mut()
             && !scan.announced
             && let Some(end) = scan.end
@@ -1288,6 +1647,54 @@ impl<I: AxIo> Live<I> {
         polled.map(|_| ())
     }
 
+    /// `rtw89_mac_bcn_fltr_rpt` (`mac.c:5389-5443`) of `report` for the one
+    /// vif (M3 spec S15): a report for another MAC ID than the vif's is
+    /// ignored, and so are the RSSI and NOTIFY ones, as nothing asks for
+    /// CQM (`ieee80211_cqm_rssi_notify`); `report.ma` is raw, its signal
+    /// `ma - MAX_RSSI`, which nothing reads. A BEACON_LOSS while associated
+    /// is handed on as [`Incoming::BeaconLost`] unless a scan has not been
+    /// ended (`rtwdev->scanning`, as `ieee80211_beacon_loss` is called only
+    /// then), and then re-arms the filter as Linux does on every loss
+    /// report, `rtw89_fw_h2c_set_bcn_fltr_cfg(.., true)` ([`H2c::bcn_fltr`]
+    /// of this firmware's [`Features`]) sent without a wait when the
+    /// firmware has BEACON_FILTER (`fw.c:5409-5410`); frames drained
+    /// meanwhile are held for the next [`Live::drain`]. While not
+    /// associated nothing happens: mac80211 takes no beacon loss of a
+    /// station not associated, and Linux sends no filter for a vif not
+    /// INFRA (`fw.c:5413`). A failed send is returned with the chip left
+    /// on, where Linux only logs it.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    unsafe fn beacon_filter(
+        &mut self,
+        report: BcnFltr,
+        sink: &mut dyn FnMut(Incoming),
+    ) -> Result<(), AxError> {
+        if report.macid != vif::MAC_ID
+            || report.kind != BCNFLTR_BEACON_LOSS
+            || self.associated.is_none()
+        {
+            return Ok(());
+        }
+        if self.scan.is_none() {
+            sink(Incoming::BeaconLost);
+        }
+        let features = Features::of(self.running.firmware);
+        if !features.beacon_filter {
+            return Ok(());
+        }
+        let sent = self.holding(|io, session, held| {
+            let packet = session
+                .h2c
+                .bcn_fltr(vif::MAC_ID, true, features.loss_count_v1);
+            // SAFETY: the caller's contract is `start`'s, which `send`'s is,
+            // for the live chip's own window and rings.
+            unsafe { session.send(io, packet, held) }.map(|_| ())
+        });
+        sent.and_then(|sent| sent)
+    }
+
     /// The end of an association step run on the session: its error, the
     /// chip powered off for it.
     fn done(&mut self, done: Result<Result<(), AxError>, AxError>) -> Result<(), AxError> {
@@ -1301,16 +1708,17 @@ impl<I: AxIo> Live<I> {
         }
     }
 
-    /// Hand the held frames to `sink`, oldest first.
+    /// Hand the held frames and beacon filter reports to `sink`, oldest
+    /// first.
     fn release(&mut self, sink: &mut dyn FnMut(Event<'_>)) {
-        while let Some(frame) = self.held.frames.pop_front() {
-            sink(Event::Frame(frame));
+        while let Some(event) = self.held.next() {
+            sink(event);
         }
     }
 
     /// `rtw89_core_stop` after a failure ([`bringup::shut_down`]): every
-    /// later call is refused with [`POWERED_OFF`], and a scan, a BSSID and
-    /// an association are gone with the firmware.
+    /// later call is refused with [`POWERED_OFF`], and a scan, a BSSID, an
+    /// association, the agreements and the keys are gone with the firmware.
     fn power_off(&mut self) {
         bringup::shut_down(&mut self.io, &self.rings, self.host);
         self.off = true;
@@ -1318,6 +1726,42 @@ impl<I: AxIo> Live<I> {
         self.bssid = None;
         self.authenticated = false;
         self.associated = None;
+        self.keys = KeyCam::default();
+        self.ba = BaCam::default();
+        self.rx_stats.forget();
+    }
+
+    /// [`Live::session`] for an operation's `f`, with a sink that holds what
+    /// it drains for the next [`Live::drain`] ([`Held`]), each frame past
+    /// the PN check first ([`Live::passing`]).
+    fn holding<R>(
+        &mut self,
+        f: impl FnOnce(&mut I, &mut Session<'_>, &mut dyn FnMut(Event<'_>)) -> R,
+    ) -> Result<R, AxError> {
+        let mut held = core::mem::take(&mut self.held);
+        let result = self.passing(&mut |e| held.keep(e), f);
+        self.held = held;
+        result
+    }
+
+    /// [`Live::session`] for a drain's `f`, with `sink` behind the PN check
+    /// ([`checked`]).
+    fn passing<R>(
+        &mut self,
+        sink: &mut dyn FnMut(Event<'_>),
+        f: impl FnOnce(&mut I, &mut Session<'_>, &mut dyn FnMut(Event<'_>)) -> R,
+    ) -> Result<R, AxError> {
+        let mut stats = core::mem::take(&mut self.rx_stats);
+        let associated = self.associated.is_some();
+        let result = self.session(|io, session| {
+            f(io, session, &mut |e| {
+                if checked(&mut stats, associated, &e) {
+                    sink(e);
+                }
+            })
+        });
+        self.rx_stats = stats;
+        result
     }
 
     /// Run `f` on the command session, resumed from where the last one was
@@ -1432,16 +1876,29 @@ impl<I: AxIo> Chip for Live<I> {
         unsafe { self.queue_management(frame.bytes, frame.basic_rates) }.map_err(|e| e.to_string())
     }
 
-    /// [`Live::queue_data`]; a frame with a key is refused until M3b.
+    /// [`Live::queue_data`], a frame's key as its CAM entry, key ID and PN
+    /// ([`TxSec`]). A frame naming an entry that holds no key
+    /// [`Live::add_key`] installed and nothing deleted since is refused
+    /// with [`KEY_NOT_IN_CAM`] before any access: the hardware would
+    /// encrypt it under whatever that entry held, or under nothing.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String> {
         if self.off {
             return Err(POWERED_OFF.to_string());
         }
-        if frame.key.is_some() {
-            return Err(KEYS_BEFORE_M3B.into());
-        }
+        let sec = match frame.key {
+            Some((cam, _, _)) if !self.key_installed(cam) => return Err(KEY_NOT_IN_CAM.into()),
+            Some((cam, keyid, pn)) => Some(TxSec { keyid, cam, pn }),
+            None => None,
+        };
+        let Data {
+            bytes,
+            tid,
+            eapol,
+            supported_rates,
+            ..
+        } = *frame;
         // SAFETY: `start`'s contract holds for the live chip's every use.
-        unsafe { self.queue_data(frame.bytes, frame.tid, frame.eapol, frame.supported_rates) }
+        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec) }
             .map_err(|e| e.to_string())
     }
 
@@ -1492,40 +1949,40 @@ impl<I: AxIo> Chip for Live<I> {
         Ok(())
     }
 
-    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
-    fn add_key(&mut self, _key: &HardwareKey<'_>) -> Result<u8, String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Err(KEYS_BEFORE_M3B.into())
+    /// [`Live::add_key`].
+    fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::add_key(self, key) }.map_err(|e| e.to_string())
     }
 
-    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
-    fn remove_key(&mut self, _cam: u8) -> Result<(), String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Err(KEYS_BEFORE_M3B.into())
+    /// [`Live::remove_key`].
+    fn remove_key(&mut self, cam: u8) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
     }
 
-    /// Accepted without the BA CAM until M3b, with no access.
-    fn start_rx_block_ack(&mut self, _tid: u8, _ssn: u16) -> Result<(), String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Ok(())
+    /// [`Live::flush`].
+    fn flush(&mut self, drop: bool) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::flush(self, drop) }.map_err(|e| e.to_string())
     }
 
-    /// As [`Chip::start_rx_block_ack`].
-    fn stop_rx_block_ack(&mut self, _tid: u8) -> Result<(), String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Ok(())
+    /// [`Live::start_rx_block_ack`].
+    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::start_rx_block_ack(self, tid, ssn, window) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::stop_rx_block_ack`].
+    fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::stop_rx_block_ack(self, tid) }.map_err(|e| e.to_string())
     }
 
     /// The TX counts, RPQ's skipped and stale reports, the receiver's
-    /// drops and the held frames dropped, naming no address.
+    /// drops and the held frames dropped, then, once any came, the RX Block
+    /// Ack starts and stops and the frames the PN check dropped, naming no
+    /// address.
     fn diagnostic(&self) -> String {
         let TxCounts {
             sent,
@@ -1547,6 +2004,14 @@ impl<I: AxIo> Chip for Live<I> {
             ));
         }
         line.push_str(&format!(", held dropped {}", self.held.dropped));
+        let BaCounts { started, stopped } = self.ba_counts;
+        if started != 0 || stopped != 0 {
+            line.push_str(&format!(", ba started {started} stopped {stopped}"));
+        }
+        let dropped = self.rx_stats.dropped();
+        if dropped != 0 {
+            line.push_str(&format!(", pn dropped {dropped}"));
+        }
         if self.off {
             line.push_str(", powered off");
         }
@@ -1570,6 +2035,19 @@ impl<I: AxIo> Live<I> {
 
     pub(crate) fn receiver(&self) -> &super::receive::Receiver {
         &self.parked.as_ref().unwrap().rx
+    }
+
+    pub(crate) fn cam_keys(&self) -> super::assoc::CamKeys {
+        self.keys.keys()
+    }
+
+    pub(crate) fn ba_tids(&self) -> Vec<u8> {
+        self.ba.tids()
+    }
+
+    /// The PN check [`Live::service`] runs, on `frame`.
+    pub(crate) fn pn_valid(&mut self, frame: &Received) -> bool {
+        self.rx_stats.valid(self.associated.is_some(), frame)
     }
 }
 

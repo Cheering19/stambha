@@ -74,7 +74,7 @@ pub struct TxSec {
 }
 
 /// The peer's RA capabilities a data frame's info carries
-/// (`rtwsta_link->ra.stbc_cap`, `ra.ldpc_cap`, `core.c:1144-1145`).
+/// (`rtwsta_link->ra.stbc_cap`, `ra.ldpc_cap`, `core.c:1145-1146`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateCaps {
     pub stbc: bool,
@@ -99,6 +99,8 @@ const SCAM_NUM: u8 = 128;
 const MAC_ID: u8 = 0;
 /// `IEEE80211_QOS_CTL_TAG1D_MASK`: `skb->priority`'s TID bits.
 const QOS_CTL_TAG1D_MASK: u8 = 0x7;
+/// `IEEE80211_QOS_CTL_TID_MASK`: the QoS control's TID field.
+const QOS_CTL_TID_MASK: u8 = 0xF;
 /// `IEEE80211_CCMP_HDR_LEN`.
 const CCMP_HDR_LEN: usize = 8;
 /// CCMP's 48-bit PN.
@@ -262,13 +264,20 @@ pub fn management(
 /// encrypted as CCMP-128 by the hardware under CAM entry `sec.cam` with
 /// `sec.pn` in BODY4/5 and `wp_offset` 1.
 ///
+/// `tid` is `skb->priority`, whose TID mac80211 also writes into a QoS
+/// frame's QoS control (`ieee80211_set_qos_hdr`, `net/mac80211/wme.c:193-232`)
+/// and which it sets to 0 for a peer without WMM, whose frames carry no QoS
+/// control (`__ieee80211_select_queue`, `wme.c:167-170`).
+///
 /// Refused: a frame that is not data or is null data (management, see
 /// [`management`]), one shorter than its 802.11 header or longer than
-/// [`MAX_TX_FRAME`], a Protected frame without `sec` (no data frame is
-/// sealed on the host, M3 spec S1.2, so it would leave unencrypted), `sec`
-/// for a frame without the Protected bit (mac80211 hands a hardware key
-/// only with a Protected frame), and a key the descriptor cannot carry (key
-/// ID past 3, PN 0 or past 48 bits, CAM entry past 127).
+/// [`MAX_TX_FRAME`], a `tid` whose TID is not the frame's own (its QoS
+/// control's four TID bits, 0 without one), a Protected frame without `sec`
+/// (no data frame is sealed on the host, M3 spec S1.2, so it would leave
+/// unencrypted), `sec` for a frame without the Protected bit (mac80211
+/// hands a hardware key only with a Protected frame), and a key the
+/// descriptor cannot carry (key ID past 3, PN 0 or past 48 bits, CAM entry
+/// past 127).
 pub fn data(
     bytes: &[u8],
     tid: u8,
@@ -290,6 +299,9 @@ pub fn data(
     }
     // rtw89_core_tx_update_data_info
     let tid = tid & QOS_CTL_TAG1D_MASK;
+    if frame.tid != tid {
+        return Err(AxError::Tx("a TID other than the frame's own"));
+    }
     let ch = TID_CHANNEL[usize::from(tid)];
     let mut info = DescInfo {
         pkt_size: frame.len,
@@ -325,15 +337,19 @@ pub fn data(
 /// The frame keeps its Protected bit; its new length is the `L` of
 /// [`data`], whose `sec.pn` must be this `pn`.
 ///
-/// Anything else changes nothing in `mpdu`: a frame that is not data or is
-/// shorter than its MAC header and 8 bytes, a key ID past 3, a PN of 0 or
-/// past 48 bits, and a header that is not the reservation's
-/// (`Tx("CCMP header does not match its reservation")`), so no frame is
-/// queued under a PN other than the one reserved for it.
+/// Anything else changes nothing in `mpdu`: a frame that is not data, one
+/// without the Protected bit (the 8 bytes after its header are plaintext,
+/// whatever they hold), one shorter than its MAC header and 8 bytes, a key
+/// ID past 3, a PN of 0 or past 48 bits, and a header that is not the
+/// reservation's (`Tx("CCMP header does not match its reservation")`), so
+/// no frame is queued under a PN other than the one reserved for it.
 pub fn strip_ccmp(mpdu: &mut Vec<u8>, pn: u64, keyid: u8) -> Result<(), AxError> {
     let fc = frame_control(mpdu)?;
     if !is_data(fc) {
         return Err(AxError::Tx("not a data frame"));
+    }
+    if fc & FCTL_PROTECTED == 0 {
+        return Err(AxError::Tx("not a protected frame"));
     }
     let header = hdrlen(fc);
     if mpdu.len() < header {
@@ -465,6 +481,9 @@ struct Frame {
     seq: u16,
     /// `is_broadcast_ether_addr(addr1) || is_multicast_ether_addr(addr1)`.
     is_bmc: bool,
+    /// A data frame's QoS control TID (`IEEE80211_QOS_CTL_TID_MASK`), 0
+    /// without one, as for a management frame.
+    tid: u8,
 }
 
 impl Frame {
@@ -478,11 +497,23 @@ impl Frame {
             return Err(AxError::Tx("frame longer than one TX address entry"));
         }
         let seq_ctrl = u16::from_le_bytes([bytes[SEQ_CTRL], bytes[SEQ_CTRL + 1]]);
+        // `ieee80211_get_qos_ctl`: right after the three or four addresses.
+        let tid = if is_data(fc) && fc & STYPE_QOS_DATA != 0 {
+            let at = if fc & (FCTL_TODS | FCTL_FROMDS) == FCTL_TODS | FCTL_FROMDS {
+                HDR_LEN_4ADDR
+            } else {
+                HDR_LEN_3ADDR
+            };
+            bytes[at] & QOS_CTL_TID_MASK
+        } else {
+            0
+        };
         Ok(Self {
             len: bytes.len() as u16,
             header,
             seq: (seq_ctrl & SCTL_SEQ) >> 4,
             is_bmc: bytes[ADDR1] & 1 != 0,
+            tid,
         })
     }
 }

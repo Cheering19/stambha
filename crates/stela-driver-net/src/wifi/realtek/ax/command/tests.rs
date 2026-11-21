@@ -1250,3 +1250,125 @@ fn ofld_cfg_counts_a_beacon_filter_report_as_another_c2h() {
         })
     );
 }
+
+// The Task 7 review's carries to M3 Task 14: a wait for an ack the packet
+// does not ask for is refused before the submit, and the address CAM's wait
+// in a key install matches its own seq.
+
+/// `wait` for a packet cat 1 / class 0xA / func 1 at `seq` with `rack` and
+/// `dack` as given, on a firmware that would answer anything.
+fn refused_wait(seq: u8, rack: bool, dack: bool, wait: Wait) -> Result<u8, CommandError> {
+    let (m, mut rings, mut io) = running();
+    reclaim_at_once(&mut io);
+    script(
+        &mut io,
+        &m,
+        vec![
+            firmware::rec_ack(0xA, 1, seq),
+            firmware::done_ack(0xA, 1, seq, 0),
+        ],
+    );
+    let mut h2c = H2c::at(seq);
+    let mut session = Session::new(&mut rings, &mut h2c, G2_1);
+    let packet = session.h2c.packet_with(1, 0xA, 1, rack, dack, &[0; 24]);
+    // SAFETY: as in `send_drains_rxq_after_the_submit`.
+    let got = unsafe { session.send_and_wait_for(&mut io, packet, wait, &mut |_| {}) };
+    assert!(io.writes().is_empty(), "{:x?}", io.writes());
+    assert!(!io.trace.contains(&Op::R32(0x1218)));
+    got
+}
+
+#[test]
+fn a_receipt_wait_refuses_a_packet_that_asks_for_no_rec_ack() {
+    // Seq 5 is no multiple of 4, so without rack the header's REC_ACK bit
+    // (H2C_HDR_REC_ACK b14, fw.h:4681) is clear: a wait would only time out
+    // and look like a silent firmware.
+    assert_eq!(
+        refused_wait(5, false, true, Wait::Received),
+        Err(CommandError::Submit(AxError::Dma(
+            "CH12 packet asks for no REC_ACK"
+        )))
+    );
+}
+
+#[test]
+fn a_done_wait_refuses_a_packet_that_asks_for_no_done_ack() {
+    let not_asked = Err(CommandError::Submit(AxError::Dma(
+        "CH12 packet asks for no DONE_ACK",
+    )));
+    let done = Wait::Done {
+        class: 0xA,
+        func: 1,
+        mask: 0xFF,
+    };
+    assert_eq!(refused_wait(5, true, false, done), not_asked);
+    assert_eq!(
+        refused_wait(5, true, false, Wait::Completed { mask: 0xFF }),
+        not_asked
+    );
+}
+
+fn completion_wait(buffers: Vec<Vec<u8>>) -> InSession<Result<u8, CommandError>> {
+    in_session(7, scripted(buffers), &mut |s, io, sink| {
+        let packet = s.h2c.packet_with(1, 6, 0, false, true, &[0; 60]);
+        // SAFETY: as in `send_drains_rxq_after_the_submit`.
+        unsafe { s.send_and_wait_for(io, packet, Wait::Completed { mask: 0xFF }, sink) }
+    })
+}
+
+#[test]
+fn a_completion_wait_matches_its_own_seq() {
+    // A late DONE_ACK of an earlier address CAM (seq 3), which
+    // `Wait::Done` would take as `rtw89_complete_cond` does, and this H2C's
+    // own REC_ACK do not end it.
+    let r = completion_wait(vec![
+        firmware::done_ack(6, 0, 3, 0),
+        firmware::rec_ack(6, 0, 7),
+        firmware::done_ack(9, 0, 7, 0),
+    ]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Wait(AxError::NoAck {
+            class: 6,
+            func: 0,
+            seq: 7,
+            other_c2h: 0,
+            unmatched_ack: 2,
+            skipped: 0,
+            rxq_hw: 3,
+        }))
+    );
+    assert!(r.elapsed >= 100_000, "elapsed {}", r.elapsed);
+    assert_eq!((r.ledger.done_acks, r.ledger.refused), (2, None));
+    // Its own DONE_ACK ends it, after the late one.
+    let r = completion_wait(vec![
+        firmware::done_ack(6, 0, 3, 0),
+        firmware::done_ack(6, 0, 7, 0),
+    ]);
+    assert_eq!(r.got, Ok(7));
+    assert!(r.elapsed < 100_000, "elapsed {}", r.elapsed);
+    // A non-zero return fails it; that DONE_ACK was consumed, while a late
+    // one's refusal is the ledger's.
+    let r = completion_wait(vec![
+        firmware::done_ack(6, 0, 3, 2),
+        firmware::done_ack(6, 0, 7, 1),
+    ]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Submit(AxError::H2cRejected {
+            class: 6,
+            func: 0,
+            seq: 7,
+            ret: 1
+        }))
+    );
+    assert_eq!(
+        r.ledger.refused,
+        Some(Refused {
+            class: 6,
+            func: 0,
+            seq: 3,
+            ret: 2
+        })
+    );
+}

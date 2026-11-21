@@ -145,7 +145,7 @@ fn ra_info_counts_streams_and_masks_rates_as_linux_does() {
         ra(peer(0xF, Some(HT_2SS)), HwBand::G2),
         [0x01B0_000A, 0xFF0F_F005, 0, 0]
     );
-    // mac80211 counts the non-zero RX mask bytes (sta_info.c:3528-3537), so
+    // mac80211 counts the non-zero RX mask bytes (sta_info.c:3570-3579), so
     // MCS 0-7 and 16-23 make two streams, and the third stream's rates go
     // (tx_nss 2). LDPC b22, no SGI, no STBC.
     let gap = HtPeer {
@@ -402,7 +402,7 @@ fn set_bssid_sends_the_pre_auth_cam_then_suspends_dig() {
     assert_eq!(got, Ok(()));
     // Spec S9.2: the BSSID's address CAM (BSS_CHANGED_BSSID, mac80211.c:
     // 771-776), then sta_add's DIG suspend (core.c:5772), as mac80211 tells
-    // the BSSID before it inserts the AP's station (mlme.c:9721-9737).
+    // the BSSID before it inserts the AP's station (mlme.c:9773-9789).
     assert_eq!(
         ran.packets,
         [H2c::at(17)
@@ -449,11 +449,11 @@ fn associate_runs_linux_order() {
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(17);
     // mac80211 programs the AP's WMM parameters from the association response
-    // first (ieee80211_assoc_config_link, mlme.c:6257, conf_tx for VO, VI,
-    // BE, BK, mlme.c:4096-4116), with the long slot it reset at the last
+    // first (ieee80211_assoc_config_link, mlme.c:6310, conf_tx for VO, VI,
+    // BE, BK, mlme.c:4094-4114), with the long slot it reset at the last
     // disassociation; then BSS_CHANGED_ASSOC: rtw89_core_sta_link_assoc
     // (core.c:5878-5979) and the port update (mac80211.c:678-697); then
-    // BSS_CHANGED_ERP_SLOT on the same notify (mlme.c:4325-4328,
+    // BSS_CHANGED_ERP_SLOT on the same notify (mlme.c:4323-4326,
     // mac80211.c:781-782): conf_tx again with the short slot.
     let mut want = edcas(&mut b, &wmm(), false, HwBand::G5);
     want.push(b.assoc_cmac_tbl(0, 0, HwBand::G5).1);
@@ -531,7 +531,7 @@ fn associate_on_2g_with_the_long_slot_sends_edca_once() {
 
 #[test]
 fn associate_on_5g_takes_the_short_slot_mac80211_forces() {
-    // ieee80211_handle_bss_capability (mlme.c:4310-4313): 5 GHz is always
+    // ieee80211_handle_bss_capability (mlme.c:4308-4311): 5 GHz is always
     // the short slot, whatever the AP's capability says.
     let a = AssocInputs {
         short_slot: false,
@@ -549,7 +549,7 @@ fn associate_on_5g_takes_the_short_slot_mac80211_forces() {
 #[test]
 fn associate_without_wmm_sends_the_qos_defaults() {
     // mac80211 still enables QoS without WMM ("we might have HT/VHT",
-    // mlme.c:6255-6270): ieee80211_set_wmm_default(.., true) hands
+    // mlme.c:6308-6323): ieee80211_set_wmm_default(.., true) hands
     // conf_tx 802.11's defaults, then the short slot sends them again. An
     // old firmware gets no beacon filter.
     let a = AssocInputs {
@@ -607,7 +607,7 @@ fn qos_defaults_are_set_wmm_defaults_with_qos() {
 
 #[test]
 fn an_invalid_edca_set_falls_back_to_the_qos_defaults() {
-    // _ieee80211_sta_wmm_params (mlme.c:4218-4247): CWmin 0, CWmin above
+    // _ieee80211_sta_wmm_params (mlme.c:4214-4245): CWmin 0, CWmin above
     // CWmax, or an AC missing (here out of ACI order) is "using defaults";
     // an AIFSN under 2 is taken as 2.
     let w = wmm();
@@ -671,11 +671,11 @@ fn leave_runs_linux_order() {
     let a = inputs(HwBand::G5);
     // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
     let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-        leave(io, s, &a, FULL, sink)
+        leave(io, s, &a, FULL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(31);
-    // mac80211's teardown (ieee80211_set_disassoc, mlme.c:4508-4720): the
+    // mac80211's teardown (ieee80211_set_disassoc, mlme.c:4506-4718): the
     // station's ASSOC -> AUTH (core.c:5799-5816: the beacon filter off),
     // AUTH -> NONE (core.c:5818-5859: the beamformee off, the CMAC table,
     // join disconnect, the CAM with NO_LINK), NONE -> NOTEXIST (nothing on
@@ -744,7 +744,7 @@ fn leave_runs_linux_order() {
 #[test]
 fn leave_takes_the_defaults_of_the_bss_it_left() {
     // ieee80211_set_wmm_default without QoS: CWmin 31 on an 11b-only 2.4 GHz
-    // BSS (no rate above 11 Mbps, mlme.c:6352-6353), else 15; AIFSN 2;
+    // BSS (no rate above 11 Mbps, mlme.c:6405-6406), else 15; AIFSN 2;
     // CWmax 1023; the long slot.
     for (legacy, word) in [
         (0xF, 0x0000_A532),
@@ -756,7 +756,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
         a.peer.ht = None;
         // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
         let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-            leave(io, s, &a, FULL, sink)
+            leave(io, s, &a, FULL, CamKeys::default(), sink)
         });
         assert_eq!(got, Ok(()));
         assert_eq!(ran.packets.len(), 13);
@@ -777,7 +777,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
     };
     // SAFETY: as above.
     let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-        leave(io, s, &a, old, sink)
+        leave(io, s, &a, old, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(31);
@@ -802,10 +802,51 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
 fn clear_bssid_sends_the_unassociated_cam() {
     // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
     let (got, ran) = on_session(18, &|_| {}, |io, s, sink| unsafe {
-        clear_bssid(io, s, LOCAL, sink)
+        clear_bssid(io, s, LOCAL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     assert_eq!(ran.packets, [H2c::at(18).addr_cam(LOCAL, 0, 0).1]);
     // DIG stays as it was: Linux resumes it only at association.
     assert!(!ran.io.trace.iter().any(|o| matches!(o, Op::R32(0x1481C))));
+}
+
+#[test]
+fn leave_carries_the_address_cams_key_fields() {
+    // rtw89_cam_fill_addr_cam_info (cam.c:906-927) reads the vif's address
+    // CAM entry, whose key IDs and entries a key delete leaves in place
+    // with only the valid map cleared (cam.c:215-246): the leave's CAM with
+    // NO_LINK and its CAM without the BSSID both carry them.
+    let stale = CamKeys {
+        keyids: 0x0040_0000,
+        valid_and_ents: 0x0100_0000,
+        ents_hi: 0,
+    };
+    let a = inputs(HwBand::G5);
+    // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
+    let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
+        leave(io, s, &a, FULL, stale, sink)
+    });
+    assert_eq!(got, Ok(()));
+    let mut b = H2c::at(34);
+    let unlinked = AddrCam {
+        keys: stale,
+        ..AddrCam::with_bssid(LOCAL, AP)
+    };
+    let cleared = AddrCam {
+        keys: stale,
+        ..AddrCam::unassociated(LOCAL)
+    };
+    assert_eq!(ran.packets[3], b.addr_cam_with(&unlinked, 0, 0).1);
+    assert_eq!(ran.packets[4], b.addr_cam_with(&cleared, 0, 0).1);
+    // w9: SEC_ENT_MODE NORMAL and SEC_ENT2_KEYID 1; w10: SEC_ENT2 1, no
+    // valid slot.
+    assert_eq!(payload_word(&ran.packets[3], 9), 0x0042_0000);
+    assert_eq!(payload_word(&ran.packets[4], 10), 0x0100_0000);
+    // The auth-only teardown's disconnect carries them too.
+    // SAFETY: as above.
+    let (got, ran) = on_session(18, &|_| {}, |io, s, sink| unsafe {
+        disconnect(io, s, LOCAL, AP, HwBand::G5, stale, sink)
+    });
+    assert_eq!(got, Ok(()));
+    assert_eq!(ran.packets[2], H2c::at(20).addr_cam_with(&unlinked, 0, 0).1);
 }

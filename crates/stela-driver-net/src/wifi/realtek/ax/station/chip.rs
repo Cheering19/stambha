@@ -17,7 +17,8 @@
 //! `BSS_CHANGED_ASSOC` ([`Chip::associate`]), the
 //! station's way down to NOTEXIST and the channel context's release
 //! ([`Chip::disassociate`]), `rtw89_ops_set_key` ([`Chip::add_key`],
-//! [`Chip::remove_key`]) and `rtw89_ops_ampdu_action`'s RX half
+//! [`Chip::remove_key`]), `rtw89_ops_flush` ([`Chip::flush`]) and
+//! `rtw89_ops_ampdu_action`'s RX half
 //! ([`Chip::start_rx_block_ack`], [`Chip::stop_rx_block_ack`]).
 //!
 //! The trait grants nothing by itself: a call's success is what its
@@ -72,7 +73,8 @@ pub enum Incoming {
     ScanEnded {
         completed: bool,
     },
-    /// The firmware reported the associated AP's beacons lost.
+    /// The firmware reported the associated AP's beacons lost, while no
+    /// scan ran (M3 spec S15).
     BeaconLost,
 }
 
@@ -164,8 +166,17 @@ pub trait Chip {
     /// Install a key; its security CAM entry (M3 spec S12).
     fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, String>;
     fn remove_key(&mut self, cam: u8) -> Result<(), String>;
-    /// Accept an RX Block Ack agreement for `tid` from `ssn` (M3 spec S13.2).
-    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16) -> Result<(), String>;
+    /// mac80211's `drv_flush`: wait for the frames the chip took to leave
+    /// its TX rings, then with `drop` drop what it still queues for the AP,
+    /// or without it wait for its TX queues to empty. Neither wait fails
+    /// for time, as Linux's only log theirs; nothing is reported for a
+    /// dropped frame beyond its release report, if any.
+    fn flush(&mut self, drop: bool) -> Result<(), String>;
+    /// Program the AP's RX Block Ack agreement on `tid` from `ssn` with a
+    /// window of `window` (M3 spec S13.2), mac80211's
+    /// `IEEE80211_AMPDU_RX_START`. The host reorders what it delivers.
+    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String>;
+    /// End the agreement on `tid`, `IEEE80211_AMPDU_RX_STOP`.
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String>;
     /// The chip's own counts, naming no address.
     fn diagnostic(&self) -> String;

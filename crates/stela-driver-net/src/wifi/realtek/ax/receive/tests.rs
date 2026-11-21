@@ -213,6 +213,10 @@ fn matched_beacon_gets_signal_and_chains() {
             gi_ltf: 0,
             bw: 0,
             free_run: 0x1234_5678,
+            hw_dec: false,
+            a1_match: false,
+            mac_id: 0,
+            sec_type: 0,
         })]
     );
     assert_eq!(rx.counts.ppdu, 1);
@@ -1054,6 +1058,10 @@ fn station_mode_delivers_auth_and_data_at_once() {
             gi_ltf: 0,
             bw: 0,
             free_run: 0x1234_5678,
+            hw_dec: false,
+            a1_match: false,
+            mac_id: 0,
+            sec_type: 0,
         })]
     );
     let data_frame = frame(0x08, 2);
@@ -1446,4 +1454,44 @@ fn station_mode_never_panics_on_any_truncation() {
             }
         }
     }
+}
+
+#[test]
+fn station_frames_carry_what_the_pn_check_reads() {
+    // rtw89_core_skb_pn_valid reads HW_DEC and A1_MATCH (d3 b2, b0), and of
+    // a long descriptor the MAC ID (d5 [23:16]) and the security type (d7
+    // [20:17]).
+    let mut rx = station(G2_1);
+    let mut b = rx_buffer(
+        &Desc {
+            d3: HW_DEC | 1,
+            ..data(1)
+        },
+        &frame(0x88, 1),
+    );
+    b[24..28].copy_from_slice(&0x0012_0000u32.to_le_bytes());
+    b[32..36].copy_from_slice(&(6u32 << 17).to_le_bytes());
+    let seen = feed(&mut rx, &[b]);
+    let f = frames(&seen);
+    assert_eq!(
+        (f[0].hw_dec, f[0].a1_match, f[0].mac_id, f[0].sec_type),
+        (true, true, 0x12, 6)
+    );
+    assert!(f[0].decrypted);
+    // SW_DEC: decrypted on the host, yet HW_DEC as the descriptor has it.
+    let seen = feed(
+        &mut rx,
+        &[rx_buffer(
+            &Desc {
+                d3: HW_DEC | SW_DEC,
+                ..data(1)
+            },
+            &frame(0x88, 2),
+        )],
+    );
+    let f = frames(&seen);
+    assert_eq!(
+        (f[0].hw_dec, f[0].decrypted, f[0].a1_match),
+        (true, false, false)
+    );
 }

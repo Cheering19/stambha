@@ -99,6 +99,8 @@ fn long_descriptor_fields_decode() {
             crc32_err: true,
             icv_err: false,
             frame_type: Some(0),
+            mac_id: 0,
+            sec_type: 0,
         }
     );
     assert_eq!(f.payload.as_ptr(), b[36..].as_ptr());
@@ -142,6 +144,8 @@ fn all_ones_long_descriptor_reads_every_field_at_its_maximum() {
             crc32_err: true,
             icv_err: true,
             frame_type: Some(3),
+            mac_id: 0,
+            sec_type: 0,
         }
     );
     assert_eq!(f.pkt_type, 15);
@@ -196,4 +200,29 @@ fn every_truncation_and_every_descriptor_never_panics() {
             let _ = parse(&buf(FS_LS | u32::from(w), d0, 20));
         }
     }
+}
+
+#[test]
+fn long_descriptor_mac_id_is_d5_and_sec_type_d7() {
+    // AX_RXD_MAC_ID_MASK d5 [23:16] and AX_RXD_SEC_TYPE_MASK d7 [20:17]
+    // (txrx.h:412, :424), each at its maximum and alone.
+    let mut b = all_ones_long(0);
+    put(&mut b, 24, 0x00FF_0000);
+    put(&mut b, 32, 0x001E_0000);
+    let Ok(RxBuffer::Frame(f)) = parse(&b) else {
+        panic!()
+    };
+    assert_eq!((f.desc.mac_id, f.desc.sec_type), (0xFF, 0xF));
+    put(&mut b, 24, !0x00FF_0000);
+    put(&mut b, 32, !0x001E_0000);
+    let Ok(RxBuffer::Frame(f)) = parse(&b) else {
+        panic!()
+    };
+    assert_eq!((f.desc.mac_id, f.desc.sec_type), (0, 0));
+    put(&mut b, 24, 0x0012_0000);
+    put(&mut b, 32, 6 << 17);
+    let Ok(RxBuffer::Frame(f)) = parse(&b) else {
+        panic!()
+    };
+    assert_eq!((f.desc.mac_id, f.desc.sec_type), (0x12, 6));
 }

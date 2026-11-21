@@ -550,3 +550,68 @@ fn data_refuses_keys_the_descriptor_cannot_carry() {
     assert_eq!(w[4..6], [0xFFFF_0000, 0xFFFF_FFFF]);
     assert_eq!(w[info(2)], 0x0000_017F);
 }
+
+#[test]
+fn strip_refuses_an_unprotected_frame() {
+    // Its 8 bytes after the header are plaintext, even when they read as
+    // the reservation's header.
+    let mut mpdu = frame(DATA, AP, 0x456, &PN_HEADER);
+    mpdu.extend_from_slice(&PLAINTEXT);
+    let before = mpdu.clone();
+    assert_eq!(
+        strip_ccmp(&mut mpdu, PN, 0),
+        Err(AxError::Tx("not a protected frame"))
+    );
+    assert_eq!(mpdu, before);
+}
+
+#[test]
+fn data_takes_the_tid_its_frame_carries() {
+    const OTHER: Result<(TxChannel, [u8; WD_HEAD_BYTES]), AxError> =
+        Err(AxError::Tx("a TID other than the frame's own"));
+    // skb->priority's TID is the QoS control's (ieee80211_set_qos_hdr).
+    let f = qos(QOS, 5, 1, &PLAINTEXT);
+    let (ch, _) = data(&f, 5, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+    assert_eq!(ch, TxChannel::Ach2);
+    assert_eq!(data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    assert_eq!(data(&f, 6, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    // A frame without QoS goes at priority 0 (__ieee80211_select_queue):
+    // TID 8 is TID 0, best effort on ACH0; TID 7 is not its own.
+    let f = frame(DATA, AP, 1, &PLAINTEXT);
+    let (ch, head) = data(&f, 8, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+    assert_eq!(ch, TxChannel::Ach0);
+    assert_eq!(words(&head)[2] & 0x00FE_0000, 0);
+    assert_eq!(data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    // The QoS control's TID field is four bits: a TSPEC TID 15 is no TID 7.
+    let f = qos(QOS, 15, 1, &PLAINTEXT);
+    assert_eq!(data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+}
+
+#[test]
+fn eapol_under_the_ptk_matches_linux() {
+    // A group handshake's message 2 under the PTK, as the strip leaves it:
+    // VO with BK and the TID indication, and the key's dwords.
+    let f = qos(QOS_PROTECTED, 7, 0x123, &EAPOL_BODY);
+    let len = f.len() as u32;
+    let (ch, head) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, sec(0, 0, PN)).unwrap();
+    assert_eq!(ch, TxChannel::Ach3);
+    assert_eq!(
+        words(&head),
+        [
+            0x0143_6880,       // B0: WP_OFFSET 1, WD_INFO_EN, ACH3, HDR_LLC_LEN 13
+            0x0400_0006,       // B1: ADDR_INFO_NUM 1, SEC_TYPE CCMP128
+            0x0086_0000 | len, // B2: TID_INDICATE, QSEL VO_0
+            0x2000 | 0x123,    // B3: BK, SW_SEQ
+            0x0201_0000,       // B4: PN1, PN0
+            0x0605_0403,       // B5: PN5..PN2
+            0,
+            0,
+            0,
+            0,
+            0x0000_0100, // I2: FORCE_KEY_EN, SEC_CAM_IDX 0
+            0,
+            0x8800_0000,
+            0,
+        ]
+    );
+}

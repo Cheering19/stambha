@@ -21,16 +21,18 @@
 //! and frames are taken in RXQ order whatever wait is running, and none is
 //! dropped. Its acks are decoded as `rtw89_mac_c2h_rec_ack` and
 //! `rtw89_mac_c2h_done_ack` do (`mac.c:5459-5554`).
-//! [`Session::send_and_wait_for`] waits for one of two things ([`Wait`]):
+//! [`Session::send_and_wait_for`] waits for one of three things ([`Wait`]),
+//! each only for a packet whose header asks for that ack:
 //!
 //! - a DONE_ACK matched on cat, class and func but not seq, as Linux's
 //!   `rtw89_complete_cond` does for ADD_SCANOFLD_CH and SCANOFLD (M2c spec
-//!   S1.13); [`Session::send_and_wait`] is that wait on FW_OFLD. The same
-//!   wait on another class (the address CAM's, M3 spec S12.5) is Stela's
-//!   own: Linux waits for no other DONE_ACK.
+//!   S1.13); [`Session::send_and_wait`] is that wait on FW_OFLD.
 //! - the H2C's REC_ACK, matched on cat, class, func and seq (M3 spec S1.12,
-//!   S12.5). Also Stela's own: Linux's REC_ACK handler only counts SCANOFLD
+//!   S12.5). Stela's own: Linux's REC_ACK handler only counts SCANOFLD
 //!   receipts (`mac.c:5459-5492`).
+//! - the H2C's DONE_ACK, matched on cat, class, func and seq: the address
+//!   CAM's in a key install (M3 spec S12.5). Also Stela's own: Linux waits
+//!   for no other DONE_ACK.
 //!
 //! Every other DONE_ACK, which Linux ignores, is recorded in the [`Ledger`],
 //! the first non-zero return as its refusal (M2c spec S1.14).
@@ -40,7 +42,9 @@
 //! its caller built) and no DMA beyond the contracts of `Ch12::submit` and
 //! `Rxq::poll`.
 use super::c2h::{self, C2h};
-use super::h2c::{H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, H2c};
+use super::h2c::{
+    H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, H2C_HDR_DONE_ACK, H2C_HDR_REC_ACK, H2c,
+};
 use super::io::{AxError, AxIo, poll_sample};
 use super::pci::Rings;
 use super::receive::{Event, Receiver, Tag};
@@ -316,6 +320,13 @@ pub enum Wait {
     /// The REC_ACK naming the packet itself: the cat, class and func of its
     /// FWCMD header and its seq.
     Received,
+    /// The DONE_ACK naming the packet itself, as [`Wait::Received`] names
+    /// it, failing as [`Wait::Done`] does on `ret & mask`. Stela's own, for
+    /// a key install's address CAM (M3 spec S12.5): the address CAM H2Cs
+    /// sent before it without a wait share its class and func, and a late
+    /// DONE_ACK of one, which [`Wait::Done`] would take, cannot complete a
+    /// key the firmware never acknowledged.
+    Completed { mask: u8 },
 }
 
 /// The ack a running [`Session::send_and_wait_for`] waits for, and what
@@ -324,8 +335,11 @@ struct Awaited {
     cat: u8,
     class: u8,
     func: u8,
-    /// `Some` for a REC_ACK wait: the seq it must name.
-    receipt: Option<u8>,
+    /// The seq the ack must name: `Some` for [`Wait::Received`] and
+    /// [`Wait::Completed`], `None` for [`Wait::Done`].
+    seq: Option<u8>,
+    /// A REC_ACK ends the wait ([`Wait::Received`]); otherwise a DONE_ACK.
+    receipt: bool,
     /// The waited-for ack, once it arrived: a DONE_ACK's raw `H2C_RETURN`,
     /// or 0 for a REC_ACK.
     met: Option<u8>,
@@ -337,23 +351,26 @@ struct Awaited {
 
 impl Awaited {
     /// Whether an ack names the awaited H2C: its cat, class and func, and
-    /// for a REC_ACK wait its seq. A REC_ACK naming the H2C a DONE_ACK wait
-    /// waits for is that H2C's own receipt, so it is not unmatched.
+    /// for a wait on the packet itself its seq. A REC_ACK naming the H2C a
+    /// DONE_ACK wait waits for is that H2C's own receipt, so it is not
+    /// unmatched.
     fn names(&self, cat: u8, class: u8, func: u8, seq: u8) -> bool {
-        (cat, class, func) == (self.cat, self.class, self.func)
-            && self.receipt.is_none_or(|s| s == seq)
+        (cat, class, func) == (self.cat, self.class, self.func) && self.seq.is_none_or(|s| s == seq)
     }
 }
 
 /// `H2C_HDR_CAT` [1:0], `H2C_HDR_CLASS` [7:2] and `H2C_HDR_FUNC` [15:8] of
-/// the FWCMD header after a CH12 packet's 16-byte descriptor
-/// (`fw.h:4673-4676`), as `H2c::packet_with` lays it out.
-fn h2c_header(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+/// the FWCMD header after a CH12 packet's 16-byte descriptor, and the
+/// header's second word with its REC_ACK (b14) and DONE_ACK (b15) requests
+/// (`fw.h:4673-4683`), as `H2c::packet_with` lays them out.
+fn h2c_header(bytes: &[u8]) -> Option<(u8, u8, u8, u32)> {
     let hdr0 = u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let hdr1 = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
     Some((
         (hdr0 & 0x3) as u8,
         ((hdr0 >> 2) & 0x3F) as u8,
         ((hdr0 >> 8) & 0xFF) as u8,
+        hdr1,
     ))
 }
 
@@ -388,7 +405,7 @@ fn account(
             if let Some(a) = awaited {
                 if !a.names(cat, class, func, seq) {
                     bump8(&mut a.unmatched_ack);
-                } else if a.receipt.is_some() && a.met.is_none() {
+                } else if a.receipt && a.met.is_none() {
                     a.met = Some(0);
                 }
             }
@@ -402,7 +419,7 @@ fn account(
         } => {
             bump(&mut ledger.done_acks);
             if let Some(a) = awaited {
-                if a.receipt.is_none() && a.met.is_none() && a.names(cat, class, func, seq) {
+                if !a.receipt && a.met.is_none() && a.names(cat, class, func, seq) {
                     a.met = Some(ret);
                     return;
                 }
@@ -628,17 +645,21 @@ impl<'r> Session<'r> {
     /// `ACK_WAIT_US` until what `wait` names arrives (M2c spec S1.13, M3
     /// spec S12.5). Returns the seq.
     ///
-    /// - [`Wait::Received`] for a packet too short for its FWCMD header:
-    ///   `Submit(Dma)`, before anything is sent.
+    /// - A packet too short for its FWCMD header, or whose header does not
+    ///   ask for the ack waited for (REC_ACK b14 for [`Wait::Received`],
+    ///   DONE_ACK b15 for the others), which could only run the wait out
+    ///   and look like a silent firmware: `Submit(Dma)`, before anything is
+    ///   sent.
     /// - The H2C not sent: `Submit` with the submit's error; RXQ untouched.
-    /// - [`Wait::Done`] and `ret & mask != 0`: `Submit(H2cRejected)` with
-    ///   the wait's class and func and the raw return. The wait consumed that
-    ///   DONE_ACK, so it never becomes the ledger's refusal.
+    /// - [`Wait::Done`] or [`Wait::Completed`] and `ret & mask != 0`:
+    ///   `Submit(H2cRejected)` with the class and func waited for and the
+    ///   raw return. The wait consumed that DONE_ACK, so it never becomes
+    ///   the ledger's refusal.
     /// - Nothing matching in time: `Wait(NoAck)` with the class and func
     ///   waited for, the C2Hs that were not acks, the unmatched acks and the
     ///   skipped buffers of this wait, and the last RXQ hardware index. A
-    ///   DONE_ACK never ends a [`Wait::Received`], nor a REC_ACK a
-    ///   [`Wait::Done`].
+    ///   DONE_ACK never ends a [`Wait::Received`], nor a REC_ACK the others,
+    ///   nor an ack of another seq [`Wait::Received`] or [`Wait::Completed`].
     /// - A drain or clock failure: `Wait` with it.
     ///
     /// Frames, scan reports and beacon filter reports drained meanwhile
@@ -654,19 +675,36 @@ impl<'r> Session<'r> {
         sink: &mut dyn FnMut(Event<'_>),
     ) -> Result<u8, CommandError> {
         let (seq, bytes) = packet;
-        let (cat, class, func, receipt, mask) = match wait {
-            Wait::Done { class, func, mask } => (H2C_CAT_MAC, class, func, None, mask),
+        let (h_cat, h_class, h_func, hdr1) = h2c_header(&bytes).ok_or(CommandError::Submit(
+            AxError::Dma("CH12 packet without an H2C header"),
+        ))?;
+        let asks = |bit: u32, missing: &'static str| {
+            if hdr1 & bit == 0 {
+                Err(CommandError::Submit(AxError::Dma(missing)))
+            } else {
+                Ok(())
+            }
+        };
+        const NO_DONE_ACK: &str = "CH12 packet asks for no DONE_ACK";
+        let (cat, class, func, seq_named, receipt, mask) = match wait {
+            Wait::Done { class, func, mask } => {
+                asks(H2C_HDR_DONE_ACK, NO_DONE_ACK)?;
+                (H2C_CAT_MAC, class, func, None, false, mask)
+            }
             Wait::Received => {
-                let (cat, class, func) = h2c_header(&bytes).ok_or(CommandError::Submit(
-                    AxError::Dma("CH12 packet without an H2C header"),
-                ))?;
-                (cat, class, func, Some(seq), 0)
+                asks(H2C_HDR_REC_ACK, "CH12 packet asks for no REC_ACK")?;
+                (h_cat, h_class, h_func, Some(seq), true, 0)
+            }
+            Wait::Completed { mask } => {
+                asks(H2C_HDR_DONE_ACK, NO_DONE_ACK)?;
+                (h_cat, h_class, h_func, Some(seq), false, mask)
             }
         };
         let fresh = || Awaited {
             cat,
             class,
             func,
+            seq: seq_named,
             receipt,
             met: None,
             other_c2h: 0,

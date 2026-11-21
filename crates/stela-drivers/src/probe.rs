@@ -75,8 +75,15 @@ pub enum Error {
     IntelWifi(net::wifi::intel::attach::AttachError),
     MediatekWifi(net::wifi::mediatek::attach::AttachError),
     RealtekWifi(net::wifi::realtek::attach::AttachError),
-    /// An RTL8852CE whose bring-up to running firmware failed.
+    /// An RTL8852CE whose bring-up to running firmware failed, at a step.
     Rtw89Wifi(net::wifi::realtek::ax::BringUpError),
+    /// An RTL8852CE that became no station for another reason: no
+    /// regulatory database, a country it lacks, or an address no station
+    /// can have.
+    Rtw89Station(net::wifi::realtek::ax::AttachError),
+    /// An RTL8852CE whose Bus Master could not be cleared again after its
+    /// attach failed, and why.
+    Rtw89BusMaster(Box<Error>),
     IntelBluetooth(crate::bluetooth::intel_pcie::Error),
     Bcm4377(crate::bluetooth::bcm4377::Error),
     Ehci(usb::ehci::Error),
@@ -111,6 +118,8 @@ impl fmt::Display for Error {
             Self::MediatekWifi(error) => write!(f, "mt76: {error}"),
             Self::RealtekWifi(error) => write!(f, "rtw88: {error}"),
             Self::Rtw89Wifi(error) => write!(f, "rtw89: {error}"),
+            Self::Rtw89Station(error) => write!(f, "rtw89: {error}"),
+            Self::Rtw89BusMaster(error) => write!(f, "rtw89: {RTW89_BUS_MASTER}: {error}"),
             Self::IntelBluetooth(error) => write!(f, "btintel_pcie: {error}"),
             Self::Bcm4377(error) => write!(f, "hci_bcm4377: {error}"),
             Self::Ehci(error) => write!(f, "EHCI: {error}"),
@@ -331,6 +340,8 @@ pub enum Adapter {
     IntelWifi(Box<native::Located<native::IntelWifi>>),
     MediatekWifi(Box<native::Located<native::MediatekWifi>>),
     RealtekWifi(Box<native::Located<native::RealtekWifi>>),
+    /// An RTL8852CE station (rtw89).
+    Rtw89Wifi(Box<native::Located<native::Rtw89Wifi>>),
 }
 
 impl Adapter {
@@ -351,6 +362,7 @@ impl Adapter {
             Self::IntelWifi(_) => "iwlwifi",
             Self::MediatekWifi(_) => "mt7925e",
             Self::RealtekWifi(_) => "rtw88_8822ce",
+            Self::Rtw89Wifi(_) => "rtw89",
             Self::UsbVendor(device) => device.driver(),
         }
     }
@@ -360,7 +372,7 @@ impl Adapter {
         match self {
             #[cfg(feature = "native-acpi")]
             Self::IntelWifi(_) => true,
-            Self::MediatekWifi(_) | Self::RealtekWifi(_) => true,
+            Self::MediatekWifi(_) | Self::RealtekWifi(_) | Self::Rtw89Wifi(_) => true,
             _ => false,
         }
     }
@@ -384,15 +396,19 @@ impl Adapter {
             Self::IntelWifi(device) => &device.location,
             Self::MediatekWifi(device) => &device.location,
             Self::RealtekWifi(device) => &device.location,
+            Self::Rtw89Wifi(device) => &device.location,
         }
     }
 }
 
 impl Link for Adapter {
-    /// The driver's own state line, where it keeps one (RTL8168 family).
+    /// The driver's own state line, where it keeps one: the RTL8168
+    /// family's registers, and an RTL8852CE station's progress (M3 spec
+    /// S14.6), which names no address.
     fn diagnostic(&mut self) -> Option<String> {
         match self {
             Self::Realtek(device) => device.diagnostic(),
+            Self::Rtw89Wifi(device) => device.diagnostic(),
             _ => None,
         }
     }
@@ -414,6 +430,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.mac(),
             Self::MediatekWifi(device) => device.mac(),
             Self::RealtekWifi(device) => device.mac(),
+            Self::Rtw89Wifi(device) => device.mac(),
         }
     }
     fn carrier(&mut self) -> bool {
@@ -434,6 +451,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.carrier(),
             Self::MediatekWifi(device) => device.carrier(),
             Self::RealtekWifi(device) => device.carrier(),
+            Self::Rtw89Wifi(device) => device.carrier(),
         }
     }
     fn carrier_wait_us(&self) -> u64 {
@@ -454,6 +472,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.carrier_wait_us(),
             Self::MediatekWifi(device) => device.carrier_wait_us(),
             Self::RealtekWifi(device) => device.carrier_wait_us(),
+            Self::Rtw89Wifi(device) => device.carrier_wait_us(),
         }
     }
     fn signals(&self) -> bool {
@@ -474,6 +493,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.signals(),
             Self::MediatekWifi(device) => device.signals(),
             Self::RealtekWifi(device) => device.signals(),
+            Self::Rtw89Wifi(device) => device.signals(),
         }
     }
     fn retarget(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
@@ -488,6 +508,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.due_us(),
             Self::MediatekWifi(device) => device.due_us(),
             Self::RealtekWifi(device) => device.due_us(),
+            Self::Rtw89Wifi(device) => device.due_us(),
             _ => None,
         }
     }
@@ -509,6 +530,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.transmit(frame),
             Self::MediatekWifi(device) => device.transmit(frame),
             Self::RealtekWifi(device) => device.transmit(frame),
+            Self::Rtw89Wifi(device) => device.transmit(frame),
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
@@ -529,6 +551,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.receive(),
             Self::MediatekWifi(device) => device.receive(),
             Self::RealtekWifi(device) => device.receive(),
+            Self::Rtw89Wifi(device) => device.receive(),
         }
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
@@ -549,6 +572,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.receive_reusing(frame),
             Self::MediatekWifi(device) => device.receive_reusing(frame),
             Self::RealtekWifi(device) => device.receive_reusing(frame),
+            Self::Rtw89Wifi(device) => device.receive_reusing(frame),
         }
     }
 }
@@ -927,33 +951,51 @@ const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again afte
 /// Why a Wi-Fi adapter is left alone.
 const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
 
-/// What an RTL8852CE whose firmware ran is, as no network link.
-const RTW89_VERIFIED: &str = "RTL8852CE firmware verified; no station driver yet";
-
 /// Said when an RTL8852CE's MAC was found powered on.
 const RTW89_WAS_ON: &str =
     "RTL8852CE: its MAC was left powered on; Stela powered it off before taking the device over";
 
-/// Record an RTL8852CE whose firmware ran. It is powered off again and runs
-/// no station, so it joins no links: like the other functions found but not
-/// driven to a device, it is listed with why, and its running firmware is
-/// reported. Its requester, domain, BAR2 and rings stay kept.
-fn rtw89_started(devices: &mut Devices, address: Address, class: [u8; 3], up: native::Rtw89Up) {
-    if up.was_on {
+/// Said, with why, of an RTL8852CE whose Bus Master stayed set after its
+/// attach failed.
+const RTW89_BUS_MASTER: &str = "RTL8852CE: Bus Master could not be cleared after the failure";
+
+/// Record an RTL8852CE whose station runs (M3 spec S16.2): it joins the
+/// links as a Wi-Fi adapter, its running firmware is reported, and its
+/// requester and domain stay kept.
+fn rtw89_started(devices: &mut Devices, address: Address, up: native::Rtw89Up) {
+    let native::Rtw89Up {
+        station,
+        running,
+        was_on,
+        kept,
+    } = up;
+    rtw89_reported(devices, address, was_on, &running);
+    devices.nics.push(Adapter::Rtw89Wifi(Box::new(station)));
+    devices.owners.push(kept);
+}
+
+/// The warnings of an RTL8852CE whose station runs: whether its MAC had
+/// been left on and was powered off first, then what its firmware runs.
+fn rtw89_reported(
+    devices: &mut Devices,
+    address: Address,
+    was_on: bool,
+    running: &net::wifi::realtek::ax::Running,
+) {
+    if was_on {
         devices
             .warnings
             .push((address, Warning::Message(RTW89_WAS_ON)));
     }
     devices
         .warnings
-        .push((address, Warning::Text(alloc::format!("{}", up.running))));
-    devices.unsupported.push((address, class, RTW89_VERIFIED));
-    devices.owners.push(up.kept);
+        .push((address, Warning::Text(alloc::format!("{running}"))));
 }
 
-/// Record an RTL8852CE whose bring-up failed: whether its MAC had been left
-/// on and was powered off, as on success, then the failure. Whatever it
-/// claimed stays kept.
+/// Record an RTL8852CE whose station attach failed: whether its MAC had been
+/// left on and was powered off, as on success, then the failure, then
+/// whether its Bus Master could not be cleared again. Whatever it claimed
+/// stays kept.
 fn rtw89_failed(devices: &mut Devices, address: Address, down: native::Rtw89Down) {
     if down.was_on {
         devices
@@ -961,6 +1003,11 @@ fn rtw89_failed(devices: &mut Devices, address: Address, down: native::Rtw89Down
             .push((address, Warning::Message(RTW89_WAS_ON)));
     }
     devices.failures.push((address, down.error));
+    if let Some(error) = down.bus_master {
+        devices
+            .failures
+            .push((address, Error::Rtw89BusMaster(Box::new(error))));
+    }
     devices.owners.extend(down.kept);
 }
 
@@ -1110,7 +1157,9 @@ impl Devices {
             Error::IntelWifi(_)
             | Error::MediatekWifi(_)
             | Error::RealtekWifi(_)
-            | Error::Rtw89Wifi(_) => "Wi-Fi",
+            | Error::Rtw89Wifi(_)
+            | Error::Rtw89Station(_)
+            | Error::Rtw89BusMaster(_) => "Wi-Fi",
             Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
             Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
             Error::Ehci(_) => "USB",
@@ -1328,6 +1377,8 @@ fn plain(error: &Error) -> impl fmt::Display + '_ {
                 Error::MediatekWifi(error) => error.fmt(f),
                 Error::RealtekWifi(error) => error.fmt(f),
                 Error::Rtw89Wifi(error) => error.fmt(f),
+                Error::Rtw89Station(error) => error.fmt(f),
+                Error::Rtw89BusMaster(error) => write!(f, "{RTW89_BUS_MASTER}: {error}"),
                 error => error.fmt(f),
             }
         }
@@ -1556,6 +1607,58 @@ unsafe fn realtek_wifi(
     };
     // SAFETY: forwarded from the caller.
     unsafe { native::realtek_wifi(services, address, completion, inputs) }
+}
+
+/// Attach the RTL8852CE at `address` as a station for `wifi.network`, once
+/// the regulatory database loaded and holds the network's country (or the
+/// world's `00`), and the mount gave entropy for its handshakes: each is
+/// refused before the function is claimed, as rtw88's are.
+///
+/// # Safety
+/// As for [`intel_wifi`].
+#[allow(
+    clippy::result_large_err,
+    reason = "a failed attach hands back the owners that must outlive the device"
+)]
+unsafe fn rtw89_wifi(
+    services: &dyn NativeServices,
+    address: Address,
+    wifi: &WifiInputs<'_>,
+    regulatory: &Option<
+        Result<
+            crate::net::wifi::regulatory::database::Database,
+            crate::net::wifi::regulatory::database::LoadError,
+        >,
+    >,
+) -> Result<native::Rtw89Up, native::Rtw89Down> {
+    use net::wifi::realtek::ax::AttachError;
+    let untouched = |error| native::Rtw89Down::from((error, None));
+    let Some(Ok(database)) = regulatory else {
+        return Err(untouched(Error::Rtw89Station(
+            AttachError::NoRegulatoryDatabase,
+        )));
+    };
+    // The attach selects the country again, before any register access;
+    // here it is refused before the claim.
+    let alpha2 = wifi.network.country.unwrap_or(*b"00");
+    if let Err(error) = database.clone().select(alpha2) {
+        return Err(untouched(Error::Rtw89Station(AttachError::Country(
+            alpha2, error,
+        ))));
+    }
+    let entropy = services
+        .entropy()
+        .map_err(|error| untouched(Error::Native(error)))?;
+    let inputs = native::Rtw89Inputs {
+        firmware: wifi.firmware,
+        pages: services.pages(),
+        clock: wifi.clock,
+        database: database.clone(),
+        network: wifi.network.clone(),
+        entropy,
+    };
+    // SAFETY: forwarded from the caller.
+    unsafe { native::rtw89_wifi(services, address, inputs) }
 }
 
 /// Attach the Broadcom PCIe Bluetooth function at `address` with its
@@ -2788,14 +2891,9 @@ unsafe fn attach_native(
                     .push((address, function.class, NO_WIFI_NETWORK));
                 return;
             };
-            let rtw89 = native::Rtw89Inputs {
-                firmware: wifi.firmware,
-                pages: services.pages(),
-                clock: wifi.clock,
-            };
             // SAFETY: as for tg3 below.
-            match unsafe { native::rtw89_wifi(services, address, rtw89) } {
-                Ok(up) => rtw89_started(devices, address, function.class, up),
+            match unsafe { rtw89_wifi(services, address, wifi, &devices.regulatory) } {
+                Ok(up) => rtw89_started(devices, address, up),
                 Err(down) => rtw89_failed(devices, address, down),
             }
             return;
@@ -4175,6 +4273,73 @@ mod tests {
         services: &services::tests::Refusing,
         network: Option<&Network>,
     ) -> Devices {
+        probe_rtl8852ce_with(ecam, services, network, None)
+    }
+
+    /// wireless-regdb's version-20 database holding the world's `00` and
+    /// `US`, each with one rule, 2.4 GHz channels 1-13 at 20 dBm, as
+    /// `regulatory::database` parses it.
+    fn regulatory_db() -> Vec<u8> {
+        let countries = [*b"00", *b"US"];
+        let mut bytes = Vec::from(*b"RGDB");
+        bytes.extend(20u32.to_be_bytes());
+        let table = bytes.len();
+        bytes.resize(table + (countries.len() + 1) * 4, 0);
+        for (index, alpha2) in countries.iter().enumerate() {
+            let collection = bytes.len();
+            bytes[table + index * 4..table + index * 4 + 2].copy_from_slice(alpha2);
+            bytes[table + index * 4 + 2..table + index * 4 + 4]
+                .copy_from_slice(&((collection / 4) as u16).to_be_bytes());
+            bytes.extend([3, 1, 0, 0]);
+            let pointers = bytes.len();
+            bytes.resize((pointers + 2).next_multiple_of(4), 0);
+            let at = bytes.len();
+            bytes[pointers..pointers + 2].copy_from_slice(&((at / 4) as u16).to_be_bytes());
+            bytes.extend([16, 0]);
+            bytes.extend(2000u16.to_be_bytes());
+            bytes.extend(2_402_000u32.to_be_bytes());
+            bytes.extend(2_482_000u32.to_be_bytes());
+            bytes.extend(80_000u32.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// [`regulatory_db`], parsed.
+    pub(super) fn regulatory_database() -> crate::net::wifi::regulatory::database::Database {
+        let bytes = regulatory_db();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        crate::net::wifi::regulatory::database::Database::parse(Arc::from(bytes), digest).unwrap()
+    }
+
+    /// A handoff catalog holding [`regulatory_db`] as regulatory.db.
+    fn regulatory_catalog() -> Arc<Catalog> {
+        let bytes = regulatory_db();
+        let requirement = crate::net::wifi::regulatory::database::REQUIREMENT;
+        Arc::new(
+            Catalog::from_handoff(vec![Resource {
+                name: requirement.name,
+                target: requirement.target,
+                provenance: Provenance {
+                    source: "synthetic-fixtures",
+                    revision: "v1",
+                    member: "fixtures/regulatory.db",
+                    license: "ISC",
+                },
+                expected_length: bytes.len(),
+                expected_sha256: Sha256::digest(&bytes).into(),
+                bytes,
+            }])
+            .unwrap(),
+        )
+    }
+
+    /// [`probe_rtl8852ce`] with `catalog` as the handoff's firmware.
+    fn probe_rtl8852ce_with(
+        ecam: &mut [u32],
+        services: &services::tests::Refusing,
+        network: Option<&Network>,
+        catalog: Option<Arc<Catalog>>,
+    ) -> Devices {
         let window = EcamWindow {
             base: ecam.as_mut_ptr() as u64,
             segment: 0,
@@ -4188,7 +4353,7 @@ mod tests {
             clock: Clock {
                 ticks_per_microsecond: 1,
             },
-            firmware: None,
+            firmware: catalog,
             completion: None,
             network: None,
         };
@@ -4209,8 +4374,8 @@ mod tests {
     }
 
     /// Without `--wifi` an RTL8852CE is listed as staying off and is never
-    /// claimed, its configuration space untouched; with one, its bring-up
-    /// starts with the claim.
+    /// claimed, its configuration space untouched; with one, regulatory.db
+    /// and entropy, its station's attach starts with the claim.
     #[test]
     fn rtw89_without_wifi_network_is_unsupported_not_touched() {
         let address = Address {
@@ -4238,8 +4403,13 @@ mod tests {
             country: None,
         };
         let mut ecam = rtl8852ce_ecam();
-        let services = services::tests::Refusing::minimum_only();
-        let devices = probe_rtl8852ce(&mut ecam, &services, Some(&network));
+        let services = services::tests::Refusing::minimum_and_entropy();
+        let devices = probe_rtl8852ce_with(
+            &mut ecam,
+            &services,
+            Some(&network),
+            Some(regulatory_catalog()),
+        );
         assert!(devices.unsupported.is_empty(), "{:?}", devices.unsupported);
         assert_eq!(*services.preparations.borrow(), [address]);
         assert!(matches!(
@@ -4249,45 +4419,107 @@ mod tests {
         assert_eq!(devices.subsystem(address, &devices.failures[0].1), "Wi-Fi");
     }
 
-    /// An RTL8852CE whose firmware ran, left on by firmware, is reported by
-    /// its firmware and why it is no link, and its owner is kept.
+    /// With `--wifi`, an RTL8852CE is refused untouched, never claimed and
+    /// its configuration space as found, when regulatory.db is missing, as
+    /// rtw88's is (M3 spec S16.2), when the network's country is not in it,
+    /// and when no entropy is there for the handshake.
     #[test]
-    fn an_rtl8852ce_whose_firmware_ran_is_accounted_for_plainly() {
+    fn rtw89_without_regulatory_database_fails_untouched() {
+        use net::wifi::realtek::ax::AttachError;
+        let address = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let network = |country| Network {
+            ssid: b"test".to_vec(),
+            secret: crate::net::wifi::network::Secret::parse(&[b'0'; 64]).unwrap(),
+            country,
+        };
+        for (country, catalog, entropy, line) in [
+            (None, None, true, "rtw89: RTL8852CE: no regulatory database"),
+            (
+                Some(*b"ZZ"),
+                Some(regulatory_catalog()),
+                true,
+                "rtw89: RTL8852CE: regulatory.db country ZZ: Country",
+            ),
+            (
+                None,
+                Some(regulatory_catalog()),
+                false,
+                "native services are unavailable",
+            ),
+        ] {
+            let mut ecam = rtl8852ce_ecam();
+            let services = if entropy {
+                services::tests::Refusing::minimum_and_entropy()
+            } else {
+                services::tests::Refusing::minimum_only()
+            };
+            let network = network(country);
+            let devices = probe_rtl8852ce_with(&mut ecam, &services, Some(&network), catalog);
+            assert!(services.requests.borrow().is_empty(), "{line}");
+            assert!(services.preparations.borrow().is_empty(), "{line}");
+            assert_eq!(ecam[1], 0, "{line}");
+            assert!(devices.unsupported.is_empty(), "{:?}", devices.unsupported);
+            let [(found, error)] = devices.failures.as_slice() else {
+                panic!("{line}: {:?}", devices.failures)
+            };
+            assert_eq!(*found, address);
+            assert!(devices.owners.is_empty(), "{line}");
+            assert_eq!(devices.subsystem(address, error), "Wi-Fi");
+            if entropy {
+                assert!(
+                    matches!(
+                        error,
+                        Error::Rtw89Station(
+                            AttachError::NoRegulatoryDatabase | AttachError::Country(..)
+                        )
+                    ),
+                    "{error:?}"
+                );
+                assert_eq!(format!("{error}"), line);
+            } else {
+                assert!(matches!(error, Error::Native(ServiceError::Unavailable)));
+            }
+        }
+    }
+
+    /// An RTL8852CE whose station runs, left on by firmware, says its MAC
+    /// was left on, then what its firmware runs; it is no unsupported
+    /// function and no failure.
+    #[test]
+    fn an_rtl8852ce_whose_station_runs_reports_its_firmware() {
         let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
         let mut devices = Devices {
             network_functions: alloc::vec![wifi],
             ..Devices::default()
         };
-        let up = native::Rtw89Up {
-            running: net::wifi::realtek::ax::Running {
-                cut: 2,
-                firmware: (0, 27, 56, 14),
-                mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
-                secure_boot: false,
-                mac_init: true,
-                ltr: true,
-                bacam_reset_timed_out: false,
-                h2c: net::wifi::realtek::ax::H2cAck {
-                    rec: true,
-                    done: true,
-                    other_c2h: 0,
-                    unmatched_ack: 0,
-                    skipped: 0,
-                    log: None,
-                },
-                phy: None,
-                rfk: None,
-                rf18: None,
-                scan: None,
+        let running = net::wifi::realtek::ax::Running {
+            cut: 2,
+            firmware: (0, 27, 56, 14),
+            mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
+            secure_boot: false,
+            mac_init: true,
+            ltr: true,
+            bacam_reset_timed_out: false,
+            h2c: net::wifi::realtek::ax::H2cAck {
+                rec: true,
+                done: true,
+                other_c2h: 0,
+                unmatched_ack: 0,
+                skipped: 0,
+                log: None,
             },
-            was_on: true,
-            kept: Box::new(()),
+            phy: None,
+            rfk: None,
+            rf18: None,
+            scan: None,
         };
-        rtw89_started(&mut devices, wifi.address, wifi.class, up);
-        assert_eq!(
-            devices.network_account(),
-            ["0000:03:00.0 10ec:c852 Wi-Fi: RTL8852CE firmware verified; no station driver yet"]
-        );
+        rtw89_reported(&mut devices, wifi.address, true, &running);
+        assert!(devices.unsupported.is_empty(), "{:?}", devices.unsupported);
         let warnings: Vec<String> = devices
             .warnings
             .iter()
@@ -4303,7 +4535,6 @@ mod tests {
                  H2C OFLD_CFG acknowledged (receive and done)",
             ]
         );
-        assert_eq!(devices.owners.len(), 1);
         assert!(devices.failures.is_empty());
     }
 
@@ -4337,6 +4568,7 @@ mod tests {
             }),
             was_on: true,
             kept: Some(Box::new(())),
+            bus_master: None,
         };
         rtw89_failed(&mut devices, wifi.address, down);
         let warnings: Vec<String> = devices
@@ -4356,6 +4588,42 @@ mod tests {
             format!("{}", devices.failures[0].1),
             "rtw89: RTL8852CE bring-up: firmware download: not ready (0x01E0=0x00000007) (first \
              of 5 attempts: timeout waiting on register 0x1080 mask 0xfff0000)"
+        );
+        assert_eq!(devices.owners.len(), 1);
+    }
+
+    /// A failed station attach whose Bus Master could not be cleared again
+    /// says so too, after its failure: the function may still master.
+    #[test]
+    fn an_rtl8852ce_whose_bus_master_stayed_on_says_so() {
+        use net::wifi::realtek::ax::AttachError;
+        let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
+        let mut devices = Devices {
+            network_functions: alloc::vec![wifi],
+            ..Devices::default()
+        };
+        let down = native::Rtw89Down {
+            error: Error::Rtw89Station(AttachError::Country(
+                *b"ZZ",
+                crate::net::wifi::regulatory::database::Error::Country,
+            )),
+            was_on: false,
+            kept: Some(Box::new(())),
+            bus_master: Some(Error::Native(ServiceError::Refused("model refusal"))),
+        };
+        rtw89_failed(&mut devices, wifi.address, down);
+        let failures: Vec<String> = devices
+            .failures
+            .iter()
+            .map(|(address, error)| format!("{address}: {error}"))
+            .collect();
+        assert_eq!(
+            failures,
+            [
+                "0000:03:00.0: rtw89: RTL8852CE: regulatory.db country ZZ: Country",
+                "0000:03:00.0: rtw89: RTL8852CE: Bus Master could not be cleared after the \
+                 failure: model refusal",
+            ]
         );
         assert_eq!(devices.owners.len(), 1);
     }
