@@ -10,7 +10,9 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use object::macho::{self, LinkeditDataCommand};
 use object::read::macho::{DyldCache, MachOFile64};
-use object::{Endianness, Object, ObjectSegment, ObjectSymbol, SegmentFlags, SymbolKind};
+use object::{
+    Endianness, Object, ObjectSection, ObjectSegment, ObjectSymbol, SegmentFlags, SymbolKind,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -62,6 +64,9 @@ pub(super) struct Image {
     /// Code symbols and function starts, ascending.
     symbols: Vec<(u64, String)>,
     starts: Vec<u64>,
+    /// The sections of its executable segments, `(start, end, name)`:
+    /// code outside `__text` (stubs) is named by its section.
+    sections: Vec<(u64, u64, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -279,13 +284,32 @@ impl Code {
         mut starts: Vec<u64>,
     ) {
         let index = self.images.len();
-        let ranges = &mut self.files[file_index].ranges;
+        let mut code = Vec::new();
         for segment in file.segments() {
             if executable(segment.flags()) && segment.size() != 0 {
                 let start = segment.address();
-                ranges.push((start, start + segment.size(), index));
+                code.push((start, start + segment.size(), index));
             }
         }
+        // The sections that lie in its code.
+        let mut sections: Vec<(u64, u64, String)> = file
+            .sections()
+            .filter(|section| {
+                code.iter()
+                    .any(|range| range.0 <= section.address() && section.address() < range.1)
+            })
+            .filter_map(|section| {
+                let start = section.address();
+                Some((
+                    start,
+                    start + section.size(),
+                    section.name().ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        sections.sort();
+        let ranges = &mut self.files[file_index].ranges;
+        ranges.extend(code);
         ranges.sort_unstable();
         let mut symbols: Vec<(u64, String)> = file
             .symbols()
@@ -301,6 +325,7 @@ impl Code {
             path: path.to_owned(),
             symbols,
             starts,
+            sections,
         });
     }
 
@@ -338,6 +363,21 @@ impl Code {
             return unnamed;
         };
         let image = &self.images[index];
+        // Stubs and other code outside `__text` hold no function: the
+        // symbol before them would name the last function of `__text`.
+        let section = image
+            .sections
+            .iter()
+            .find(|section| section.0 <= address && address < section.1);
+        if let Some((start, _, name)) = section
+            && name != "__text"
+        {
+            return Named {
+                image: Some(&image.path),
+                function: name.clone(),
+                start: *start,
+            };
+        }
         let symbol = image
             .symbols
             .partition_point(|symbol| symbol.0 <= address)
@@ -554,7 +594,7 @@ impl Drop for Mapped {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{self, ALPHA, BETA, CACHE_BASE, CACHE_PATH, PAGE, UNNAMED};
+    use super::super::fixtures::{self, ALPHA, BETA, CACHE_BASE, CACHE_PATH, PAGE, STUBS, UNNAMED};
     use super::*;
 
     const BASE: u64 = 0x7000_0000;
@@ -617,6 +657,17 @@ mod tests {
         );
         assert_eq!(code.name(0, BASE + 0x2020).function, "_beta");
         assert_eq!(code.name(0, BASE + 0x2020).start, BASE + BETA);
+        // Code outside `__text` is named by its section, not by the
+        // function before it.
+        assert_eq!(
+            code.name(0, BASE + STUBS + 0x10),
+            Named {
+                image,
+                function: "__auth_stubs".into(),
+                start: BASE + STUBS
+            }
+        );
+        assert_eq!(code.name(0, BASE + STUBS - 4).function, "_beta");
         // Outside every image.
         assert_eq!(code.name(0, 0x10).image, None);
         assert_eq!(
@@ -654,7 +705,8 @@ mod tests {
             code.name(0, CACHE_BASE + UNNAMED).function,
             format!("sub_{:x}", CACHE_BASE + UNNAMED)
         );
-        assert_eq!(code.name(0, CACHE_BASE + 0x2ffc).function, "_beta");
+        assert_eq!(code.name(0, CACHE_BASE + STUBS - 4).function, "_beta");
+        assert_eq!(code.name(0, CACHE_BASE + 0x2ffc).function, "__auth_stubs");
         assert_eq!(
             code.loaded,
             ["dyld_shared_cache_arm64e: 1 image, 2 of 2 wanted pages"]

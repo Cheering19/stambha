@@ -14,6 +14,9 @@ const LINKEDIT: usize = PAGE;
 pub(super) const ALPHA: u64 = 0x1000;
 pub(super) const UNNAMED: u64 = 0x1400;
 pub(super) const BETA: u64 = 0x1800;
+/// Where `__text` ends and the `__auth_stubs` section, the rest of the
+/// last page, starts.
+pub(super) const STUBS: u64 = 0x2c00;
 /// The dyld cache's image path and its unslid base.
 pub(super) const CACHE_PATH: &str = "/usr/lib/system/libsynthetic.dylib";
 pub(super) const CACHE_BASE: u64 = 0x1_8000_0000;
@@ -38,23 +41,23 @@ fn name16(out: &mut Vec<u8>, name: &[u8]) {
     out.extend_from_slice(&field);
 }
 
-/// An `LC_SEGMENT_64` with at most one section, `(name, address, size,
-/// file offset, flags)`.
+/// An `LC_SEGMENT_64` with `sections`, each `(name, address, size, file
+/// offset, flags)`.
 fn segment(
     name: &[u8],
     address: u64,
     size: u64,
     offset: u64,
     protection: u32,
-    section: Option<(&[u8], u64, u64, u32, u32)>,
+    sections: &[(&[u8], u64, u64, u32, u32)],
 ) -> Vec<u8> {
-    let sections = u32::from(section.is_some());
+    let count = sections.len() as u32;
     let mut out = Vec::new();
-    u32s(&mut out, &[0x19, 72 + 80 * sections]);
+    u32s(&mut out, &[0x19, 72 + 80 * count]);
     name16(&mut out, name);
     u64s(&mut out, &[address, size, offset, size]);
-    u32s(&mut out, &[protection, protection, sections, 0]);
-    if let Some((section, address, size, offset, flags)) = section {
+    u32s(&mut out, &[protection, protection, count, 0]);
+    for &(section, address, size, offset, flags) in sections {
         name16(&mut out, section);
         name16(&mut out, name);
         u64s(&mut out, &[address, size]);
@@ -83,13 +86,23 @@ fn image(
         TEXT as u64,
         text_offset.into(),
         5,
-        Some((
-            b"__text",
-            base + ALPHA,
-            (TEXT - PAGE) as u64,
-            text_offset + ALPHA as u32,
-            0x8000_0400,
-        )),
+        &[
+            (
+                b"__text",
+                base + ALPHA,
+                STUBS - ALPHA,
+                text_offset + ALPHA as u32,
+                0x8000_0400,
+            ),
+            // S_SYMBOL_STUBS, pure instructions.
+            (
+                b"__auth_stubs",
+                base + STUBS,
+                TEXT as u64 - STUBS,
+                text_offset + STUBS as u32,
+                0x8000_0408,
+            ),
+        ],
     ));
     commands.extend(segment(
         b"__LINKEDIT",
@@ -97,7 +110,7 @@ fn image(
         LINKEDIT as u64,
         linkedit_offset.into(),
         1,
-        None,
+        &[],
     ));
     // LC_SYMTAB: two symbols at 0, their strings at 0x200.
     u32s(
