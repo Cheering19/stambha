@@ -119,9 +119,13 @@ pub fn device_skips() -> Skips {
 }
 
 /// Read the log on `device` back from its newest line until it holds a
-/// whole boot with a device-start marker, and keep the skips it gives.
+/// whole boot with a device-start marker, and keep the skips it gives. The
+/// bytes read are parsed only as each boot's marker line comes, so a long
+/// last boot costs its read once, not a parse a chunk.
 fn read_device_skips(device: &mut dyn BlockDevice) {
-    let Ok(newest) = boot_log::read_newest(device, 64 * 1024, device_starts::settled) else {
+    let marker = device_starts::BOOT.as_bytes();
+    let read = boot_log::read_newest_marked(device, 64 * 1024, marker, device_starts::settled);
+    let Ok(newest) = read else {
         output::arguments(format_args!(
             "BOOT LOG FILE unreadable for its device-start record: no device is skipped\n"
         ));

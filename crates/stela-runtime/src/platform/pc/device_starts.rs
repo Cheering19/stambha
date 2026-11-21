@@ -20,6 +20,9 @@ pub const STARTED: &str = "HOST DEVICES STARTED";
 pub const SKIPPED: &str = "HOST DEVICE SKIPPED";
 /// Every skip ends: `stela repair` or `stela update` wrote it.
 pub const CLEARED: &str = "HOST DEVICE SKIPS CLEARED";
+/// What each boot's marker line in the log begins with (`boot_log`): the
+/// boots [`read`] parts the stream into.
+pub const BOOT: &str = "=== STELA BOOT ";
 
 /// The most functions a boot skips; a stall record names at most one
 /// function per boot, so this many takes several boots to reach.
@@ -188,7 +191,7 @@ pub fn retried_line(function: &Function) -> String {
 /// without markers, such as one Stela 0.3.0 wrote, gives none.
 pub fn read(stream: &[u8]) -> Skips {
     let text = String::from_utf8_lossy(stream);
-    let mut boots: alloc::vec::Vec<&str> = text.split("=== STELA BOOT ").collect();
+    let mut boots: alloc::vec::Vec<&str> = text.split(BOOT).collect();
     while let Some(boot) = boots.pop() {
         if let Some(skips) = boot_skips(boot) {
             return skips;
@@ -199,10 +202,13 @@ pub fn read(stream: &[u8]) -> Skips {
 
 /// Whether the newest bytes of a stream, `newest`, give what [`read`] gives
 /// for the whole stream: they hold a whole boot with a device-start marker.
-/// The bytes before their first boot line may be the end of a cut boot.
+/// The bytes before their first boot line may be the end of a cut boot, so
+/// older bytes before them change the answer only once they hold another
+/// boot line ([`BOOT`]): a reader asks it only then
+/// (`boot_log::read_newest_marked`).
 pub fn settled(newest: &[u8]) -> bool {
     String::from_utf8_lossy(newest)
-        .split("=== STELA BOOT ")
+        .split(BOOT)
         .skip(1)
         .any(|boot| boot_skips(boot).is_some())
 }

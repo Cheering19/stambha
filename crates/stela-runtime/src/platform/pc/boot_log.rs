@@ -1917,6 +1917,21 @@ pub fn read_newest(
     chunk: u64,
     enough: impl Fn(&[u8]) -> bool,
 ) -> Result<Vec<u8>, BlockError> {
+    read_newest_marked(device, chunk, &[], enough)
+}
+
+/// [`read_newest`] for an `enough` whose answer can change only once the
+/// bytes read hold another `marker`, as `device_starts::settled`'s does
+/// with each boot's marker line: it is asked only then, so a log read back
+/// through one long boot is asked of once, not once a chunk, and one whose
+/// marker the ring wrote over is read whole without asking. Every chunk
+/// holds an empty `marker`.
+pub fn read_newest_marked(
+    device: &mut dyn BlockDevice,
+    chunk: u64,
+    marker: &[u8],
+    enough: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<u8>, BlockError> {
     let identity = device.identity();
     let block = u64::from(identity.block_size);
     let bytes = identity.blocks.saturating_mul(block);
@@ -1949,18 +1964,37 @@ pub fn read_newest(
     };
     let (head, ring_bytes) = (header.head, header.layout.ring_bytes);
     let oldest = head.saturating_sub(ring_bytes);
-    let mut newest = Vec::new();
+    // The bytes read so far, `newest[start..]`: each chunk goes before
+    // them, in a buffer that doubles as it fills, up to the stream's
+    // length, so the copies add up to a few times the bytes read.
+    let most = (head - oldest) as usize;
+    let (mut newest, mut start) = (Vec::new(), 0);
     let mut from = head;
     while from > oldest {
         let to = from;
         from = to.saturating_sub(chunk.max(block)).max(oldest);
-        let mut read = read_stream(device, ring_bytes, from, to)?;
-        read.extend_from_slice(&newest);
-        newest = read;
-        if enough(&newest) {
+        let read = read_stream(device, ring_bytes, from, to)?;
+        if read.len() > start {
+            let held = newest.len() - start;
+            let room = (held + read.len()).max((2 * held).min(most));
+            let mut grown = vec![0; room];
+            grown[room - held..].copy_from_slice(&newest[start..]);
+            (newest, start) = (grown, room - held);
+        }
+        start -= read.len();
+        newest[start..start + read.len()].copy_from_slice(&read);
+        // A marker that starts in the bytes just read, maybe ending in
+        // those after them.
+        let around = (start + read.len() + marker.len().saturating_sub(1)).min(newest.len());
+        let marked = marker.is_empty()
+            || newest[start..around]
+                .windows(marker.len())
+                .any(|bytes| bytes == marker);
+        if marked && enough(&newest[start..]) {
             break;
         }
     }
+    newest.drain(..start);
     Ok(newest)
 }
 

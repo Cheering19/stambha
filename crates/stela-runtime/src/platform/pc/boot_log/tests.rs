@@ -1309,3 +1309,84 @@ fn an_older_loader_s_log_over_the_copy_is_grown_alone() {
     );
     assert_eq!(writer.boots(), 3);
 }
+
+/// A log of a boot for each of `boots`, each its device-start lines and
+/// then that many bytes of lines, in a region that is all ring.
+fn long_boots(ring: u64, boots: &[usize]) -> Recorder {
+    use super::super::device_starts::STARTED;
+    let mut disk = Recorder::new(HEADER_BYTES + ring, 512);
+    for &bytes in boots {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        writer.append(
+            format!("HOST DEVICE START pci=0000:05:00.0 id=144d:a808\n{STARTED}\n").as_bytes(),
+        );
+        for from in (0..bytes / 12).step_by(4096) {
+            writer.append(&lines(from, 4096.min(bytes / 12 - from)));
+            writer.flush(&mut disk).unwrap();
+        }
+    }
+    disk
+}
+
+/// Read back until a whole boot holds a device-start marker, the log asks
+/// `settled` only once another boot's marker line has come: a long boot is
+/// parsed once, not once a chunk, and one whose marker the ring wrote over
+/// is read whole without a parse. The bytes are those asking after every
+/// chunk gives.
+#[test]
+fn reading_back_to_a_marked_boot_asks_once_a_marker_comes_not_once_a_chunk() {
+    use super::super::device_starts::{self, BOOT, settled};
+    // A short boot and a long one, its marker 1.5 MiB back; a boot longer
+    // than the ring.
+    for boots in [&[64 << 10, 1536 << 10][..], &[3 << 20][..]] {
+        let mut disk = long_boots(2 << 20, boots);
+        let asked = core::cell::Cell::new(0);
+        let newest = read_newest_marked(&mut disk, 64 << 10, BOOT.as_bytes(), |read| {
+            asked.set(asked.get() + read.len());
+            settled(read)
+        })
+        .unwrap();
+        assert_eq!(newest, read_newest(&mut disk, 64 << 10, settled).unwrap());
+        assert!(
+            asked.get() <= newest.len(),
+            "{boots:?}: asked over {} bytes for {}",
+            asked.get(),
+            newest.len()
+        );
+        let whole = disk.log().unwrap().stream;
+        assert_eq!(device_starts::read(&newest), device_starts::read(&whole));
+    }
+}
+
+/// Asked only as markers come, the read back stops where asking after
+/// every chunk does, whatever the chunk, one that cuts a marker line
+/// between two reads among them.
+#[test]
+fn reading_back_to_a_marked_boot_stops_where_asking_every_chunk_does() {
+    use super::super::device_starts::{BOOT, START, STARTED, settled};
+    let mut disk = Recorder::new(HEADER_BYTES + (64 << 10), 512);
+    for (boot, marked) in [(0, true), (1, false), (2, true), (3, false), (4, false)] {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        if marked {
+            writer.append(format!("{START} pci=0000:05:00.0 id=144d:a808\n{STARTED}\n").as_bytes());
+        }
+        writer.append(&lines(boot * 1000, 300 + 97 * boot));
+        writer.flush(&mut disk).unwrap();
+    }
+    let stream = disk.log().unwrap().stream;
+    let text = String::from_utf8(stream.clone()).unwrap();
+    let mut chunks = alloc::vec![1, 512, 700, 1000, 1536, 4099, 1 << 20];
+    // The first read ends 5 bytes into the newest marker line, then into
+    // the one of the boot that settles it.
+    for boot in ["=== STELA BOOT 5 ", "=== STELA BOOT 3 "] {
+        let at = text.find(boot).unwrap();
+        chunks.push((stream.len() - at - 5) as u64);
+    }
+    for chunk in chunks {
+        let every = read_newest(&mut disk, chunk, settled).unwrap();
+        let marked = read_newest_marked(&mut disk, chunk, BOOT.as_bytes(), settled).unwrap();
+        assert_eq!(marked, every, "chunk {chunk}");
+        assert!(settled(&marked), "chunk {chunk}");
+        assert!(stream.ends_with(&marked));
+    }
+}
