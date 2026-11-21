@@ -26,12 +26,13 @@
 //! connection keeper, polled through `carrier()` until its progress line
 //! shows the 4-way handshake's frames both ways and the radio's refusal of
 //! the first key, which M3a does not install, then [`FLUSH_US`] more, or
-//! until [`STATION_BUDGET_US`] passes. The keeper's last failure is taken,
-//! the station deauthenticates and is polled [`FLUSH_US`] more, and the chip
-//! is stopped (`Live::stop`); its rings and TX pools are kept. Every address
-//! the line would print is masked, the network's name is never printed,
-//! and the secret never is: it lives in the keeper's network, which clears
-//! it when the keeper goes.
+//! until [`STATION_BUDGET_US`] passes or `--deadline` comes within
+//! [`DEADLINE_MARGIN_US`]. The keeper's last failure is taken, the station
+//! deauthenticates and is polled [`FLUSH_US`] more, and the chip is stopped
+//! (`Live::stop`); its rings and TX pools are kept. The network's name is
+//! hidden wherever the line would print it (the keeper's failures name it),
+//! then every address is masked; the secret is never printed: it lives in
+//! the keeper's network, which clears it when the keeper goes.
 //!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
@@ -45,7 +46,10 @@ use alloc::{boxed::Box, format, string::String, string::ToString, sync::Arc, vec
 use core::{any::Any, ops::Range, ptr::NonNull};
 use stela_boot_core::{
     heap::Heap,
-    host_wifi::{FLUSH_US, Progress, STATION_BUDGET_US, Watch, mask_addresses},
+    host_wifi::{
+        DEADLINE_MARGIN_US, End, FLUSH_US, Progress, STATION_BUDGET_US, Watch, hide_ssid,
+        mask_addresses,
+    },
     native_memory::NativeMemory,
     options::{DEFAULT_WIFI_KEY, HostCheck},
     passthrough::Passthrough,
@@ -74,7 +78,7 @@ use stela_drivers::{
                 ax::{self, AxIo, FirmwareFile, Host, NativeAxIo, attach::Inputs, pci::TxPools},
                 identity::Observed,
             },
-            regulatory::database,
+            regulatory::database::{self, Database},
         },
     },
     probe::{
@@ -127,8 +131,10 @@ pub(super) struct Prepared {
     dma: Range<u64>,
     firmware: Arc<Catalog>,
     clock: Clock,
-    /// With `--wifi`: the network to keep the chip connected to.
-    station: Option<Station>,
+    /// With `--wifi`: the network to keep the chip connected to, boxed so
+    /// that its secret (a passphrase's 63 bytes inline) is not copied each
+    /// time the plan is handed on.
+    station: Option<Box<Station>>,
 }
 
 /// The `--wifi` key file's bytes, wiped when dropped: [`prepare`] parses
@@ -162,7 +168,7 @@ struct Station {
 /// The network `options` names, with `key`'s secret: a key file that is
 /// missing, empty or unusable fails as `key: …`, without its contents; and
 /// a stream seeded before ExitBootServices for the handshake's nonces.
-fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Station, String> {
+fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Box<Station>, String> {
     let path = options.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
     if key.0.is_empty() {
         return Err(format!("key: {path} is missing, empty or unreadable"));
@@ -175,14 +181,14 @@ fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Station, String>
         .as_deref()
         .and_then(|code| code.as_bytes().try_into().ok());
     let (source, _) = crate::entropy::source().map_err(|error| format!("entropy: {error}"))?;
-    Ok(Station {
+    Ok(Box::new(Station {
         network: Network {
             ssid: ssid.as_bytes().to_vec(),
             secret,
             country,
         },
         entropy: Arc::new(source),
-    })
+    }))
 }
 
 impl Plan {
@@ -496,12 +502,6 @@ fn attach(
             ""
         }
     };
-    let inputs = station.map(|(station, database)| Inputs {
-        clock,
-        database,
-        network: station.network,
-        entropy: station.entropy,
-    });
     // `rtw89_attach`'s contract, which is `rtw89_attach_with`'s too, as the
     // host check holds it:
     // - `chip.io` is the uncached BAR2 window of this function alone, which
@@ -521,7 +521,7 @@ fn attach(
     //   by the chip with No Snoop off.
     // - `chip` keeps BAR2 and the function through every outcome, and the
     //   rings (and with `--wifi` the TX pools) are kept below.
-    if let Some(inputs) = inputs {
+    if let Some((station, database)) = station {
         // SAFETY: the contract above.
         let attached = unsafe {
             rtw89_attach_with(
@@ -530,7 +530,9 @@ fn attach(
                 provider(&firmware),
                 pages,
                 |io, pages, domain, cut, file, host| {
-                    Ok(keep(io, pages, domain, cut, file, host, inputs, timing))
+                    Ok(keep(
+                        io, pages, domain, cut, file, host, station, database, clock, timing,
+                    ))
                 },
             )
         };
@@ -583,17 +585,24 @@ struct Kept {
 }
 
 /// The station check (M3 spec S17.3-S17.5) on a chip `rtw89_attach_with`
-/// took over: `ax::attach` with `inputs`, the keeper polled through
-/// `carrier()` until [`Watch`] ends it, the keeper's last failure taken
-/// with one `receive()` (`into_radio` drops one not yet reported), then the
-/// deauthentication, [`FLUSH_US`] of service and the stop. The line is the
-/// bring-up's report and the station's progress, with the keeper's failure
-/// when it had one, every address masked; a PASS once the handshake ran, a
-/// FAIL when the budget passed first or the attach failed. `timing` beats
-/// through every wait, so `--deadline` holds.
+/// took over: `ax::attach` with `station`, `database` and `clock`, the
+/// keeper polled through `carrier()` until [`Watch`] ends it, the keeper's
+/// last failure taken with one `receive()` (`into_radio` drops one not yet
+/// reported), then the deauthentication, [`FLUSH_US`] of service and the
+/// stop. The line is the bring-up's report and the station's progress, with
+/// the keeper's failure when it had one, the network's name hidden and then
+/// every address masked; a PASS once the handshake ran, a FAIL when the
+/// budget or the deadline's margin passed first or the attach failed.
+/// `timing` beats through every wait but never stops here: the watch stops
+/// [`DEADLINE_MARGIN_US`] short of `--deadline`, so the chip is stopped
+/// (and then Bus Master cleared) before the deadline can end the check.
 #[expect(
     clippy::too_many_arguments,
     reason = "rtw89_attach_with's step 5 inputs, then the station's own."
+)]
+#[expect(
+    clippy::boxed_local,
+    reason = "The box keeps the passphrase's inline bytes from being copied on every hand-on."
 )]
 fn keep(
     io: &mut NativeAxIo,
@@ -602,10 +611,19 @@ fn keep(
     cut: u8,
     file: FirmwareFile<'_>,
     host: Host,
-    inputs: Inputs,
+    station: Box<Station>,
+    database: Database,
+    clock: Clock,
     timing: &mut Timing,
 ) -> Kept {
-    let clock = inputs.clock;
+    // The keeper owns the network once attached, and its failures name it.
+    let ssid = station.network.ssid.clone();
+    let inputs = Inputs {
+        clock,
+        database,
+        network: station.network,
+        entropy: station.entropy,
+    };
     // SAFETY: `rtw89_attach_with` runs this with `bring_up`'s contract
     // holding for `io`, `pages` and `domain`, and `ax::attach`'s contract is
     // that one (`live::start`'s): the window is this requester's alone, the
@@ -617,33 +635,38 @@ fn keep(
         Ok(wifi) => wifi,
         Err((error, returned)) => {
             return Kept {
-                result: Err(mask_addresses(&error.to_string())),
+                result: Err(mask_addresses(&hide_ssid(&error.to_string(), &ssid))),
                 rings: returned.and_then(|(_, rings)| rings),
                 pools: None,
             };
         }
     };
-    let mut watch = Watch::new(clock.now_us());
-    let handshaken = loop {
-        timing.tick();
+    let now = clock.now_us();
+    let deadline = timing
+        .until_deadline_us()
+        .map(|left| now.saturating_add(left));
+    let mut watch = Watch::new(now, deadline);
+    let end = loop {
+        timing.beat();
         wifi.carrier();
         let line = wifi.diagnostic().unwrap_or_default();
-        if let Some(handshaken) = watch.after(clock.now_us(), &Progress::read(&line)) {
-            break handshaken;
+        if let Some(end) = watch.after(clock.now_us(), &Progress::read(&line)) {
+            break end;
         }
     };
     let failure = match wifi.receive() {
         Err(LinkError::Adapter(failure)) => Some(failure),
         Err(error) => Some(format!("{error:?}")),
         Ok(_) => None,
-    };
+    }
+    .map(|failure| hide_ssid(&failure, &ssid));
     let progress = wifi.diagnostic().unwrap_or_default();
     // Spec S17.4: leave, let the deauthentication go out, stop the chip.
     let mut radio = wifi.into_radio();
     let _ = radio.deauthenticate(DEAUTH_LEAVING);
     let left = clock.now_us();
     loop {
-        timing.tick();
+        timing.beat();
         let _ = radio.service();
         if clock.now_us().saturating_sub(left) >= FLUSH_US {
             break;
@@ -657,16 +680,21 @@ fn keep(
     if let Some(failure) = failure {
         detail.push_str(&format!("; keeper {failure}"));
     }
-    if !handshaken {
-        detail.push_str(&format!(
+    match end {
+        End::Handshaken => {}
+        End::Budget => detail.push_str(&format!(
             "; no EAPOL handshake within {} s",
             STATION_BUDGET_US / 1_000_000
-        ));
+        )),
+        End::Deadline => detail.push_str(&format!(
+            "; stopped {} s before --deadline without an EAPOL handshake",
+            DEADLINE_MARGIN_US / 1_000_000
+        )),
     }
-    let detail = mask_addresses(&detail);
+    let detail = mask_addresses(&hide_ssid(&detail, &ssid));
     let lines = running.rf18_lines().map(|line| line.to_string()).collect();
     Kept {
-        result: if handshaken {
+        result: if end == End::Handshaken {
             Ok((detail, lines))
         } else {
             Err(detail)

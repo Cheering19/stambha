@@ -28,8 +28,10 @@
 //!   up instead, as a station that scans for the network, authenticates,
 //!   associates and runs the 4-way handshake with the key file's secret
 //!   (read before ExitBootServices, `\EFI\stela\wifi.key` without
-//!   `--wifi-key`), and the station's progress is reported before it
-//!   deauthenticates and the chip is powered off.
+//!   `--wifi-key`), and the station's progress is reported, with the
+//!   network's name hidden, before it deauthenticates and the chip is
+//!   powered off. It waits for the handshake until 10 s before
+//!   `--deadline` at most, so the chip is stopped before the deadline.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
@@ -170,14 +172,28 @@ impl Timing {
         (rdtsc() - self.started) / self.tsc_hz
     }
 
-    /// Print a beat when one is due and stop at the deadline.
-    fn tick(&mut self) {
+    /// Print a beat when one is due, and give the TSC read for it; unlike
+    /// [`Self::tick`], never stop.
+    fn beat(&mut self) -> u64 {
         let now = rdtsc();
         if now >= self.next_beat {
             self.next_beat = now + BEAT_SECONDS * self.tsc_hz;
             output::arguments(format_args!("BEAT t={}s\n", self.elapsed_seconds()));
             output::flush_log();
         }
+        now
+    }
+
+    /// How long until the deadline, in microseconds, none passing as 0;
+    /// `None` without `--deadline`.
+    fn until_deadline_us(&self) -> Option<u64> {
+        let left = u128::from(self.deadline?.saturating_sub(rdtsc()));
+        Some(u64::try_from(left * 1_000_000 / u128::from(self.tsc_hz)).unwrap_or(u64::MAX))
+    }
+
+    /// Print a beat when one is due and stop at the deadline.
+    fn tick(&mut self) {
+        let now = self.beat();
         if let Some(deadline) = self.deadline
             && now >= deadline
         {
