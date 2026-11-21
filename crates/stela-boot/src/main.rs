@@ -350,9 +350,13 @@ fn main() -> Status {
     }
     drop(snapshot);
     if options.starts_with(stela_boot_core::options::HOST_CHECK.as_bytes()) {
+        // A `--wifi` key is read while the firmware's FAT driver runs, as a
+        // system boot's is.
+        #[cfg(feature = "diagnostics")]
+        let wifi_key = host_check::wifi_key(&options, &mut volume);
         drop(volume);
         #[cfg(feature = "diagnostics")]
-        host_check::boot(options, host_firmware);
+        host_check::boot(options, host_firmware, wifi_key);
         #[cfg(not(feature = "diagnostics"))]
         output::fatal("host checks require a diagnostics build");
     }

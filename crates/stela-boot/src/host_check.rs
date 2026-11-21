@@ -2,7 +2,9 @@
 //! (so no LA57) and no write to any internal disk.
 //!
 //! `stela.cfg`: `--host-check [--nor-file GUID:/PATH] [--deadline SECONDS]
-//! [--key-seconds SECONDS] [--wifi-check] [--keep-lines]`.
+//! [--key-seconds SECONDS] [--wifi-check [--wifi SSID [--wifi-key PATH]
+//! [--wifi-country CC]]] [--keep-lines]`. The line is printed with the
+//! network's name left out.
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
@@ -22,7 +24,12 @@
 //!   firmware (`rtw89/rtw8852c_fw-2.bin` from the USB stick's verified host
 //!   firmware), its MAC address read, then powered off again with its Bus
 //!   Master cleared ([`wifi`]). Only that function is touched, and no disk;
-//!   without the option it is skipped.
+//!   without the option it is skipped. With `--wifi SSID` the chip is kept
+//!   up instead, as a station that scans for the network, authenticates,
+//!   associates and runs the 4-way handshake with the key file's secret
+//!   (read before ExitBootServices, `\EFI\stela\wifi.key` without
+//!   `--wifi-key`), and the station's progress is reported before it
+//!   deauthenticates and the chip is powered off.
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
@@ -216,11 +223,33 @@ impl Machine {
     }
 }
 
+/// The `--wifi` key file of the host check line `options`, read from
+/// `volume` while the firmware's FAT driver runs, as the loader reads a
+/// system boot's (`system::inputs`); empty without `--wifi`, for a line
+/// that does not parse, and for a file that is missing or unreadable. Its
+/// bytes are wiped once [`wifi::prepare`] parsed them, or when dropped.
+pub fn wifi_key(options: &[u8], volume: &mut uefi::fs::FileSystem) -> wifi::Key {
+    let options = core::str::from_utf8(options)
+        .ok()
+        .and_then(|text| HostCheck::parse(text).ok());
+    let bytes = options.and_then(|options| {
+        let path = options.ssid.as_ref().and(options.wifi_key.as_deref())?;
+        let path = uefi::CString16::try_from(path).ok()?;
+        volume.read(uefi::fs::PathBuf::from(path)).ok()
+    });
+    wifi::Key::new(bytes.unwrap_or_default())
+}
+
 /// Run the host check from `stela.cfg`'s `options`, with the USB stick's
-/// host firmware for `--wifi-check`; never returns.
-pub fn boot(options: Vec<u8>, host_firmware: crate::host_firmware::Resources) -> ! {
+/// host firmware for `--wifi-check` and the key file [`wifi_key`] read for
+/// `--wifi`; never returns.
+pub fn boot(
+    options: Vec<u8>,
+    host_firmware: crate::host_firmware::Resources,
+    wifi_key: wifi::Key,
+) -> ! {
     let (mut machine, tables) =
-        prepare(&options, &host_firmware).unwrap_or_else(|error| output::fatal(error));
+        prepare(&options, &host_firmware, wifi_key).unwrap_or_else(|error| output::fatal(error));
     let stack = machine.stack_top;
     // SAFETY: boot services have ended; the tables map the image, the heap,
     // the stack, every RAM byte in use, the framebuffer and the registers
@@ -250,11 +279,15 @@ pub fn boot(options: Vec<u8>, host_firmware: crate::host_firmware::Resources) ->
 fn prepare(
     options: &[u8],
     host_firmware: &crate::host_firmware::Resources,
+    wifi_key: wifi::Key,
 ) -> Result<(Machine, paging::Tables)> {
     let text = core::str::from_utf8(options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let options = HostCheck::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let started = rdtsc();
-    output::arguments(format_args!("HOST CHECK {}\n", text.trim()));
+    output::arguments(format_args!(
+        "HOST CHECK {}\n",
+        stela_boot_core::host_wifi::hide_network(text.trim())
+    ));
     for line in cpu::report() {
         output::arguments(format_args!("CPU {line}\n"));
     }
@@ -306,7 +339,12 @@ fn prepare(
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
     }
     let wifi = if machine.options.wifi_check {
-        wifi::prepare(machine.storage.as_ref(), host_firmware)
+        wifi::prepare(
+            machine.storage.as_ref(),
+            host_firmware,
+            &machine.options,
+            wifi_key,
+        )
     } else {
         wifi::Plan::Off
     };

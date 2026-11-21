@@ -17,6 +17,22 @@
 //! is cleared again whatever the outcome, and memory decode is left as the
 //! firmware left it.
 //!
+//! With `--wifi SSID` (M3 spec S17) the key file's secret is parsed before
+//! ExitBootServices and its bytes wiped ([`Key`]), and a ChaCha20 stream is
+//! seeded for the handshake's nonces. After it, regulatory.db is loaded
+//! from the same catalog before the function is touched, and the same
+//! take-over runs `ax::attach` in place of `bring_up`
+//! (`rtw89_attach_with`): the chip stays up as an rtw89 station kept by the
+//! connection keeper, polled through `carrier()` until its progress line
+//! shows the 4-way handshake's frames both ways and the radio's refusal of
+//! the first key, which M3a does not install, then [`FLUSH_US`] more, or
+//! until [`STATION_BUDGET_US`] passes. The keeper's last failure is taken,
+//! the station deauthenticates and is polled [`FLUSH_US`] more, and the chip
+//! is stopped (`Live::stop`); its rings and TX pools are kept. Every address
+//! the line would print is masked, the network's name is never printed,
+//! and the secret never is: it lives in the keeper's network, which clears
+//! it when the keeper goes.
+//!
 //! This touches no other device and writes no disk. It does not grant DMA
 //! isolation: with no IOMMU the chip can reach any address, as under the
 //! firmware. If the firmware left an IOMMU translating that does not map the
@@ -24,15 +40,21 @@
 //! fails at the first step the chip reads memory in, the firmware download
 //! (`dma rings` only allocates and maps; CH12's descriptors or the
 //! firmware's ready status then time out).
-use super::{Machine, Verdict};
+use super::{Machine, Timing, Verdict};
 use alloc::{boxed::Box, format, string::String, string::ToString, sync::Arc, vec, vec::Vec};
 use core::{any::Any, ops::Range, ptr::NonNull};
-use stela_boot_core::{heap::Heap, native_memory::NativeMemory, passthrough::Passthrough};
+use stela_boot_core::{
+    heap::Heap,
+    host_wifi::{FLUSH_US, Progress, STATION_BUDGET_US, Watch, mask_addresses},
+    native_memory::NativeMemory,
+    options::{DEFAULT_WIFI_KEY, HostCheck},
+    passthrough::Passthrough,
+};
 use stela_drivers::{
     Clock,
     block::BlockError,
     bus::{
-        dma::mapping::DmaDomain,
+        dma::{mapping::DmaDomain, memory::PageSource},
         pci::{
             Address, Bar, ConfigSpace, EcamConfig, EcamWindow, Function, power_up_config, regs,
             requester::{
@@ -41,14 +63,23 @@ use stela_drivers::{
             },
         },
     },
+    entropy::Entropy,
     firmware::Catalog,
-    net::wifi::realtek::{
-        ax::{AxIo, Host, NativeAxIo},
-        identity::Observed,
+    net::{
+        Link, LinkError,
+        wifi::{
+            connection::keeper::Radio,
+            network::{Network, Secret},
+            realtek::{
+                ax::{self, AxIo, FirmwareFile, Host, NativeAxIo, attach::Inputs, pci::TxPools},
+                identity::Observed,
+            },
+            regulatory::database,
+        },
     },
     probe::{
         Error, ServiceError,
-        native::{Rtw89Device, rtw89_attach},
+        native::{Rtw89Device, rtw89_attach, rtw89_attach_with},
     },
 };
 use uefi::boot::{self, AllocateType, MemoryType};
@@ -61,8 +92,13 @@ const BAR: u8 = 2;
 /// The rings' pages: 13 TX BD rings, the RXQ and RPQ rings with 32
 /// 11498-byte buffers of three pages each, and sixteen CH12 slots take 211
 /// pages of payload, 278 with the heap's per-allocation page (a 16-byte
-/// block header before each page-aligned block); the rest is room.
-const DMA_PAGES: usize = 320;
+/// block header before each page-aligned block); the TX pools of the data
+/// and management queues that every start now allocates (M3 spec S5.1)
+/// take 43 more in one allocation, 44 with its header page: 322. The rest
+/// is room.
+const DMA_PAGES: usize = 384;
+/// `WLAN_REASON_DEAUTH_LEAVING`, the station check's departure (spec S17.4).
+const DEAUTH_LEAVING: u16 = 3;
 const PAGE: usize = crate::paging::PAGE;
 /// How long the function may keep requests outstanding after Bus Master is
 /// cleared, about as long as Linux's `pci_wait_for_pending_transaction`.
@@ -91,6 +127,62 @@ pub(super) struct Prepared {
     dma: Range<u64>,
     firmware: Arc<Catalog>,
     clock: Clock,
+    /// With `--wifi`: the network to keep the chip connected to.
+    station: Option<Station>,
+}
+
+/// The `--wifi` key file's bytes, wiped when dropped: [`prepare`] parses
+/// them and drops them before anything else is prepared.
+pub(crate) struct Key(Vec<u8>);
+
+impl Key {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            // SAFETY: a byte of the key, which nothing else reads, cleared
+            // with a write the compiler keeps after its last use.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What `--wifi` keeps the chip connected to: the network, with the key
+/// file's secret, and the handshake nonces' source.
+struct Station {
+    network: Network,
+    entropy: Arc<dyn Entropy>,
+}
+
+/// The network `options` names, with `key`'s secret: a key file that is
+/// missing, empty or unusable fails as `key: …`, without its contents; and
+/// a stream seeded before ExitBootServices for the handshake's nonces.
+fn station(options: &HostCheck, ssid: &str, key: Key) -> Result<Station, String> {
+    let path = options.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
+    if key.0.is_empty() {
+        return Err(format!("key: {path} is missing, empty or unreadable"));
+    }
+    let secret = Secret::parse(&key.0);
+    drop(key);
+    let secret = secret.map_err(|error| format!("key: {path} is unusable: {error}"))?;
+    let country = options
+        .wifi_country
+        .as_deref()
+        .and_then(|code| code.as_bytes().try_into().ok());
+    let (source, _) = crate::entropy::source().map_err(|error| format!("entropy: {error}"))?;
+    Ok(Station {
+        network: Network {
+            ssid: ssid.as_bytes().to_vec(),
+            secret,
+            country,
+        },
+        entropy: Arc::new(source),
+    })
 }
 
 impl Plan {
@@ -110,14 +202,27 @@ impl Plan {
     }
 }
 
-/// Before ExitBootServices: the first RTL8852CE in the firmware's PCI
+/// Before ExitBootServices: with `--wifi`, the network and the nonces'
+/// stream ([`station`]); then the first RTL8852CE in the firmware's PCI
 /// census, its BAR2, the ECAM window that reaches it, the verified firmware
 /// catalog and the ring pages. Nothing here touches the function.
 pub(super) fn prepare(
     handoff: Option<&stela_drivers::Handoff>,
     resources: &crate::host_firmware::Resources,
+    options: &HostCheck,
+    key: Key,
 ) -> Plan {
     let fail = |detail: String| Plan::Decided(Verdict::Fail, detail);
+    let station = match options.ssid.as_deref() {
+        Some(ssid) => match station(options, ssid, key) {
+            Ok(station) => Some(station),
+            Err(why) => return fail(why),
+        },
+        None => {
+            drop(key);
+            None
+        }
+    };
     let census = match crate::pci_io::capture() {
         Ok(census) => census,
         Err(error) => return fail(format!("no firmware PCI census: {error}")),
@@ -184,6 +289,7 @@ pub(super) fn prepare(
         dma: dma..dma + (DMA_PAGES * PAGE) as u64,
         firmware,
         clock: handoff.clock,
+        station,
     })
 }
 
@@ -194,7 +300,7 @@ pub(super) fn check(machine: &mut Machine) {
     let (verdict, detail) = match core::mem::replace(&mut machine.wifi, Plan::Off) {
         Plan::Off => (Verdict::Skip, String::from("no --wifi-check")),
         Plan::Decided(verdict, detail) => (verdict, detail),
-        Plan::Ready(prepared) => match run(prepared, &mut machine.kept, machine.timing.tsc_hz) {
+        Plan::Ready(prepared) => match run(prepared, &mut machine.kept, &mut machine.timing) {
             Ok((detail, found)) => {
                 lines = found;
                 (Verdict::Pass, detail)
@@ -252,7 +358,7 @@ impl Rtw89Device for Chip<'_> {
 fn run(
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
-    tsc_hz: u64,
+    timing: &mut Timing,
 ) -> Result<(String, Vec<String>), String> {
     let address = prepared.address;
     // SAFETY: one CPU after ExitBootServices; the storage probe is done
@@ -276,7 +382,7 @@ fn run(
         .config()
         .read16(regs::COMMAND)
         .map_err(|error| format!("pci={address} COMMAND: {error}"))?;
-    let result = attach(&mut function, prepared, kept, tsc_hz);
+    let result = attach(&mut function, prepared, kept, timing);
     // Bus Master off, and memory decode as found; the rest of the park
     // (MSI, MSI-X, No Snoop, ATS off, INTx disabled) stays.
     let restored = function.set_bus_master(false).and_then(|()| {
@@ -296,11 +402,15 @@ fn run(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "rtw89_attach_with's step 5 returns the probe's own error, as bring_up's does."
+)]
 fn attach(
     function: &mut Function<EcamConfig>,
     prepared: Prepared,
     kept: &mut Vec<Box<dyn Any>>,
-    tsc_hz: u64,
+    timing: &mut Timing,
 ) -> Result<(String, Vec<String>), String> {
     let Prepared {
         address,
@@ -308,10 +418,19 @@ fn attach(
         dma,
         firmware,
         clock,
+        station,
         ..
     } = prepared;
     let at = |what: &str| format!("pci={address} {what}");
-    park(function, tsc_hz).map_err(|why| at(&why))?;
+    // A station needs regulatory.db before anything is touched (spec S17.3).
+    let station = match station {
+        Some(station) => match database::load(provider(&firmware)) {
+            Ok(database) => Some((station, database)),
+            Err(error) => return Err(format!("regulatory.db: {error:?}")),
+        },
+        None => None,
+    };
+    park(function, timing.tsc_hz).map_err(|why| at(&why))?;
     // Linux `pci_power_up`, as the mount's `rtw89_wake`: D0, with the BARs
     // a D3hot soft reset cleared written back; then BAR2 sized again.
     power_up_config(function.config(), |microseconds| {
@@ -370,7 +489,21 @@ fn attach(
         domain: Arc::new(Passthrough::new(vec![dma])),
         ltr,
     };
-    // SAFETY: `rtw89_attach`'s contract, as the host check holds it:
+    let left_on = |was_on: bool| {
+        if was_on {
+            "; its MAC had been left powered on, and was powered off first"
+        } else {
+            ""
+        }
+    };
+    let inputs = station.map(|(station, database)| Inputs {
+        clock,
+        database,
+        network: station.network,
+        entropy: station.entropy,
+    });
+    // `rtw89_attach`'s contract, which is `rtw89_attach_with`'s too, as the
+    // host check holds it:
     // - `chip.io` is the uncached BAR2 window of this function alone, which
     //   `park` stopped (Bus Master, MSI, MSI-X, No Snoop and ATS off, INTx
     //   disabled, as `containment::Plan` parks it for the mount) and whose
@@ -387,17 +520,42 @@ fn attach(
     //   4 GiB, identity-mapped write-back and checked so (`pages`), snooped
     //   by the chip with No Snoop off.
     // - `chip` keeps BAR2 and the function through every outcome, and the
-    //   rings are kept below.
+    //   rings (and with `--wifi` the TX pools) are kept below.
+    if let Some(inputs) = inputs {
+        // SAFETY: the contract above.
+        let attached = unsafe {
+            rtw89_attach_with(
+                &mut chip,
+                observed,
+                provider(&firmware),
+                pages,
+                |io, pages, domain, cut, file, host| {
+                    Ok(keep(io, pages, domain, cut, file, host, inputs, timing))
+                },
+            )
+        };
+        let Chip { io, domain, .. } = chip;
+        kept.push(Box::new((io, domain, firmware)));
+        return match attached {
+            Ok((ran, was_on)) => {
+                let Kept {
+                    result,
+                    rings,
+                    pools,
+                } = ran;
+                kept.push(Box::new((rings, pools)));
+                match result {
+                    Ok((detail, lines)) => Ok((format!("{detail}{}", left_on(was_on)), lines)),
+                    Err(detail) => Err(format!("{detail}{}", left_on(was_on))),
+                }
+            }
+            Err((error, was_on)) => Err(format!("{}{}", failed(&error), left_on(was_on))),
+        };
+    }
+    // SAFETY: the contract above.
     let attached = unsafe { rtw89_attach(&mut chip, observed, provider(&firmware), pages) };
     let Chip { io, domain, .. } = chip;
     kept.push(Box::new((io, domain, firmware)));
-    let left_on = |was_on: bool| {
-        if was_on {
-            "; its MAC had been left powered on, and was powered off first"
-        } else {
-            ""
-        }
-    };
     match attached {
         Ok((running, rings, was_on)) => {
             kept.push(Box::new(rings));
@@ -413,6 +571,108 @@ fn attach(
             Ok((format!("{running}{}", left_on(was_on)), lines))
         }
         Err((error, was_on)) => Err(format!("{}{}", failed(&error), left_on(was_on))),
+    }
+}
+
+/// What the station check ran to: its line and the `WIFI RF18` lines, or
+/// its failure; and what DMA could still reach, which is kept.
+struct Kept {
+    result: Result<(String, Vec<String>), String>,
+    rings: Option<ax::Rings>,
+    pools: Option<TxPools>,
+}
+
+/// The station check (M3 spec S17.3-S17.5) on a chip `rtw89_attach_with`
+/// took over: `ax::attach` with `inputs`, the keeper polled through
+/// `carrier()` until [`Watch`] ends it, the keeper's last failure taken
+/// with one `receive()` (`into_radio` drops one not yet reported), then the
+/// deauthentication, [`FLUSH_US`] of service and the stop. The line is the
+/// bring-up's report and the station's progress, with the keeper's failure
+/// when it had one, every address masked; a PASS once the handshake ran, a
+/// FAIL when the budget passed first or the attach failed. `timing` beats
+/// through every wait, so `--deadline` holds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rtw89_attach_with's step 5 inputs, then the station's own."
+)]
+fn keep(
+    io: &mut NativeAxIo,
+    pages: &dyn PageSource,
+    domain: Arc<dyn DmaDomain>,
+    cut: u8,
+    file: FirmwareFile<'_>,
+    host: Host,
+    inputs: Inputs,
+    timing: &mut Timing,
+) -> Kept {
+    let clock = inputs.clock;
+    // SAFETY: `rtw89_attach_with` runs this with `bring_up`'s contract
+    // holding for `io`, `pages` and `domain`, and `ax::attach`'s contract is
+    // that one (`live::start`'s): the window is this requester's alone, the
+    // domain isolates it, the pages are coherent write-back RAM, and this
+    // check is its one worker. The station lives only inside this call,
+    // while that holds, and is stopped before it returns.
+    let attached = unsafe { ax::attach(io, pages, domain, cut, file, host, inputs) };
+    let mut wifi = match attached {
+        Ok(wifi) => wifi,
+        Err((error, returned)) => {
+            return Kept {
+                result: Err(mask_addresses(&error.to_string())),
+                rings: returned.and_then(|(_, rings)| rings),
+                pools: None,
+            };
+        }
+    };
+    let mut watch = Watch::new(clock.now_us());
+    let handshaken = loop {
+        timing.tick();
+        wifi.carrier();
+        let line = wifi.diagnostic().unwrap_or_default();
+        if let Some(handshaken) = watch.after(clock.now_us(), &Progress::read(&line)) {
+            break handshaken;
+        }
+    };
+    let failure = match wifi.receive() {
+        Err(LinkError::Adapter(failure)) => Some(failure),
+        Err(error) => Some(format!("{error:?}")),
+        Ok(_) => None,
+    };
+    let progress = wifi.diagnostic().unwrap_or_default();
+    // Spec S17.4: leave, let the deauthentication go out, stop the chip.
+    let mut radio = wifi.into_radio();
+    let _ = radio.deauthenticate(DEAUTH_LEAVING);
+    let left = clock.now_us();
+    loop {
+        timing.tick();
+        let _ = radio.service();
+        if clock.now_us().saturating_sub(left) >= FLUSH_US {
+            break;
+        }
+    }
+    let live = radio.into_chip();
+    let running = *live.running();
+    // SAFETY: as for `ax::attach` above, still holding.
+    let (_, rings, pools) = unsafe { live.stop() };
+    let mut detail = format!("{running}; station {progress}");
+    if let Some(failure) = failure {
+        detail.push_str(&format!("; keeper {failure}"));
+    }
+    if !handshaken {
+        detail.push_str(&format!(
+            "; no EAPOL handshake within {} s",
+            STATION_BUDGET_US / 1_000_000
+        ));
+    }
+    let detail = mask_addresses(&detail);
+    let lines = running.rf18_lines().map(|line| line.to_string()).collect();
+    Kept {
+        result: if handshaken {
+            Ok((detail, lines))
+        } else {
+            Err(detail)
+        },
+        rings: Some(rings),
+        pools: Some(pools),
     }
 }
 

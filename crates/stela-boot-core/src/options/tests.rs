@@ -132,6 +132,101 @@ fn host_check_keep_lines_is_off_unless_named_and_round_trips() {
     );
 }
 
+#[test]
+fn host_check_parses_wifi() {
+    let options = HostCheck::parse("--host-check --wifi-check --wifi home").unwrap();
+    assert!(options.wifi_check);
+    assert_eq!(options.ssid.as_deref(), Some("home"));
+    assert_eq!(options.wifi_key.as_deref(), Some(DEFAULT_WIFI_KEY));
+    assert_eq!(options.wifi_country, None);
+    // The default key path is not printed.
+    assert_eq!(options.to_string(), "--host-check --wifi-check --wifi home");
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // System's word rules: `%XX` escapes, a key path, a country in any case.
+    let options = HostCheck::parse(
+        "--host-check --wifi-country in --wifi my%20net --keep-lines --wifi-check \
+         --wifi-key \\EFI\\k.key --deadline 600",
+    )
+    .unwrap();
+    assert_eq!(options.ssid.as_deref(), Some("my net"));
+    assert_eq!(options.wifi_key.as_deref(), Some("\\EFI\\k.key"));
+    assert_eq!(options.wifi_country.as_deref(), Some("IN"));
+    assert_eq!(
+        options.to_string(),
+        "--host-check --deadline 600 --wifi-check --wifi my%20net --wifi-key \\EFI\\k.key \
+         --wifi-country IN --keep-lines"
+    );
+    assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
+    // Without --wifi nothing of it is set, as before.
+    let options = HostCheck::parse("--host-check --wifi-check").unwrap();
+    assert_eq!(
+        (options.ssid, options.wifi_key, options.wifi_country),
+        (None, None, None)
+    );
+    for (text, error) in [
+        (
+            "--host-check --wifi-check --wifi",
+            Error::MissingWifiNetwork,
+        ),
+        ("--host-check --wifi-check --wifi %", Error::WifiNetwork),
+        (
+            "--host-check --wifi-check --wifi a --wifi b",
+            Error::DuplicateWifi,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --wifi-key",
+            Error::MissingWifiKey,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --wifi-key k --wifi-key k",
+            Error::DuplicateWifiKey,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --wifi-country USA",
+            Error::WifiCountry,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --wifi-country U1",
+            Error::WifiCountry,
+        ),
+        (
+            "--host-check --wifi-check --wifi a --wifi-country US --wifi-country US",
+            Error::DuplicateWifiCountry,
+        ),
+    ] {
+        assert_eq!(HostCheck::parse(text), Err(error), "{text}");
+    }
+}
+
+#[test]
+fn wifi_without_wifi_check_is_refused() {
+    for text in [
+        "--host-check --wifi home",
+        "--host-check --keep-lines --wifi home --wifi-key k",
+    ] {
+        assert_eq!(
+            HostCheck::parse(text),
+            Err(Error::Constraint(Constraint::HostWifiDependency)),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn wifi_key_without_wifi_is_refused() {
+    for text in [
+        "--host-check --wifi-check --wifi-key k",
+        "--host-check --wifi-check --wifi-country US",
+        "--host-check --wifi-key k",
+    ] {
+        assert_eq!(
+            HostCheck::parse(text),
+            Err(Error::Constraint(Constraint::WifiDependency)),
+            "{text}"
+        );
+    }
+}
+
 const DISK: &str = "74EXN0LI:11111111-2222-3333-4444-555555555555";
 
 fn round_trip(text: &str) -> System {

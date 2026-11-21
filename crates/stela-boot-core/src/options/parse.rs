@@ -183,15 +183,8 @@ impl ParseState<'_> {
                 }
             }
             WIFI_COUNTRY => {
-                let code = value().ok_or(Error::WifiCountry)?;
-                if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-                    return Err(Error::WifiCountry);
-                }
-                if options
-                    .wifi_country
-                    .replace(code.to_ascii_uppercase())
-                    .is_some()
-                {
+                let code = wifi_country(value())?;
+                if options.wifi_country.replace(code).is_some() {
                     return Err(Error::DuplicateWifiCountry);
                 }
             }
@@ -330,4 +323,13 @@ impl ParseState<'_> {
         options.check()?;
         Ok(self.options)
     }
+}
+
+/// A `--wifi-country` word: two ASCII letters, upper-cased.
+pub(super) fn wifi_country(word: Option<&str>) -> Result<String, Error> {
+    let code = word.ok_or(Error::WifiCountry)?;
+    if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(Error::WifiCountry);
+    }
+    Ok(code.to_ascii_uppercase())
 }

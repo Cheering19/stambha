@@ -911,6 +911,15 @@ pub struct HostCheck {
     /// Bring an RTL8852CE up to running firmware and power it off again
     /// (`--wifi-check`).
     pub wifi_check: bool,
+    /// Keep the brought-up RTL8852CE connected to this network through the
+    /// station check, then power it off (`--wifi SSID`, with
+    /// `--wifi-check`), with `System`'s word rules.
+    pub ssid: Option<String>,
+    /// The ESP file holding the network's passphrase or PSK (`--wifi-key
+    /// PATH`); `DEFAULT_WIFI_KEY` when `--wifi` is set without it.
+    pub wifi_key: Option<String>,
+    /// The network's country, upper case (`--wifi-country XX`).
+    pub wifi_country: Option<String>,
     /// Keep the newest lines, the summary among them, in the firmware's
     /// stop-record variables once the checks end (`--keep-lines`).
     pub keep_lines: bool,
@@ -923,6 +932,9 @@ impl Default for HostCheck {
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
             wifi_check: false,
+            ssid: None,
+            wifi_key: None,
+            wifi_country: None,
             keep_lines: false,
         }
     }
@@ -961,8 +973,30 @@ impl HostCheck {
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
                 "--wifi-check" => options.wifi_check = true,
                 "--keep-lines" => options.keep_lines = true,
+                WIFI => {
+                    let ssid = ssid(words.next().ok_or(Error::MissingWifiNetwork)?)?;
+                    if options.ssid.replace(ssid).is_some() {
+                        return Err(Error::DuplicateWifi);
+                    }
+                }
+                WIFI_KEY => {
+                    let path = words.next().ok_or(Error::MissingWifiKey)?;
+                    if options.wifi_key.replace(String::from(path)).is_some() {
+                        return Err(Error::DuplicateWifiKey);
+                    }
+                }
+                WIFI_COUNTRY => {
+                    let code = parse::wifi_country(words.next())?;
+                    if options.wifi_country.replace(code).is_some() {
+                        return Err(Error::DuplicateWifiCountry);
+                    }
+                }
                 _ => return Err(Error::UnknownHostOption),
             }
+        }
+        validate::host_check(&options)?;
+        if options.ssid.is_some() && options.wifi_key.is_none() {
+            options.wifi_key = Some(String::from(DEFAULT_WIFI_KEY));
         }
         Ok(options)
     }
@@ -980,6 +1014,14 @@ impl fmt::Display for HostCheck {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }
         line.flag("--wifi-check", self.wifi_check)?;
+        line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
+        line.value(
+            WIFI_KEY,
+            self.wifi_key
+                .as_deref()
+                .filter(|&path| path != DEFAULT_WIFI_KEY),
+        )?;
+        line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
         line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }

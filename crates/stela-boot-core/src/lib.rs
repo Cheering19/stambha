@@ -67,6 +67,7 @@ pub mod host_power_limits;
 pub mod host_resources;
 pub mod host_samples;
 pub mod host_speed;
+pub mod host_wifi;
 pub mod hpet;
 pub mod interrupt_image;
 pub mod ioapic;

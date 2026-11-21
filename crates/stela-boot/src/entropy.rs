@@ -90,6 +90,27 @@ pub fn retain_seed() -> Result<(crate::handoff::Region, &'static str)> {
     ))
 }
 
+/// A ChaCha20 stream of its own from a seed taken as [`retain_seed`] takes
+/// one, for the host check's Wi-Fi station check before firmware services
+/// end, and the seed's source; the seed itself is wiped.
+#[cfg(feature = "diagnostics")]
+pub fn source() -> Result<(stela_boot_core::random::Source, &'static str)> {
+    let mut seed = [0; 32];
+    let source = match firmware_seed(&mut seed) {
+        Ok(()) => "uefi-rng",
+        Err(_) => match hardware_seed(&mut seed) {
+            Ok(source) => source,
+            Err(error) => {
+                erase(&mut seed);
+                return Err(error);
+            }
+        },
+    };
+    let stream = stela_boot_core::random::Source::from_seed(seed);
+    erase(&mut seed);
+    Ok((stream, source))
+}
+
 fn firmware_seed(seed: &mut [u8; 32]) -> Result<()> {
     use uefi::{boot, proto::rng::Rng};
     let handle = boot::get_handle_for_protocol::<Rng>()

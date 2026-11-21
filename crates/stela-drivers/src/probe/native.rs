@@ -1036,6 +1036,51 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     firmware: &dyn crate::firmware::Provider,
     pages: &dyn PageSource,
 ) -> Result<(Running, Rings, bool), (Error, bool)> {
+    // SAFETY: this function's contract is `rtw89_attach_with`'s; and
+    // `bring_up` runs at its step 5, where `rtw89_attach_with` promises
+    // `bring_up`'s contract for `io`, `pages` and `domain`.
+    let attached = unsafe {
+        rtw89_attach_with(
+            device,
+            observed,
+            firmware,
+            pages,
+            |io, pages, domain, cut, firmware, host| {
+                bring_up(io, pages, domain, cut, firmware, host).map_err(Error::Rtw89Wifi)
+            },
+        )
+    };
+    attached.map(|((running, rings), was_on)| (running, rings, was_on))
+}
+
+/// [`rtw89_attach`] with `run` at step 5 in place of [`bring_up`]: `run` is
+/// called once, after Bus Master is set, with the register window, `pages`,
+/// the domain just bound, the chip cut, the staged firmware file and the
+/// host input, and [`bring_up`]'s contract holds for the window, the pages
+/// and the domain while it runs. The host check's station check runs
+/// [`realtek_wifi::ax::attach`] and its keeper there. Returns what `run`
+/// returned and whether the MAC was on, as [`rtw89_attach`] does.
+///
+/// # Safety
+/// As for [`rtw89_attach`].
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+pub unsafe fn rtw89_attach_with<D: Rtw89Device + ?Sized, T>(
+    device: &mut D,
+    observed: realtek_wifi::identity::Observed,
+    firmware: &dyn crate::firmware::Provider,
+    pages: &dyn PageSource,
+    run: impl FnOnce(
+        &mut D::Io,
+        &dyn PageSource,
+        Arc<dyn DmaDomain>,
+        u8,
+        FirmwareFile<'_>,
+        Host,
+    ) -> Result<T, Error>,
+) -> Result<(T, bool), (Error, bool)> {
     use realtek_wifi::firmware::Layout;
     let fail = |step, error| (Error::Rtw89Wifi(BringUpError::new(step, error)), false);
     let (profile, staged) =
@@ -1059,13 +1104,14 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     let was_on = quiesce(device.io()).map_err(|error| fail("quiesce", error))?;
     let file = staged.image.bytes();
     // SAFETY: this function's contract, with the chip just quiesced.
-    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, file, pages) } {
-        Ok((running, rings)) => Ok((running, rings, was_on)),
+    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, file, pages, run) } {
+        Ok(ran) => Ok((ran, was_on)),
         Err(error) => Err((error, was_on)),
     }
 }
 
-/// Steps 3 to 5 of [`rtw89_attach`], on a chip [`quiesce`] just stopped.
+/// Steps 3 to 5 of [`rtw89_attach_with`], on a chip [`quiesce`] just
+/// stopped: `run` is step 5.
 ///
 /// # Safety
 /// As for [`rtw89_attach`], and `quiesce` returned `Ok` on `device.io()`
@@ -1074,13 +1120,21 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
+unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized, T>(
     device: &mut D,
     cut: u8,
     image: &realtek_wifi::firmware::AxImage<'_>,
     file: &[u8],
     pages: &dyn PageSource,
-) -> Result<(Running, Rings), Error> {
+    run: impl FnOnce(
+        &mut D::Io,
+        &dyn PageSource,
+        Arc<dyn DmaDomain>,
+        u8,
+        FirmwareFile<'_>,
+        Host,
+    ) -> Result<T, Error>,
+) -> Result<T, Error> {
     // SAFETY: `device.finalize()` acknowledges the quiescence
     // (`PreparingRequester::acknowledge_quiescence`, inside
     // `Rtw89Native::finalize`), then finalizes the receipt; its contract is
@@ -1099,7 +1153,8 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     //   scoreboard. Either way the PCIe side has issued nothing since the
     //   park. LPS, where the firmware is alive, and the undefined state were
     //   refused before this. No Stela queue or ring exists yet, and only
-    //   `bring_up` below powers the MAC on again, after the binding.
+    //   `run` below (`bring_up`, or the station's start) powers the MAC on
+    //   again, after the binding.
     // - Firmware, IRQ delivery and worker users retired: the mount's cold
     //   grant excludes earlier firmware, IRQ and work users; MSI, MSI-X and
     //   INTx were turned off before BAR2 was read, no handler exists, and
@@ -1116,7 +1171,8 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     // The DEVCTL2 LTR_EN read while the function was prepared.
     let host = device.host();
     let firmware = FirmwareFile { image, file };
-    // SAFETY: `bring_up`'s contract:
+    // `run` is called with `bring_up`'s contract holding, as
+    // `rtw89_attach_with` promises it:
     // - `device.io()` is the exclusive register window of exactly the
     //   requester whose own domain `finalize` just bound: the receipt
     //   finalized this requester's snooped coherent domain through its
@@ -1130,7 +1186,7 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     // `host` and `firmware` are no part of that contract: one decides
     // whether the chip's own LTR registers are programmed, the other what
     // is downloaded and what the BB, RF and TX power registers are set to.
-    unsafe { bring_up(device.io(), pages, domain, cut, firmware, host) }.map_err(Error::Rtw89Wifi)
+    run(device.io(), pages, domain, cut, firmware, host)
 }
 
 /// The RTL8852C profile of `observed`, and its firmware staged from

@@ -121,6 +121,7 @@ pub enum Constraint {
     RestoreConfiguration,
     UnexpectedRestoreInputs,
     WifiDependency,
+    HostWifiDependency,
     Ipv4Gateway,
     InstallSourceDependency,
     InstallConfiguration,
@@ -236,6 +237,7 @@ impl Constraint {
             }
             Self::UnexpectedRestoreInputs => "restore inputs require explicit --restore-study",
             Self::WifiDependency => "--wifi-key and --wifi-country configure a --wifi network",
+            Self::HostWifiDependency => "host check: --wifi joins the network of --wifi-check",
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",
             Self::InstallSourceDependency => {
                 "--install-source names the partition of an --install medium"

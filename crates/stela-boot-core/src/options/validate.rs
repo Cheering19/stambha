@@ -49,6 +49,18 @@ fn wifi(options: &System) -> Result<(), Error> {
     Ok(())
 }
 
+/// A host check's `--wifi` runs on the `--wifi-check` bring-up, and its key
+/// and country configure that network.
+pub(super) fn host_check(options: &HostCheck) -> Result<(), Error> {
+    if options.ssid.is_none() && (options.wifi_key.is_some() || options.wifi_country.is_some()) {
+        return Err(Error::Constraint(Constraint::WifiDependency));
+    }
+    if options.ssid.is_some() && !options.wifi_check {
+        return Err(Error::Constraint(Constraint::HostWifiDependency));
+    }
+    Ok(())
+}
+
 fn ipv4(options: &System) -> Result<(), Error> {
     if let Some(gateway) = options.ipv4_gateway
         && !options.ipv4.is_some_and(|ipv4| ipv4.neighbors(gateway))
