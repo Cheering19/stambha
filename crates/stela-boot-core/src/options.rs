@@ -37,6 +37,9 @@ pub const GUEST_PES: &str = "--guest-pes";
 /// The board's code window in MiB (`--code-window MIB`), in place of the
 /// one sized from the host's RAM (`host_memory::with_window`).
 pub const CODE_WINDOW: &str = "--code-window";
+/// Issue no indirect branch prediction barrier at guest context switches
+/// (`--no-ibpb`): see [`System::no_ibpb`].
+pub const NO_IBPB: &str = "--no-ibpb";
 /// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
 /// place of the monitor's preferred mode: for a capture device that cannot
 /// take the mode its EDID prefers.
@@ -288,6 +291,14 @@ pub struct System {
     /// window's bounds. Each MiB past the sized window takes two from the
     /// guest (the window and its block records); the guest keeps its floor.
     pub code_window: Option<u64>,
+    /// Isolate no branch predictions between guest contexts ([`NO_IBPB`]):
+    /// no IBPB and return stack refill at each change of the guest's
+    /// translation regime, table bases or VMID, and no FEAT_CSV2 disclosed
+    /// to the guest. This gives up Spectre-v2 (branch target injection)
+    /// isolation between the guest's address spaces, its processes, and its
+    /// translation regimes, for the time each barrier and the predictions
+    /// it discards cost; a measurement option, off unless asked for.
+    pub no_ibpb: bool,
     /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
     pub display_size: Option<(u32, u32)>,
     /// Check owned AP startup/host resources, then stop before guest entry.
@@ -405,6 +416,7 @@ impl Default for System {
             native_cores: None,
             guest_pes: None,
             code_window: None,
+            no_ibpb: false,
             display_size: None,
             native_bootstrap_check: false,
             native_shared_check: false,
@@ -856,6 +868,7 @@ impl fmt::Display for System {
         line.value(NATIVE_CORES, self.native_cores)?;
         line.value(GUEST_PES, self.guest_pes)?;
         line.value(CODE_WINDOW, self.code_window)?;
+        line.flag(NO_IBPB, self.no_ibpb)?;
         line.value(
             DISPLAY_SIZE,
             self.display_size

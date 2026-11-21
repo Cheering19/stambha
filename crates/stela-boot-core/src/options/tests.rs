@@ -319,6 +319,17 @@ fn native_core_counts_refuse_duplicates_zero_and_over_capacity() {
     );
 }
 
+/// `--no-ibpb` drops the prediction barrier at guest context switches; a
+/// boot without it isolates as before.
+#[test]
+fn prediction_isolation_stays_on_unless_no_ibpb_is_given() {
+    assert!(!System::default().no_ibpb);
+    assert!(!System::parse("--system").unwrap().no_ibpb);
+    let options = round_trip("--system --no-ibpb");
+    assert!(options.no_ibpb);
+    assert_eq!(options.to_string(), "--system --no-ibpb");
+}
+
 /// `--code-window` names the board's code window in MiB: whole 16 MiB
 /// steps from 64 MiB to 2 GiB, the window's own bounds, once.
 #[test]

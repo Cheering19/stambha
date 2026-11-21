@@ -2173,6 +2173,9 @@ impl Heartbeat {
             let mut transition_misses = [0u64; 36];
             // All PEs: why TTBR0 changes took the engine path.
             let mut switch_misses = [0u64; stela_engine::machine::SWITCH_MISS_REASONS];
+            // All PEs: their guest context changes and native TTBR0
+            // switches (`PES PREDICTION`).
+            let mut contexts = [0u64; 2];
             // All PEs: why runs ended at fallthrough, direct, indirect, call
             // and return exits.
             let mut branch_misses = [0u64; 40];
@@ -2406,6 +2409,12 @@ impl Heartbeat {
                 for (total, (now, before)) in switch_misses
                     .iter_mut()
                     .zip(now.switch_misses.iter().zip(&before.switch_misses))
+                {
+                    *total += now.saturating_sub(*before);
+                }
+                for (total, (now, before)) in contexts
+                    .iter_mut()
+                    .zip(now.contexts.iter().zip(&before.contexts))
                 {
                     *total += now.saturating_sub(*before);
                 }
@@ -2729,6 +2738,14 @@ impl Heartbeat {
             output::arguments(format_args!(
                 "PES SWITCH MISSES closed/never/forgotten/context/set/class/other ttbr0={closed}/{never}/{forgotten}/{context}/{set}/{class}/{other}\n"
             ));
+            let [isolations, native] = contexts;
+            let prediction = stela_boot_core::prediction_lines::Contexts {
+                isolating: super::speculation::isolates(),
+                isolations,
+                native,
+                engine_barriers: super::speculation::take_issued(),
+            };
+            output::arguments(format_args!("{}", prediction.line()));
             let [fallthrough, direct, indirect, call, ret] = [0, 1, 2, 3, 4].map(|kind| {
                 branch_misses[kind * 8..kind * 8 + 8]
                     .iter()

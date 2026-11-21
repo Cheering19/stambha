@@ -7,7 +7,9 @@
 //! apply. FEAT_CSV2 holds where the CPU has an indirect branch prediction
 //! barrier: the engine calls [`isolate`] at every guest context change
 //! (`engine::PredictionContext`), which issues IBPB and refills the return
-//! stack buffer.
+//! stack buffer. A boot with `--no-ibpb` gives that up: [`probe`] then
+//! finds no barrier, so neither the engine nor native TTBR0 switches issue
+//! one and the guest sees no FEAT_CSV2, as on a CPU without IBPB.
 //!
 //! FEAT_CSV3 holds where the CPU documents that its loads forward no data
 //! from a faulting access, nor stale buffer data to one, to later
@@ -21,7 +23,7 @@ use core::{
         asm,
         x86_64::{__cpuid, __cpuid_count},
     },
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_engine::machine::identification::Speculation;
 
@@ -73,6 +75,9 @@ const CPUID_80000021_ECX_TSA_L1_NO: u32 = 1 << 2;
 
 /// [`isolate`] issues IBPB.
 static BARRIER: AtomicBool = AtomicBool::new(false);
+/// The barriers [`isolate`] issued since [`take_issued`] last took them,
+/// every PE's: one atomic add beside each IBPB's thousands of cycles.
+static ISSUED: AtomicU64 = AtomicU64::new(0);
 /// [`fence`] issues LFENCE.
 static FENCE: AtomicBool = AtomicBool::new(false);
 
@@ -110,9 +115,23 @@ fn extended(leaf: u32) -> Option<core::arch::x86_64::CpuidResult> {
 }
 
 /// The host's guarantees, probed once before guest code runs; the barrier
-/// [`isolate`] issues follows the result.
-pub fn probe() -> Speculation {
-    let contexts = match vendor() {
+/// [`isolate`] issues follows the result. Without `isolate` (`--no-ibpb`)
+/// a CPU's barrier goes unused, and the guest is told so.
+pub fn probe(isolate: bool) -> Speculation {
+    let contexts = isolate && enumerated();
+    BARRIER.store(contexts, Ordering::Relaxed);
+    let faulting_data = forwards_no_faulting_data(vendor());
+    FENCE.store(faulting_data, Ordering::Relaxed);
+    Speculation {
+        contexts,
+        faulting_data,
+    }
+}
+
+/// Whether the CPU has a barrier that isolates indirect branch and return
+/// predictions between contexts, whether or not the boot uses it.
+pub fn enumerated() -> bool {
+    match vendor() {
         Vendor::Intel => __cpuid_count(7, 0).edx & CPUID_7_EDX_SPEC_CTRL != 0,
         // From Zen 3, IBPB isolates return predictions only where it also
         // flushes branch types or no return stack overflow exists; Zen 1
@@ -126,13 +145,6 @@ pub fn probe() -> Speculation {
                     }))
         }
         Vendor::Other => false,
-    };
-    BARRIER.store(contexts, Ordering::Relaxed);
-    let faulting_data = forwards_no_faulting_data(vendor());
-    FENCE.store(faulting_data, Ordering::Relaxed);
-    Speculation {
-        contexts,
-        faulting_data,
     }
 }
 
@@ -176,6 +188,12 @@ pub fn isolates() -> bool {
     BARRIER.load(Ordering::Relaxed)
 }
 
+/// The barriers [`isolate`] issued since the last call, every PE's; native
+/// TTBR0 switches issue theirs without it.
+pub fn take_issued() -> u64 {
+    ISSUED.swap(0, Ordering::Relaxed)
+}
+
 /// Keep branch predictions trained before the call from steering
 /// speculation after it: IBPB, then a refill of the return stack buffer
 /// with entries that each lead to a trap, so a return that underflows it
@@ -185,6 +203,7 @@ pub fn isolate() {
     if !BARRIER.load(Ordering::Relaxed) {
         return;
     }
+    ISSUED.fetch_add(1, Ordering::Relaxed);
     // SAFETY: [`probe`] found IBPB enumerated; ring 0. Each refill call
     // pushes its return address, which the final addition pops; nothing
     // executes the INT3s but speculation.
