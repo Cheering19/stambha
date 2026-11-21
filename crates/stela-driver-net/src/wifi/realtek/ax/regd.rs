@@ -23,10 +23,13 @@
 //! country the index of a network configured without one stays the
 //! world's, `WW`, whatever the AP announces.
 //!
+//! [`unii4_allowed`] is rtw89's UNII-4 policy without ACPI, for the channels
+//! the station offers (M4 spec S14.2).
+//!
 //! This module does not grant any channel, the channel rules a country
-//! allows (Stela's regulatory database owns those), UNII-4 or 6 GHz policy,
-//! TAS or antenna-gain policy, or any register write; it only names the
-//! index the TX power tables are read at.
+//! allows (Stela's regulatory database owns those), 6 GHz policy, TAS or
+//! antenna-gain policy, or any register write; it only names the index the
+//! TX power tables are read at and whether UNII-4 stays enabled.
 use super::{chan::HwBand, txpwr_tables::RegdEntry};
 
 /// `enum rtw89_regulation_type` (core.h:774-792).
@@ -74,6 +77,29 @@ impl Regd {
             _ => Self::Na,
         }
     }
+
+    /// The index's name, its `RTW89_` enumerator without the prefix, as the
+    /// station's progress line prints it (M4 spec S3.4).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ww => "WW",
+            Self::Etsi => "ETSI",
+            Self::Fcc => "FCC",
+            Self::Mkk => "MKK",
+            Self::Na => "NA",
+            Self::Ic => "IC",
+            Self::Kcc => "KCC",
+            Self::Acma => "ACMA",
+            Self::Ncc => "NCC",
+            Self::Mexico => "MEXICO",
+            Self::Chile => "CHILE",
+            Self::Ukraine => "UKRAINE",
+            Self::Cn => "CN",
+            Self::Qatar => "QATAR",
+            Self::Uk => "UK",
+            Self::Thailand => "THAILAND",
+        }
+    }
 }
 
 /// `regd->txpwr_regd` for the bands Stela runs, as the map gives them
@@ -106,6 +132,18 @@ impl Regds {
 
 /// `rtw89_ww_regd.alpha2` (regd.c:24-25).
 const WW_ALPHA2: [u8; 2] = *b"00";
+
+/// Whether the regd found by `alpha2` ([`select`]'s, `00` for the world's)
+/// may use UNII-4 (channels 169, 173 and 177), as PCIe rtw89 decides it
+/// without ACPI: `rtw89_regd_setup_unii4` fills `block_unii4`, its DSM
+/// evaluation fails, and the fallback `val` (`RTW89_ACPI_CONF_UNII4_US`
+/// alone) clears only US (regd.c:359-409); `rtw89_regd_apply_policy_unii4`
+/// then disables the channels for any regd still blocked or without an
+/// index, the world's (regd.c:327-338, :770-797). `alpha2` names a map
+/// entry, so "US" is in the map. CA needs the DSM's `UNII4_CA` bit.
+pub fn unii4_allowed(alpha2: [u8; 2]) -> bool {
+    alpha2 == *b"US"
+}
 
 /// `rtw89_regd_find_reg_by_name` (regd.c:307-320): the first entry with
 /// this alpha2, or `None` for the world regd.

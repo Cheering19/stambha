@@ -1,6 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
+// The duplicate check is adapted from pinned Linux net/mac80211/rx.c
+// (ieee80211_rx_h_check_dup): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2005-2006, Devicescape Software, Inc.; 2006-2007 Jiri Benc; 2007-2010
+// Johannes Berg; 2013-2014 Intel Mobile Communications GmbH; 2015-2017 Intel
+// Deutschland GmbH; 2018-2026 Intel Corporation. See NOTICE.
 //! An RTL8852CE as the connection keeper's radio (M3 spec S14). rtw89
 //! leaves the MAC's soft half to mac80211, as rtw88 does, so the station's
 //! orchestration is Stela's, after rtw88's `realtek/station.rs` (its
@@ -90,11 +95,21 @@
 //!   its SSN; a DELBA, a replacement or the departure stops it on the chip
 //!   and drops what it held. Block Ack action frames are robust: under PMF
 //!   they come and go protected.
+//! - The station's TX Block Ack agreements (M4 spec S10) go through the
+//!   station's `ba::tx` as rtw88 drives it, at rtw89's rules
+//!   (`rtw89_core_txq_check_agg`, `core.c:4707`): the first QoS data on a
+//!   TID without one asks the AP, VO included, under the pairwise key with
+//!   PMF; the TID's data waits unnumbered while its agreement changes; one
+//!   in force is the chip's TX_OPERATIONAL ([`chip::Chip::aggregation`]),
+//!   and the TID's data goes in A-MPDUs of its window. A start that
+//!   `ieee80211_start_tx_ba_session` refuses with -EINVAL blocks the TID for
+//!   the association; EAPOL on an aggregating TID stops its agreement with a
+//!   DELBA and forbids the TID for 4 s (`rtw89_core_stop_tx_ba_session`).
 //! - A departure leaves through the chip (spec S11), which releases its
 //!   channel. From an association, mac80211's `ieee80211_set_disassoc`
 //!   (`mlme.c:4506`) flushes first ([`chip::Chip::flush`] with drop, then
 //!   without it after a deauthentication of the station's own); the
-//!   agreements stop on the chip without a DELBA
+//!   agreements stop on the chip without a DELBA, RX then TX
 //!   (`ieee80211_sta_tear_down_BA_sessions`, `ht.c:286`); each key is deleted
 //!   after a flush without drop, as `rtw89_ops_set_key`'s DISABLE_KEY
 //!   flushes, the PTK first, then the group keys, before the chip
@@ -116,7 +131,7 @@
 //! WEP), hardware-encrypted management frames (`hw_mgmt_tx_encrypt`), the
 //! IGTK in the CAM, SAE on 6 GHz or on an MLD link, the probe of the AP
 //! mac80211 sends on a beacon loss before it gives the AP up
-//! (`ieee80211_mgd_probe_ap`, `mlme.c:4914`), A-MSDU or aggregated TX, power
+//! (`ieee80211_mgd_probe_ap`, `mlme.c:4914`), A-MSDU TX, power
 //! save, templates, the watchdog, SA Query requests of its own, or following
 //! the AP's beacons and channel switches. Under PMF an unprotected
 //! deauthentication or disassociation is dropped
@@ -146,6 +161,9 @@ pub mod chip;
 
 use self::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
 use super::assoc::HtPeer;
+use super::c2h::{RaReport, ra_rate};
+use super::regd::unii4_allowed;
+use super::rx::{Rate, RateMode};
 use super::txd;
 use crate::{
     Clock, Link, LinkError, Mac,
@@ -167,17 +185,26 @@ use crate::{
         },
         station::{
             Action, AssociationContext, Completion, Failure, Join, NativeBssObservation,
-            Phase as Peering, RegulatoryPolicy, Station, Ticket, ba,
+            Phase as Peering, RegulatoryPolicy, Station, Ticket,
+            ba::{self, tx},
             data::{self, Ingress, Protection, Qos, SequenceOwner, TxClass},
             external,
             fragments::Fragments,
             multi_link::Affiliation,
+            operations::Operations,
             phy::{Capabilities, McsMaps, Role},
             wire::six_ghz::Selection,
         },
     },
 };
-use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, VecDeque},
+    format,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::fmt;
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
@@ -207,6 +234,13 @@ const NO_MLO: &str = "MLO on an RTL8852C";
 const RECEIVE_WINDOW: u16 = 64;
 /// A reorder clock of microseconds, as rtw88's.
 const REORDER_TICKS_PER_SECOND: u32 = 1_000_000;
+/// 8852C's `max_tx_agg_num` (`rtw8852c.c:3156`), which rtw89 makes
+/// `max_tx_aggregation_subframes` (`core.c:7484`): a TX agreement's largest
+/// window (M4 spec S10.1).
+const TRANSMIT_WINDOW: u16 = 128;
+/// `RTW89_FORBID_BA_TIMER` (`core.h:56`): how long EAPOL on an aggregating
+/// TID keeps the TID from asking again (M4 spec S10.5).
+const FORBID_BA_US: u64 = 4_000_000;
 /// `WLAN_CATEGORY_BACK`.
 const BLOCK_ACK_CATEGORY: u8 = 3;
 /// The frames that wait behind an accepted association response, the
@@ -242,6 +276,9 @@ const CHANNELS_5GHZ: [u16; 28] = [
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
     149, 153, 157, 161, 165, 169, 173, 177,
 ];
+/// `RTW89_5GHZ_UNII4_START_INDEX` (`core.h:6991`): channel 169's.
+const UNII4_START_INDEX: usize = 25;
+const _: () = assert!(CHANNELS_5GHZ[UNII4_START_INDEX] == 169);
 /// The Supported Channels a spectrum-managed request names (spec S14.4).
 const SUPPORTED_2GHZ: [u8; 2] = [1, 14];
 const SUPPORTED_5GHZ: [u8; 4] = [36, 28, 149, 9];
@@ -254,6 +291,7 @@ pub enum Error {
     Data(data::Error),
     Key(security::Error),
     Scan(scan::Error),
+    BlockAck(ba::Error),
     Refused(&'static str),
     Unsupported(&'static str),
     /// Frames must drain before this can go on.
@@ -293,13 +331,15 @@ struct Heard {
 
 /// A data frame waiting for room: its MPDU (without its CCMP header when
 /// it goes under a key), the queue's TID, whether it is EAPOL, the peer's
-/// rates, and the key it goes under: CAM entry, key ID and its reserved PN.
+/// rates, the key it goes under: CAM entry, key ID and its reserved PN, and
+/// the A-MPDU it goes in.
 struct Held {
     bytes: Vec<u8>,
     tid: u8,
     eapol: bool,
     supported: u16,
     key: Option<(u8, u8, u64)>,
+    aggregate: Option<txd::Aggregate>,
 }
 
 /// What a management frame is to the progress line.
@@ -366,6 +406,10 @@ struct Progress {
     data: Option<Traffic>,
     beacon_lost: Option<u32>,
     last: Option<&'static str>,
+    /// The ADDBA Requests the station sent, and those the AP answered with
+    /// success (M4 spec S3.4).
+    addba_sent: u32,
+    addba_ok: u32,
 }
 
 fn bump(counter: &mut u32) {
@@ -382,6 +426,159 @@ fn exchange(exchange: Option<Exchange>) -> String {
         || String::from("-"),
         |e| format!("{}/{} status {}", e.sent, e.acked, or_dash(e.status)),
     )
+}
+
+/// The rates of the data frames the chip handed on addressed to the
+/// station, each with the A-MPDU bit of its RX descriptor (M4 spec S3.1):
+/// `counts` by rate, `ampdu` those that came in an A-MPDU, `total` all,
+/// each saturating. The key space is the descriptor's, so the map stays
+/// bounded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RateHistogram {
+    pub counts: BTreeMap<Rate, u32>,
+    pub ampdu: u32,
+    pub total: u32,
+}
+
+impl RateHistogram {
+    pub fn record(&mut self, rate: Rate, ampdu: bool) {
+        bump(self.counts.entry(rate).or_default());
+        if ampdu {
+            bump(&mut self.ampdu);
+        }
+        bump(&mut self.total);
+    }
+
+    /// The rate most frames came at, the highest of a tie, and its count.
+    pub fn top(&self) -> Option<(Rate, u32)> {
+        self.counts
+            .iter()
+            .max_by_key(|&(_, &count)| count)
+            .map(|(&rate, &count)| (rate, count))
+    }
+}
+
+/// `rate` as the progress line prints it: mode and width, streams, MCS (a
+/// legacy rate's index) and a short GI.
+fn rate_text(rate: &Rate) -> String {
+    let mode = match rate.mode {
+        RateMode::Legacy => "legacy",
+        RateMode::Ht => "ht",
+        RateMode::Vht => "vht",
+        RateMode::He => "he",
+    };
+    let sgi = if rate.sgi { " sgi" } else { "" };
+    format!(
+        "{mode}{} {}ss mcs{}{sgi}",
+        width_text(rate.bw),
+        rate.nss,
+        rate.mcs
+    )
+}
+
+/// `enum rtw89_bandwidth`'s 20 to 160 MHz.
+fn width_text(bw: u8) -> &'static str {
+    match bw {
+        0 => "20",
+        1 => "40",
+        2 => "80",
+        3 => "160",
+        _ => "?",
+    }
+}
+
+/// `part` of `whole` in whole percent, rounded down.
+fn percent(part: u32, whole: u32) -> u64 {
+    u64::from(part) * 100 / u64::from(whole.max(1))
+}
+
+/// The joined AP's operation as its beacon states it (M4 spec S3.4): its
+/// mode (`he` with an HE operation, else `vht` with a VHT operation on 5
+/// GHz, else `ht` with an HT operation, else `legacy`), its width and
+/// centre channel from the HT operation's secondary channel offset and the
+/// VHT operation's width and centre segments (`ieee80211_chandef_vht_oper`,
+/// read as the AP states it, not as the station joined), its primary
+/// channel, and the extended NSS bandwidth support of its VHT capability
+/// (bits 31:30) when it has one (M4 spec S7.2, SL-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApOperation {
+    mode: &'static str,
+    width: &'static str,
+    primary: u16,
+    centre: u16,
+    ext_nss_bw: Option<u8>,
+}
+
+impl ApOperation {
+    fn of(bss: &Bss) -> Self {
+        let primary = bss.channel.number;
+        let operations = Operations::parse(&bss.elements).ok();
+        let ht = operations.as_ref().and_then(|o| o.ht.as_ref());
+        let vht = operations
+            .as_ref()
+            .and_then(|o| o.vht.as_ref())
+            .filter(|_| bss.channel.band == Band::Ghz5);
+        let he = operations.as_ref().is_some_and(|o| o.he.is_some());
+        let mode = match (he, vht.is_some(), ht.is_some()) {
+            (true, _, _) => "he",
+            (false, true, _) => "vht",
+            (false, false, true) => "ht",
+            _ => "legacy",
+        };
+        let (mut width, mut centre) = ("20", primary);
+        match ht.map(|ht| ht.parameter & 3) {
+            Some(1) => (width, centre) = ("40", primary + 2),
+            Some(3) => (width, centre) = ("40", primary.saturating_sub(2)),
+            _ => {}
+        }
+        if let Some(vht) = vht {
+            let (c0, c1) = (u16::from(vht.center0), u16::from(vht.center1));
+            match vht.width {
+                1 if c1 != 0 && c0.abs_diff(c1) == 8 => (width, centre) = ("160", c1),
+                1 if c1 != 0 && c0.abs_diff(c1) > 8 => (width, centre) = ("80p80", c0),
+                1 => (width, centre) = ("80", c0),
+                2 => (width, centre) = ("160", c0),
+                3 => (width, centre) = ("80p80", c0),
+                _ => {}
+            }
+        }
+        // The VHT Capabilities element (191) and its capability's bits
+        // 31:30.
+        let mut ext_nss_bw = None;
+        let mut rest = &bss.elements[..];
+        while let [id, len, tail @ ..] = rest {
+            let Some(body) = tail.get(..usize::from(*len)) else {
+                break;
+            };
+            if *id == 191
+                && let Some(cap) = body.get(..4)
+            {
+                ext_nss_bw = Some(cap[3] >> 6);
+            }
+            rest = &tail[usize::from(*len)..];
+        }
+        Self {
+            mode,
+            width,
+            primary,
+            centre,
+            ext_nss_bw,
+        }
+    }
+}
+
+impl fmt::Display for ApOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{} ch {} (c {})",
+            self.mode, self.width, self.primary, self.centre
+        )?;
+        if let Some(bits) = self.ext_nss_bw {
+            write!(f, " ext nss bw {bits}")?;
+        }
+        Ok(())
+    }
 }
 
 /// The channels the country admits, which the real check gates at each frame.
@@ -432,8 +629,14 @@ fn rate_elements(band: Band) -> &'static [u8] {
     }
 }
 
-/// The channels mac80211 registers for rtw89, as `country` leaves them.
-fn channels(country: &Country) -> Vec<(Channel, u32)> {
+/// The channels mac80211 registers for rtw89, as `country` leaves them,
+/// then UNII-4 (169, 173 and 177, from `RTW89_5GHZ_UNII4_START_INDEX`,
+/// `core.h:6991-6992`) dropped unless the regd `alpha2` names may use it
+/// ([`unii4_allowed`], M4 spec S14.2): `rtw89_regd_apply_policy_unii4`
+/// disables them from the regd notifier, after cfg80211's own channel and
+/// HT40 flags (`wiphy_update_regulatory`'s `reg_call_notifier` comes last),
+/// so the channels below keep the flags they had with UNII-4 present.
+fn channels(country: &Country, alpha2: [u8; 2]) -> Vec<(Channel, u32)> {
     let mut out = Vec::new();
     let mut band = |band: Band, numbers: &[u16], frequency: fn(u16) -> u16| {
         let centers: Vec<u16> = numbers.iter().map(|&number| frequency(number)).collect();
@@ -461,6 +664,10 @@ fn channels(country: &Country) -> Vec<(Channel, u32)> {
         }
     });
     band(Band::Ghz5, &CHANNELS_5GHZ, |number| 5000 + 5 * number);
+    if !unii4_allowed(alpha2) {
+        let unii4 = &CHANNELS_5GHZ[UNII4_START_INDEX..];
+        out.retain(|(channel, _)| !(channel.band == Band::Ghz5 && unii4.contains(&channel.number)));
+    }
     out
 }
 
@@ -518,6 +725,21 @@ pub struct Rtl8852c<C: Chip> {
     events: VecDeque<keeper::Event>,
     received: VecDeque<Vec<u8>>,
     held: VecDeque<Held>,
+    /// Data kept from a TID whose TX agreement is changing, as
+    /// `ieee80211_agg_stop_txq` keeps it in the TXQ.
+    parked: VecDeque<(u8, Vec<u8>, TxClass)>,
+    /// What TX agreements have yet to do, in turn.
+    changes: VecDeque<tx::Action>,
+    /// Each TID's TX agreement in force, `RTW89_TXQ_F_AMPDU`.
+    aggregating: [Option<Arc<tx::Session>>; 8],
+    /// The TIDs an agreement cannot start on in this association,
+    /// `RTW89_TXQ_F_BLOCK_BA`.
+    blocked: [bool; 8],
+    /// The TIDs EAPOL stopped an agreement on, `RTW89_TXQ_F_FORBID_BA`,
+    /// until `forbid_ends`: one timer for all of them, as rtw89's
+    /// `forbid_ba_work` is one delayed work restarted on each stop.
+    forbidden: [bool; 8],
+    forbid_ends: Option<u64>,
     admitted: Option<(Ticket, Arc<AssociationContext>)>,
     context: Option<Arc<AssociationContext>>,
     /// The BSS joined, as the keeper's profile of it.
@@ -557,12 +779,20 @@ pub struct Rtl8852c<C: Chip> {
     /// The configured network's name, compared and never printed.
     ssid: Vec<u8>,
     progress: Progress,
+    /// The rates the station's data came at, and the last RA report of the
+    /// firmware's for the AP, across every association (M4 spec S3.1,
+    /// S3.3).
+    rx_rates: RateHistogram,
+    tx_rate: Option<RaReport>,
+    /// The last BSS joined's operation.
+    ap_operation: Option<ApOperation>,
 }
 
 impl<C: Chip> Rtl8852c<C> {
     /// `chip`, running at `address` under `country`, as a keeper's radio.
     pub fn new(chip: C, address: Mac, country: Country, clock: Clock) -> Result<Self, Error> {
-        let channels = channels(&country);
+        let alpha2 = chip.link_counts().regd.map_or(*b"00", |(alpha2, _)| alpha2);
+        let channels = channels(&country, alpha2);
         Ok(Self {
             chip,
             address,
@@ -578,6 +808,12 @@ impl<C: Chip> Rtl8852c<C> {
             events: VecDeque::new(),
             received: VecDeque::new(),
             held: VecDeque::new(),
+            parked: VecDeque::new(),
+            changes: VecDeque::new(),
+            aggregating: Default::default(),
+            blocked: [false; 8],
+            forbidden: [false; 8],
+            forbid_ends: None,
             admitted: None,
             context: None,
             peer: None,
@@ -600,6 +836,9 @@ impl<C: Chip> Rtl8852c<C> {
             reported: Vec::new(),
             ssid: Vec::new(),
             progress: Progress::default(),
+            rx_rates: RateHistogram::default(),
+            tx_rate: None,
+            ap_operation: None,
         })
     }
 
@@ -614,6 +853,12 @@ impl<C: Chip> Rtl8852c<C> {
     /// The chip, as the radio left it.
     pub fn into_chip(self) -> C {
         self.chip
+    }
+
+    /// The rates of the data the chip handed on addressed to the station
+    /// (M4 spec S3.1).
+    pub fn rx_rates(&self) -> &RateHistogram {
+        &self.rx_rates
     }
 
     fn chip<T>(result: Result<T, String>) -> Result<T, Error> {
@@ -700,6 +945,7 @@ impl<C: Chip> Rtl8852c<C> {
         self.admitted = None;
         self.outbox.clear();
         self.held.clear();
+        self.parked.clear();
         self.deferred.clear();
     }
 
@@ -718,6 +964,14 @@ impl<C: Chip> Rtl8852c<C> {
         self.authorized = false;
         self.outbox.clear();
         self.held.clear();
+        self.parked.clear();
+        // `rtw89_core_free_sta_pending_ba` and `_forbid_ba`
+        // (`mac80211.c:619-620`): the AP's station takes its TXQ flags with it.
+        self.changes.clear();
+        self.aggregating = Default::default();
+        self.blocked = [false; 8];
+        self.forbidden = [false; 8];
+        self.forbid_ends = None;
         self.keys.clear();
         self.management_cipher = None;
         self.integrity = None;
@@ -760,7 +1014,12 @@ impl<C: Chip> Rtl8852c<C> {
     /// `IEEE80211_TX_CTL_REQ_TX_STATUS`, rtw89 reporting TX status
     /// (`REPORTS_TX_ACK_STATUS`, `core.c:7495`), and the status times the
     /// exchange's next try (`ieee80211_mgd_conn_tx_status`). A protected
-    /// frame was sealed as it was queued.
+    /// frame was sealed as it was queued. A frame the chip refuses (a chip
+    /// off, or one the encoder or the submit refuses) stays at the head and
+    /// its error is returned, as rtw88's does, so the frames behind it wait
+    /// until a departure clears the outbox; rtw89 frees just that frame
+    /// (`ieee80211_free_txskb` after `rtw89_core_tx_write` fails,
+    /// `mac80211.c:39-43`).
     fn send_management(&mut self) -> Result<(), Error> {
         let basic_rates = self.basic_rates();
         while let Some((_, bytes)) = self.outbox.front() {
@@ -790,7 +1049,10 @@ impl<C: Chip> Rtl8852c<C> {
     }
 
     /// rtw88's `send_data` (`station.rs:943`): `held`, oldest first, while
-    /// the chip has room. Each EAPOL frame's token is kept for its report.
+    /// the chip has room, each written to the chip and left for the service
+    /// pass's kick (M4 spec S9.1). Each EAPOL frame's token is kept for its
+    /// report; an A-MPDU's frame is published to its agreement, which
+    /// restarts the agreement's inactivity timeout.
     fn send_data(&mut self) -> Result<(), Error> {
         while let Some(held) = self.held.front() {
             let frame = Data {
@@ -799,12 +1061,25 @@ impl<C: Chip> Rtl8852c<C> {
                 eapol: held.eapol,
                 supported_rates: held.supported,
                 key: held.key,
+                aggregate: held.aggregate,
             };
             let Some(token) = Self::chip(self.chip.transmit_data(&frame))? else {
                 return Ok(());
             };
             let eapol = held.eapol;
+            let session = held.aggregate.and(
+                self.aggregating
+                    .get(usize::from(held.tid))
+                    .cloned()
+                    .flatten(),
+            );
             self.held.pop_front();
+            if let Some(session) = session {
+                let now = self.clock.now_us();
+                // SAFETY: this frame just went to the chip under `session`.
+                // A stop under way has revoked it, and that refusal is right.
+                let _ = unsafe { self.station.tx_block_ack_published(&session, now) };
+            }
             if eapol {
                 bump(&mut self.progress.eapol.get_or_insert_default().sent);
                 if self.eapol_reports.len() >= MAX_EAPOL_REPORTS {
@@ -850,11 +1125,15 @@ impl<C: Chip> Rtl8852c<C> {
         ))
     }
 
-    /// rtw88's `send` (`station.rs:1121`, spec S13.1) without A-MSDU or TX
-    /// Block Ack: the MSDU as the station prepares it under the keys held,
-    /// a `HostIv` frame's CCMP header checked against its reservation and
-    /// removed (spec S5.4), held, then sent while the chip has room, as
-    /// mac80211 hands a frame to the driver at once. A frame the strip
+    /// rtw88's `send` (`station.rs:1121`, spec S13.1) without A-MSDU: data
+    /// of a TID whose TX agreement is changing parked, unnumbered, as
+    /// `ieee80211_agg_stop_txq` keeps it (M4 spec S10.1); otherwise the MSDU
+    /// as the station prepares it under the keys held, a `HostIv` frame's
+    /// CCMP header checked against its reservation and removed (spec S5.4),
+    /// in an A-MPDU when its TID aggregates, held, then written to the chip
+    /// while it has room, as mac80211 hands a frame to the driver at once;
+    /// the service pass's kick sends it. `rtw89_core_txq_check_agg` then
+    /// weighs the TID's agreement (M4 spec S10.4, S10.5). A frame the strip
     /// refuses is dropped, its PN spent.
     fn send(&mut self, ethernet: &[u8], class: TxClass) -> Result<(), Error> {
         let epoch = self
@@ -863,6 +1142,15 @@ impl<C: Chip> Rtl8852c<C> {
             .ok_or(Error::Refused("no association"))?;
         let context = self.context.clone().ok_or(Error::Refused("no context"))?;
         let tid = data::data_tid(&context, None, None, ethernet);
+        if let Some(tid) = tid
+            && self.station.tx_block_ack_blocks_data(tid)
+        {
+            if self.parked.len() >= MAX_HELD {
+                self.parked.pop_front();
+            }
+            self.parked.push_back((tid, ethernet.to_vec(), class));
+            return Ok(());
+        }
         let mut policy = Admitted(&self.channels);
         let mut keys: Vec<&mut KeySlot> = self.keys.iter_mut().map(|key| &mut key.slot).collect();
         let plan = match tid {
@@ -903,17 +1191,294 @@ impl<C: Chip> Rtl8852c<C> {
             }
             Protection::Firmware { .. } => return Err(Error::Refused("a firmware key")),
         };
+        let eapol = class != TxClass::Data;
+        let aggregate = tid
+            .filter(|_| !eapol)
+            .and_then(|tid| self.aggregate(&context, tid));
         if self.held.len() >= MAX_HELD {
             self.held.pop_front();
         }
         self.held.push_back(Held {
             bytes: mpdu,
             tid: tid.unwrap_or(0),
-            eapol: class != TxClass::Data,
+            eapol,
             supported: context.negotiated().legacy.supported,
             key,
+            aggregate,
         });
+        if let Some(tid) = tid {
+            self.check_aggregation(tid, eapol);
+        }
         self.send_data()
+    }
+
+    /// `rtw89_core_txq_check_agg`'s `IEEE80211_TX_CTL_AMPDU` and
+    /// `rtw89_core_tx_update_ampdu_info` (`core.c:636-675`, M4 spec S10.3):
+    /// data on `tid` goes in an A-MPDU while its agreement is operational and
+    /// the TID is not forbidden, of the agreement's window at the AP's HT
+    /// A-MPDU length exponent and MPDU spacing.
+    fn aggregate(&self, context: &AssociationContext, tid: u8) -> Option<txd::Aggregate> {
+        let index = usize::from(tid);
+        if *self.forbidden.get(index)? {
+            return None;
+        }
+        let session = self.aggregating.get(index)?.as_ref()?;
+        let agreement = self.station.validate_tx_block_ack(session).ok()?;
+        let ht = context.negotiated().ht.as_ref()?;
+        Some(txd::Aggregate {
+            agg_num: agreement.window(),
+            factor: ht.peer_ampdu_base_exponent,
+            density: ht.peer_mpdu_spacing,
+        })
+    }
+
+    /// `rtw89_core_txq_check_agg` (`core.c:4707-4741`) of a frame just
+    /// queued on `tid`, then `rtw89_core_ba_work` (`:4601-4637`): nothing
+    /// while the TID is forbidden; EAPOL stops an operational agreement
+    /// ([`Self::forbid`]); otherwise a TID neither blocked nor aggregating
+    /// starts one, unless the station is leaving (`rtwsta->disassoc`). Under
+    /// PMF the ADDBA goes under the pairwise key, so none starts before it
+    /// (rtw88's `start_aggregation`). There is no VO exclusion: rtw88 has one,
+    /// rtw89 none. `ieee80211_start_tx_ba_session`'s -EINVAL
+    /// (`Unsupported`, `InvalidLimits`) blocks the TID for the association;
+    /// its other refusals leave the next frame to ask again.
+    fn check_aggregation(&mut self, tid: u8, eapol: bool) {
+        let index = usize::from(tid);
+        if self.forbidden.get(index).is_none_or(|&forbidden| forbidden) {
+            return;
+        }
+        if eapol {
+            self.forbid(tid);
+            return;
+        }
+        if self.blocked[index] || self.aggregating[index].is_some() || self.left {
+            return;
+        }
+        let now = self.clock.now_us();
+        let started = if !self.station.requires_protected_management() {
+            self.station.begin_tx_block_ack(tid, 0, now)
+        } else if self.keys.iter().any(|key| key.pairwise) {
+            self.station.begin_authenticated_tx_block_ack(tid, 0, now)
+        } else {
+            return;
+        };
+        match started {
+            Ok(action) => self.changes.push_back(action),
+            Err(ba::Error::Unsupported | ba::Error::InvalidLimits) => self.blocked[index] = true,
+            Err(_) => {}
+        }
+    }
+
+    /// `rtw89_core_stop_tx_ba_session` (`core.c:4682-4705`, M4 spec S10.5):
+    /// EAPOL on a TID whose agreement is operational (`RTW89_TXQ_F_AMPDU`)
+    /// forbids the TID and stops the agreement with a DELBA
+    /// (`ieee80211_stop_tx_ba_session`); the one forbid timer restarts
+    /// (`cancel_delayed_work`, then `RTW89_FORBID_BA_TIMER` again), and its
+    /// end clears every TID it forbade (`rtw89_forbid_ba_work`,
+    /// `:4900-4912`).
+    fn forbid(&mut self, tid: u8) {
+        let index = usize::from(tid);
+        if self.left || self.aggregating[index].is_none() {
+            return;
+        }
+        self.forbidden[index] = true;
+        if let Ok(action) = self.station.stop_tx_block_ack(tid, true) {
+            self.changes.push_back(action);
+        }
+        self.forbid_ends = self.clock.now_us().checked_add(FORBID_BA_US);
+    }
+
+    /// mac80211's aggregation work over `rtw89_ops_ampdu_action`
+    /// (`mac80211.c:1026-1075`, M4 spec S10.2) after rtw88's
+    /// `change_agreements` (`station.rs:992`), each action in turn:
+    /// - Prepare waits while data of its TID the station numbered is held,
+    ///   as mac80211 numbers a frame as it leaves the TXQ, then gives the
+    ///   TID's next sequence number (TX_START: IMMEDIATE, no I/O).
+    /// - A frame goes to the chip at once ([`Self::send_agreement_frame`]),
+    ///   waiting at the head for room; one the station no longer sends, or
+    ///   one the chip refuses, is rejected.
+    /// - Programming is [`Chip::aggregation`]: TX_OPERATIONAL with the
+    ///   agreement's window, or TX_STOP; a stop takes the TID's A-MPDUs off
+    ///   what is held. rtw89 returns 0 whatever it did, so the agreement goes
+    ///   on, and the chip's error is returned after the rest.
+    /// - Operational puts the agreement in force and counts it.
+    fn change_agreements(&mut self) -> Result<(), Error> {
+        let mut first = Ok(());
+        while let Some(action) = self.changes.pop_front() {
+            let now = self.clock.now_us();
+            let next = match action {
+                tx::Action::Prepare { ticket, session } => {
+                    let tid = session.tid();
+                    if self.held.iter().any(|held| held.tid == tid) {
+                        self.changes
+                            .push_front(tx::Action::Prepare { ticket, session });
+                        return first;
+                    }
+                    let sequence = self
+                        .context
+                        .as_ref()
+                        .and_then(|context| self.station.next_qos_sequence(context, tid).ok());
+                    // SAFETY: new data of this TID waits in `parked`, none of
+                    // it is held, and `sequence` is the station's own counter.
+                    unsafe {
+                        self.station.complete_tx_block_ack_prepare(
+                            ticket,
+                            Completion::Accepted,
+                            sequence,
+                            now,
+                        )
+                    }
+                }
+                tx::Action::Transmit {
+                    ticket,
+                    session,
+                    bytes,
+                } => {
+                    let result = if self.left
+                        || self
+                            .station
+                            .validate_tx_block_ack_transmit(ticket, &session, &bytes)
+                            .is_err()
+                    {
+                        Completion::RejectedAndIdle
+                    } else {
+                        match self.send_agreement_frame(&bytes) {
+                            Ok(true) => Completion::Accepted,
+                            Ok(false) => {
+                                self.changes.push_front(tx::Action::Transmit {
+                                    ticket,
+                                    session,
+                                    bytes,
+                                });
+                                return first;
+                            }
+                            Err(error) => {
+                                if first.is_ok() {
+                                    first = Err(error);
+                                }
+                                Completion::RejectedAndIdle
+                            }
+                        }
+                    };
+                    // SAFETY: the frame reached the chip, or never will.
+                    unsafe {
+                        self.station
+                            .complete_tx_block_ack_transmit(ticket, result, now)
+                    }
+                }
+                tx::Action::Program {
+                    ticket,
+                    session,
+                    agreement,
+                } => {
+                    let tid = session.tid();
+                    let window = agreement.map(tx::Agreement::window);
+                    let programmed = Self::chip(self.chip.aggregation(tid, window));
+                    if first.is_ok() {
+                        first = programmed;
+                    }
+                    if agreement.is_none() {
+                        if let Some(slot) = self.aggregating.get_mut(usize::from(tid)) {
+                            *slot = None;
+                        }
+                        for held in &mut self.held {
+                            if held.tid == tid {
+                                held.aggregate = None;
+                            }
+                        }
+                    }
+                    // SAFETY: rtw89 holds no agreement in firmware (the
+                    // 8852C's `h2c_ampdu_cmac_tbl` is NULL), only the TID's
+                    // `agg_num` and the RA aggregation limit. As under
+                    // `IEEE80211_AMPDU_TX_STOP_CONT`, a frame the chip took
+                    // goes as its descriptor says and later ones go singly.
+                    unsafe {
+                        self.station
+                            .complete_tx_block_ack_program(ticket, Completion::Accepted)
+                    }
+                }
+                tx::Action::Operational { session, .. } => {
+                    if let Some(slot) = self.aggregating.get_mut(usize::from(session.tid())) {
+                        *slot = Some(session);
+                        bump(&mut self.progress.addba_ok);
+                    }
+                    continue;
+                }
+                tx::Action::ResumeLegacy { .. } | tx::Action::None => continue,
+            }
+            .map_err(Error::BlockAck)?;
+            self.changes.push_front(next);
+        }
+        first
+    }
+
+    /// rtw88's `send_agreement_frame` (`station.rs:1085`): `bytes` to the
+    /// chip's management queue at once, as `ieee80211_tx_skb` sends an ADDBA
+    /// or a DELBA, sealed under PMF, as Block Ack action frames are robust;
+    /// false when the chip has no room. An ADDBA Request taken is counted.
+    fn send_agreement_frame(&mut self, bytes: &[u8]) -> Result<bool, Error> {
+        let context = self.context.clone().ok_or(Error::Refused("no context"))?;
+        let frame = if context.pmf().is_some() {
+            let mut robust = bytes.to_vec();
+            if let Some(fc1) = robust.get_mut(1) {
+                *fc1 |= 0x40;
+            }
+            self.seal(&robust)?
+        } else {
+            bytes.to_vec()
+        };
+        let management = Management {
+            bytes: &frame,
+            basic_rates: self.basic_rates(),
+        };
+        let taken = Self::chip(self.chip.transmit_management(&management))?.is_some();
+        if taken
+            && bytes.get(MANAGEMENT_HEADER..MANAGEMENT_HEADER + 2) == Some(&[BLOCK_ACK_CATEGORY, 0])
+        {
+            bump(&mut self.progress.addba_sent);
+        }
+        Ok(taken)
+    }
+
+    /// rtw88's `release_parked` (`station.rs:1100`), `ieee80211_agg_start_txq`
+    /// of each TID no longer changing: its parked data sent in order while
+    /// `held` has room. A frame the link refuses now is dropped, as mac80211
+    /// drops one it can no longer take.
+    fn release_parked(&mut self) -> Result<(), Error> {
+        let mut at = 0;
+        while at < self.parked.len() && self.held.len() < MAX_HELD {
+            let (tid, ..) = self.parked[at];
+            if self.station.tx_block_ack_blocks_data(tid) {
+                at += 1;
+                continue;
+            }
+            let Some((_, ethernet, class)) = self.parked.remove(at) else {
+                break;
+            };
+            match self.send(&ethernet, class) {
+                Err(Error::Data(_)) => self.unsupported("a data frame its link refused once held"),
+                result => result?,
+            }
+        }
+        Ok(())
+    }
+
+    /// `ieee80211_sta_tear_down_BA_sessions`' TX half
+    /// (`AGG_STOP_DESTROY_STA`, rtw88's `end_aggregation`,
+    /// `station.rs:689`): each TID's agreement stopped without a DELBA
+    /// (TX_STOP_FLUSH), so the next association's
+    /// `configure_tx_block_ack` finds none.
+    fn end_aggregation(&mut self) -> Result<(), Error> {
+        for tid in 0..8 {
+            if let Ok(action) = self.station.stop_tx_block_ack(tid, false) {
+                self.changes.push_back(action);
+            }
+        }
+        let ended = self.change_agreements();
+        if ended.is_err() || !self.changes.is_empty() {
+            self.unsupported("a TX Block Ack agreement that would not end");
+        }
+        ended
     }
 
     /// What the chip handed on since the last poll, every item taken: once
@@ -943,7 +1508,7 @@ impl<C: Chip> Rtl8852c<C> {
                     token,
                     acknowledged,
                 } => self.transmitted(token, acknowledged, now),
-                Incoming::Frame(received) => match Self::mpdu(received) {
+                Incoming::Frame(received) => match self.count_rate(received) {
                     Some(mpdu) if self.admitted.is_some() => {
                         if self.deferred.len() < MAX_DEFERRED {
                             self.deferred.push_back(mpdu);
@@ -955,6 +1520,10 @@ impl<C: Chip> Rtl8852c<C> {
                 },
                 Incoming::ScanEnded { completed } => self.scan_ended(completed),
                 Incoming::BeaconLost => self.beacon_lost(),
+                Incoming::RaReport(report) => {
+                    self.tx_rate = Some(report);
+                    Ok(())
+                }
             };
             if first.is_ok() {
                 first = taken;
@@ -1073,6 +1642,21 @@ impl<C: Chip> Rtl8852c<C> {
         self.scanned = Some(ticket);
         bump(&mut self.progress.scans);
         recorded.and(restored)
+    }
+
+    /// [`Self::mpdu`], a data frame addressed to the station that passed
+    /// its FCS counted at its rate first (M4 spec S3.1).
+    fn count_rate(&mut self, received: Received) -> Option<Mpdu> {
+        let to_station = received.bytes.len() >= 10
+            && received.bytes[0] & 0x0c == 0x08
+            && received.bytes[4..10] == self.address.0;
+        if to_station
+            && !received.fcs_error
+            && let Some(rate) = received.rate
+        {
+            self.rx_rates.record(rate, received.ampdu);
+        }
+        Self::mpdu(received)
     }
 
     /// `received` as an MPDU on the channel the chip heard it on, its
@@ -1280,6 +1864,8 @@ impl<C: Chip> Rtl8852c<C> {
     /// - A frame to send: queued, protected under PMF, as Block Ack action
     ///   frames are robust.
     /// - A BAR: what waits before its SSN released.
+    /// - A TX agreement's step (the AP's ADDBA Response or DELBA): kept for
+    ///   [`Self::change_agreements`].
     fn block_ack(&mut self, action: ba::Action) -> Result<(), Error> {
         match action {
             ba::Action::Program {
@@ -1351,8 +1937,13 @@ impl<C: Chip> Rtl8852c<C> {
                 }
                 Ok(())
             }
-            // No TX agreement is ever started (spec S1.13).
-            ba::Action::Tx(_) | ba::Action::None => Ok(()),
+            // The AP's answer to an ADDBA Request, or its DELBA of a TX
+            // agreement, for the next pass's `change_agreements`.
+            ba::Action::Tx(action) => {
+                self.changes.push_back(action);
+                Ok(())
+            }
+            ba::Action::None => Ok(()),
         }
     }
 
@@ -1733,6 +2324,33 @@ impl<C: Chip> Rtl8852c<C> {
                 }
             }
         }
+        // `rtw89_forbid_ba_work` once its 4 s passed.
+        if self.forbid_ends.is_some_and(|ends| ends <= now) {
+            self.forbid_ends = None;
+            self.forbidden = [false; 8];
+        }
+        // The TX agreements' due timers (`ieee80211_addba_resp_timer_expired`,
+        // `sta_tx_agg_session_timer_expired`), each due one in turn, as
+        // rtw88's `operate`.
+        while !self.left
+            && self
+                .station
+                .next_tx_block_ack_deadline()
+                .is_some_and(|deadline| deadline <= now)
+        {
+            match self.station.poll_tx_block_ack(now) {
+                Ok(tx::Action::None) => break,
+                Ok(action) => self.changes.push_back(action),
+                Err(error) => {
+                    if first.is_ok() {
+                        first = Err(Error::BlockAck(error));
+                    }
+                    break;
+                }
+            }
+        }
+        // rtw88's order: management, data, the agreements' changes, the
+        // data they released, then data again.
         let sent = self.send_management();
         if first.is_ok() {
             first = sent;
@@ -1740,6 +2358,26 @@ impl<C: Chip> Rtl8852c<C> {
         let sent = self.send_data();
         if first.is_ok() {
             first = sent;
+        }
+        let changed = self.change_agreements();
+        if first.is_ok() {
+            first = changed;
+        }
+        let released = self.release_parked();
+        if first.is_ok() {
+            first = released;
+        }
+        let sent = self.send_data();
+        if first.is_ok() {
+            first = sent;
+        }
+        // The pass's kick hands over every data frame queued since the last
+        // (`rtw89_core_txq_schedule`'s `rtw89_core_tx_kick_off`, M4 spec
+        // S9.1): the network's frames and the station's own, written to the
+        // chip as they came.
+        let kicked = Self::chip(self.chip.kick());
+        if first.is_ok() {
+            first = kicked;
         }
         first
     }
@@ -1800,6 +2438,7 @@ impl<C: Chip> Rtl8852c<C> {
         } else {
             ", port closed"
         });
+        self.link_progress(&mut line);
         if let Some(d) = p.data {
             line.push_str(&format!(
                 ", rx data {} sealed {} nokey {} refused {}, tx data {}",
@@ -1815,6 +2454,72 @@ impl<C: Chip> Rtl8852c<C> {
         line.push_str("; ");
         line.push_str(&self.chip.diagnostic());
         line
+    }
+
+    /// The progress line's link fields (M4 spec S3.4), each `-` until known:
+    /// the joined AP's operation; the TX power's map entry and regulatory
+    /// index; the rate most of the station's data came at, its share and
+    /// the data counted, and the share in A-MPDUs; RXQ's full polls; the
+    /// firmware's last RA report (the AX report has no retry ratio, which
+    /// Linux reads on BE only, `phy.c:3263`); ACH0's kicks and releases, and
+    /// the releases per kick; the ADDBA Requests answered with success and
+    /// sent; and the TIDs aggregating.
+    fn link_progress(&self, line: &mut String) {
+        let link = self.chip.link_counts();
+        line.push_str(&format!(", ap {}", or_dash(self.ap_operation)));
+        match link.regd {
+            Some((alpha2, regd)) => line.push_str(&format!(
+                ", regd {}{} {}",
+                char::from(alpha2[0]),
+                char::from(alpha2[1]),
+                regd.name()
+            )),
+            None => line.push_str(", regd -"),
+        }
+        let h = &self.rx_rates;
+        match h.top() {
+            Some((rate, count)) => line.push_str(&format!(
+                ", rx {} {}% ({}), ampdu {}%",
+                rate_text(&rate),
+                percent(count, h.total),
+                h.total,
+                percent(h.ampdu, h.total)
+            )),
+            None => line.push_str(", rx -, ampdu -"),
+        }
+        line.push_str(&format!(", rxq full {}", link.rxq_full));
+        match &self.tx_rate {
+            Some(report) => {
+                line.push_str(&format!(", tx ra {} retry -", rate_text(&ra_rate(report))))
+            }
+            None => line.push_str(", tx ra -"),
+        }
+        let (kicks, released) = (link.tx.kicks[0], link.tx.released[0]);
+        let mean = match kicks {
+            0 => String::from("-"),
+            kicks => {
+                let tenths = (u64::from(released) * 10 + u64::from(kicks) / 2) / u64::from(kicks);
+                format!("{}.{}", tenths / 10, tenths % 10)
+            }
+        };
+        line.push_str(&format!(", kicks {kicks} rel {released} ({mean}/kick)"));
+        let p = &self.progress;
+        line.push_str(&format!(", addba {}/{}", p.addba_ok, p.addba_sent));
+        line.push_str(&format!(", agg {}", self.aggregating_tids()));
+    }
+
+    /// The TIDs whose TX Block Ack agreement is operational, space-separated,
+    /// `-` for none.
+    fn aggregating_tids(&self) -> String {
+        let tids: Vec<String> = (0..self.aggregating.len())
+            .filter(|&tid| self.aggregating[tid].is_some())
+            .map(|tid| format!("{tid}"))
+            .collect();
+        if tids.is_empty() {
+            String::from("-")
+        } else {
+            tids.join(" ")
+        }
     }
 
     fn begin_scan_with(&mut self, request: scan::Request, budget_us: u64) -> Result<(), Error> {
@@ -1850,6 +2555,7 @@ impl<C: Chip> Rtl8852c<C> {
     /// the channel, then the BSSID; the BSS's profile kept, and the AP's
     /// station new (`sta_info_alloc`).
     fn approach(&mut self, bss: &Bss, peer: Peer) -> Result<(), Error> {
+        self.ap_operation = Some(ApOperation::of(bss));
         Self::chip(self.chip.tune(bss.channel))?;
         Self::chip(self.chip.set_bssid(bss.bssid))?;
         self.peer = Some(peer);
@@ -1981,8 +2687,8 @@ impl<C: Chip> Rtl8852c<C> {
     /// chip's association on the join's channel, without a switch of the
     /// radio's own, then the station configured, and with HT its RX Block
     /// Ack limits: `max_rx_agg_num` and A-MSDUs in A-MPDUs
-    /// (`SUPPORTS_AMSDU_IN_AMPDU`, `core.c:7500`). No TX agreement is
-    /// configured (spec S1.13).
+    /// (`SUPPORTS_AMSDU_IN_AMPDU`, `core.c:7500`); with a peer that
+    /// aggregates, its TX Block Ack limit, `max_tx_agg_num` (M4 spec S10.1).
     fn configure_admitted(&mut self) -> Result<(), Error> {
         let (ticket, context) = self
             .admitted
@@ -1990,6 +2696,7 @@ impl<C: Chip> Rtl8852c<C> {
             .ok_or(Error::Refused("configuration"))?;
         Self::chip(self.chip.associate(&association(&context)))?;
         let ht = context.negotiated().ht.is_some();
+        let aggregates = context.negotiated().aggregates();
         self.context = Some(context);
         self.station
             .complete_configuration(ticket, Completion::Accepted, self.clock.now_us())
@@ -1997,6 +2704,11 @@ impl<C: Chip> Rtl8852c<C> {
         if ht {
             self.station
                 .configure_rx_block_ack(RECEIVE_WINDOW, true)
+                .map_err(|_| Error::Refused("Block Ack limits"))?;
+        }
+        if aggregates {
+            self.station
+                .configure_tx_block_ack(TRANSMIT_WINDOW)
                 .map_err(|_| Error::Refused("Block Ack limits"))?;
         }
         self.progress.eapol.get_or_insert_default();
@@ -2049,7 +2761,8 @@ impl<C: Chip> Rtl8852c<C> {
     /// rtw88's `retire_peer` (`station.rs:2311`) on rtw89 (spec S14.5):
     /// `sta_info_flush`'s `__sta_info_destroy_part1` first stops each RX
     /// Block Ack agreement on the chip without a DELBA and drops what it
-    /// held (`ieee80211_sta_tear_down_BA_sessions(AGG_STOP_DESTROY_STA)`,
+    /// held, then each TX agreement ([`Self::end_aggregation`])
+    /// (`ieee80211_sta_tear_down_BA_sessions(AGG_STOP_DESTROY_STA)`,
     /// `sta_info.c:1348` at the donor's mac80211); then `_part2`'s key
     /// deletes, the PTK, then the group keys by key ID, each as
     /// `rtw89_ops_set_key`'s DISABLE_KEY runs it, a flush without drop, then
@@ -2070,6 +2783,10 @@ impl<C: Chip> Rtl8852c<C> {
                 }
             }
         }
+        let ended = self.end_aggregation();
+        if first.is_ok() {
+            first = ended;
+        }
         let mut keys = core::mem::take(&mut self.keys);
         keys.sort_by_key(|key| (!key.pairwise, key.index));
         for key in &keys {
@@ -2084,7 +2801,9 @@ impl<C: Chip> Rtl8852c<C> {
         if first.is_ok() {
             first = left;
         }
-        if let Some(ticket) = self.departing.take() {
+        // rtw88's order: the ticket stays until the removal is completed,
+        // and `clear` drops it with the rest.
+        if let Some(ticket) = self.departing {
             self.station
                 .complete_removal(ticket, Completion::Accepted)
                 .map_err(Error::Station)?;

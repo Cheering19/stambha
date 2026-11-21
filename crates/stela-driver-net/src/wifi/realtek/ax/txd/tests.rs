@@ -144,7 +144,7 @@ fn broadcast_management_has_no_rts() {
 fn eapol_on_vo_sets_bk_and_tid_indicate() {
     let f = qos(QOS, 7, 0x123, &EAPOL_BODY);
     let len = f.len() as u32;
-    let (ch, head) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, None).unwrap();
+    let (ch, head) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, None, None).unwrap();
     assert_eq!(ch, TxChannel::Ach3);
     assert_eq!(
         words(&head),
@@ -166,7 +166,7 @@ fn eapol_on_vo_sets_bk_and_tid_indicate() {
         ]
     );
     // Not EAPOL: the same frame without BK.
-    let (_, head) = data(&f, 7, false, HwBand::G2, 0xFFF, NO_CAPS, None).unwrap();
+    let (_, head) = data(&f, 7, false, HwBand::G2, 0xFFF, NO_CAPS, None, None).unwrap();
     assert_eq!(words(&head)[3], 0x123);
 }
 
@@ -175,7 +175,17 @@ fn ccmp_non_qos_and_qos_match_linux() {
     // Non-QoS, key ID 0, CAM 0: the frame as the strip leaves it.
     let f = frame(DATA_PROTECTED, AP, 0x456, &PLAINTEXT);
     let len = f.len() as u32;
-    let (ch, head) = data(&f, 0, false, HwBand::G2, 0xFFF, NO_CAPS, sec(0, 0, PN)).unwrap();
+    let (ch, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G2,
+        0xFFF,
+        NO_CAPS,
+        sec(0, 0, PN),
+        None,
+    )
+    .unwrap();
     assert_eq!(ch, TxChannel::Ach0);
     assert_eq!(
         words(&head),
@@ -199,7 +209,17 @@ fn ccmp_non_qos_and_qos_match_linux() {
     // QoS, key ID 2, CAM 5: the header is 26 bytes.
     let f = qos(QOS_PROTECTED, 0, 0x456, &PLAINTEXT);
     let len = f.len() as u32;
-    let (ch, head) = data(&f, 0, false, HwBand::G2, 0xFFF, NO_CAPS, sec(2, 5, PN)).unwrap();
+    let (ch, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G2,
+        0xFFF,
+        NO_CAPS,
+        sec(2, 5, PN),
+        None,
+    )
+    .unwrap();
     assert_eq!(ch, TxChannel::Ach0);
     let w = words(&head);
     assert_eq!(w[0], 0x0140_6880);
@@ -222,7 +242,7 @@ fn data_lowest_rate_and_caps() {
         stbc: true,
         ldpc: true,
     };
-    let (_, head) = data(&f, 0, false, HwBand::G2, 0xFFF, caps, None).unwrap();
+    let (_, head) = data(&f, 0, false, HwBand::G2, 0xFFF, caps, None, None).unwrap();
     assert_eq!(words(&head)[info(0)], 0x1800);
     assert_eq!(words(&head)[info(1)], 0);
     let caps = RateCaps {
@@ -230,7 +250,7 @@ fn data_lowest_rate_and_caps() {
         ldpc: false,
     };
     // 5 GHz, lowest supported OFDM12 (bit 2): 0x4 + 2.
-    let (_, head) = data(&f, 0, false, HwBand::G5, 0xFC, caps, None).unwrap();
+    let (_, head) = data(&f, 0, false, HwBand::G5, 0xFC, caps, None, None).unwrap();
     assert_eq!(words(&head)[info(0)], 0x1000);
     assert_eq!(words(&head)[info(1)], 0x0006_0000);
     // Data frames leave the rate to the firmware's RA: B7 stays 0.
@@ -246,7 +266,17 @@ fn strip_removes_the_header_and_keeps_protected() {
     assert_eq!(mpdu, frame(DATA_PROTECTED, AP, 0x456, &PLAINTEXT));
     assert_eq!(u16::from_le_bytes([mpdu[0], mpdu[1]]) & 0x4000, 0x4000);
     // L is the length after the removal.
-    let (_, head) = data(&mpdu, 0, false, HwBand::G2, 0xFFF, NO_CAPS, sec(0, 0, PN)).unwrap();
+    let (_, head) = data(
+        &mpdu,
+        0,
+        false,
+        HwBand::G2,
+        0xFFF,
+        NO_CAPS,
+        sec(0, 0, PN),
+        None,
+    )
+    .unwrap();
     assert_eq!(words(&head)[2], (header.len() - 8) as u32);
 
     // A QoS frame's header is 26 bytes; key ID 2 sets b7:6 of byte 3.
@@ -352,7 +382,7 @@ fn tid_tables_match_linux() {
         assert_eq!(qsel_of_tid(tid), qsel[t], "tid {tid}");
         assert_eq!(tid_indicate(tid), indicate[t], "tid {tid}");
         let f = qos(QOS, tid, 1, &PLAINTEXT);
-        let (ch, head) = data(&f, tid, false, HwBand::G2, 0xFFF, NO_CAPS, None).unwrap();
+        let (ch, head) = data(&f, tid, false, HwBand::G2, 0xFFF, NO_CAPS, None, None).unwrap();
         assert_eq!(ch, channel[t], "tid {tid}");
         let w = words(&head);
         assert_eq!((w[0] >> 16) & 0xF, ch.ring() as u32, "tid {tid}");
@@ -364,7 +394,7 @@ fn tid_tables_match_linux() {
     assert!(!tid_indicate(8));
     // `skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK`: TID 15 is TID 7.
     let f = qos(QOS, 7, 1, &PLAINTEXT);
-    let (ch, head) = data(&f, 15, false, HwBand::G2, 0xFFF, NO_CAPS, None).unwrap();
+    let (ch, head) = data(&f, 15, false, HwBand::G2, 0xFFF, NO_CAPS, None, None).unwrap();
     assert_eq!(ch, TxChannel::Ach3);
     assert_eq!(words(&head)[2] & 0x00FE_0000, 0x0086_0000);
 }
@@ -384,6 +414,7 @@ fn every_head_sets_wd_info_en() {
             0,
             NO_CAPS,
             None,
+            None,
         )
         .unwrap(),
         data(
@@ -393,6 +424,7 @@ fn every_head_sets_wd_info_en() {
             HwBand::G5,
             0,
             NO_CAPS,
+            None,
             None,
         )
         .unwrap(),
@@ -404,6 +436,7 @@ fn every_head_sets_wd_info_en() {
             0,
             NO_CAPS,
             sec(0, 0, 1),
+            None,
         )
         .unwrap(),
     ];
@@ -431,18 +464,24 @@ fn each_encoder_takes_only_its_frames() {
             words(&head)[..4],
             [0x0048_0080, 0x0400_0000, 0x0024_0000 | f.len() as u32, 3]
         );
-        assert_eq!(data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None), NOT_DATA);
+        assert_eq!(
+            data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
+            NOT_DATA
+        );
     }
     for f in [frame(DATA, AP, 1, &PLAINTEXT), qos(QOS, 0, 1, &PLAINTEXT)] {
         assert_eq!(management(&f, HwBand::G2, 0), NOT_MANAGEMENT);
     }
     assert_eq!(
-        data(&auth(1), 0, false, HwBand::G2, 0, NO_CAPS, None),
+        data(&auth(1), 0, false, HwBand::G2, 0, NO_CAPS, None, None),
         NOT_DATA
     );
     let ack = frame(ACK, AP, 0, &[]);
     assert_eq!(management(&ack, HwBand::G2, 0), NOT_MANAGEMENT);
-    assert_eq!(data(&ack, 0, false, HwBand::G2, 0, NO_CAPS, None), NOT_DATA);
+    assert_eq!(
+        data(&ack, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
+        NOT_DATA
+    );
 }
 
 #[test]
@@ -458,10 +497,13 @@ fn encoders_refuse_short_and_long_frames() {
     // A QoS data frame needs its QoS control too.
     let q = qos(QOS, 0, 1, &PLAINTEXT);
     assert_eq!(
-        data(&q[..25], 0, false, HwBand::G2, 0, NO_CAPS, None),
+        data(&q[..25], 0, false, HwBand::G2, 0, NO_CAPS, None, None),
         SHORT
     );
-    assert_eq!(data(&[], 0, false, HwBand::G2, 0, NO_CAPS, None), SHORT);
+    assert_eq!(
+        data(&[], 0, false, HwBand::G2, 0, NO_CAPS, None, None),
+        SHORT
+    );
     // 2044 bytes fit one TX address entry (TXPKT_SIZE in B2); 2045 do not.
     let mut big = frame(AUTH, AP, 1, &[]);
     big.resize(MAX_TX_FRAME, 0);
@@ -471,10 +513,13 @@ fn encoders_refuse_short_and_long_frames() {
     assert_eq!(management(&big, HwBand::G2, 0), LONG);
     let mut big = frame(DATA, AP, 1, &[]);
     big.resize(MAX_TX_FRAME, 0);
-    let (_, head) = data(&big, 0, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+    let (_, head) = data(&big, 0, false, HwBand::G2, 0, NO_CAPS, None, None).unwrap();
     assert_eq!(words(&head)[2], 2044);
     big.push(0);
-    assert_eq!(data(&big, 0, false, HwBand::G2, 0, NO_CAPS, None), LONG);
+    assert_eq!(
+        data(&big, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
+        LONG
+    );
 }
 
 #[test]
@@ -491,12 +536,12 @@ fn data_header_length_is_ieee80211_hdrlen() {
         let mut f = frame(fc, AP, 1, &[]);
         f.resize(header, 0);
         f.extend_from_slice(&PLAINTEXT);
-        let (_, head) = data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+        let (_, head) = data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None, None).unwrap();
         assert_eq!(words(&head)[0], 0x0040_0080 | (len << 11), "fc {fc:#06x}");
         let mut short = f.clone();
         short.truncate(header - 1);
         assert_eq!(
-            data(&short, 0, false, HwBand::G2, 0, NO_CAPS, None),
+            data(&short, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
             Err(AxError::Tx("frame shorter than its 802.11 header")),
             "fc {fc:#06x}"
         );
@@ -507,12 +552,21 @@ fn data_header_length_is_ieee80211_hdrlen() {
 fn data_refuses_protection_without_its_key() {
     let protected = frame(DATA_PROTECTED, AP, 1, &PLAINTEXT);
     assert_eq!(
-        data(&protected, 0, false, HwBand::G2, 0, NO_CAPS, None),
+        data(&protected, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
         Err(AxError::Tx("a protected data frame without its key"))
     );
     let plain = frame(DATA, AP, 1, &PLAINTEXT);
     assert_eq!(
-        data(&plain, 0, false, HwBand::G2, 0, NO_CAPS, sec(0, 0, PN)),
+        data(
+            &plain,
+            0,
+            false,
+            HwBand::G2,
+            0,
+            NO_CAPS,
+            sec(0, 0, PN),
+            None
+        ),
         Err(AxError::Tx("a key for an unprotected data frame"))
     );
 }
@@ -530,7 +584,7 @@ fn data_refuses_keys_the_descriptor_cannot_carry() {
         (sec(0, 128, PN), "a security CAM index past 127"),
     ] {
         assert_eq!(
-            data(&f, 0, false, HwBand::G2, 0, NO_CAPS, s),
+            data(&f, 0, false, HwBand::G2, 0, NO_CAPS, s, None),
             Err(AxError::Tx(error))
         );
     }
@@ -543,6 +597,7 @@ fn data_refuses_keys_the_descriptor_cannot_carry() {
         0,
         NO_CAPS,
         sec(3, 127, (1 << 48) - 1),
+        None,
     )
     .unwrap();
     let w = words(&head);
@@ -571,20 +626,32 @@ fn data_takes_the_tid_its_frame_carries() {
         Err(AxError::Tx("a TID other than the frame's own"));
     // skb->priority's TID is the QoS control's (ieee80211_set_qos_hdr).
     let f = qos(QOS, 5, 1, &PLAINTEXT);
-    let (ch, _) = data(&f, 5, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+    let (ch, _) = data(&f, 5, false, HwBand::G2, 0, NO_CAPS, None, None).unwrap();
     assert_eq!(ch, TxChannel::Ach2);
-    assert_eq!(data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
-    assert_eq!(data(&f, 6, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    assert_eq!(
+        data(&f, 0, false, HwBand::G2, 0, NO_CAPS, None, None),
+        OTHER
+    );
+    assert_eq!(
+        data(&f, 6, false, HwBand::G2, 0, NO_CAPS, None, None),
+        OTHER
+    );
     // A frame without QoS goes at priority 0 (__ieee80211_select_queue):
     // TID 8 is TID 0, best effort on ACH0; TID 7 is not its own.
     let f = frame(DATA, AP, 1, &PLAINTEXT);
-    let (ch, head) = data(&f, 8, false, HwBand::G2, 0, NO_CAPS, None).unwrap();
+    let (ch, head) = data(&f, 8, false, HwBand::G2, 0, NO_CAPS, None, None).unwrap();
     assert_eq!(ch, TxChannel::Ach0);
     assert_eq!(words(&head)[2] & 0x00FE_0000, 0);
-    assert_eq!(data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    assert_eq!(
+        data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None, None),
+        OTHER
+    );
     // The QoS control's TID field is four bits: a TSPEC TID 15 is no TID 7.
     let f = qos(QOS, 15, 1, &PLAINTEXT);
-    assert_eq!(data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None), OTHER);
+    assert_eq!(
+        data(&f, 7, false, HwBand::G2, 0, NO_CAPS, None, None),
+        OTHER
+    );
 }
 
 #[test]
@@ -593,7 +660,7 @@ fn eapol_under_the_ptk_matches_linux() {
     // VO with BK and the TID indication, and the key's dwords.
     let f = qos(QOS_PROTECTED, 7, 0x123, &EAPOL_BODY);
     let len = f.len() as u32;
-    let (ch, head) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, sec(0, 0, PN)).unwrap();
+    let (ch, head) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, sec(0, 0, PN), None).unwrap();
     assert_eq!(ch, TxChannel::Ach3);
     assert_eq!(
         words(&head),
@@ -614,4 +681,131 @@ fn eapol_under_the_ptk_matches_linux() {
             0,
         ]
     );
+}
+
+/// TID 0's agreement: a window of `agg_num`, the peer's HT A-MPDU length
+/// exponent `factor` and MPDU spacing `density`.
+fn agg(agg_num: u16, factor: u8, density: u8) -> Option<Aggregate> {
+    Some(Aggregate {
+        agg_num,
+        factor,
+        density,
+    })
+}
+
+#[test]
+fn aggregated_qos_ccmp_matches_linux() {
+    // M4 spec S10.3: rtw89_core_tx_update_ampdu_info (core.c:636-675) sets
+    // agg_en, ampdu_num and ampdu_density; B3 AGG_EN b12 (txrx.h:96), I1
+    // MAX_AGGNUM [7:0] (txrx.h:134), I2 AMPDU_DENSITY [20:18] (txrx.h:137).
+    let body = [0x5Au8; 1500 - 26];
+    let f = qos(QOS_PROTECTED, 0, 0x123, &body);
+    assert_eq!(f.len(), 1500);
+    let (ch, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G5,
+        0xFF,
+        NO_CAPS,
+        sec(0, 3, PN),
+        agg(64, 3, 0),
+    )
+    .unwrap();
+    assert_eq!(ch, TxChannel::Ach0);
+    let w = words(&head);
+    assert_eq!(w[0], 0x0140_6880);
+    assert_eq!(w[2], 1500);
+    assert_eq!(w[3], 0x0000_1123);
+    // MAX_AGGNUM 63, then 5 GHz's retry floor OFDM6 (4) in [24:16].
+    assert_eq!(w[info(1)], 0x0004_003F);
+    assert_eq!(w[info(2)], 0x0000_0100 | 3);
+    // Spacing 5 (4 us): I2 | 5 << 18.
+    let (_, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G5,
+        0xFF,
+        NO_CAPS,
+        sec(0, 3, PN),
+        agg(64, 3, 5),
+    )
+    .unwrap();
+    assert_eq!(words(&head)[info(2)], 0x0014_0103);
+    // An HE window of 128, and no window yet: 4 << factor (core.c:668-670).
+    let (_, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G5,
+        0xFF,
+        NO_CAPS,
+        sec(0, 3, PN),
+        agg(128, 3, 0),
+    )
+    .unwrap();
+    assert_eq!(words(&head)[info(1)] & 0xFF, 0x7F);
+    let (_, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G5,
+        0xFF,
+        NO_CAPS,
+        sec(0, 3, PN),
+        agg(0, 3, 0),
+    )
+    .unwrap();
+    assert_eq!(words(&head)[info(1)] & 0xFF, 31);
+    let (_, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G5,
+        0xFF,
+        NO_CAPS,
+        sec(0, 3, PN),
+        agg(256, 3, 0),
+    )
+    .unwrap();
+    assert_eq!(words(&head)[info(1)] & 0xFF, 255);
+}
+
+#[test]
+fn eapol_never_aggregates() {
+    // core.c:649-651: an EAPOL frame takes BK and returns before any
+    // aggregation, whatever the frame's TID has agreed.
+    let mut body = Vec::from(EAPOL_BODY);
+    body.extend_from_slice(&[0; 8]);
+    let f = qos(QOS, 7, 9, &body);
+    let (_, plain) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, None, None).unwrap();
+    let (_, offered) = data(&f, 7, true, HwBand::G2, 0xFFF, NO_CAPS, None, agg(64, 3, 5)).unwrap();
+    assert_eq!(offered, plain);
+    let w = words(&offered);
+    assert_eq!(w[3] & 1 << 12, 0);
+    assert_eq!(w[3] & 1 << 13, 1 << 13);
+    assert_eq!(w[info(1)] & 0xFF, 0);
+    assert_eq!(w[info(2)] & 0x7 << 18, 0);
+}
+
+#[test]
+fn unaggregated_data_is_m3s() {
+    // Without an agreement every field stays 0: the M3 vectors above hold.
+    let f = qos(QOS_PROTECTED, 0, 0x456, &PLAINTEXT);
+    let (_, head) = data(
+        &f,
+        0,
+        false,
+        HwBand::G2,
+        0xFFF,
+        NO_CAPS,
+        sec(2, 5, PN),
+        None,
+    )
+    .unwrap();
+    let w = words(&head);
+    assert_eq!(w[3], 0x456);
+    assert_eq!(w[info(1)], 0);
+    assert_eq!(w[info(2)], 0x0000_0105);
 }

@@ -13,7 +13,7 @@ use crate::wifi::realtek::ax::command::H2cAck;
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::h2c::ScanChannel;
 use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, TX_ENTRIES_CTRL};
 use crate::wifi::realtek::ax::receive::{Event, Mode, Received, Tag};
 use crate::wifi::realtek::ax::regd::Regd;
 use crate::wifi::realtek::ax::scan::{STOP_WAIT_US, ScanEnd, run_once, scan_budget_us, scan_list};
@@ -172,12 +172,14 @@ fn start_leaves_a_station_receiver_on_its_channel_and_fresh_tx_pools() {
             channel: 1
         }
     );
-    // "tx rings": the pools' own allocation of 174 080 bytes in 43 pages,
+    // "tx rings": the pools' own allocation of 2 263 040 bytes in 553 pages,
     // the last this start mapped, after the rings'.
-    let model = m.lock().unwrap();
-    let sizes: Vec<usize> = model.mappings.values().map(|(p, _)| p.bytes()).collect();
-    assert_eq!(sizes.iter().filter(|&&b| b == 43 * 4096).count(), 1);
-    assert_eq!(sizes.last(), Some(&(43 * 4096)), "{sizes:?}");
+    let sizes: Vec<usize> = {
+        let model = m.lock().unwrap();
+        model.mappings.values().map(|(p, _)| p.bytes()).collect()
+    };
+    assert_eq!(sizes.iter().filter(|&&b| b == 553 * 4096).count(), 1);
+    assert_eq!(sizes.last(), Some(&(553 * 4096)), "{sizes:?}");
 }
 
 #[test]
@@ -441,23 +443,26 @@ fn drain_until_ended(live: &mut Live<RegisterModel>) -> Vec<Vec<Received>> {
 /// The CH12 packet, its descriptor included, whose FWCMD header names cat
 /// 1, `class`, `func` and `seq`.
 fn h2c_bytes(m: &Arc<Mutex<Model>>, class: u8, func: u8, seq: u8) -> Vec<u8> {
-    let state = m.lock().unwrap();
-    for n in 0..TX_ENTRIES {
-        let at = u64::from(FWCMD) + (n * FWCMD_SLOT_BYTES) as u64;
-        let head = device_read(&state, at, 24);
-        let hdr0 = u32::from_le_bytes(head[16..20].try_into().unwrap());
-        let hdr1 = u32::from_le_bytes(head[20..24].try_into().unwrap());
-        let named = (
-            hdr0 & 0x3,
-            (hdr0 >> 2) & 0x3F,
-            (hdr0 >> 8) & 0xFF,
-            hdr0 >> 24,
-        );
-        if named == (1, u32::from(class), u32::from(func), u32::from(seq)) {
-            return device_read(&state, at, 16 + (hdr1 & 0x3FFF) as usize);
-        }
-    }
-    panic!("no H2C {class}/{func} seq {seq} in the CH12 slots");
+    // The guard goes before any panic, so a missing H2C fails this test
+    // alone and leaves the model's mutex unpoisoned.
+    let found = {
+        let state = m.lock().unwrap();
+        (0..TX_ENTRIES_CTRL).find_map(|n| {
+            let at = u64::from(FWCMD) + (n * FWCMD_SLOT_BYTES) as u64;
+            let head = device_read(&state, at, 24);
+            let hdr0 = u32::from_le_bytes(head[16..20].try_into().unwrap());
+            let hdr1 = u32::from_le_bytes(head[20..24].try_into().unwrap());
+            let named = (
+                hdr0 & 0x3,
+                (hdr0 >> 2) & 0x3F,
+                (hdr0 >> 8) & 0xFF,
+                hdr0 >> 24,
+            );
+            (named == (1, u32::from(class), u32::from(func), u32::from(seq)))
+                .then(|| device_read(&state, at, 16 + (hdr1 & 0x3FFF) as usize))
+        })
+    };
+    found.unwrap_or_else(|| panic!("no H2C {class}/{func} seq {seq} in the CH12 slots"))
 }
 
 /// The CH12 kicks in a trace.
@@ -1148,7 +1153,7 @@ fn a_live_chip_joins_associates_and_leaves() {
         h2c_bytes(&m, 9, 0x1E, 31)[24..28],
         0x0028_4F00u32.to_le_bytes()
     );
-    let cleared = H2c::at(35).addr_cam(MAC, 0, 0).1;
+    let cleared = H2c::at(35).addr_cam_unassociated(MAC, 0, 0).1;
     assert_eq!(h2c_bytes(&m, 6, 0, 35)[24..], cleared[24..]);
     // Leaving with nothing set does nothing.
     let left = live.io().trace.len();

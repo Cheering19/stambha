@@ -27,6 +27,10 @@
 use crate::Mac;
 use crate::wifi::Channel;
 use crate::wifi::realtek::ax::assoc::HtPeer;
+use crate::wifi::realtek::ax::c2h::RaReport;
+use crate::wifi::realtek::ax::regd::Regd;
+use crate::wifi::realtek::ax::rx::Rate;
+use crate::wifi::realtek::ax::txd::Aggregate;
 use crate::wifi::station::phy::AccessCategory;
 use alloc::{string::String, vec::Vec};
 
@@ -44,6 +48,8 @@ pub struct Token(pub u16);
 /// the chip's free-running counter at its reception. `fcs_error` is set only
 /// on a scan's frames, which the scanner refuses (M2c's scan); a station's
 /// frames failing their FCS or ICV are dropped beneath this interface.
+/// `rate` is its PPDU's rate as the chip decoded it, when it did, and
+/// `ampdu` whether it came in an A-MPDU (M4 spec S3.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub bytes: Vec<u8>,
@@ -55,6 +61,8 @@ pub struct Received {
     pub icv_error: bool,
     /// `RX_FLAG_FAILED_FCS_CRC`.
     pub fcs_error: bool,
+    pub rate: Option<Rate>,
+    pub ampdu: bool,
 }
 
 /// What [`Chip::poll`] hands its sink.
@@ -76,6 +84,9 @@ pub enum Incoming {
     /// The firmware reported the associated AP's beacons lost, while no
     /// scan ran (M3 spec S15).
     BeaconLost,
+    /// The firmware's rate adaptation reported the rate it sends the AP at
+    /// (`rtw89_phy_c2h_ra_rpt`, M4 spec S3.3), for the station's MAC ID.
+    RaReport(RaReport),
 }
 
 /// A management frame (or null data frame) to send: `bytes` from its MAC
@@ -95,12 +106,15 @@ pub struct Management<'a> {
 /// [`Management::basic_rates`]' order: the lowest is the retry floor. `key`
 /// is the security CAM entry, key ID and packet number the frame is
 /// encrypted under (`Protection::HostIv`'s, the IV already removed).
+/// `aggregate` is the A-MPDU it goes in, when its TID's TX Block Ack agreement
+/// is operational (M4 spec S10.3).
 pub struct Data<'a> {
     pub bytes: &'a [u8],
     pub tid: u8,
     pub eapol: bool,
     pub supported_rates: u16,
     pub key: Option<(u8, u8, u64)>,
+    pub aggregate: Option<Aggregate>,
 }
 
 /// An association as mac80211 holds it at `BSS_CHANGED_ASSOC`: the AP's
@@ -126,6 +140,36 @@ pub struct HardwareKey<'a> {
     pub pairwise: bool,
     pub index: u8,
     pub material: &'a [u8; 16],
+}
+
+/// What an RTL8852C's TX side did (M4 spec S3.2), saturating, each array
+/// indexed by channel: ACH0 to ACH3 (BE, BK, VI, VO), then CH8, the
+/// management queue. `submitted` counts the frames each channel took,
+/// `kicks` the writes of its TX ring index (`__rtw89_pci_tx_kick_off`),
+/// `released` the RPQ release reports for it (`rtw89_pci_release_rpp`), and
+/// `failed` the releases of any channel whose TX status was not
+/// `RTW89_TX_DONE` (statuses 1 to 3: retry limit, lifetime, MACID drop).
+/// `rpq_full` counts the RPQ polls that found every BD filled. The mean
+/// releases per kick on ACH0 is the aggregation's proxy: the firmware does
+/// not report its aggregates' sizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxCounts {
+    pub submitted: [u32; 5],
+    pub kicks: [u32; 5],
+    pub released: [u32; 5],
+    pub failed: u32,
+    pub rpq_full: u32,
+}
+
+/// What the chip counts for the station's progress line (M4 spec S3.4):
+/// the alpha2 of the TX power's regulatory map entry (`00` for the
+/// world's) and its regulatory index on the band tuned, once known; the
+/// RXQ polls that found the ring full; and [`TxCounts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounts {
+    pub regd: Option<([u8; 2], Regd)>,
+    pub rxq_full: u32,
+    pub tx: TxCounts,
 }
 
 /// The hardware beneath an rtw89 station (module documentation).
@@ -156,8 +200,16 @@ pub trait Chip {
     fn authenticated(&mut self) -> Result<(), String>;
     /// Queue a management frame; `Ok(None)` when there is no room now.
     fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String>;
-    /// Queue a data frame; `Ok(None)` when there is no room now.
+    /// Queue a data frame; `Ok(None)` when there is no room now. It may wait
+    /// for the next [`Chip::kick`] to leave; a management frame does not.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String>;
+    /// Hand over every data frame queued since the last kick, the end of a
+    /// service pass (`rtw89_core_tx_kick_off` after
+    /// `rtw89_core_txq_schedule` pushed a TID's frames, M4 spec S9.1); none
+    /// for a chip whose frames leave as they are queued.
+    fn kick(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Program the association (M3 spec S10).
     fn associate(&mut self, association: &Association) -> Result<(), String>;
     /// Leave the BSS set, authenticated to or associated with (M3 spec
@@ -178,6 +230,19 @@ pub trait Chip {
     fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String>;
     /// End the agreement on `tid`, `IEEE80211_AMPDU_RX_STOP`.
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String>;
+    /// The station's TX Block Ack agreement on `tid` is operational with a
+    /// window of `window` (`IEEE80211_AMPDU_TX_OPERATIONAL`), or, `None`,
+    /// stopped (`IEEE80211_AMPDU_TX_STOP_*`), M4 spec S10.2; nothing for a chip
+    /// that keeps no aggregation state.
+    fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), String> {
+        let _ = (tid, window);
+        Ok(())
+    }
     /// The chip's own counts, naming no address.
     fn diagnostic(&self) -> String;
+    /// The counts the station's progress line prints (M4 spec S3.4); none
+    /// for a chip that keeps none.
+    fn link_counts(&self) -> LinkCounts {
+        LinkCounts::default()
+    }
 }

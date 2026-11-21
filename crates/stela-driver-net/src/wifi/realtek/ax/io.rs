@@ -77,7 +77,7 @@ pub enum AxError {
         unmatched_ack: u8,
         /// RXQ buffers that were not one whole C2H.
         skipped: u8,
-        /// The last RXQ hardware index read (`IDX` [27:16]).
+        /// The last RXQ hardware index read (`IDX` `[27:16]`).
         rxq_hw: u16,
     },
     /// The firmware acknowledged an H2C with a return code that fails it.

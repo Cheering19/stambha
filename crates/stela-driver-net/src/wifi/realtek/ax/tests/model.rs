@@ -48,6 +48,8 @@ pub struct RegisterModel {
     pub read_cost_us: u64,
     /// Registers whose reads fail with [`READ_FAILED`].
     failing_reads: Vec<u32>,
+    /// Registers whose 16-bit writes fail with [`WRITE_FAILED`], unstored.
+    failing_writes: Vec<u32>,
     /// Status bits ORed into every emulated read of 0x1174C: set b24
     /// (`W_BUSY`) or b25 (`R_BUSY`) to keep SWSI busy.
     pub swsi_status: u32,
@@ -63,6 +65,7 @@ pub struct RegisterModel {
 /// What a read of a register named by [`RegisterModel::fail_reads_of`]
 /// returns, as a register window that errors would.
 pub const READ_FAILED: AxError = AxError::Mac("injected read failure");
+pub const WRITE_FAILED: AxError = AxError::Mac("injected write failure");
 
 impl RegisterModel {
     pub fn new() -> Self {
@@ -74,6 +77,7 @@ impl RegisterModel {
             freeze_clock: false,
             read_cost_us: 0,
             failing_reads: Vec::new(),
+            failing_writes: Vec::new(),
             swsi_status: 0,
             rf_emulated: false,
             rf: BTreeMap::new(),
@@ -161,6 +165,14 @@ impl RegisterModel {
     pub fn fail_reads_of(&mut self, reg: u32) {
         self.failing_reads.push(reg);
     }
+    /// Make every 16-bit write of `reg` fail with [`WRITE_FAILED`], traced
+    /// but not stored, until [`RegisterModel::allow_writes_of`].
+    pub fn fail_writes_of(&mut self, reg: u32) {
+        self.failing_writes.push(reg);
+    }
+    pub fn allow_writes_of(&mut self, reg: u32) {
+        self.failing_writes.retain(|&failing| failing != reg);
+    }
     fn get(&self, reg: u32, width: u32) -> u32 {
         (0..width).fold(0, |v, i| {
             v | (*self.regs.get(&(reg + i)).unwrap_or(&0) as u32) << (8 * i)
@@ -238,6 +250,9 @@ impl AxIo for RegisterModel {
     }
     fn write16(&mut self, reg: u32, v: u16) -> Result<(), AxError> {
         self.trace.push(Op::W16(reg, v));
+        if self.failing_writes.contains(&reg) {
+            return Err(WRITE_FAILED);
+        }
         self.put(reg, 2, v as u32);
         Ok(())
     }

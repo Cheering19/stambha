@@ -793,7 +793,7 @@ pub(crate) fn kicks_after(c: &Chip, from: usize) -> Vec<(usize, u8, u8)> {
         .skip(from)
         .filter_map(|(i, o)| match o {
             Op::W16(0x1080, v) => {
-                let slot = (usize::from(*v) + pci::TX_ENTRIES - 1) % pci::TX_ENTRIES;
+                let slot = (usize::from(*v) + pci::TX_ENTRIES_CTRL - 1) % pci::TX_ENTRIES_CTRL;
                 let p = ch12_packet(&c.m, slot, 20);
                 Some((i, p[19], p[17]))
             }
@@ -896,17 +896,46 @@ fn scan_steps_run_after_calibration_in_linux_order() {
 
 /// The whole trace of [`ran`]`(BOTH, host)` at `b4b9ab57e`, the last M2c
 /// bring-up before the live chip, as the SHA-256 of one `{op:?}` line per
-/// access: without LTR, then with.
-const M2C_TRACES: [(Host, &str); 2] = [
+/// access, without LTR then with, was `33fab45b…aff5f70` and
+/// `e724f8cb…b25f337a`; through M4's Task 5 (`aebab83ab`) the trace
+/// without `set_txpwr`'s window still hashed to those. These are its views
+/// across M4's ring depths ([`depth_free`]) at `aebab83ab`: Task 6's deeper
+/// rings change only what the view hides.
+const M2C_DEPTH_FREE: [(Host, &str); 2] = [
     (
         NO_LTR,
-        "33fab45bf66f8cddecf4adf0f4db6544c7045849ba32fc9ea2737fda5aff5f70",
+        "df33ace920a78db290ce67c5d6390c0ae2f721db12fca1b7bad29a0fde8234d1",
     ),
     (
         Host { ltr: true },
-        "e724f8cb1e21d7ef1d71c66369282392f1aa107705ccd0a43e96d523b25f337a",
+        "d74a9b38cb4a3723899080a942aa04c7e489328954d7f06a6e52dada0cd9375e",
     ),
 ];
+
+/// `trace` as it reads across M4's ring depths (M4 plan Task 6): the NUM
+/// writes of ACH0-ACH3 (0x1024-0x102A) and RXQ (0x1210), 256 since then, as
+/// M2c's 16 and 32; every ring's DESA_L, which moves with the rings'
+/// sizes, as 0; and RXQ's host index (W16 0x1218) modulo M2c's 32
+/// entries. Everything else is kept as it was.
+pub(crate) fn depth_free<'a>(trace: impl IntoIterator<Item = &'a Op>) -> Vec<Op> {
+    const ACH_NUM: [u32; 4] = [0x1024, 0x1026, 0x1028, 0x102A];
+    const RXQ_NUM: u32 = 0x1210;
+    const RXQ_IDX: u32 = 0x1218;
+    const DESA_L: [u32; 15] = [
+        0x1230, 0x1238, 0x1240, 0x1248, 0x1250, 0x1258, 0x1260, 0x1268, 0x1270, 0x1278, 0x1458,
+        0x1460, 0x1280, 0x1220, 0x1228,
+    ];
+    trace
+        .into_iter()
+        .map(|op| match *op {
+            Op::W16(reg, _) if ACH_NUM.contains(&reg) => Op::W16(reg, 16),
+            Op::W16(RXQ_NUM, _) => Op::W16(RXQ_NUM, 32),
+            Op::W16(RXQ_IDX, host) => Op::W16(RXQ_IDX, host % 32),
+            Op::W32(reg, _) if DESA_L.contains(&reg) => Op::W32(reg, 0),
+            op => op,
+        })
+        .collect()
+}
 
 /// The SHA-256 of one `{op:?}` line per access, in lower-case hex.
 pub(crate) fn trace_sha256<'a>(trace: impl IntoIterator<Item = &'a Op>) -> String {
@@ -965,10 +994,11 @@ fn the_bring_up_is_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
     // Ruling R1: Linux's __rtw89_set_channel runs set_txpwr between
     // set_channel_rf and help_exit (core.c:584-588). Take its 119 accesses
     // out of the trace and what is left is M2c's bring-up, access for
-    // access, through the scan, the deinit and the power-off.
+    // access, through the scan, the deinit and the power-off, as
+    // M2c's rings were 16 and 32 entries deep ([`depth_free`]).
     let alone = txpwr_alone(Chan::new20(HwBand::G2, 1).unwrap());
     assert_eq!(alone.len(), 119);
-    for (host, m2c) in M2C_TRACES {
+    for (host, m2c) in M2C_DEPTH_FREE {
         let (c, result) = ran(BOTH, host);
         let (_, rings) = result.unwrap();
         let t = &c.io.trace;
@@ -983,11 +1013,8 @@ fn the_bring_up_is_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
             t[window.end..window.end + 2],
             [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
         );
-        assert_eq!(
-            trace_sha256(t[..window.start].iter().chain(&t[window.end..])),
-            m2c,
-            "{host:?}"
-        );
+        let rest = depth_free(t[..window.start].iter().chain(&t[window.end..]));
+        assert_eq!(trace_sha256(&rest), m2c, "{host:?}");
         drop(rings);
     }
 }
@@ -2340,7 +2367,7 @@ fn rf_pages_follow_ofld_cfg_at_seq_1_and_2_without_an_ack_request() {
         .collect();
     assert_eq!(kicks.len(), 3, "{kicks:?}");
     // Each kick writes the host index past the slot it fills.
-    let slot = |kick: u16| (usize::from(kick) + pci::TX_ENTRIES - 1) % pci::TX_ENTRIES;
+    let slot = |kick: u16| (usize::from(kick) + pci::TX_ENTRIES_CTRL - 1) % pci::TX_ENTRIES_CTRL;
     // OFLD_CFG: seq 0, which forces REC_ACK (bit 14), and DONE_ACK.
     let p = ch12_packet(&c.m, slot(kicks[0]), 24);
     assert_eq!(p[19], 0);
@@ -2474,7 +2501,7 @@ fn phy_failure_names_step_and_powers_off() {
                 if m.get32(0x1F014) == 0 {
                     host | host << 16
                 } else {
-                    let hw = (host + pci::TX_ENTRIES as u32 - 1) % pci::TX_ENTRIES as u32;
+                    let hw = (host + pci::TX_ENTRIES_CTRL as u32 - 1) % pci::TX_ENTRIES_CTRL as u32;
                     host | hw << 16
                 }
             }),
@@ -2560,6 +2587,12 @@ fn phy_failure_names_step_and_powers_off() {
     // (`fails_on` checks it).
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA48));
     assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
+
+    // phy report: RF 0x18 cannot be read through path A's direct window
+    // (DDV), so the error carries no RF 0x18 and no WIFI RF18 line.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0x1E060));
+    assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
+    assert_eq!((err.rf18, err.rf18_lines().count()), (None, 0));
 
     // coex init: the grant sample before it fails; coex never ran, so
     // nothing of it is undone.

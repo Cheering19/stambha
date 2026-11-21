@@ -9,11 +9,15 @@
 //! narrowing of Linux, so a buffer whose descriptor claims fewer bytes than
 //! the BD wrote yields only those. The descriptor fields are those of
 //! `rtw89_core_query_rxdesc` (`core.c:4107-4160`, `txrx.h:345-424`) for the
-//! RTL8852C (`BW` is the `_v1` mask, d1 [31:29]); of a long descriptor's
-//! d5 and d7 only the MAC ID [23:16] and the security type [20:17], which
+//! RTL8852C (`BW` is the `_v1` mask, d1 `[31:29]`); of a long descriptor's
+//! d5 and d7 only the MAC ID `[23:16]` and the security type `[20:17]`, which
 //! `rtw89_core_skb_pn_valid` reads; the fields Stela does not use are not
 //! read. Only FS && LS single-segment buffers are framed. It reads no
 //! register and grants no DMA.
+//!
+//! [`decode_rate`] is the rate half of `rtw89_core_update_rx_status`
+//! (`core.c:4408-4438`) with the AX masks (`txrx.h:10-23`, `:26-66`), for
+//! the station's counts (M4 spec S3.1); nothing else reads it.
 use super::io::AxError;
 
 const RXBD_FS: u32 = 1 << 15;
@@ -35,6 +39,73 @@ const BD_INFO_BYTES: usize = 4;
 const SHORT_RXD: usize = 16;
 const LONG_RXD: usize = 32;
 const TOO_SHORT: AxError = AxError::Rx("RX buffer shorter than its descriptor");
+/// `DATA_RATE_MODE_CTRL_MASK` and its modes (`txrx.h:10-23`).
+const DATA_RATE_MODE_SHIFT: u16 = 7;
+const DATA_RATE_MODE: u16 = 0x3;
+/// `RTW89_GILTF_SGI_4XHE08`, `_2XHE08` and `_1XHE08` (`core.h:4466-4471`).
+const HE_GI_0_8: [u8; 3] = [1, 3, 5];
+
+/// A PPDU's modulation, `DATA_RATE_MODE_NON_HT` to `_HE` (`txrx.h:13-23`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RateMode {
+    Legacy,
+    Ht,
+    Vht,
+    He,
+}
+
+/// A rate as `rtw89_core_update_rx_status` gives it to mac80211: the mode,
+/// the streams and MCS (a legacy rate's `mcs` is its rate index, 0-3 CCK
+/// and 4-11 OFDM), the width as the hardware codes it (0 = 20 MHz to 3 =
+/// 160 MHz, `enum rtw89_bandwidth`), and the short guard interval: HT and
+/// VHT's `RX_ENC_FLAG_SHORT_GI`, HE's 0.8 us GI (`NL80211_RATE_INFO_HE_GI_0_8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rate {
+    pub mode: RateMode,
+    pub nss: u8,
+    pub mcs: u8,
+    pub bw: u8,
+    pub sgi: bool,
+}
+
+/// The RX descriptor's `data_rate`, `bw` and `gi_ltf` as
+/// `rtw89_core_update_rx_status` reads them (`core.c:4408-4438`): MOD `[8:7]`;
+/// a legacy rate's index `[3:0]` (`rtw89_get_data_not_ht_idx`); HT's MCS
+/// `[4:0]` and streams `[4:3]` + 1 (`rtw89_get_data_rate_nss`,
+/// `core.c:2016-2034`); VHT's and HE's streams `[6:4]` + 1 and MCS `[3:0]`.
+/// HT and VHT take any GI/LTF but 0 as short (`core.c:4419-4426`); HE takes
+/// the 0.8 us ones (`rtw89_rxdesc_to_nl_he_gi`, `core.c:2375-2395`).
+pub fn decode_rate(data_rate: u16, bw: u8, gi_ltf: u8) -> Rate {
+    let mode = (data_rate >> DATA_RATE_MODE_SHIFT) & DATA_RATE_MODE;
+    let (mode, nss, mcs, sgi) = match mode {
+        0 => (RateMode::Legacy, 1, data_rate & 0xF, false),
+        1 => (
+            RateMode::Ht,
+            ((data_rate >> 3) & 0x3) as u8 + 1,
+            data_rate & 0x1F,
+            gi_ltf != 0,
+        ),
+        2 => (
+            RateMode::Vht,
+            ((data_rate >> 4) & 0x7) as u8 + 1,
+            data_rate & 0xF,
+            gi_ltf != 0,
+        ),
+        _ => (
+            RateMode::He,
+            ((data_rate >> 4) & 0x7) as u8 + 1,
+            data_rate & 0xF,
+            HE_GI_0_8.contains(&gi_ltf),
+        ),
+    };
+    Rate {
+        mode,
+        nss,
+        mcs: mcs as u8,
+        bw,
+        sgi,
+    }
+}
 
 /// The fields `rtw89_core_query_rxdesc` reads that Stela uses (spec S11.1).
 /// `frame_type` is `Some` only for a long descriptor; `mac_id` and

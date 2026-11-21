@@ -141,7 +141,7 @@ use super::assoc::{self, AddrCam, AssocInputs, Features, RaPeer};
 use super::ba::{self, BaCam, RxStats};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
-use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, SCAN_END};
+use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, RaReport, SCAN_END};
 use super::chan::{Chan, frequency};
 use super::channel::{self, ChannelError, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
@@ -154,11 +154,12 @@ use super::keys::{self, KeyCam};
 use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
 use super::regd::Regds;
+use super::rx::decode_rate;
 use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
 use super::station::chip::{
-    self, Association, Chip, Data, HardwareKey, Incoming, Management, Token,
+    self, Association, Chip, Data, HardwareKey, Incoming, LinkCounts, Management, Token, TxCounts,
 };
-use super::txd::{self, RateCaps, TxSec};
+use super::txd::{self, Aggregate, RateCaps, TxSec};
 use super::txpwr_tables::TxPowerTables;
 use super::vif;
 use crate::Mac;
@@ -224,9 +225,9 @@ const TX_CHANNELS: [TxChannel; 5] = [
 /// What the TX side did, saturating, for [`Chip::diagnostic`]: frames
 /// queued, refused for no room, reported, reported acknowledged; release
 /// reports skipped (`Releases::invalid`) and stale (for a page not in
-/// flight or already reported).
+/// flight or already reported). [`Live::tx_counts`] counts by channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TxCounts {
+struct TxTally {
     sent: u32,
     full: u32,
     reported: u32,
@@ -293,7 +294,12 @@ pub struct Live<I: AxIo> {
     ba: BaCam,
     /// The AP's station's `tid_rx_stats`, for the PN check.
     rx_stats: RxStats,
-    tx: TxCounts,
+    /// The AP's station's `ampdu_map` with each TID's `ampdu_params[tid].agg_num`:
+    /// the TX agreements [`Live::aggregation`] made operational.
+    ampdu: [Option<u16>; 8],
+    tx: TxTally,
+    /// [`Live::tx_counts`].
+    counts: TxCounts,
     ba_counts: BaCounts,
     /// A failure powered the chip off.
     off: bool,
@@ -327,21 +333,23 @@ impl LiveScan {
     }
 }
 
-/// What [`Held`] keeps: a frame, or a beacon filter report.
+/// What [`Held`] keeps: a frame, a beacon filter report, or an RA report.
 enum Kept {
     Frame(Received),
     Report(BcnFltr),
+    Rate(RaReport),
 }
 
-/// Frames and beacon filter reports drained outside [`Live::drain`] and
-/// [`Live::expire_scan`], oldest first, for the next [`Live::drain`] to hand
-/// out, at most [`MAX_HELD`] of each; past it they are dropped and counted.
-/// Other C2Hs are not held: the ledger counts them.
+/// Frames, beacon filter reports and RA reports drained outside
+/// [`Live::drain`] and [`Live::expire_scan`], oldest first, for the next
+/// [`Live::drain`] to hand out, at most [`MAX_HELD`] of each; past it they are
+/// dropped and counted. Other C2Hs are not held: the ledger counts them.
 #[derive(Default)]
 struct Held {
     kept: VecDeque<Kept>,
     frames: usize,
     reports: usize,
+    rates: usize,
     dropped: u16,
 }
 
@@ -350,6 +358,7 @@ impl Held {
         let (kept, count) = match event {
             Event::Frame(frame) => (Kept::Frame(frame), &mut self.frames),
             Event::C2h(C2h::BeaconFilter(report)) => (Kept::Report(report), &mut self.reports),
+            Event::C2h(C2h::RaReport(report)) => (Kept::Rate(report), &mut self.rates),
             Event::C2h(_) => return,
         };
         if *count < MAX_HELD {
@@ -370,6 +379,10 @@ impl Held {
             Kept::Report(report) => {
                 self.reports -= 1;
                 Event::C2h(C2h::BeaconFilter(report))
+            }
+            Kept::Rate(report) => {
+                self.rates -= 1;
+                Event::C2h(C2h::RaReport(report))
             }
         })
     }
@@ -430,7 +443,7 @@ pub unsafe fn leave_ips<I: AxIo + ?Sized>(
 ///
 /// On a failure the chip is powered off as [`super::bringup::bring_up`]
 /// powers it off for that step (a failure from `"core start"` on as a
-/// calibration failure is, [`bringup::shut_down`]), and the window and the
+/// calibration failure is, `bringup::shut_down`), and the window and the
 /// rings come back in the error.
 ///
 /// # Safety
@@ -556,7 +569,9 @@ pub unsafe fn start<I: AxIo>(
         keys: KeyCam::default(),
         ba: BaCam::default(),
         rx_stats: RxStats::default(),
-        tx: TxCounts::default(),
+        ampdu: [None; 8],
+        tx: TxTally::default(),
+        counts: TxCounts::default(),
         ba_counts: BaCounts::default(),
         off: false,
     })
@@ -583,7 +598,8 @@ fn token(ch: TxChannel, page: u8) -> Token {
 }
 
 /// A received frame as the station hears it: the tag as a channel at its
-/// cfg80211 frequency, the free-running counter as its TSF.
+/// cfg80211 frequency, the free-running counter as its TSF, the
+/// descriptor's rate decoded ([`decode_rate`]) with its A-MPDU bit.
 fn heard(frame: Received) -> chip::Received {
     let Tag { band, channel } = frame.tag;
     chip::Received {
@@ -598,6 +614,8 @@ fn heard(frame: Received) -> chip::Received {
         decrypted: frame.decrypted,
         icv_error: frame.icv_error,
         fcs_error: frame.fcs_error,
+        rate: Some(decode_rate(frame.data_rate, frame.bw, frame.gi_ltf)),
+        ampdu: frame.ampdu,
     }
 }
 
@@ -617,6 +635,13 @@ fn chan_of(channel: Channel) -> Result<Chan, AxError> {
 /// A failure of `step` as [`Chip`] reports it.
 fn failed(step: &str, error: AxError) -> String {
     format!("{step}: {error}")
+}
+
+/// Whether an RA report goes to the station: for its MAC ID
+/// (`__rtw89_phy_c2h_ra_rpt_iter` matches `rtwsta_link->mac_id`,
+/// `phy.c:3247-3249`), and kept as Linux keeps one ([`RaReport::valid`]).
+fn station_rate(report: &RaReport) -> bool {
+    report.macid == u16::from(vif::MAC_ID) && report.valid()
 }
 
 /// Whether `event` goes on from the drain that brought it: a frame only
@@ -647,6 +672,17 @@ impl<I: AxIo> Live<I> {
     /// (`00` for the world's).
     pub fn regds(&self) -> (Regds, [u8; 2]) {
         self.regds
+    }
+
+    /// What the TX side did by channel (M4 spec S3.2): each frame a submit
+    /// took, each write of a ring's index, each release report and those
+    /// not `RTW89_TX_DONE`, and the RPQ polls that found RPQ full
+    /// ([`super::pci::Rings::rpq_full_batches`]).
+    pub fn tx_counts(&self) -> TxCounts {
+        TxCounts {
+            rpq_full: u32::from(self.rings.rpq_full_batches()),
+            ..self.counts
+        }
     }
 
     /// The channel the last switch set: [`start`]'s 2.4 GHz channel 1, then
@@ -725,7 +761,7 @@ impl<I: AxIo> Live<I> {
     /// been ended ([`SCAN_NOT_ENDED`]: the firmware moves the radio), and for
     /// a channel [`Chan::new20`] would not build. Any later failure leaves
     /// the TX scheduler stopped, so the chip is powered off
-    /// ([`bringup::shut_down`]) and every later call fails with
+    /// (`bringup::shut_down`) and every later call fails with
     /// [`POWERED_OFF`]. The channel becomes the one a scan's restore
     /// returns to.
     ///
@@ -772,11 +808,11 @@ impl<I: AxIo> Live<I> {
     }
 
     /// Begin a firmware scan of `list` (M3 spec S8.1): `rtw89_hw_scan_start`'s
-    /// chip steps ([`scan::hw_scan_start`]), then the scan's receiver
+    /// chip steps (`scan::hw_scan_start`), then the scan's receiver
     /// ([`Mode::Scan`], see the module documentation), into which the frames
     /// still waiting for their PPDU status, received before the scan, are
     /// flushed for the next [`Live::drain`]; then `rtw89_hw_scan_offload(true)`
-    /// ([`scan::offload`]: ADD_SCANOFLD_CH with `list`, SCANOFLD start, each
+    /// (`scan::offload`: ADD_SCANOFLD_CH with `list`, SCANOFLD start, each
     /// with its 100 ms DONE_ACK wait). The scan's budget,
     /// [`scan::scan_budget_us`] of the list, runs from SCANOFLD start's
     /// DONE_ACK ([`Live::expire_scan`]). Frames drained meanwhile are held
@@ -787,7 +823,7 @@ impl<I: AxIo> Live<I> {
     /// ([`SCAN_NOT_ENDED`]), while a BSSID is set ([`CONNECTED`]), for a list
     /// [`scan::scan_list`] would refuse, and on a firmware without
     /// SCAN_OFFLOAD. A failure in the scan start's own steps powers the chip
-    /// off. A failed offload is aborted as Linux aborts it: [`scan::stop`],
+    /// off. A failed offload is aborted as Linux aborts it: `scan::stop`,
     /// its failure ignored, then the restore of [`Live::end_scan`]; its error
     /// is returned, and the chip stays on unless the restore failed.
     ///
@@ -851,13 +887,13 @@ impl<I: AxIo> Live<I> {
     /// One RXQ poll for `sink` (the RXQ step of the radio's poll): first the
     /// frames and beacon filter reports an operation held, oldest first
     /// (see [`Live::service`]), then every RXQ entry through the receiver,
-    /// the session's ledger and `rtw89_core_skb_pn_valid` ([`checked`]: a
+    /// the session's ledger and `rtw89_core_skb_pn_valid` (`checked`: a
     /// frame it drops is counted, not handed on), as `rtw89_pci_poll_rxq_dma`
     /// hands them to `rtw89_core_rx`; a held frame passed that check as it
     /// was drained. A running
     /// scan's first END_SCAN ends it: the same call then drains what
     /// followed END_SCAN and flushes the receiver into `sink`
-    /// ([`scan::tail`]), so every frame the scan heard is handed on before
+    /// (`scan::tail`), so every frame the scan heard is handed on before
     /// [`Live::scan_state`] says how it ended. A malformed buffer ends the
     /// drain with its error after the buffers before it were handed on, and
     /// a later call goes on. Refused with [`POWERED_OFF`] on a chip off.
@@ -899,8 +935,8 @@ impl<I: AxIo> Live<I> {
 
     /// The scan budget (the radio poll's last step, M3 spec S8.1): a scan
     /// without END_SCAN at its deadline is stopped as `rtw89_hw_scan_abort`
-    /// does ([`scan::stop`]: SCANOFLD stop, then up to `STOP_WAIT_US` for
-    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]) as
+    /// does (`scan::stop`: SCANOFLD stop, then up to `STOP_WAIT_US` for
+    /// END_SCAN), what followed drained into `sink` (`scan::tail`) as
     /// [`Live::drain`] drains it, after the frames held, and it ends
     /// [`ScanEnd::Stopped`], `ended` when
     /// END_SCAN came in the stop's wait or its tail. A stop or tail that
@@ -956,7 +992,7 @@ impl<I: AxIo> Live<I> {
     /// `rtw89_hw_scan_complete` for the ended scan (M3 spec S8.3; see the
     /// module documentation): the switch back to the operating channel through
     /// [`Live::tune`], with its TX power and the receiver's tag, then
-    /// [`scan::hw_scan_complete`] (the RX filter, the station receiver
+    /// `scan::hw_scan_complete` (the RX filter, the station receiver
     /// again, the address CAM, EDCCA, TSF sync, DIG), frames its CAM send
     /// drains held for the next [`Live::drain`]. The scan is over either way;
     /// a failure powers the chip off. Refused before any I/O on a chip off
@@ -1167,6 +1203,9 @@ impl<I: AxIo> Live<I> {
         let mut cam = core::mem::take(&mut self.keys);
         let mut agreements = core::mem::take(&mut self.ba);
         self.rx_stats.forget();
+        // The station goes with its `ampdu_map`; the limit register keeps
+        // its last value, as Linux writes it only from `ampdu_action`.
+        self.ampdu = [None; 8];
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
         let band = self.chan.band;
@@ -1331,6 +1370,35 @@ impl<I: AxIo> Live<I> {
         Ok(())
     }
 
+    /// `rtw89_ops_ampdu_action`'s TX half (`mac80211.c:1041-1061`, M4 spec
+    /// S10.2) for the AP's station's agreement on `tid`: `Some(window)` is
+    /// TX_OPERATIONAL, the TID's `agg_num` set and its bit in `ampdu_map`;
+    /// `None` is TX_STOP, the bit cleared. Either then runs
+    /// `rtw89_phy_ra_recalc_agg_limit` ([`assoc::set_ra_agg_limit`]). TX_START
+    /// takes nothing here (`IEEE80211_AMPDU_TX_START_IMMEDIATE`), no LPS is
+    /// left, and `h2c_ampdu_cmac_tbl` is NULL on the 8852C
+    /// (`rtw8852c.c:3115`), so no H2C is sent. Refused before any I/O,
+    /// changing nothing, on a chip off ([`POWERED_OFF`]), while a scan has
+    /// not been ended ([`SCAN_NOT_ENDED`]), while not associated
+    /// ([`BA_WITHOUT_ASSOCIATION`]) and for a TID past 7. A failed register
+    /// access is returned with the map changed and the chip left on, as
+    /// Linux's write cannot fail.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), AxError> {
+        self.idle()?;
+        if self.associated.is_none() {
+            return Err(BA_WITHOUT_ASSOCIATION);
+        }
+        let slot = self
+            .ampdu
+            .get_mut(usize::from(tid))
+            .ok_or(AxError::Mac("a TX Block Ack agreement on a TID past 7"))?;
+        *slot = window;
+        assoc::set_ra_agg_limit(&mut self.io, &self.ampdu)
+    }
+
     /// `rtw89_ops_ampdu_action`'s RX_STOP (`mac80211.c:1066-1069`) of the
     /// agreement on `tid`: its PN check stopped, then [`ba::stop`], the
     /// oldest entry it holds freed and its stop H2C sent without a wait; an
@@ -1376,15 +1444,21 @@ impl<I: AxIo> Live<I> {
     /// every 10 ms for up to 200 ms until `dle_is_txq_empty`'s queues are
     /// all empty (`mac.c:2388-2412`), a timeout passed over as Linux only
     /// logs it. Frames drained meanwhile are held for the next
-    /// [`Live::drain`]. Refused before any I/O on a chip off
-    /// ([`POWERED_OFF`]) and while a scan has not been ended
-    /// ([`SCAN_NOT_ENDED`]); a failed register read is returned, the chip
-    /// left on, as is the first PKT_DROP that could not be sent.
+    /// [`Live::drain`]. Before the wait, the data written and not yet
+    /// kicked is handed over ([`Live::kick`]): Linux's TX path kicks what it
+    /// pushed before a flush can run (`rtw89_core_txq_schedule`), and Stela
+    /// splits the write and the kick within one service pass (M4 spec
+    /// S9.1). Refused before any I/O on a chip off ([`POWERED_OFF`]) and
+    /// while a scan has not been ended ([`SCAN_NOT_ENDED`]); a failed
+    /// register read or kick is returned, the chip left on, as is the first
+    /// PKT_DROP that could not be sent.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     pub unsafe fn flush(&mut self, drop: bool) -> Result<(), AxError> {
         self.idle()?;
+        // SAFETY: the caller's contract is `kick`'s, word for word.
+        unsafe { self.kick() }?;
         self.rings.flush_tx(&mut self.io)?;
         if !drop {
             return match poll32(
@@ -1465,7 +1539,10 @@ impl<I: AxIo> Live<I> {
         }
         let (ch, head) = txd::management(bytes, self.chan.band, basic)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
-        unsafe { self.submit(ch, &head, bytes) }
+        let queued = unsafe { self.submit(ch, &head, bytes) }?;
+        // SAFETY: as above, `kick_channel`'s.
+        unsafe { self.kick_channel(ch) }?;
+        Ok(queued)
     }
 
     /// Queue a data frame, as [`Live::queue_management`] queues a
@@ -1476,6 +1553,7 @@ impl<I: AxIo> Live<I> {
     /// Protected frame goes under (`rtw89_core_tx_update_sec_key`), whose
     /// CCMP header [`txd::strip_ccmp`] removed. The key's CAM entry is the
     /// caller's to have installed ([`Chip::transmit_data`] checks it).
+    /// With `agg`, the frame goes in its TID's A-MPDU ([`txd::data`]).
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1486,6 +1564,7 @@ impl<I: AxIo> Live<I> {
         eapol: bool,
         supported: u16,
         sec: Option<TxSec>,
+        agg: Option<Aggregate>,
     ) -> Result<Option<Token>, AxError> {
         if self.off {
             return Err(POWERED_OFF);
@@ -1506,7 +1585,7 @@ impl<I: AxIo> Live<I> {
                 ldpc: false,
             },
         };
-        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec)?;
+        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec, agg)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
         unsafe { self.submit(ch, &head, bytes) }
     }
@@ -1525,14 +1604,11 @@ impl<I: AxIo> Live<I> {
     ) -> Result<Option<Token>, AxError> {
         // SAFETY: the caller's contract; `start` installed the pools for
         // these rings' own requester.
-        let queued = unsafe {
-            self.rings
-                .txq(&mut self.pools, ch)
-                .submit(&mut self.io, head, bytes)
-        }?;
+        let queued = unsafe { self.rings.txq(&mut self.pools, ch).submit(head, bytes) }?;
         match queued {
             Some(page) => {
                 bump(&mut self.tx.sent);
+                bump(&mut self.counts.submitted[ch.slot()]);
                 Ok(Some(token(ch, page)))
             }
             None => {
@@ -1542,16 +1618,55 @@ impl<I: AxIo> Live<I> {
         }
     }
 
+    /// `rtw89_core_tx_kick_off` (`core.c:1337-1344`) of every data and
+    /// management channel a frame was written to since its last kick
+    /// ([`super::pci::Txq::kick`]), in ring order, each kick counted
+    /// ([`Live::tx_counts`]): the end of the radio's service pass, as
+    /// `rtw89_core_txq_schedule` kicks each TID's channel once after pushing
+    /// its frames (`core.c:4854-4858`, M4 spec S9.1). A channel with nothing
+    /// new is not written. Every channel is tried; the first failed write is
+    /// returned, its frames still pending for the next kick. Refused with
+    /// [`POWERED_OFF`] on a chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn kick(&mut self) -> Result<(), AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        let mut first = Ok(());
+        for ch in TX_CHANNELS {
+            // SAFETY: the caller's contract is `kick_channel`'s.
+            keep(&mut first, unsafe { self.kick_channel(ch) });
+        }
+        first
+    }
+
+    /// One channel's kick, counted when it wrote.
+    ///
+    /// # Safety
+    /// [`start`]'s contract: [`super::pci::Txq::kick`]'s for the live
+    /// chip's own window, rings and pools.
+    unsafe fn kick_channel(&mut self, ch: TxChannel) -> Result<(), AxError> {
+        // SAFETY: the caller's contract.
+        let kicked = unsafe { self.rings.txq(&mut self.pools, ch).kick(&mut self.io) }?;
+        if kicked {
+            bump(&mut self.counts.kicks[ch.slot()]);
+        }
+        Ok(())
+    }
+
     /// The radio's poll (M3 spec S1.4), `rtw89_pci_napi_poll`'s order: RPQ,
     /// each release report returning its page ([`TxPools::release`]) and
     /// handed on as [`Incoming::Transmitted`], acknowledged for
     /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
     /// outstanding; RXQ ([`Live::drain`]), its frames handed on, each past
     /// `rtw89_core_skb_pn_valid` as it was drained ([`RxStats::valid`], a
-    /// drop counted); the scan budget ([`Live::expire_scan`]); then each
-    /// beacon filter report
+    /// drop counted), with each RA report for the station's MAC ID as
+    /// [`Incoming::RaReport`] (`rtw89_phy_c2h_ra_rpt`, M4 spec S3.3); the
+    /// scan budget ([`Live::expire_scan`]); then each beacon filter report
     /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
-    /// takes it ([`Live::beacon_filter`]); then, once,
+    /// takes it (`Live::beacon_filter`); then, once,
     /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
     /// frame it heard. Every step runs whatever an earlier one returned,
     /// and the first error is returned. Such an error is not fatal: no step
@@ -1577,6 +1692,9 @@ impl<I: AxIo> Live<I> {
         let mut frames = |e: Event<'_>| match e {
             Event::Frame(frame) => sink(Incoming::Frame(heard(frame))),
             Event::C2h(C2h::BeaconFilter(report)) => filter.push(report),
+            Event::C2h(C2h::RaReport(report)) if station_rate(&report) => {
+                sink(Incoming::RaReport(report))
+            }
             Event::C2h(_) => {}
         };
         // SAFETY: as above, `drain`'s.
@@ -1610,6 +1728,7 @@ impl<I: AxIo> Live<I> {
             rings,
             pools,
             tx,
+            counts,
             ..
         } = self;
         let mut rpq = rings.rpq();
@@ -1633,8 +1752,11 @@ impl<I: AxIo> Live<I> {
                     }
                     let acknowledged = release.status == TX_DONE;
                     bump(&mut tx.reported);
+                    bump(&mut counts.released[ch.slot()]);
                     if acknowledged {
                         bump(&mut tx.acked);
+                    } else {
+                        bump(&mut counts.failed);
                     }
                     sink(Incoming::Transmitted {
                         token: token(ch, page),
@@ -1728,6 +1850,7 @@ impl<I: AxIo> Live<I> {
         self.associated = None;
         self.keys = KeyCam::default();
         self.ba = BaCam::default();
+        self.ampdu = [None; 8];
         self.rx_stats.forget();
     }
 
@@ -1785,7 +1908,7 @@ impl<I: AxIo> Live<I> {
         Ok(result)
     }
 
-    /// `rtw89_core_stop` (M3 spec S3.2, [`bringup::shut_down`]): the coex
+    /// `rtw89_core_stop` (M3 spec S3.2, `bringup::shut_down`): the coex
     /// half, `pci::deinit`, then the power-off, every result ignored as
     /// Linux ignores them; nothing on a chip a failure already powered
     /// off. The window, the rings and the pools come back and must be kept:
@@ -1895,10 +2018,11 @@ impl<I: AxIo> Chip for Live<I> {
             tid,
             eapol,
             supported_rates,
+            aggregate,
             ..
         } = *frame;
         // SAFETY: `start`'s contract holds for the live chip's every use.
-        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec) }
+        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec, aggregate) }
             .map_err(|e| e.to_string())
     }
 
@@ -1961,6 +2085,18 @@ impl<I: AxIo> Chip for Live<I> {
         unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
     }
 
+    /// [`Live::aggregation`].
+    fn aggregation(&mut self, tid: u8, window: Option<u16>) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::aggregation(self, tid, window) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::kick`].
+    fn kick(&mut self) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::kick(self) }.map_err(|e| e.to_string())
+    }
+
     /// [`Live::flush`].
     fn flush(&mut self, drop: bool) -> Result<(), String> {
         // SAFETY: `start`'s contract holds for the live chip's every use.
@@ -1984,7 +2120,7 @@ impl<I: AxIo> Chip for Live<I> {
     /// Ack starts and stops and the frames the PN check dropped, naming no
     /// address.
     fn diagnostic(&self) -> String {
-        let TxCounts {
+        let TxTally {
             sent,
             full,
             reported,
@@ -2017,6 +2153,18 @@ impl<I: AxIo> Chip for Live<I> {
         }
         line
     }
+
+    /// The TX power's alpha2 and its index on the band tuned
+    /// ([`Regds::txpwr`]), the RXQ polls that found RXQ full and
+    /// [`Live::tx_counts`].
+    fn link_counts(&self) -> LinkCounts {
+        let (regds, alpha2) = self.regds;
+        LinkCounts {
+            regd: Some((alpha2, regds.txpwr(self.chan.band))),
+            rxq_full: u32::from(self.rings.rxq_full_batches()),
+            tx: self.tx_counts(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2045,7 +2193,8 @@ impl<I: AxIo> Live<I> {
         self.ba.tids()
     }
 
-    /// The PN check [`Live::service`] runs, on `frame`.
+    /// The PN check every drain runs on what it brings (`Live::passing`,
+    /// through `checked`), on `frame`.
     pub(crate) fn pn_valid(&mut self, frame: &Received) -> bool {
         self.rx_stats.valid(self.associated.is_some(), frame)
     }

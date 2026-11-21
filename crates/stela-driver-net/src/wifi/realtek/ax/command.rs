@@ -168,6 +168,7 @@ impl Seen {
                 | C2h::FormattedLog
                 | C2h::ScanOfld(_)
                 | C2h::BeaconFilter(_)
+                | C2h::RaReport(_)
                 | C2h::Other { .. },
             ) => ack.other_c2h = ack.other_c2h.saturating_add(1),
         }
@@ -383,7 +384,7 @@ fn bump8(counter: &mut u8) {
 }
 
 /// One event from the receiver: C2Hs pass the ledger (and the running wait)
-/// first; SCANOFLD_RSPs, BCNFLTR_RPTs and frames go on to `sink`.
+/// first; SCANOFLD_RSPs, BCNFLTR_RPTs, RA reports and frames go on to `sink`.
 fn account(
     ledger: &mut Ledger,
     awaited: &mut Option<Awaited>,
@@ -446,7 +447,7 @@ fn account(
                 bump8(&mut a.other_c2h);
             }
         }
-        C2h::ScanOfld(_) | C2h::BeaconFilter(_) => {
+        C2h::ScanOfld(_) | C2h::BeaconFilter(_) | C2h::RaReport(_) => {
             if let Some(a) = awaited {
                 bump8(&mut a.other_c2h);
             }

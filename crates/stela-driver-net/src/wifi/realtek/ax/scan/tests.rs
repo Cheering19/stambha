@@ -3,8 +3,8 @@ use super::*;
 use crate::wifi::realtek::ax::bb::BbGain;
 use crate::wifi::realtek::ax::bringup::FirmwareFile;
 use crate::wifi::realtek::ax::bringup::tests::{
-    BOTH, NO_LTR, chip_hearing, efuse_with_mac, never, same_access, tables_file, trace_sha256,
-    txpwr_window,
+    BOTH, NO_LTR, chip_hearing, depth_free, efuse_with_mac, never, same_access, tables_file,
+    trace_sha256, txpwr_window,
 };
 use crate::wifi::realtek::ax::chan::Chan;
 use crate::wifi::realtek::ax::channel::{ChannelInputs, TxPower};
@@ -13,7 +13,7 @@ use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::h2c::H2c;
 use crate::wifi::realtek::ax::live::{self, BOOT_CHANNEL, Live, StartError, leave_ips};
 use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read, running};
-use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings, TX_ENTRIES};
+use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings, TX_ENTRIES_CTRL};
 use crate::wifi::realtek::ax::receive::{Mode, Tag};
 use crate::wifi::realtek::ax::regd::{Regd, Regds};
 use crate::wifi::realtek::ax::tests::firmware::{
@@ -172,7 +172,7 @@ fn time_at(trace: &[Op], at: usize) -> u64 {
 
 /// The first `len` bytes of the FWCMD slot that carried `seq`.
 fn slot(m: &Arc<Mutex<Model>>, seq: u8, len: usize) -> Vec<u8> {
-    let n = usize::from(seq - 3) % TX_ENTRIES;
+    let n = usize::from(seq - 3) % TX_ENTRIES_CTRL;
     let state = m.lock().unwrap();
     device_read(
         &state,
@@ -332,10 +332,10 @@ fn the_scan_steps_are_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
         t[window.end..window.end + 2],
         [Op::R32(0xC000), Op::W32(0xCE40, 0x2B)]
     );
-    assert_eq!(
-        trace_sha256(t[..window.start].iter().chain(&t[window.end..])),
-        M2C_SCAN_TRACE
-    );
+    // Its view across M4's ring depths is the same trace: the scan writes no
+    // ring size or address, and RXQ's host index stays under 32.
+    let rest = depth_free(t[..window.start].iter().chain(&t[window.end..]));
+    assert_eq!(trace_sha256(&rest), M2C_SCAN_TRACE);
 }
 
 /// A data frame on channel 6 during the scan: M2c's scan receiver counts it
@@ -859,7 +859,7 @@ fn refused_vif_h2c_is_named_in_the_line() {
 
 #[test]
 fn rxq_full_is_reported() {
-    let r = scan(|fw| fw.burst(31)).report();
+    let r = scan(|fw| fw.burst(255)).report();
     assert_eq!((r.rxq_full, r.dropped, r.frames), (1, 0, 0));
     assert!(
         r.to_string().ends_with("(0 without RSSI), RXQ full 1"),
@@ -964,6 +964,52 @@ fn frames_before_scanofld_is_acked_are_kept() {
         r.networks[0],
         Some(network(HOME, HwBand::G2, 1, Some(-54), b"Early"))
     );
+}
+
+#[test]
+fn frames_past_the_early_bound_are_dropped() {
+    // 66 beacons, each with its PPDU status, right after ADD_SCANOFLD_CH's
+    // acks: drained during SCANOFLD's wait, before `Scanner::submitted`,
+    // the first MAX_EARLY wait for it and the two past are dropped.
+    let s = scan(|fw| {
+        let mut batch = Vec::new();
+        for n in 0..66u8 {
+            let bssid = [0x02, 0xBB, 0, 0, 0, n];
+            batch.extend(frame_with_status(
+                0x80,
+                BROADCAST,
+                bssid,
+                b"Early",
+                Some(1),
+                n % 8,
+                0x70,
+            ));
+        }
+        fw.after(9, 0x16, batch);
+    });
+    let r = s.report();
+    assert_eq!(MAX_EARLY, 64);
+    assert_eq!((r.frames, r.dropped, r.networks_total), (64, 2, 64));
+}
+
+#[test]
+fn a_bssid_past_the_table_bound_is_dropped() {
+    // 513 BSSIDs over the listed channels: the table keeps the first 512
+    // heard, and the 513th's beacon is dropped.
+    let s = scan(|fw| {
+        for n in 0..513u16 {
+            let [hi, lo] = n.to_be_bytes();
+            fw.beacon(
+                usize::from(n) % 38,
+                [0x02, 0xBB, 0, 0, hi, lo],
+                b"Net",
+                0x70,
+            );
+        }
+    });
+    let r = s.report();
+    assert_eq!(MAX_NETWORKS, 512);
+    assert_eq!((r.frames, r.dropped, r.networks_total), (512, 1, 512));
 }
 
 #[test]

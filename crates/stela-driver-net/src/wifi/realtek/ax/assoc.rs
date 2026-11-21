@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2019-2020  Realtek Corporation
+// The QoS defaults and the WMM parameter checks are adapted from pinned Linux
+// net/mac80211/util.c (ieee80211_set_wmm_default) and mlme.c
+// (_ieee80211_sta_wmm_params): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2003-2008, Jouni Malinen; 2005-2006, Devicescape Software, Inc.; 2006-2007
+// Jiri Benc; 2007 Johannes Berg; 2007 Michael Wu; 2013-2014 Intel Mobile
+// Communications GmbH; 2015-2017 Intel Deutschland GmbH; 2018-2026 Intel
+// Corporation. See NOTICE.
 //! A station's join, association and leaving on an RTL8852C (M3 spec S9-S11),
 //! as Linux's mac80211 drives rtw89 through them, each step the H2Cs and
 //! register accesses of the rtw89 callback mac80211 calls there, in that
@@ -86,7 +93,7 @@
 use super::chan::HwBand;
 use super::command::Session;
 use super::dm::Dig;
-use super::io::{AxError, AxIo, clear32};
+use super::io::{AxError, AxIo, clear32, field32};
 use super::receive::Event;
 use super::vif::{self, MAC_ID, NET_TYPE_INFRA, NET_TYPE_NO_LINK, PORT};
 use crate::wifi::station::phy::AccessCategory;
@@ -94,14 +101,14 @@ use crate::wifi::station::phy::AccessCategory;
 pub use super::vif::PortConfig;
 
 /// The address CAM's security fields (`cam.c:906-927`): the key IDs of
-/// w9 [31:18] in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
+/// w9 `[31:18]` in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
 /// holds them; 0 before any key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CamKeys {
-    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 [31:18]; other bits are
+    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 `[31:18]`; other bits are
     /// ignored.
     pub keyids: u32,
-    /// w10: `SEC_ENT_VALID` [7:0], `SEC_ENT0` to `SEC_ENT2`.
+    /// w10: `SEC_ENT_VALID` `[7:0]`, `SEC_ENT0` to `SEC_ENT2`.
     pub valid_and_ents: u32,
     /// w11: `SEC_ENT3` to `SEC_ENT6`.
     pub ents_hi: u32,
@@ -343,9 +350,40 @@ pub fn ra_info(peer: &RaPeer, band: HwBand) -> RaInfo {
     info
 }
 
+/// `R_AX_AMPDU_AGG_LIMIT` and its `B_AX_RA_TRY_RATE_AGG_LMT_MASK`
+/// (`reg.h:2563-2565`), the 8852C's `ra_agg_limit` (`mac.c:7479-7480`).
+const R_AX_AMPDU_AGG_LIMIT: u32 = 0xC610;
+const B_AX_RA_TRY_RATE_AGG_LMT: u32 = 0x00FF_0000;
+
+/// `rtw89_phy_ra_recalc_agg_limit`'s value (`phy.c:778-797`) for the one
+/// station's TX agreements, `windows[tid]` the window of each TID in
+/// `ampdu_map` (`ampdu_params[tid].agg_num`): the smallest, clamped to 1-256,
+/// less one; 0x3F with none.
+pub fn ra_agg_limit(windows: &[Option<u16>; 8]) -> u32 {
+    match windows.iter().flatten().min() {
+        Some(&least) => u32::from(least.clamp(1, 256)) - 1,
+        None => 0x3F,
+    }
+}
+
+/// `rtw89_phy_ra_recalc_agg_limit` (`phy.c:778-803`): [`ra_agg_limit`] into
+/// `R_AX_AMPDU_AGG_LIMIT` [23:16] of MAC 0, a read-modify-write
+/// (`rtw89_write32_idx`, `mac.h:1204-1209`); no DBCC, so no MAC 1.
+pub fn set_ra_agg_limit<I: AxIo + ?Sized>(
+    io: &mut I,
+    windows: &[Option<u16>; 8],
+) -> Result<(), AxError> {
+    field32(
+        io,
+        R_AX_AMPDU_AGG_LIMIT,
+        B_AX_RA_TRY_RATE_AGG_LMT,
+        ra_agg_limit(windows),
+    )
+}
+
 /// `____rtw89_conf_tx_edca`'s word for one access category (M3 spec S10.8):
-/// TXOPLMT [26:16] = `txop_32us`, CWMAX [15:12] and CWMIN [11:8] the
-/// exponents, AIFS [7:0] = `aifsn * slot + sifs` with slot 9 (short) or 20
+/// TXOPLMT `[26:16]` = `txop_32us`, CWMAX `[15:12]` and CWMIN `[11:8]` the
+/// exponents, AIFS `[7:0]` = `aifsn * slot + sifs` with slot 9 (short) or 20
 /// and SIFS 10 on 2.4 GHz, else 16 (`rtw89_aifsn_to_aifs`,
 /// `mac80211.c:393-412`, which returns it as a u8). mac80211 hands rtw89
 /// `cw = 2^ecw - 1`, of which rtw89 takes `ilog2(cw + 1)`, the exponent
@@ -618,7 +656,7 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 /// (`rtw89_cam_fill_addr_cam_info` reads the vif's entry, `cam.c:906-927`);
 /// the association's EDCA parameters ([`AssocInputs::params`]) with the
 /// long slot (`BSS_CHANGED_ERP_SLOT`, which `ieee80211_reset_erp_info`
-/// always raises), the GID table cleared, then [`wmm_defaults`] with the
+/// always raises), the GID table cleared, then `wmm_defaults` with the
 /// long slot. Nothing of the port or DIG.
 ///
 /// # Safety

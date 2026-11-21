@@ -256,7 +256,7 @@ fn role_and_join_place_macid_port_and_update_mode() {
 
 #[test]
 fn addr_cam_is_byte_exact_for_the_test_mac() {
-    let (seq, p) = H2c::at(15).addr_cam([0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0);
+    let (seq, p) = H2c::at(15).addr_cam_unassociated([0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0);
     assert_eq!(seq, 15);
     let (len, b) = body(&p);
     assert_eq!(len, 68);
@@ -274,7 +274,7 @@ fn addr_cam_is_byte_exact_for_the_test_mac() {
 #[test]
 fn addr_cam_places_port_and_macid_in_w8() {
     // w8 (v0): macid [7:0], PORT_INT [10:8], TSF_SYNC [13:11] (cam.h:73-75).
-    let (_, p) = H2c::at(1).addr_cam([0; 6], 9, 2);
+    let (_, p) = H2c::at(1).addr_cam_unassociated([0; 6], 9, 2);
     let b = body(&p).1;
     assert_eq!(word(b, 2 + 8), 9 | 2 << 8 | 2 << 11);
     // An all-zero MAC hashes to 0, leaving only VALID in w2.
@@ -402,6 +402,19 @@ fn add_scanofld_ch_refuses_70_entries_without_advancing_seq() {
     assert_eq!(p.len(), 16 + 8 + 4 + 28 * 69);
     assert_eq!(p[24], 69);
     assert_eq!(h, H2c::at(19));
+}
+
+#[test]
+fn add_scanofld_ch_refuses_an_empty_list_without_advancing_seq() {
+    // A batch without a channel leaves the firmware nothing to scan; the
+    // live chip refuses an empty list before any H2C, and so does the
+    // builder.
+    let mut h = H2c::at(18);
+    assert_eq!(
+        h.add_scanofld_ch(&[]),
+        Err(AxError::Scan("an empty scan list"))
+    );
+    assert_eq!(h, H2c::at(18));
 }
 
 #[test]
@@ -544,7 +557,7 @@ fn addr_cam_pre_auth_and_connected_match_spec() {
     );
     // M2c's builder is the unassociated CAM: zero BSSID, NO_LINK.
     assert_eq!(
-        H2c::at(15).addr_cam(LOCAL, 0, 0),
+        H2c::at(15).addr_cam_unassociated(LOCAL, 0, 0),
         H2c::at(15).addr_cam_with(&AddrCam::unassociated(LOCAL), 0, 0)
     );
 }

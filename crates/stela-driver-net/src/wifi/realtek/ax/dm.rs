@@ -422,7 +422,7 @@ fn cck_pd_lower_bound(rssi: u8, igi_rssi: u8) -> u32 {
 /// nothing; `rtw89_phy_dig_reset` (phy.c:7707-7717) then sets the PD
 /// thresholds with dynamic PD off (`dig_dyn_pd_th(rssi_nolink, false)`:
 /// lower bound 0, spatial reuse off, the CCK limit off and the CCK lower
-/// bound of [`cck_pd_lower_bound`]; `disabled_dm_bitmap` is only set from
+/// bound of `cck_pd_lower_bound`; `disabled_dm_bitmap` is only set from
 /// debugfs) and turns `sdagc_follow_pagc` off on both paths.
 pub fn dig_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let enable = 0;
@@ -578,9 +578,9 @@ const TXPWR_REF_MASK: u32 = 0x07FF_FFFF;
 const TXPWR_REF_0DBM: u32 = (0xAC << 18) | (0x138 << 9);
 
 /// `rtw8852c_set_txpwr_ctrl(PHY0)` (rtw8852c.c:2261-2265), which is
-/// `rtw8852c_set_txpwr_ref(PHY0, 0)` (:2103-2135): clear [27:10] of the MAC
+/// `rtw8852c_set_txpwr_ref(PHY0, 0)` (:2103-2135): clear `[27:10]` of the MAC
 /// rate control word (`rtw89_mac_txpwr_write32_mask`, a read-modify-write,
-/// mac.h:1602-1614), then write the 0 dBm reference to [26:0] of the OFDM
+/// mac.h:1602-1614), then write the 0 dBm reference to `[26:0]` of the OFDM
 /// word of path A then B, then of the CCK word of path A then B. Each BB
 /// write is `rtw89_phy_write32_idx` on PHY 0, so a read-modify-write
 /// (phy.c:2111-2117).
@@ -614,11 +614,11 @@ fn thm_setting(raw: u8) -> u8 {
 /// `rtw8852c_power_trim` (rtw8852c.c:816-820) with the efuse trims of
 /// `efuse`:
 /// - `rtw8852c_thermal_trim` (:733-759): when `thermal_trim` is `Some`
-///   (Linux's `pg_thermal_trim`: either byte != 0xFF), RF 0x43 [19:16] of
+///   (Linux's `pg_thermal_trim`: either byte != 0xFF), RF 0x43 `[19:16]` of
 ///   path A then B becomes `__thm_setting` of the path's byte;
 /// - `rtw8852c_pa_bias_trim` (:781-805): when `pa_bias_trim` is `Some`, for
-///   path A then B, RF 0x60 [15:12] becomes the byte's low nibble (2G),
-///   then [19:16] its high nibble (5G).
+///   path A then B, RF 0x60 `[15:12]` becomes the byte's low nibble (2G),
+///   then `[19:16]` its high nibble (5G).
 ///
 /// Each trim's flag covers both paths, so a path whose byte is 0xFF inside
 /// a programmed pair is written too (0xF for thermal, 0xF and 0xF for PA

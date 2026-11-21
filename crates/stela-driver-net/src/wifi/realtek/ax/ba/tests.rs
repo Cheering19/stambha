@@ -89,6 +89,7 @@ fn frame(tid: u8, sn: u16, pn: u64) -> Received {
         data_rate: 0,
         gi_ltf: 0,
         bw: 0,
+        ampdu: false,
         free_run: 0,
         hw_dec: true,
         a1_match: true,

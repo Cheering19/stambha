@@ -689,7 +689,7 @@ fn leave_runs_linux_order() {
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, false).1,
         b.addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0).1,
-        b.addr_cam(LOCAL, 0, 0).1,
+        b.addr_cam_unassociated(LOCAL, 0, 0).1,
     ];
     want.extend(edcas(&mut b, &wmm(), false, HwBand::G5));
     let defaults = [
@@ -785,7 +785,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, false).1,
         b.addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0).1,
-        b.addr_cam(LOCAL, 0, 0).1,
+        b.addr_cam_unassociated(LOCAL, 0, 0).1,
     ];
     want.extend(edcas(&mut b, &qos_defaults(false), false, HwBand::G5));
     let defaults = [
@@ -805,7 +805,10 @@ fn clear_bssid_sends_the_unassociated_cam() {
         clear_bssid(io, s, LOCAL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
-    assert_eq!(ran.packets, [H2c::at(18).addr_cam(LOCAL, 0, 0).1]);
+    assert_eq!(
+        ran.packets,
+        [H2c::at(18).addr_cam_unassociated(LOCAL, 0, 0).1]
+    );
     // DIG stays as it was: Linux resumes it only at association.
     assert!(!ran.io.trace.iter().any(|o| matches!(o, Op::R32(0x1481C))));
 }
@@ -849,4 +852,47 @@ fn leave_carries_the_address_cams_key_fields() {
     });
     assert_eq!(got, Ok(()));
     assert_eq!(ran.packets[2], H2c::at(20).addr_cam_with(&unlinked, 0, 0).1);
+}
+
+/// `rtw89_phy_ra_recalc_agg_limit` (`phy.c:778-803`) over `windows`, as the
+/// RMW of `R_AX_AMPDU_AGG_LIMIT` [23:16] (`B_AX_RA_TRY_RATE_AGG_LMT_MASK`,
+/// `reg.h:2563-2565`) it writes, with the register holding `before`.
+fn agg_limit_write(windows: &[Option<u16>; 8], before: u32) -> Vec<Op> {
+    let mut io = RegisterModel::new();
+    io.set32(0xC610, before);
+    set_ra_agg_limit(&mut io, windows).unwrap();
+    io.trace
+}
+
+#[test]
+fn ra_agg_limit_follows_the_map() {
+    // TX_OPERATIONAL sets the TID's window and its bit (mac80211.c:1053-1061),
+    // TX_STOP clears the bit (:1043-1052); either recalculates: the smallest
+    // window of the map, clamped to 1-256, less one; 0x3F with none.
+    let mut map = [None; 8];
+    assert_eq!(ra_agg_limit(&map), 0x3F);
+    map[0] = Some(64);
+    assert_eq!(ra_agg_limit(&map), 0x3F);
+    map[5] = Some(128);
+    assert_eq!(ra_agg_limit(&map), 0x3F);
+    map[0] = None;
+    assert_eq!(ra_agg_limit(&map), 0x7F);
+    map[5] = Some(512);
+    assert_eq!(ra_agg_limit(&map), 0xFF);
+    map[5] = Some(0);
+    assert_eq!(ra_agg_limit(&map), 0);
+    map[5] = None;
+    assert_eq!(ra_agg_limit(&map), 0x3F);
+    // The write keeps every bit but [23:16] (AMPDU_MAX_TIME [31:24] and the
+    // rest), read first.
+    let mut one = [None; 8];
+    one[0] = Some(128);
+    assert_eq!(
+        agg_limit_write(&one, 0xA5C3_1234),
+        [Op::R32(0xC610), Op::W32(0xC610, 0xA57F_1234)]
+    );
+    assert_eq!(
+        agg_limit_write(&[None; 8], 0xA5C3_1234),
+        [Op::R32(0xC610), Op::W32(0xC610, 0xA53F_1234)]
+    );
 }

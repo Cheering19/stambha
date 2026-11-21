@@ -13,7 +13,7 @@
 //! (phy.c:1885-1911) for an RTL8852C's PHY 0 without DBCC: the firmware's
 //! BB table through [`config_bb_reg`] (`rtw89_phy_config_bb_reg`,
 //! phy.c:1347-1376), `rtw8852c_init_txpwr_unit` (rtw8852c.c:2293-2316)
-//! with its TSSI bandedge step ([`tssi_ctrl_set_bandedge_cfg`], which
+//! with its TSSI bandedge step (`tssi_ctrl_set_bandedge_cfg`, which
 //! [`super::txpwr`] also runs), the BB gain table decoded into [`BbGain`] (`rtw89_phy_config_bb_gain_ax`,
 //! phy.c:1577-1621, and its helpers from phy.c:1394) and
 //! `rtw8852c_bb_reset_all` (rtw8852c.c:1648-1671). `io_pack`/`unpack` do
@@ -338,9 +338,9 @@ fn store(dst: &mut [i8], at: usize, n: usize, data: u32) {
 impl BbGain {
     /// `rtw89_phy_config_bb_gain_ax` (phy.c:1577-1621) for one BB gain
     /// table entry at RFE type `rfe`. `addr` is the `rtw89_phy_bb_gain_arg`
-    /// union (phy.c:1378-1392): `type` [7:0] (for cfg 1, `rxsc_start`
-    /// [3:0] and `bw` [7:4]), `path` [15:8], `gain_band` [23:16] and
-    /// `cfg_type` [31:24]. A band past 8, a path past the chip's two and
+    /// union (phy.c:1378-1392): `type` `[7:0]` (for cfg 1, `rxsc_start`
+    /// `[3:0]` and `bw` `[7:4]`), `path` `[15:8]`, `gain_band` `[23:16]` and
+    /// `cfg_type` `[31:24]`. A band past 8, a path past the chip's two and
     /// the delay addresses 0xF9..=0xFE are ignored, in that order, and so
     /// is every key Linux warns of as unknown. Nothing is written to the
     /// chip.

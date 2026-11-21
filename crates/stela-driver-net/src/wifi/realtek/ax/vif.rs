@@ -349,7 +349,7 @@ pub unsafe fn init<I: AxIo + ?Sized>(
     let packet = session.h2c.join_info_disconnect(MAC_ID, PORT);
     // SAFETY: as above.
     unsafe { session.send(io, packet, drop) }?;
-    let packet = session.h2c.addr_cam(mac, MAC_ID, PORT);
+    let packet = session.h2c.addr_cam_unassociated(mac, MAC_ID, PORT);
     // SAFETY: as above.
     unsafe { session.send(io, packet, drop) }?;
     let packet = session.h2c.default_cmac_tbl(MAC_ID);
