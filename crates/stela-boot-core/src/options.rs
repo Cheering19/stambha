@@ -908,6 +908,9 @@ pub struct HostCheck {
     pub deadline: Option<u64>,
     /// How long a prompt waits for a key (`--key-seconds`).
     pub key_seconds: u64,
+    /// Keep the newest lines, the summary among them, in the firmware's
+    /// stop-record variables once the checks end (`--keep-lines`).
+    pub keep_lines: bool,
 }
 
 impl Default for HostCheck {
@@ -916,6 +919,7 @@ impl Default for HostCheck {
             nor_file: None,
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
+            keep_lines: false,
         }
     }
 }
@@ -951,6 +955,7 @@ impl HostCheck {
                 }
                 "--deadline" => options.deadline = Some(seconds(words.next())?),
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
+                "--keep-lines" => options.keep_lines = true,
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -969,6 +974,7 @@ impl fmt::Display for HostCheck {
         if self.key_seconds != DEFAULT_KEY_SECONDS {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }
+        line.flag("--keep-lines", self.keep_lines)?;
         Ok(())
     }
 }
