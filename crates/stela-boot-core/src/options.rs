@@ -56,6 +56,49 @@ pub const IPV4_GATEWAY: &str = "--ipv4-gateway";
 pub const DNS: &str = "--dns";
 /// The most `--dns` servers, as glibc's resolver keeps (`MAXNS`).
 pub const MAX_DNS_SERVERS: usize = 3;
+pub const BATTERY: &str = "--battery";
+pub const TEST_BATTERY: &str = "--test-battery";
+
+pub use stela_driver_base::platform::power_snapshot::TestState;
+
+/// The battery the guest's SMC presents (`--battery`, `--test-battery`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Battery {
+    /// The host's first ACPI battery and its AC adapter.
+    Host,
+    /// A synthetic battery, for a machine with none such as a virtual one:
+    /// `PERCENT,STATE`, 0 to 100 and `charging`, `discharging` or `full`,
+    /// which is only at 100.
+    Test { percent: u8, state: TestState },
+}
+
+impl Battery {
+    fn parse_test(word: &str) -> Option<Self> {
+        let (percent, state) = word.split_once(',')?;
+        let percent: u8 = percent.parse().ok().filter(|&percent| percent <= 100)?;
+        let state = match state {
+            "charging" => TestState::Charging,
+            "discharging" => TestState::Discharging,
+            "full" if percent == 100 => TestState::Full,
+            _ => return None,
+        };
+        Some(Self::Test { percent, state })
+    }
+}
+
+/// A `--test-battery` value, as it is written.
+struct TestBattery(u8, TestState);
+
+impl fmt::Display for TestBattery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.1 {
+            TestState::Charging => "charging",
+            TestState::Discharging => "discharging",
+            TestState::Full => "full",
+        };
+        write!(f, "{},{state}", self.0)
+    }
+}
 
 /// A `--audio-check` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +364,10 @@ pub struct System {
     /// Give the guest a USB Ethernet adapter bridged to a host network
     /// adapter of its own (`--guest-network`).
     pub guest_network: bool,
+    /// Give the guest's SMC a battery and AC adapter: the host's
+    /// (`--battery`) or a synthetic one (`--test-battery PERCENT,STATE`).
+    /// Without either the SMC answers as the Mac mini's.
+    pub battery: Option<Battery>,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -412,6 +459,7 @@ impl Default for System {
             usb4_approved: Vec::new(),
             external_disks: false,
             guest_network: false,
+            battery: None,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -829,6 +877,14 @@ impl fmt::Display for System {
         }
         line.flag(EXTERNAL_DISKS, self.external_disks)?;
         line.flag("--guest-network", self.guest_network)?;
+        line.flag(BATTERY, self.battery == Some(Battery::Host))?;
+        line.value(
+            TEST_BATTERY,
+            match self.battery {
+                Some(Battery::Test { percent, state }) => Some(TestBattery(percent, state)),
+                _ => None,
+            },
+        )?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

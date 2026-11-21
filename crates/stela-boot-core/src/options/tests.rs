@@ -401,6 +401,62 @@ fn invalid_lines_refuse() {
 }
 
 #[test]
+fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
+    assert_eq!(System::default().battery, None);
+    assert!(!System::default().to_string().contains("battery"));
+    assert_eq!(
+        round_trip("--system --battery").battery,
+        Some(Battery::Host)
+    );
+    assert_eq!(
+        System::parse("--system --battery").unwrap().to_string(),
+        "--system --battery"
+    );
+    for (text, percent, state) in [
+        ("80,charging", 80, TestState::Charging),
+        ("0,discharging", 0, TestState::Discharging),
+        ("100,full", 100, TestState::Full),
+    ] {
+        let line = format!("--system {TEST_BATTERY} {text}");
+        assert_eq!(
+            round_trip(&line).battery,
+            Some(Battery::Test { percent, state })
+        );
+        assert_eq!(System::parse(&line).unwrap().to_string(), line);
+    }
+    for text in [
+        "--system --battery --battery",
+        "--system --battery --test-battery 1,charging",
+        "--system --test-battery 1,charging --battery",
+        "--system --test-battery 1,charging --test-battery 2,charging",
+    ] {
+        assert_eq!(
+            System::parse(text).unwrap_err(),
+            Error::DuplicateBattery,
+            "{text}"
+        );
+    }
+    for value in [
+        "",
+        "80",
+        "101,charging",
+        "-1,charging",
+        "80,full",
+        "80,idle",
+        "80,charging,more",
+        "80,Charging",
+        ",charging",
+    ] {
+        let text = format!("--system --test-battery {value}");
+        assert_eq!(
+            System::parse(&text).unwrap_err(),
+            Error::TestBattery,
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn numbers_take_decimal_and_separated_hex() {
     assert_eq!(number("0x1_0000"), Ok(0x10000));
     assert_eq!(number("42"), Ok(42));

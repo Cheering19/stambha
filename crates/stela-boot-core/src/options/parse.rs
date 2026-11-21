@@ -150,6 +150,19 @@ impl ParseState<'_> {
                 options.usb_storage.push(String::from(serial));
             }
             "--guest-network" => options.guest_network = true,
+            BATTERY => {
+                if options.battery.replace(Battery::Host).is_some() {
+                    return Err(Error::DuplicateBattery);
+                }
+            }
+            TEST_BATTERY => {
+                let battery = value()
+                    .and_then(Battery::parse_test)
+                    .ok_or(Error::TestBattery)?;
+                if options.battery.replace(battery).is_some() {
+                    return Err(Error::DuplicateBattery);
+                }
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

@@ -57,6 +57,8 @@ pub enum Error {
     DuplicateWifiKey,
     WifiCountry,
     DuplicateWifiCountry,
+    DuplicateBattery,
+    TestBattery,
     Usb4Approve,
     DuplicateUsb4Approve,
     Ipv4,
@@ -177,6 +179,10 @@ impl Error {
             Self::DuplicateWifiKey => "duplicate --wifi-key",
             Self::WifiCountry => "--wifi-country needs a two-letter country",
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
+            Self::DuplicateBattery => "duplicate --battery or --test-battery",
+            Self::TestBattery => {
+                "--test-battery needs PERCENT,STATE: 0 to 100, then charging, discharging or full (at 100 only)"
+            }
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",
             Self::Ipv4 => "--ipv4 needs a host ADDRESS/PREFIX, such as 192.168.1.20/24",
