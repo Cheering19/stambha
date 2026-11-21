@@ -72,12 +72,13 @@ impl Mode {
     }
 }
 
-/// Any IPSW source, its errors described; a remote image's reader also
-/// reads ahead between the restore's requests ([`Source::pump`]).
+/// Any IPSW source, its errors described; a remote image's reader, and a
+/// partition's, also read ahead between the restore's requests
+/// ([`Source::pump`]).
 pub struct Source {
     reader: Box<dyn ReadAt<Error = Refusal>>,
     remote: Option<Rc<RefCell<Remote>>>,
-    /// The partition's read-ahead ([`Source::extent`]).
+    /// The partition's read-ahead ([`Source::read_ahead`]).
     ahead: Option<Ahead>,
     /// The bound of a partition's reads ([`Source::bound`]).
     local: Option<ReadBound>,
@@ -120,11 +121,14 @@ impl Source {
         }
     }
 
-    /// A source read from a partition whose reads `bound` bounds
-    /// ([`Bounded`]), as the install medium's are.
-    pub fn bounded<R: ReadAt + 'static>(reader: R, bound: ReadBound) -> Self {
+    /// A source read through `ahead`, the read-ahead of a partition whose
+    /// reads `bound` bounds ([`read_ahead`]), as the install medium's and the
+    /// study's are: [`Self::pump`] keeps the partition's next reads in
+    /// flight between the service's turns.
+    pub fn read_ahead<R: ReadAt + 'static>(reader: R, bound: ReadBound, ahead: Ahead) -> Self {
         Self {
             local: Some(bound),
+            ahead: Some(ahead),
             ..Self::new(reader)
         }
     }
@@ -152,19 +156,22 @@ impl Source {
     /// The study's raw source: the IPSW from the partition's first byte,
     /// read ahead in the host storage's largest commands.
     pub fn extent(partition: Box<dyn BlockDevice>, bytes: u64) -> Result<Self> {
-        let partition = Bounded::new(partition);
-        let bound = partition.bound();
-        let ahead = Ahead::new(ReadAhead::new(
-            Box::new(partition),
-            READ_AHEAD_BYTES,
-            READ_AHEAD_DEPTH,
-        ));
+        let (bound, ahead) = read_ahead(partition);
         let extent = Extent::new(Bytes::new(ahead.clone()), bytes)
             .map_err(|error| refuse!("restore source extent: {error}", %error))?;
-        let mut source = Self::bounded(extent, bound);
-        source.ahead = Some(ahead);
-        Ok(source)
+        Ok(Self::read_ahead(extent, bound, ahead))
     }
+}
+
+/// `partition` bounded ([`Bounded`]) and read ahead: the bound its reads
+/// wait within once the service reads it ([`Source::bound`]), and the
+/// read-ahead the service pumps each turn ([`Source::pump`]), through
+/// which it is read.
+pub(super) fn read_ahead(partition: Box<dyn BlockDevice>) -> (ReadBound, Ahead) {
+    let partition = Bounded::new(partition);
+    let bound = partition.bound();
+    let ahead = ReadAhead::bounded(partition, READ_AHEAD_BYTES, READ_AHEAD_DEPTH);
+    (bound, Ahead::new(ahead))
 }
 
 impl ReadAt for Source {
@@ -343,7 +350,8 @@ pub struct Experiment {
 /// reaches the console after that.
 const FAILURE_GRACE_MS: u64 = 10_000;
 
-/// The install medium's read-ahead: requests of 1 MiB, the most a USB
+/// The read-ahead of a partition the source is on, the install medium's
+/// or the study's ([`read_ahead`]): requests of 1 MiB, the most a USB
 /// disk's command moves, four kept ahead.
 const READ_AHEAD_BYTES: usize = 1 << 20;
 const READ_AHEAD_DEPTH: usize = 4;

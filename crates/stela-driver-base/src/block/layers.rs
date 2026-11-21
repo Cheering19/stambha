@@ -348,12 +348,21 @@ impl BlockDevice for Runs {
 }
 
 /// Sequential read-ahead over a device that takes queued commands, as an
-/// operating system's page cache reads a file ahead: [`ReadAhead::pump`]
-/// keeps `depth` chunks after the last read in memory or in flight, never
-/// waiting, and a read finds them in memory. A read memory lacks reads the
-/// device directly and starts the read-ahead over after it.
+/// operating system's page cache reads a file ahead: while its reader
+/// streams, each read going on from the last or served ahead,
+/// [`ReadAhead::pump`] keeps `depth` chunks after the last read in memory
+/// or in flight, never waiting, and a read finds them in memory. A read
+/// that catches up with a chunk in flight waits for that chunk, within the
+/// bound of a bounded device ([`ReadAhead::bounded`]), rather than read its
+/// blocks again. A read that nothing read ahead holds reads the device
+/// directly and starts the read-ahead over after it; one that jumped there
+/// is read ahead again once its reader reads on from it, so a reader that
+/// moves between two places reads nothing for nothing.
 pub struct ReadAhead {
     pub(super) device: Box<dyn BlockDevice>,
+    /// The bound of a bounded device's reads, which a read waiting for a
+    /// chunk in flight waits within too.
+    pub(super) bound: Option<ReadBound>,
     /// Blocks per read-ahead request, and requests kept ahead.
     pub(super) chunk: u64,
     pub(super) depth: usize,
@@ -361,29 +370,57 @@ pub struct ReadAhead {
     pub(super) ready: BTreeMap<u64, Vec<u8>>,
     /// The first block of the next chunk to read ahead.
     pub(super) next: u64,
-    /// The first block a reader may still want.
+    /// The first block of the last read that succeeded: its chunks stay for
+    /// a caller whose next read ran past its bound and who reads it again.
+    pub(super) last: u64,
+    /// The block after it, the first a reader may still want.
     pub(super) wanted: u64,
+    /// Whether the last read went on from the one before it or was served
+    /// ahead: only then is the device read ahead.
+    pub(super) streaming: bool,
     /// The chunks being read, by first block.
     pub(super) running: Vec<(u64, Submission)>,
 }
 
 impl ReadAhead {
-    /// Read `device` ahead in requests of `chunk_bytes`, keeping `depth`.
+    /// Read `device` ahead in requests of `chunk_bytes`, keeping `depth`. A
+    /// read that waits for a chunk in flight waits until it arrives; over a
+    /// [`Bounded`] device take [`Self::bounded`].
     pub fn new(device: Box<dyn BlockDevice>, chunk_bytes: usize, depth: usize) -> Self {
         let block = u64::from(device.identity().block_size.max(1));
         Self {
+            bound: None,
             chunk: (chunk_bytes as u64 / block).max(1),
             depth,
             ready: BTreeMap::new(),
             next: 0,
+            last: 0,
             wanted: 0,
+            streaming: true,
             running: Vec::new(),
             device,
         }
     }
 
-    /// Collect completed read-aheads and submit the next; never waits. A
-    /// device without queued commands is read only when asked.
+    /// [`Self::new`] over a bounded device: a read that waits for a chunk in
+    /// flight waits only within the device's bound, as the device's own reads
+    /// do, and past it fails as blocked ([`BlockError::Timeout`]).
+    pub fn bounded(device: Bounded, chunk_bytes: usize, depth: usize) -> Self {
+        let bound = device.bound();
+        Self {
+            bound: Some(bound),
+            ..Self::new(Box::new(device), chunk_bytes, depth)
+        }
+    }
+
+    /// The blocks `data`, a chunk's bytes, holds.
+    fn blocks(&self, data: &[u8]) -> u64 {
+        data.len() as u64 / u64::from(self.device.identity().block_size.max(1))
+    }
+
+    /// Collect completed read-aheads and, while the reader streams, submit
+    /// the next; never waits. A device without queued commands is read only
+    /// when asked.
     pub fn pump(&mut self) {
         if self.device.depth() == 0 {
             return;
@@ -396,40 +433,90 @@ impl ReadAhead {
                 continue;
             };
             let (first, _) = self.running.swap_remove(index);
-            // A failed read-ahead is read again when asked, directly.
-            if let Ok(Some(data)) = finished
-                && first + data.len() as u64 / block > self.wanted
-            {
-                self.ready.insert(first, data);
-            }
+            self.arrived(first, finished);
+        }
+        if !self.streaming {
+            return;
         }
         let blocks = self.device.identity().blocks;
-        while self.ready.len() + self.running.len() < self.depth
-            && self.next < blocks
-            && self.device.room()
-        {
-            let count = self.chunk.min(blocks - self.next);
+        while self.ahead() < self.depth && self.next < blocks && self.device.room() {
+            let (first, count) = (self.next, self.chunk.min(blocks - self.next));
             let request = Request::Read {
-                lba: self.next,
+                lba: first,
                 bytes: (count * block) as usize,
             };
             let Ok(mut submission) = Submission::new(request, self.device.identity()) else {
                 return;
             };
-            if let Some(Err(_)) = submission.poll(&mut *self.device) {
-                return;
+            match submission.poll(&mut *self.device) {
+                Some(Err(_)) => return,
+                Some(finished) => {
+                    self.next += count;
+                    self.arrived(first, finished);
+                }
+                None => {
+                    self.running.push((first, submission));
+                    self.next += count;
+                }
             }
-            self.running.push((self.next, submission));
-            self.next += count;
+        }
+    }
+
+    /// A chunk read ahead from `first` finished: kept while a reader may
+    /// still want it. A failed one is read again when asked, directly; one
+    /// a read that went elsewhere left behind goes.
+    fn arrived(&mut self, first: u64, finished: Finished) {
+        if let Ok(Some(data)) = finished
+            && first + self.blocks(&data) > self.wanted
+            && first < self.next
+        {
+            self.ready.insert(first, data);
+        }
+    }
+
+    /// The chunks after the last read, in memory or in flight.
+    fn ahead(&self) -> usize {
+        let after = |(first, data): &(&u64, &Vec<u8>)| **first + self.blocks(data) > self.wanted;
+        self.ready.iter().filter(after).count() + self.running.len()
+    }
+
+    /// Wait for chunk `index` in flight, which holds a block a read wants:
+    /// whether it arrived. One that failed is read again directly. Within a
+    /// bound ([`Self::bounded`]), as a [`Bounded`] read: past it, only a
+    /// result the device has by then is taken, else the read is blocked.
+    fn wait(&mut self, index: usize) -> Result<bool, BlockError> {
+        loop {
+            if let Some(finished) = self.running[index].1.poll(&mut *self.device) {
+                let (first, _) = self.running.swap_remove(index);
+                return Ok(match finished {
+                    Ok(Some(data)) => {
+                        self.ready.insert(first, data);
+                        true
+                    }
+                    _ => false,
+                });
+            }
+            if let Some(bound) = &self.bound
+                && bound.passed()
+            {
+                bound.block();
+                return Err(BlockError::Timeout);
+            }
+            crate::waiting();
+            core::hint::spin_loop();
         }
     }
 
     pub(super) fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         let block = self.device.identity().block_size as usize;
         let blocks = (buffer.len() / block) as u64;
-        // Chunks wholly before this read are not read again.
+        let end = lba + blocks;
+        // Chunks wholly before this read and the last one are not read
+        // again: a caller whose read past its bound failed reads the last
+        // one again first.
+        let keep = lba.min(self.last);
         while let Some((&first, data)) = self.ready.first_key_value() {
-            if first + (data.len() / block) as u64 > lba {
+            if first + self.blocks(data) > keep {
                 break;
             }
             self.ready.pop_first();
@@ -441,30 +528,50 @@ impl ReadAhead {
                 .ready
                 .range(..=want)
                 .next_back()
-                .filter(|(first, data)| **first + (data.len() / block) as u64 > want)
+                .filter(|(first, data)| **first + self.blocks(data) > want)
                 .map(|(first, data)| (*first, data));
-            let Some((first, data)) = found else {
+            if let Some((first, data)) = found {
+                let from = (want - first) as usize * block;
+                let count = (data.len() - from).min((blocks - at) as usize * block);
+                let to = at as usize * block;
+                buffer[to..to + count].copy_from_slice(&data[from..from + count]);
+                at += (count / block) as u64;
+                continue;
+            }
+            let chunk = self.chunk;
+            let Some(index) = self
+                .running
+                .iter()
+                .position(|(first, _)| (*first..*first + chunk).contains(&want))
+            else {
                 break;
             };
-            let from = (want - first) as usize * block;
-            let count = (data.len() - from).min((blocks - at) as usize * block);
-            let to = at as usize * block;
-            buffer[to..to + count].copy_from_slice(&data[from..from + count]);
-            at += (count / block) as u64;
+            if !self.wait(index)? {
+                break;
+            }
         }
-        self.wanted = lba + blocks;
+        let served = at > 0;
         if at < blocks {
-            // A miss: read the rest here and read ahead from its end, unless
-            // a read in flight already covers it.
+            // A miss: what nothing read ahead holds is read here. The
+            // read-ahead goes on after it where a chunk starts there, else
+            // over from there, with only the last read's chunks kept.
+            let continued = self.ready.contains_key(&end)
+                || self.running.iter().any(|(first, _)| *first == end);
+            if !continued {
+                let (last, wanted) = (self.last, self.wanted.min(end));
+                let size = u64::from(self.device.identity().block_size.max(1));
+                self.ready.retain(|first, data| {
+                    *first < wanted && *first + data.len() as u64 / size > last
+                });
+                self.next = end;
+            }
             let to = at as usize * block;
             self.device.read(lba + at, &mut buffer[to..])?;
-            self.ready.clear();
-            if !self.running.iter().any(|(first, _)| *first == self.wanted) {
-                self.next = self.wanted;
-            }
-        } else if self.running.is_empty() && self.ready.is_empty() {
-            self.next = self.next.max(self.wanted);
         }
+        self.streaming = served || (self.last..=self.wanted).contains(&lba);
+        self.last = lba;
+        self.wanted = end;
+        self.next = self.next.max(end);
         Ok(())
     }
 }

@@ -15,7 +15,7 @@ use crate::Result;
 use crate::output;
 use alloc::{boxed::Box, format, vec::Vec};
 use stela_contracts::refuse;
-use stela_drivers::block::{BlockDevice, Bounded, ReadBound};
+use stela_drivers::block::{Ahead, BlockDevice, ReadBound};
 use uefi::proto::media::file::Directory;
 use {
     stela_formats::payload::Layout, stela_formats::payload::PayloadError,
@@ -30,8 +30,11 @@ use {
 pub(super) struct Medium {
     joined: Joined<Bytes<Box<dyn BlockDevice>>>,
     reported: bool,
-    /// The bound of the partition's reads ([`Bounded`]).
+    /// The bound of the partition's reads
+    /// ([`stela_drivers::block::Bounded`]).
     bound: ReadBound,
+    /// The partition's read-ahead, which the restore host pumps each turn.
+    ahead: Ahead,
 }
 
 impl Medium {
@@ -39,6 +42,12 @@ impl Medium {
     /// serves on a PE whose guest waits meanwhile.
     pub(super) fn read_bound(&self) -> ReadBound {
         self.bound.clone()
+    }
+
+    /// The read-ahead the pieces are read through: pumped, it keeps the
+    /// USB's next reads in flight while the service is away.
+    pub(super) fn read_ahead(&self) -> Ahead {
+        self.ahead.clone()
     }
 }
 
@@ -139,9 +148,10 @@ pub(super) fn open(
     // The restore host reads the pieces in service turns, and the USB may
     // hold a read behind its own slow writes (the logs, the translation
     // store) for seconds: once bounded, a read waits for it only briefly.
-    let partition = Bounded::new(partition);
-    let bound = partition.bound();
-    let partition: Box<dyn BlockDevice> = Box::new(partition);
+    // Read ahead, as the study's raw source is, the USB goes on reading the
+    // pieces between the turns instead of only within each one's bound.
+    let (bound, ahead) = super::restore::read_ahead(partition);
+    let partition: Box<dyn BlockDevice> = Box::new(ahead.clone());
     let mut volume = Fat32::open(Bytes::new(partition))
         .map_err(|error| refuse!("install medium: {error}", %error))?;
     let directory = directory.replace('\\', "/");
@@ -157,6 +167,7 @@ pub(super) fn open(
             joined: joined.with_two_block_reads(read_limit, sector_bytes),
             reported: false,
             bound,
+            ahead,
         })
         .map_err(|error| refuse!("install medium: {error}", %error))
 }
