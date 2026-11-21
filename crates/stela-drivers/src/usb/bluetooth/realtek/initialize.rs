@@ -3,8 +3,8 @@
 //! Pinned btrtl USB register/ROM/security, exact-image download and version flow.
 //! HCI synchronization, failure quarantine and owned observations are Stela glue.
 use super::{
-    Attempt, Configuration, ConfigurationEvidence, ContainerVersion, DownloadResponse, Error,
-    Identity, LocalVersion, OwnedReport, Patch, Project, Result, UsbIdentity, V2Patch,
+    Attempt, Configuration, ConfigurationEvidence, Container, ContainerVersion, DownloadResponse,
+    Error, Identity, LocalVersion, OwnedReport, Patch, Result, UsbIdentity, V2Patch,
 };
 use crate::firmware::{ErrorKind as ResourceErrorKind, Provider, Requirement};
 use crate::usb::bluetooth::{
@@ -183,19 +183,16 @@ impl<B: Io> Engine<'_, B> {
         self.attempt.security = Some(security);
         let identity = Identity::select(usb, version, subversion, revision, rom[1], security)?;
         self.attempt.identity = Some(identity.clone());
+        let (name, container) = identity.firmware_images()[0];
         let hardware = identity.usb.hardware_label();
-        let revision = identity.revision_label();
-        let target = identity.target(&hardware, &revision);
+        let revision = identity.revision_label_for(container);
+        let target = identity.target(container, &hardware, &revision);
         // Both immutable requirements are observed before propagating any error.
         // A failed integrity/target/config parse is never optional absence.
         let firmware = provider.load(Requirement {
-            name: identity.firmware_name(),
+            name,
             target,
-            minimum_bytes: if identity.project == Project::Rtl8852Bu {
-                28
-            } else {
-                22
-            },
+            minimum_bytes: container.minimum_bytes(),
         });
         let configuration = provider.load(Requirement {
             name: identity.configuration_name(),
@@ -225,23 +222,26 @@ impl<B: Io> Engine<'_, B> {
             }
             Err(error) => return Err(Error::Resource(error)),
         };
-        let (container_version, stage) = if identity.project == Project::Rtl8852Bu {
-            let patch = V2Patch::parse(
-                firmware.bytes(),
-                identity.project,
-                identity.rom_version,
-                identity.security[0],
-            )?;
-            let version = ContainerVersion::V2(patch.metadata.version);
-            let stage = patch.stage(config.as_ref());
-            self.attempt.v2 = Some(patch.metadata);
-            (version, stage)
-        } else {
-            let patch = Patch::parse(firmware.bytes(), identity.project, identity.rom_version)?;
-            (
-                ContainerVersion::V1(patch.firmware_version),
-                patch.stage(config.as_ref()),
-            )
+        let (container_version, stage) = match container {
+            Container::V2 => {
+                let patch = V2Patch::parse(
+                    firmware.bytes(),
+                    identity.project,
+                    identity.rom_version,
+                    identity.security[0],
+                )?;
+                let version = ContainerVersion::V2(patch.metadata.version);
+                let stage = patch.stage(config.as_ref());
+                self.attempt.v2 = Some(patch.metadata);
+                (version, stage)
+            }
+            Container::V1 => {
+                let patch = Patch::parse(firmware.bytes(), identity.project, identity.rom_version)?;
+                (
+                    ContainerVersion::V1(patch.firmware_version),
+                    patch.stage(config.as_ref()),
+                )
+            }
         };
         self.attempt.container_version = Some(container_version);
         for fragment in stage.fragments() {

@@ -68,6 +68,13 @@ impl UsbIdentity {
             | (0x0bda, 0x4853 | 0x887b | 0xb85b)
             | (0x13d3, 0x3570 | 0x3571 | 0x3572 | 0x3591)
             | (0x0489, 0xe123 | 0xe125) => Some(Project::Rtl8852Bu),
+            // Complete explicit btusb 8852CE group (btusb.c:575-591); the
+            // 8852C USB stock-ROM profile is required independently below.
+            (0x04ca, 0x4007)
+            | (0x04c5, 0x1675)
+            | (0x0cb8, 0xc558)
+            | (0x13d3, 0x3587 | 0x3586 | 0x3592 | 0x3612)
+            | (0x0489, 0xe122) => Some(Project::Rtl8852Cu),
             _ => None,
         }
     }
@@ -108,6 +115,8 @@ impl Identity {
             Project::Rtl8761Bu => (0x8761, 0xb, 0xa),
             Project::Rtl8822B => (0x8822, 0xb, 7),
             Project::Rtl8852Bu => (0x8852, 0xb, 0xb),
+            // IC_INFO(RTL_ROM_LMP_8852A, 0xc, 0xc, HCI_USB) (btrtl.c:305-306).
+            Project::Rtl8852Cu => (0x8852, 0xc, 0xc),
         };
         if version.manufacturer() != 0x005d
             || version.lmp_subversion() != lmp
@@ -136,17 +145,19 @@ impl Identity {
             project,
         })
     }
+    /// The label bound into the first image's request
+    /// ([`Self::firmware_images`]) and its configuration's.
     pub fn revision_label(&self) -> String {
+        self.revision_label_for(self.firmware_images()[0].1)
+    }
+    /// The label bound into the request of an image in `container`.
+    pub fn revision_label_for(&self, container: Container) -> String {
         let revision = self
             .register_revision
             .map_or_else(|| "none".into(), |v| format!("{v:04x}"));
-        let format = if self.project == Project::Rtl8852Bu {
-            "epatch-v2"
-        } else {
-            "epatch-v1"
-        };
         format!(
-            "{format}:hci-{:02x}-{:04x}:lmp-{:02x}-{:04x}:manufacturer-{:04x}:register-{:04x}-{revision}:rom-{:02x}:security-{:02x}-{:02x}",
+            "{}:hci-{:02x}-{:04x}:lmp-{:02x}-{:04x}:manufacturer-{:04x}:register-{:04x}-{revision}:rom-{:02x}:security-{:02x}-{:02x}",
+            container.label(),
             self.version.hci_version(),
             self.version.hci_revision(),
             self.version.lmp_version(),
@@ -158,36 +169,83 @@ impl Identity {
             self.security[1]
         )
     }
-    pub(super) fn target<'a>(&self, hardware: &'a str, revision: &'a str) -> Target<'a> {
+    pub(super) fn target<'a>(
+        &self,
+        container: Container,
+        hardware: &'a str,
+        revision: &'a str,
+    ) -> Target<'a> {
         Target {
-            driver: if self.project == Project::Rtl8852Bu {
-                "realtek-bluetooth-usb-epatch-v2"
-            } else {
-                "realtek-bluetooth-usb-epatch-v1"
-            },
+            driver: container.driver(),
             hardware,
             revision,
             board: None,
         }
     }
-    pub fn firmware_name(&self) -> &'static str {
+    /// The images btrtl loads for this profile, first choice first
+    /// (btrtl.c:1196-1209): an RTL8852C (lmp_subver 0x8852 with hci_rev
+    /// 0x000c) tries `<fw_name>_v2.bin`, then `<fw_name>.bin`; every other
+    /// profile its `<fw_name>.bin` alone. A later image is asked only when
+    /// the one before it is absent.
+    pub fn firmware_images(&self) -> &'static [(&'static str, Container)] {
         match self.project {
-            Project::Rtl8761Bu => "rtl_bt/rtl8761bu_fw.bin",
-            Project::Rtl8822B => "rtl_bt/rtl8822b_fw.bin",
-            Project::Rtl8852Bu => "rtl_bt/rtl8852bu_fw.bin",
+            Project::Rtl8761Bu => &[("rtl_bt/rtl8761bu_fw.bin", Container::V1)],
+            Project::Rtl8822B => &[("rtl_bt/rtl8822b_fw.bin", Container::V1)],
+            Project::Rtl8852Bu => &[("rtl_bt/rtl8852bu_fw.bin", Container::V2)],
+            Project::Rtl8852Cu => &[
+                ("rtl_bt/rtl8852cu_fw_v2.bin", Container::V2),
+                ("rtl_bt/rtl8852cu_fw.bin", Container::V1),
+            ],
         }
+    }
+    /// The first image's name.
+    pub fn firmware_name(&self) -> &'static str {
+        self.firmware_images()[0].0
     }
     pub fn configuration_name(&self) -> &'static str {
         match self.project {
             Project::Rtl8761Bu => "rtl_bt/rtl8761bu_config.bin",
             Project::Rtl8822B => "rtl_bt/rtl8822b_config.bin",
             Project::Rtl8852Bu => "rtl_bt/rtl8852bu_config.bin",
+            Project::Rtl8852Cu => "rtl_bt/rtl8852cu_config.bin",
         }
     }
     pub fn configuration_required(&self) -> bool {
         match self.project {
             Project::Rtl8822B => true,
-            Project::Rtl8761Bu | Project::Rtl8852Bu => false,
+            // `.config_needed = false` (btrtl.c:307).
+            Project::Rtl8761Bu | Project::Rtl8852Bu | Project::Rtl8852Cu => false,
+        }
+    }
+}
+
+/// The EPATCH container a profile's image is, by its name: RTBTCore
+/// (`_v2.bin` and RTL8852BU's file) or Realtech. Its request's target names
+/// it, and it chooses the parser; an image of the other signature is
+/// refused rather than parsed as Linux would (btrtl.c:680-687).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Container {
+    V1,
+    V2,
+}
+impl Container {
+    fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "epatch-v1",
+            Self::V2 => "epatch-v2",
+        }
+    }
+    fn driver(self) -> &'static str {
+        match self {
+            Self::V1 => "realtek-bluetooth-usb-epatch-v1",
+            Self::V2 => "realtek-bluetooth-usb-epatch-v2",
+        }
+    }
+    /// The shortest image of this container the parser can take.
+    pub(super) fn minimum_bytes(self) -> usize {
+        match self {
+            Self::V1 => 22,
+            Self::V2 => 28,
         }
     }
 }

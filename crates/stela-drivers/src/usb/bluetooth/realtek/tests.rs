@@ -13,6 +13,20 @@ use crate::{
 use alloc::{collections::VecDeque, rc::Rc, string::String};
 use core::cell::{Cell, RefCell};
 use sha2::{Digest, Sha256};
+/// The RTL8852CU's stock-ROM label for its first image, `_v2.bin`.
+const RTL8852CU_V2: &str =
+    "epatch-v2:hci-0c-000c:lmp-0c-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00";
+/// The complete btusb 8852CE group (btusb.c:575-591).
+const RTL8852CE: [(u16, u16); 8] = [
+    (0x04ca, 0x4007),
+    (0x04c5, 0x1675),
+    (0x0cb8, 0xc558),
+    (0x13d3, 0x3587),
+    (0x13d3, 0x3586),
+    (0x13d3, 0x3592),
+    (0x13d3, 0x3612),
+    (0x0489, 0xe122),
+];
 pub(super) fn initialized_report(project: Project) -> OwnedReport {
     let (mut hci, catalog, _) = fixture(project, true);
     initialize(&mut hci, &catalog).unwrap()
@@ -93,18 +107,24 @@ fn cc(op: u16, p: &[u8]) -> Vec<u8> {
     b.extend_from_slice(p);
     b
 }
+/// The projects whose first image is an RTBTCore (EPATCH v2) container.
+fn v2(project: Project) -> bool {
+    matches!(project, Project::Rtl8852Bu | Project::Rtl8852Cu)
+}
 fn version(project: Project, after: bool) -> Vec<u8> {
-    let (hci, lmp) = match project {
-        Project::Rtl8761Bu => (10, 0x8761u16),
-        Project::Rtl8822B => (7, 0x8822),
-        Project::Rtl8852Bu => (11, 0x8852),
+    let (hci, revision, lmp) = match project {
+        Project::Rtl8761Bu => (10, 11, 0x8761u16),
+        Project::Rtl8822B => (7, 11, 0x8822),
+        Project::Rtl8852Bu => (11, 11, 0x8852),
+        // btrtl.c:305-306: IC_INFO(RTL_ROM_LMP_8852A, 0xc, 0xc, HCI_USB).
+        Project::Rtl8852Cu => (12, 12, 0x8852),
     };
-    let mut b = vec![0, hci, 11, 0, hci, 0x5d, 0];
+    let mut b = vec![0, hci, revision, 0, hci, 0x5d, 0];
     b.extend_from_slice(&(if after { 0x5678 } else { lmp }).to_le_bytes());
     b
 }
 fn firmware(project: Project) -> Vec<u8> {
-    if project == Project::Rtl8852Bu {
+    if v2(project) {
         let mut b = b"RTBTCore".to_vec();
         b.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         b.extend_from_slice(&2u32.to_le_bytes());
@@ -114,7 +134,7 @@ fn firmware(project: Project) -> Vec<u8> {
         b.extend_from_slice(&8u32.to_le_bytes());
         b.extend_from_slice(&2u32.to_le_bytes());
         b.extend_from_slice(&[0x99, 0x98]);
-        b.extend_from_slice(&[0xff, 2, 1, 1, 20, 1, 0, 0x51, 4, 0xfd, 0x77]);
+        b.extend_from_slice(&[0xff, 2, 1, 1, project.id(), 1, 0, 0x51, 4, 0xfd, 0x77]);
         return b;
     }
     let mut b = vec![0; 36];
@@ -132,6 +152,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => (0x0bdau16, 0x8771u16, 0x8761u16, 10),
         Project::Rtl8822B => (0x13d3, 0x3526, 0x8822, 7),
         Project::Rtl8852Bu => (0x0bda, 0xb85b, 0x8852, 11),
+        Project::Rtl8852Cu => (0x13d3, 0x3612, 0x8852, 12),
     };
     let mut descriptor = [18, 1, 0, 2, 0xe0, 1, 1, 64, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
     descriptor[8..10].copy_from_slice(&vid.to_le_bytes());
@@ -159,6 +180,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => "usb:0bda:8771:0100",
         Project::Rtl8822B => "usb:13d3:3526:0100",
         Project::Rtl8852Bu => "usb:0bda:b85b:0100",
+        Project::Rtl8852Cu => "usb:13d3:3612:0100",
     };
     let revision = match project {
         Project::Rtl8761Bu => {
@@ -170,9 +192,10 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8852Bu => {
             "epatch-v2:hci-0b-000b:lmp-0b-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00"
         }
+        Project::Rtl8852Cu => RTL8852CU_V2,
     };
     let target = Target {
-        driver: if project == Project::Rtl8852Bu {
+        driver: if v2(project) {
             "realtek-bluetooth-usb-epatch-v2"
         } else {
             "realtek-bluetooth-usb-epatch-v1"
@@ -185,11 +208,13 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => "rtl_bt/rtl8761bu_fw.bin",
         Project::Rtl8822B => "rtl_bt/rtl8822b_fw.bin",
         Project::Rtl8852Bu => "rtl_bt/rtl8852bu_fw.bin",
+        Project::Rtl8852Cu => "rtl_bt/rtl8852cu_fw_v2.bin",
     };
     let cfgname = match project {
         Project::Rtl8761Bu => "rtl_bt/rtl8761bu_config.bin",
         Project::Rtl8822B => "rtl_bt/rtl8822b_config.bin",
         Project::Rtl8852Bu => "rtl_bt/rtl8852bu_config.bin",
+        Project::Rtl8852Cu => "rtl_bt/rtl8852cu_config.bin",
     };
     let cfg = vec![0x55, 0xab, 0x23, 0x87, 0, 0];
     let fw = firmware(project);
@@ -199,7 +224,8 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         provenance: Provenance {
             source: "original stateful fixture",
             revision: "model-v1",
-            member: if project == Project::Rtl8852Bu && name == cfgname {
+            // linux-firmware WHENCE links both v2 profiles' configs to it.
+            member: if v2(project) && name == cfgname {
                 "rtl_bt/rtl8761bu_config.bin"
             } else {
                 name
@@ -233,7 +259,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
     add(0x1001, &[], &version(project, false));
     add(0xfc6d, &[], &[0, 0]);
     add(0xfc61, &[0x10, 0xa4, 0xad, 0, 0xb0], &[0, 0, 0]);
-    let mut data = if project == Project::Rtl8852Bu {
+    let mut data = if v2(project) {
         vec![0x80, 0xde, 0xad, 0xbe, 0xef]
     } else {
         vec![0x80, 0x78, 0x56, 0x34, 0x12]
@@ -591,12 +617,9 @@ fn v2_requires_exact_usb_stock_hci_register_rom_and_key_profile() {
         assert!(Identity::select(usb, v.clone(), 0x8851, None, 1, [0, 0]).is_err());
         assert!(Identity::select(usb, v, 0x8852, None, 1, [1, 0]).is_err());
     }
-    for (vendor, product) in [
-        (0x0bda, 0x8520),
-        (0x0cb8, 0xc558),
-        (0x13d3, 0x3573),
-        (0x1209, 0xb85b),
-    ] {
+    // 0cb8:c558 left this list: btusb.c:580 lists it as an 8852CE, which
+    // the RTL8852CU test below takes.
+    for (vendor, product) in [(0x0bda, 0x8520), (0x13d3, 0x3573), (0x1209, 0xb85b)] {
         assert!(
             UsbIdentity {
                 vendor,
@@ -682,5 +705,92 @@ fn v2_validated_metadata_and_alias_receipt_survive_rejected_upload_or_boot() {
         );
         assert_eq!(trace.borrow().commands, commands);
         assert!(hci.submit_command(&[3, 0x0c, 0]).is_err());
+    }
+}
+#[test]
+fn rtl8852cu_requires_the_btusb_8852ce_group_and_its_usb_stock_profile() {
+    // CHIP_ID_8852C (btrtl.c:71, :670).
+    assert_eq!(Project::Rtl8852Cu.id(), 25);
+    for (vendor, product) in RTL8852CE {
+        let usb = UsbIdentity {
+            vendor,
+            product,
+            revision: 0,
+        };
+        assert_eq!(
+            usb.project(),
+            Some(Project::Rtl8852Cu),
+            "{vendor:04x}:{product:04x}"
+        );
+        assert_eq!(
+            crate::usb::bluetooth::Setup::of(vendor, product, false),
+            Some(crate::usb::bluetooth::Setup::Realtek)
+        );
+        let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+        let identity = Identity::select(usb, stock.clone(), 0x8852, None, 1, [0, 0x42]).unwrap();
+        assert_eq!(identity.project, Project::Rtl8852Cu);
+        assert!(
+            identity
+                .revision_label()
+                .ends_with(":rom-01:security-00-42")
+        );
+        // An 8852B's or 8761B's stock readings, another register
+        // subversion and a nonzero key are refused under an 8852CE ID.
+        for wrong in [Project::Rtl8852Bu, Project::Rtl8761Bu] {
+            let other = LocalVersion::parse(&version(wrong, false)).unwrap();
+            assert!(Identity::select(usb, other, 0x8852, None, 0, [0, 0]).is_err());
+        }
+        assert!(Identity::select(usb, stock.clone(), 0x8851, None, 0, [0, 0]).is_err());
+        assert!(Identity::select(usb, stock, 0x8852, None, 0, [1, 0]).is_err());
+    }
+    // An 8852C's readings under an 8852BE ID select nothing.
+    let be = UsbIdentity {
+        vendor: 0x0bda,
+        product: 0xb85b,
+        revision: 0,
+    };
+    let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+    assert!(Identity::select(be, stock, 0x8852, None, 0, [0, 0]).is_err());
+}
+#[test]
+fn rtl8852cu_names_btrtls_v2_image_then_its_v1_image_and_an_optional_config() {
+    let usb = UsbIdentity {
+        vendor: 0x13d3,
+        product: 0x3612,
+        revision: 0,
+    };
+    let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+    let identity = Identity::select(usb, stock, 0x8852, None, 0, [0, 0]).unwrap();
+    // btrtl.c:1196-1209, :310-311.
+    assert_eq!(
+        identity.firmware_images(),
+        [
+            ("rtl_bt/rtl8852cu_fw_v2.bin", Container::V2),
+            ("rtl_bt/rtl8852cu_fw.bin", Container::V1)
+        ]
+    );
+    assert_eq!(identity.firmware_name(), "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(identity.configuration_name(), "rtl_bt/rtl8852cu_config.bin");
+    assert!(!identity.configuration_required());
+    assert_eq!(identity.revision_label(), RTL8852CU_V2);
+    assert_eq!(
+        identity.revision_label_for(Container::V1),
+        RTL8852CU_V2.replacen("epatch-v2", "epatch-v1", 1)
+    );
+    // The other profiles name their one image, in the container they had.
+    for (project, image) in [
+        (
+            Project::Rtl8761Bu,
+            ("rtl_bt/rtl8761bu_fw.bin", Container::V1),
+        ),
+        (Project::Rtl8822B, ("rtl_bt/rtl8822b_fw.bin", Container::V1)),
+        (
+            Project::Rtl8852Bu,
+            ("rtl_bt/rtl8852bu_fw.bin", Container::V2),
+        ),
+    ] {
+        let (mut hci, catalog, _) = fixture(project, true);
+        let report = initialize(&mut hci, &catalog).unwrap();
+        assert_eq!(report.before.firmware_images(), [image]);
     }
 }

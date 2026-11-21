@@ -12,7 +12,7 @@ mod initialize;
 pub mod media;
 mod v2;
 pub use firmware::{Configuration, Fragment, Patch, Project, Staged};
-pub use identity::{Identity, LocalVersion, UsbIdentity};
+pub use identity::{Container, Identity, LocalVersion, UsbIdentity};
 pub use v2::{ExtensionRecord, SectionObservation, SubsectionObservation, V2Metadata, V2Patch};
 
 /// Malformed or explicitly unsupported Realtek input. Parsing never emits a

@@ -15,19 +15,24 @@ const FRAGMENT: usize = 252;
 const EXTENSION_SIGNATURE: [u8; 4] = [0x51, 0x04, 0xfd, 0x77];
 
 /// Exact firmware project, selected only after independent controller identity.
-/// V1 and V2 parsing remain separate: RTL8852BU uses RTBTCore through V2Patch.
+/// V1 and V2 parsing remain separate; the container a requested image's name
+/// implies (`identity::Container`) chooses the parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Project {
     Rtl8761Bu,
     Rtl8822B,
     Rtl8852Bu,
+    Rtl8852Cu,
 }
 impl Project {
+    /// `enum btrtl_chip_id` (btrtl.c:59-76), the id a container's terminal
+    /// project instruction names.
     pub fn id(self) -> u8 {
         match self {
             Self::Rtl8761Bu => 14,
             Self::Rtl8822B => 8,
             Self::Rtl8852Bu => 20,
+            Self::Rtl8852Cu => 25,
         }
     }
 }
