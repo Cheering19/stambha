@@ -6,6 +6,8 @@ pub mod ac;
 pub mod acpi;
 #[cfg(feature = "native-acpi")]
 pub mod battery;
+#[cfg(feature = "native-acpi")]
+pub mod button;
 pub mod ec;
 pub mod ec_smbus;
 pub mod image;

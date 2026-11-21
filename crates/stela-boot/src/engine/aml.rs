@@ -1130,6 +1130,8 @@ pub struct HostAcpi {
     installed_ec: RefCell<Option<stela_drivers::platform::ec::capability::Installed<'static>>>,
     power: RefCell<stela_drivers::probe::Power>,
     notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
+    /// The control-method power buttons whose presses set [`BUTTON_NOTIFIED`].
+    buttons: RefCell<Vec<stela_drivers::platform::button::PowerButton<'static>>>,
     ec_pending: Cell<bool>,
     hardware: AtomicBool,
     ec_failed: AtomicBool,
@@ -1138,6 +1140,9 @@ pub struct HostAcpi {
 static EC_EVENT: AtomicBool = AtomicBool::new(false);
 static POWER_CHANGED: AtomicBool = AtomicBool::new(false);
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
+/// A control-method power button (PNP0C0C) was pressed: its firmware
+/// notified it, as a FADT with PWR_BUTTON set reports presses.
+static BUTTON_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
 impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
@@ -1307,6 +1312,7 @@ impl HostAcpi {
             installed_ec: RefCell::new(None),
             power: RefCell::new(Default::default()),
             notification: RefCell::new(None),
+            buttons: RefCell::new(Vec::new()),
             ec_pending: Cell::new(false),
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
@@ -1409,6 +1415,7 @@ impl HostAcpi {
                 ) {
                     output::arguments(format_args!("HOST ACPI power button refused: {error:?}\n"));
                 }
+                self.attach_power_buttons();
                 match self
                     .session
                     .notify_all(|_, _| POWER_CHANGED.store(true, Ordering::Release))
@@ -1518,8 +1525,46 @@ impl HostAcpi {
     pub(super) fn hardware_active(&self) -> bool {
         self.hardware.load(Ordering::Acquire)
     }
+    /// Whether the power button was pressed since the last call: the fixed
+    /// event, or a control-method button's notification.
     pub(super) fn take_power_button(&self) -> bool {
-        POWER_BUTTON.swap(false, Ordering::AcqRel)
+        let fixed = POWER_BUTTON.swap(false, Ordering::AcqRel);
+        let notified = BUTTON_NOTIFIED.swap(false, Ordering::AcqRel);
+        if notified {
+            output::arguments(format_args!(
+                "POWER host button pressed: the firmware notified its ACPI power button\n"
+            ));
+        }
+        fixed || notified
+    }
+
+    /// Linux's `acpi_button` on each control-method power button (PNP0C0C),
+    /// whose presses a firmware with PWR_BUTTON set in its FADT sends as
+    /// notifications rather than the fixed event: each press reaches the
+    /// guest as the fixed button's does. One line for each button.
+    fn attach_power_buttons(&'static self) {
+        use stela_drivers::platform::button;
+        let found = match button::attach_power_buttons(&self.session, &BUTTON_NOTIFIED) {
+            Ok(found) => found,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI power button search refused: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        for (path, error) in &found.refused {
+            output::arguments(format_args!(
+                "HOST ACPI power button {path}: notify handler refused: {error:?}\n"
+            ));
+        }
+        for button in &found.buttons {
+            output::arguments(format_args!(
+                "HOST ACPI power button {}: control method, its presses reach the guest\n",
+                button.path
+            ));
+        }
+        *self.buttons.borrow_mut() = found.buttons;
     }
 
     pub(super) fn poll(&'static self) {
