@@ -1602,6 +1602,115 @@ fn full_install_requires_system_image() {
     assert!(!record.active_medium().unwrap().remote);
 }
 
+/// Every option of `stela.cfg`'s grammar, with a value where it takes one,
+/// put in `line`, setup's Install macOS line, before each of its words and
+/// at its end, leaves install mode off: `stela.efi` reads install mode's
+/// options from the chosen line before any other parsing, and must read
+/// none of the mount's as one, whatever its name or place.
+fn no_system_option_reads_as_install_mode(line: &str) {
+    use stela_boot_core::{install_mode, options};
+    use stela_loader::boot_selection as selection;
+    let disk = format!("{SERIAL}:{NOR_GUID}");
+    let guid = STELA_GUID;
+    let flags = [
+        "--native-artifacts",
+        "--native-rounds",
+        "--parallel",
+        "--serialized",
+        "--profile",
+        options::MAINTENANCE_WRITE,
+        options::SINGLE_USER,
+        options::SCANOUT_MIRROR,
+        "--monitor-trace",
+        "--display-trace",
+        "--native-shared-check",
+        "--native-bootstrap-check",
+        "--restore-study",
+        "--survey",
+        options::VERIFY_ON_READ,
+        options::UPDATE_RESTORE,
+        "--development-restore",
+        "--idle-skip",
+        "--input",
+        "--guest-network",
+        options::EXTERNAL_DISKS,
+        "--audio-own-hpet",
+        "--native-pci-own-ioapic",
+        "--sep-observe",
+        selection::SAFE_BOOT_OPTION,
+        selection::BUNDLE_REPAIR_OPTION,
+        selection::UPGRADE_OPTION,
+        selection::PAIRED_RECOVERY_OPTION,
+        selection::SYSTEM_RECOVERY_OPTION,
+    ];
+    let valued = [
+        (options::NATIVE_CORES, "2".to_string()),
+        (options::GUEST_PES, "2".to_string()),
+        (options::DISPLAY_SIZE, "1920x1080".to_string()),
+        ("--restore-source", disk.clone()),
+        ("--restore-manifest", "m.plist".to_string()),
+        (options::INSTALL, "p.json".to_string()),
+        (options::INSTALL_SOURCE, guid.to_string()),
+        (options::MEDIUM_READ_AHEAD, "0".to_string()),
+        ("--restore-identity", "2".to_string()),
+        (selection::BUNDLE_OPTION, "b".to_string()),
+        ("--usb-storage", "A".to_string()),
+        (options::WIFI, "network".to_string()),
+        (options::WIFI_KEY, "\\EFI\\stela\\wifi.key".to_string()),
+        (options::IPV4, "10.0.0.2/24".to_string()),
+        (options::IPV4_GATEWAY, "10.0.0.1".to_string()),
+        (options::DNS, "1.1.1.1".to_string()),
+        (options::WIFI_COUNTRY, "US".to_string()),
+        (
+            options::USB4_APPROVE,
+            "446ab8f0-5aff-47c9-8962-5870641e4d61".to_string(),
+        ),
+        ("--audio-check", "duplex".to_string()),
+        ("--network-check", "http://h/p".to_string()),
+        ("--ecid", "0x1".to_string()),
+        ("--storage", disk.clone()),
+        ("--storage-ram", "0x10000".to_string()),
+        ("--nor", disk.clone()),
+        (selection::PREBOOT_OPTION, disk.clone()),
+        ("--watch", "0x30,0x40".to_string()),
+        (selection::BOOT_VOLUME_OPTION, "volume".to_string()),
+        (selection::BOOT_COMMAND_OPTION, "1".to_string()),
+        ("--dump", "0x50,0x60".to_string()),
+        ("--break", "0x10".to_string()),
+        ("--trace", "0x20".to_string()),
+        ("--dram-base", "0x10000000000".to_string()),
+        ("--load", "0x10000004000".to_string()),
+        ("--entry", "0x10000008000".to_string()),
+        ("--x0", "7".to_string()),
+        ("--budget", "99".to_string()),
+    ];
+    let every = flags
+        .iter()
+        .map(|flag| flag.to_string())
+        .chain(valued.iter().map(|(name, value)| format!("{name} {value}")));
+    let words: Vec<&str> = line.split_ascii_whitespace().collect();
+    for option in every {
+        // Each is a spelling the grammar knows.
+        let alone = options::System::parse(&format!("{} {option}", options::SYSTEM));
+        assert_ne!(
+            alone.err(),
+            Some(options::Error::UnknownSystemOption),
+            "{option}"
+        );
+        for at in 1..=words.len() {
+            let mut placed = words[..at].to_vec();
+            placed.extend(option.split_ascii_whitespace());
+            placed.extend(&words[at..]);
+            let placed = placed.join(" ");
+            let read = install_mode::parse(&placed);
+            assert!(
+                read.as_ref().is_ok_and(|mode| !mode.verify),
+                "{placed}: {read:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn installed_disk_preserves_boot_choices_and_partitions() {
     let mut f = fixture(64 * GIB, false);
@@ -1675,6 +1784,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
             STELA_GUID.to_ascii_uppercase()
         )
     );
+    no_system_option_reads_as_install_mode(&choices.entries[1].options);
     let restore_bundle = record.restore_bundle(Kind::Restore, Some(ecid)).unwrap();
     assert!(
         bundle::verify(

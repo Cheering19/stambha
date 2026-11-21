@@ -48,42 +48,13 @@ use {
 const VERIFIED: u32 = 0x12;
 const COPY_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Default)]
-struct Install {
-    verify: bool,
-    build: Option<String>,
-}
-
-/// Read the install options in `stela.cfg`, skipping the mount's own.
-fn parse(options: &str) -> Result<Install> {
-    let mut install = Install::default();
-    let mut words = options.split_ascii_whitespace();
-    while let Some(name) = words.next() {
-        if !name.starts_with("--install-") {
-            words.next();
-            continue;
-        }
-        let value = words
-            .next()
-            .ok_or(refuse!("install option without a value"))?;
-        match name {
-            "--install-mode" if value == "verify" => install.verify = true,
-            "--install-mode" => return Err(refuse!("--install-mode must be verify")),
-            "--install-build" => install.build = Some(value.into()),
-            _ => return Err(refuse!("unknown install option")),
-        }
-    }
-    if !install.verify && install.build.is_some() {
-        return Err(refuse!("install options need --install-mode"));
-    }
-    Ok(install)
-}
-
 /// Run install mode if `stela.cfg` asks for it, which ends in
-/// [`output::terminate`]. Otherwise return the mount's own options.
+/// [`output::terminate`]. Otherwise return the mount's own options, whose
+/// words install mode's reading leaves alone
+/// ([`stela_boot_core::install_mode::parse`]).
 pub fn run(options: Vec<u8>) -> Result<Vec<u8>> {
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
-    let install = parse(text)?;
+    let install = stela_boot_core::install_mode::parse(text)?;
     if !install.verify {
         return Ok(options);
     }

@@ -375,7 +375,7 @@ const FAILURE_GRACE_MS: u64 = 10_000;
 
 /// The read-ahead of a partition the source is on, the install medium's
 /// or the study's ([`read_ahead`]): requests of 1 MiB, the most a USB
-/// disk's command moves, four kept ahead unless `--install-read-ahead`
+/// disk's command moves, four kept ahead unless `--medium-read-ahead`
 /// says otherwise. Its memory is the chunks kept ahead, in memory or in
 /// flight, and those of the last read, kept for a read asked again (2 at
 /// most): about 6 MiB at four, and up to about 10 MiB for a while after a
@@ -401,7 +401,7 @@ const READ_WAIT_MICROS: u64 = 20_000;
 /// already, so a service moves on as much as two did.
 const PREFETCH_CHUNKS: usize = 16;
 
-/// From a source read only when asked (`--install-read-ahead 0`): one read
+/// From a source read only when asked (`--medium-read-ahead 0`): one read
 /// of 1 MiB, as before the read-ahead.
 const ASKED_PREFETCH_CHUNKS: usize = 8;
 

@@ -124,14 +124,14 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateInstallSource);
                 }
             }
-            INSTALL_READ_AHEAD => {
-                let chunks = number(value().ok_or(Error::InstallReadAhead)?)?;
-                let chunks = usize::try_from(chunks)
-                    .ok()
-                    .filter(|&chunks| chunks <= MAX_INSTALL_READ_AHEAD)
-                    .ok_or(Error::InstallReadAhead)?;
-                if options.install_read_ahead.replace(chunks).is_some() {
-                    return Err(Error::DuplicateInstallReadAhead);
+            MEDIUM_READ_AHEAD => {
+                let chunks = value()
+                    .and_then(|value| number(value).ok())
+                    .and_then(|chunks| usize::try_from(chunks).ok())
+                    .filter(|&chunks| chunks <= MAX_MEDIUM_READ_AHEAD)
+                    .ok_or(Error::MediumReadAhead)?;
+                if options.medium_read_ahead.replace(chunks).is_some() {
+                    return Err(Error::DuplicateMediumReadAhead);
                 }
             }
             "--restore-identity" => {

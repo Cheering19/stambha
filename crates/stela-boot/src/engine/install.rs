@@ -34,7 +34,7 @@ pub(super) struct Medium {
     /// The bound of the partition's reads ([`Bounded`]).
     bound: ReadBound,
     /// The partition's read-ahead, which the restore host pumps each turn;
-    /// none with `--install-read-ahead 0`.
+    /// none with `--medium-read-ahead 0`.
     ahead: Option<Ahead>,
 }
 
@@ -129,7 +129,7 @@ pub fn check_pieces(
 /// The install medium on `partition`: each piece of `manifest` found
 /// through FAT32 in `directory` (the manifest's own, as `stela.cfg` names
 /// it) and joined, checked against `hashes`, the piece hash file. The
-/// partition is read `read_ahead` chunks ahead (`--install-read-ahead`);
+/// partition is read `read_ahead` chunks ahead (`--medium-read-ahead`);
 /// with none it is read only when asked, through the bound alone, as it
 /// was before the read-ahead.
 pub(super) fn open(
@@ -170,11 +170,11 @@ pub(super) fn open(
     let prefetch = (super::restore::prefetch_chunks(ahead.is_some()) * CHUNK_BYTES) >> 10;
     match read_ahead {
         0 => output::arguments(format_args!(
-            "INSTALL MEDIUM read-ahead off (--install-read-ahead 0): each read waits for the \
+            "INSTALL MEDIUM read-ahead off (--medium-read-ahead 0): each read waits for the \
              USB within its service, {prefetch} KiB a service, as before the read-ahead\n"
         )),
         depth => output::arguments(format_args!(
-            "INSTALL MEDIUM read-ahead {depth} chunks of {} KiB (--install-read-ahead), \
+            "INSTALL MEDIUM read-ahead {depth} chunks of {} KiB (--medium-read-ahead), \
              {prefetch} KiB a service\n",
             super::restore::READ_AHEAD_BYTES >> 10
         )),

@@ -68,6 +68,7 @@ pub mod host_resources;
 pub mod host_samples;
 pub mod host_speed;
 pub mod hpet;
+pub mod install_mode;
 pub mod install_progress;
 pub mod interrupt_image;
 pub mod ioapic;

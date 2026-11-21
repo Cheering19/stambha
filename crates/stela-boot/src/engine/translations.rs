@@ -1779,7 +1779,9 @@ struct Reader {
     latency: u64,
     longest: u64,
     /// The ticks every record took to read, from its read's start to its
-    /// end, queued behind other reads of the disk included.
+    /// end, queued behind other reads of the disk included, summed: the
+    /// reader's own reads ahead count, and reads in flight together each
+    /// count whole, so it is not wall time.
     waited: u64,
     next: usize,
     failed: u64,
@@ -2066,10 +2068,12 @@ impl WriterReads {
 
 /// Report the reader: the records left in the file it read, the time a
 /// record took (mean and longest) and all took (`waited_ms`, behind the
-/// install medium's read-ahead on the same USB among them), whether
-/// lookups stopped asking a slow disk, and the reads it gave up
-/// (`dropped`, those a lookup asked for that would have waited past its
-/// bound).
+/// install medium's read-ahead on the same USB among them: the sum of each
+/// record read's time, the reader's reads ahead included and reads in
+/// flight together each counted whole, so not wall time; `waited_ms` over
+/// `read` is a record's mean), whether lookups stopped asking a slow disk,
+/// and the reads it gave up (`dropped`, those a lookup asked for that would
+/// have waited past its bound).
 fn report_reader(counters: &pack::Counters) {
     let Some((latency, longest, waited, slow, failed, launched, dropped)) = READER.with(|reader| {
         (

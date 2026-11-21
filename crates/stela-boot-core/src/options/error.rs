@@ -45,8 +45,8 @@ pub enum Error {
     DuplicateInstallMedium,
     MissingInstallSource,
     DuplicateInstallSource,
-    InstallReadAhead,
-    DuplicateInstallReadAhead,
+    MediumReadAhead,
+    DuplicateMediumReadAhead,
     MissingRestoreIdentity,
     RestoreIdentityCapacity,
     DuplicateRestoreIdentity,
@@ -125,7 +125,7 @@ pub enum Constraint {
     WifiDependency,
     Ipv4Gateway,
     InstallSourceDependency,
-    InstallReadAheadDependency,
+    MediumReadAheadDependency,
     InstallConfiguration,
     UpdateDependency,
     DevelopmentRestore,
@@ -168,10 +168,10 @@ impl Error {
             Self::DuplicateInstallMedium => "duplicate install medium",
             Self::MissingInstallSource => "missing install medium partition",
             Self::DuplicateInstallSource => "duplicate install medium partition",
-            Self::InstallReadAhead => {
-                "--install-read-ahead needs a count of 1 MiB chunks from 0 to 16"
+            Self::MediumReadAhead => {
+                "--medium-read-ahead needs a count of 1 MiB chunks from 0 to 16"
             }
-            Self::DuplicateInstallReadAhead => "--install-read-ahead must occur once",
+            Self::DuplicateMediumReadAhead => "--medium-read-ahead must occur once",
             Self::MissingRestoreIdentity => "missing restore identity index",
             Self::RestoreIdentityCapacity => "restore identity too large",
             Self::DuplicateRestoreIdentity => "duplicate restore identity",
@@ -247,7 +247,7 @@ impl Constraint {
             Self::InstallSourceDependency => {
                 "--install-source names the partition of an --install medium"
             }
-            Self::InstallReadAheadDependency => "--install-read-ahead applies to --install",
+            Self::MediumReadAheadDependency => "--medium-read-ahead applies to --install",
             Self::InstallConfiguration => {
                 "--install requires --bundle, --storage and --nor; refuses --restore-study, --preboot and --survey"
             }

@@ -30,11 +30,12 @@ pub const SYSTEM: &str = "--system";
 pub const INSTALL: &str = mount_interface::INSTALL_OPTION;
 pub const INSTALL_SOURCE: &str = "--install-source";
 /// The install medium's read-ahead, in 1 MiB chunks kept ahead of its
-/// reader (`--install-read-ahead N`): 0 reads it only when asked, as before
-/// the read-ahead, for an A/B of one image.
-pub const INSTALL_READ_AHEAD: &str = "--install-read-ahead";
-/// The most chunks `--install-read-ahead` keeps ahead: 16 MiB of memory.
-pub const MAX_INSTALL_READ_AHEAD: usize = 16;
+/// reader (`--medium-read-ahead N`): 0 reads it only when asked, as before
+/// the read-ahead, for an A/B of one image. Named apart from install mode's
+/// own `--install-mode` and `--install-build` ([`crate::install_mode`]).
+pub const MEDIUM_READ_AHEAD: &str = "--medium-read-ahead";
+/// The most chunks `--medium-read-ahead` keeps ahead: 16 MiB of memory.
+pub const MAX_MEDIUM_READ_AHEAD: usize = 16;
 pub const VERIFY_ON_READ: &str = "--verify-on-read";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
@@ -260,8 +261,8 @@ pub struct System {
     /// The install medium's partition, by its unique GUID alone.
     pub install_source: Option<Guid>,
     /// The install medium's read-ahead in 1 MiB chunks
-    /// ([`INSTALL_READ_AHEAD`]); `None` takes the engine's default.
-    pub install_read_ahead: Option<usize>,
+    /// ([`MEDIUM_READ_AHEAD`]); `None` takes the engine's default.
+    pub medium_read_ahead: Option<usize>,
     /// Refuse a payload without recorded block hashes, which would be read
     /// whole before StartRestore (`--verify-on-read`).
     pub verify_on_read: bool,
@@ -396,7 +397,7 @@ impl Default for System {
             restore_identity: None,
             install: None,
             install_source: None,
-            install_read_ahead: None,
+            medium_read_ahead: None,
             verify_on_read: false,
             update_restore: false,
             development_restore: false,
@@ -828,7 +829,7 @@ impl fmt::Display for System {
         line.value("--restore-identity", self.restore_identity)?;
         line.value(INSTALL, self.install.as_deref())?;
         line.value(INSTALL_SOURCE, self.install_source)?;
-        line.value(INSTALL_READ_AHEAD, self.install_read_ahead)?;
+        line.value(MEDIUM_READ_AHEAD, self.medium_read_ahead)?;
         line.flag(VERIFY_ON_READ, self.verify_on_read)?;
         line.flag(UPDATE_RESTORE, self.update_restore)?;
         line.flag("--development-restore", self.development_restore)?;
