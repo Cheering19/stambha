@@ -794,3 +794,64 @@ fn rtl8852cu_names_btrtls_v2_image_then_its_v1_image_and_an_optional_config() {
         assert_eq!(report.before.firmware_images(), [image]);
     }
 }
+#[test]
+fn rtl8852cu_boots_its_v2_image_with_the_linked_empty_config() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    let provider = Recording {
+        catalog: &catalog,
+        requests: RefCell::new(vec![]),
+    };
+    let InitializationReport::Realtek(r) = hci
+        .initialize_with_provider(&provider, PlatformInputs::default())
+        .unwrap()
+    else {
+        panic!("Realtek report expected")
+    };
+    assert_eq!(r.before.project, Project::Rtl8852Cu);
+    assert_eq!(r.before.usb.hardware_label(), "usb:13d3:3612:0100");
+    assert_eq!(r.after.raw, version(Project::Rtl8852Cu, true)[..]);
+    assert_eq!(
+        r.container_version,
+        ContainerVersion::V2([1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    let meta = r.v2.as_ref().unwrap();
+    assert_eq!(meta.project, Project::Rtl8852Cu);
+    assert_eq!(meta.extensions.last().unwrap().value, 25);
+    assert_eq!(r.firmware.name, "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(r.firmware.target_driver, "realtek-bluetooth-usb-epatch-v2");
+    assert_eq!(r.firmware.target_revision, RTL8852CU_V2);
+    // linux-firmware links the 8852C config to the 8761BU's six bytes,
+    // which btrtl appends to the patch (btrtl.c:936-950).
+    let ConfigurationEvidence::Supplied(config) = &r.configuration else {
+        panic!("supplied config expected")
+    };
+    assert_eq!(config.name, "rtl_bt/rtl8852cu_config.bin");
+    assert_eq!(config.member, "rtl_bt/rtl8761bu_config.bin");
+    assert_eq!(
+        r.download,
+        [DownloadResponse {
+            sent_index: 0x80,
+            returned_index: 0x42
+        }]
+    );
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            )
+        ]
+    );
+    drop(requests);
+    assert!(hci.io.steps.is_empty());
+    assert_eq!(trace.borrow().closed, 0);
+}

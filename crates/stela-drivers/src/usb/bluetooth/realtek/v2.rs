@@ -3,6 +3,7 @@
 //! EPATCH v2 adapted from the pinned btrtl iovec/section/priority-list parser.
 //! Unknown section bodies are skipped by that format policy, with metadata and
 //! whole-body hashes kept. Nonzero key/security selection is not implemented.
+//! The RTL8852BU's file and the RTL8852CU's `_v2.bin` are such containers.
 use super::{Configuration, FormatError, Project, Staged};
 use crate::bytes::le32;
 use alloc::vec::Vec;
@@ -67,17 +68,20 @@ impl<'a> V2Patch<'a> {
         if &bytes[..8] != b"RTBTCore" {
             return Err(FormatError::Signature);
         }
-        if project != Project::Rtl8852Bu {
-            return Err(FormatError::Project);
-        }
         if key_id != 0 {
             return Err(FormatError::Security);
         }
+        // The terminal project instruction (opcode 0, length 1) before the
+        // extension signature names the chip, as `rtlbt_parse_firmware`
+        // finds it (btrtl.c:692-725). No container is one project's: a file
+        // for another chip is refused (btrtl.c:745-751), here by its exact
+        // project id where Linux compares the id's lmp_subver.
         let tail = bytes.len() - 7;
-        if bytes[tail..tail + 3] != [project.id(), 1, 0]
-            || bytes[tail + 3..] != [0x51, 4, 0xfd, 0x77]
-        {
+        if bytes[tail + 1..tail + 3] != [1, 0] || bytes[tail + 3..] != [0x51, 4, 0xfd, 0x77] {
             return Err(FormatError::Extension);
+        }
+        if bytes[tail] != project.id() {
+            return Err(FormatError::Project);
         }
         let version = bytes[8..16].try_into().unwrap();
         let count = le32(bytes, 16) as usize;
@@ -302,6 +306,92 @@ mod tests {
                 "at {at}"
             );
         }
+    }
+    /// `rtl_bt/rtl8852cu_fw_v2.bin`'s layout at linux-firmware 59f9fc2 with
+    /// short bodies: its version, one SNIPPETS section holding ECO 1 (ROM 0)
+    /// and ECO 2 (ROM 1) at priority 15, an empty opcode 8 section, the
+    /// extension `ff 02 01 01` and the tail `19 01 00` (project 25).
+    fn rtl8852cu_layout() -> Vec<u8> {
+        let mut b = b"RTBTCore".to_vec();
+        b.extend_from_slice(&[0x6e, 0xb1, 0x34, 0x01, 0x49, 0x8c, 0x01, 0x00]);
+        b.extend_from_slice(&2u32.to_le_bytes());
+        let mut section = vec![2, 0, 0, 0];
+        for (eco, body) in [(1u8, &[0xa0u8; 9][..]), (2, &[0xb1; 7][..])] {
+            section.extend_from_slice(&[eco, 15, 0, 0]);
+            section.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            section.extend_from_slice(body);
+        }
+        b.extend_from_slice(&SNIPPETS.to_le_bytes());
+        b.extend_from_slice(&(section.len() as u32).to_le_bytes());
+        b.extend_from_slice(&section);
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&[0xff, 2, 1, 1, 0x19, 1, 0, 0x51, 4, 0xfd, 0x77]);
+        b
+    }
+    #[test]
+    fn the_rtl8852cu_layout_stages_each_roms_subsection_and_names_only_its_project() {
+        let b = rtl8852cu_layout();
+        let p = V2Patch::parse(&b, Project::Rtl8852Cu, 0, 0).unwrap();
+        assert_eq!(p.stage(None).bytes(), [0xa0; 9]);
+        assert_eq!(p.metadata.version, [0x6e, 0xb1, 0x34, 1, 0x49, 0x8c, 1, 0]);
+        assert_eq!(p.metadata.project, Project::Rtl8852Cu);
+        let snippets = &p.metadata.sections[0];
+        assert_eq!((snippets.opcode, snippets.skipped), (SNIPPETS, false));
+        assert_eq!(
+            snippets
+                .subsections
+                .iter()
+                .map(|s| (s.eco, s.priority, s.length, s.selected))
+                .collect::<Vec<_>>(),
+            [(1, 15, 9, true), (2, 15, 7, false)]
+        );
+        let opaque = &p.metadata.sections[1];
+        assert_eq!((opaque.opcode, opaque.length, opaque.skipped), (8, 0, true));
+        assert_eq!(
+            p.metadata.extensions,
+            [
+                ExtensionRecord {
+                    opcode: 1,
+                    value: 2
+                },
+                ExtensionRecord {
+                    opcode: 0,
+                    value: 25
+                }
+            ]
+        );
+        assert_eq!(
+            V2Patch::parse(&b, Project::Rtl8852Cu, 1, 0)
+                .unwrap()
+                .stage(None)
+                .bytes(),
+            [0xb1; 7]
+        );
+        assert_eq!(
+            V2Patch::parse(&b, Project::Rtl8852Cu, 2, 0).unwrap_err(),
+            FormatError::MissingRom
+        );
+        // Another chip's file is refused, as btrtl.c:745-751 refuses it,
+        // and so is this one for another chip.
+        for other in [Project::Rtl8852Bu, Project::Rtl8761Bu] {
+            assert_eq!(
+                V2Patch::parse(&b, other, 0, 0).unwrap_err(),
+                FormatError::Project
+            );
+        }
+        assert_eq!(
+            V2Patch::parse(&image(), Project::Rtl8852Cu, 0, 0).unwrap_err(),
+            FormatError::Project
+        );
+        // A tail that is no project instruction stays an extension error.
+        let mut malformed = b.clone();
+        let at = malformed.len() - 6;
+        malformed[at] = 2;
+        assert_eq!(
+            V2Patch::parse(&malformed, Project::Rtl8852Cu, 0, 0).unwrap_err(),
+            FormatError::Extension
+        );
     }
     #[test]
     fn priorities_apply_across_snippet_and_dummy_sections_before_exact_configuration() {

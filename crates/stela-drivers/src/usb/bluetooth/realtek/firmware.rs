@@ -54,12 +54,11 @@ impl<'a> Patch<'a> {
         if &bytes[..8] != b"Realtech" {
             return Err(FormatError::Signature);
         }
-        if project == Project::Rtl8852Bu {
-            return Err(FormatError::Project);
-        }
         // The supported real v1 inputs have exactly the donor's terminal
         // project instruction preceded by EOF. Unknown extension programs are
         // refused explicitly, rather than guessing their backwards traversal.
+        // No container is one project's: the instruction's id must be the
+        // selected project's (btrtl.c:745-751).
         let trailer = &bytes[bytes.len() - 8..];
         if trailer[0] != 0xff || trailer[2..4] != [1, 0] || trailer[4..] != EXTENSION_SIGNATURE {
             return Err(FormatError::Extension);
@@ -231,6 +230,49 @@ mod tests {
             Patch::parse(&b, Project::Rtl8822B, 0).unwrap_err(),
             FormatError::Project
         );
+    }
+    /// `rtl_bt/rtl8852cu_fw.bin`'s table at linux-firmware 59f9fc2 with short
+    /// patches: version 0xd7b8fabf, chip ids 1 and 2, the first patch at
+    /// offset 48 past a gap, and the trailer `ff 19 01 00` (project 25).
+    fn rtl8852cu_layout() -> Vec<u8> {
+        let mut b = vec![0; 72];
+        b[..8].copy_from_slice(b"Realtech");
+        b[8..12].copy_from_slice(&0xd7b8_fabfu32.to_le_bytes());
+        b[12..14].copy_from_slice(&2u16.to_le_bytes());
+        for (i, chip, len, start) in [(0, 1u16, 6u16, 48u32), (1, 2, 8, 56)] {
+            b[14 + i * 2..16 + i * 2].copy_from_slice(&chip.to_le_bytes());
+            b[18 + i * 2..20 + i * 2].copy_from_slice(&len.to_le_bytes());
+            b[22 + i * 4..26 + i * 4].copy_from_slice(&start.to_le_bytes());
+        }
+        b[48..54].copy_from_slice(&[0x10, 0x11, 0x12, 0x13, 0x14, 0x15]);
+        b[56..64].fill(0x20);
+        b[64..].copy_from_slice(&[0xff, 0x19, 1, 0, 0x51, 4, 0xfd, 0x77]);
+        b
+    }
+    #[test]
+    fn the_rtl8852cu_v1_layout_selects_its_roms_patch_and_names_only_its_project() {
+        let b = rtl8852cu_layout();
+        let rom0 = Patch::parse(&b, Project::Rtl8852Cu, 0).unwrap();
+        assert_eq!(rom0.firmware_version, 0xd7b8_fabf);
+        assert_eq!(
+            rom0.stage(None).bytes(),
+            [0x10, 0x11, 0xbf, 0xfa, 0xb8, 0xd7]
+        );
+        let rom1 = Patch::parse(&b, Project::Rtl8852Cu, 1).unwrap();
+        assert_eq!(
+            rom1.stage(None).bytes(),
+            [0x20, 0x20, 0x20, 0x20, 0xbf, 0xfa, 0xb8, 0xd7]
+        );
+        assert_eq!(
+            Patch::parse(&b, Project::Rtl8852Cu, 2).unwrap_err(),
+            FormatError::MissingRom
+        );
+        for other in [Project::Rtl8852Bu, Project::Rtl8761Bu] {
+            assert_eq!(
+                Patch::parse(&b, other, 0).unwrap_err(),
+                FormatError::Project
+            );
+        }
     }
     #[test]
     fn validates_entire_container_before_emitting_any_selected_patch() {
