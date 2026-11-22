@@ -140,6 +140,8 @@ struct Pending {
     /// The shadow's answer, the first of its events, given on a fallback.
     shadow: Vec<Vec<u8>>,
     deadline: u64,
+    /// The command, while it waits for one of the controller's credits.
+    unsent: Option<ChipCommand>,
 }
 
 /// The bridge.
@@ -162,6 +164,9 @@ pub struct Bridge {
     running: Vec<Running>,
     /// Whether the controller answered an HCI Reset: the start-up ran.
     started: bool,
+    /// The commands the controller takes now, as its last Command Complete
+    /// or Command Status said (Num_HCI_Command_Packets, Vol 4 Part E 4.4).
+    credits: u8,
     counters: Counters,
 }
 
@@ -262,6 +267,7 @@ impl Bridge {
             address_differs: false,
             running: Vec::new(),
             started: false,
+            credits: 1,
             counters: Counters::default(),
         }
     }
@@ -359,12 +365,13 @@ impl Bridge {
             self.counters.local += 1;
             return guest(shadow);
         };
-        let pending = Pending {
+        let mut pending = Pending {
             opcode: opcode(packet),
             parameters: packet[3..].to_vec(),
             kind,
             shadow,
             deadline: now.saturating_add(DEADLINE),
+            unsent: None,
         };
         // A reset after the start-up is bluetoothd restarting; at the
         // second, the model takes over, answering this reset. A reset ends
@@ -378,7 +385,28 @@ impl Bridge {
             }
         }
         self.counters.forwarded += 1;
+        // With no credit the command waits for the controller to give one
+        // back; its deadline runs from now all the same.
+        let steps = if self.credits == 0 {
+            pending.unsent = Some(command);
+            Vec::new()
+        } else {
+            self.credits -= 1;
+            vec![Step::Chip(command)]
+        };
         self.pending = Some(pending);
+        steps
+    }
+
+    /// The command waiting for a credit, once the controller has one.
+    fn send_held(&mut self) -> Vec<Step> {
+        if self.credits == 0 {
+            return Vec::new();
+        }
+        let Some(command) = self.pending.as_mut().and_then(|p| p.unsent.take()) else {
+            return Vec::new();
+        };
+        self.credits -= 1;
         vec![Step::Chip(command)]
     }
 
@@ -435,15 +463,24 @@ impl Bridge {
             return Vec::new();
         }
         if completes(event) {
+            // Every completion gives the controller's credits, a stale one
+            // and credits alone too.
+            match *event {
+                [COMMAND_COMPLETE, _, credits, ..] | [COMMAND_STATUS, _, _, credits, ..] => {
+                    self.credits = credits;
+                }
+                _ => {}
+            }
             let completion = Completion::of(event);
-            let pending = completion
-                .as_ref()
-                .and_then(|completion| self.pending.take_if(|p| p.opcode == completion.opcode));
+            let pending = completion.as_ref().and_then(|completion| {
+                self.pending
+                    .take_if(|p| p.unsent.is_none() && p.opcode == completion.opcode)
+            });
             let (Some(completion), Some(pending)) = (completion, pending) else {
                 // Credits alone (opcode 0, no status), or the answer to a
                 // command no longer in flight.
                 self.counters.dropped += 1;
-                return Vec::new();
+                return self.send_held();
             };
             return self.answer(pending, &completion, now);
         }

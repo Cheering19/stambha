@@ -646,6 +646,42 @@ fn bluetoothd_restarting_twice_after_its_start_up_falls_back() {
     for _ in 0..3 {
         chip(bridge.command(&reset, 0));
         bridge.resync();
+        // Its late answer, stale now, gives the controller's credit back.
+        assert!(
+            bridge
+                .chip_event(&complete(0x0c03, 1, 0, &[]), 0)
+                .is_empty()
+        );
     }
     assert_eq!((bridge.fallen(), bridge.counters().restarts), (None, 0));
+}
+
+/// The controller's own command credits: a forwarded command waits until
+/// the controller has one, and falls back at its deadline if none comes.
+#[test]
+fn a_command_waits_for_the_controllers_credit() {
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0c03, &[]), 0));
+    // Answered with no credit left; the guest still sees one.
+    let answer = events(bridge.chip_event(&complete(0x0c03, 0, 0, &[]), 0));
+    assert_eq!(answer, [complete(0x0c03, 1, 0, &[])]);
+    let mask = packet(0x0c01, &[0xff; 8]);
+    assert!(bridge.command(&mask, 0).is_empty(), "held for a credit");
+    assert!(bridge.busy());
+    // Credits alone give one back: the command goes.
+    assert_eq!(
+        chip(bridge.chip_event(&[COMMAND_COMPLETE, 3, 1, 0, 0], 0)),
+        mask
+    );
+    events(bridge.chip_event(&complete(0x0c01, 0, 0, &[]), 0));
+    // A Command Status gives credits too.
+    let address = packet(0x1009, &[]);
+    assert!(bridge.command(&address, 0).is_empty());
+    assert_eq!(chip(bridge.chip_event(&status(0x0000, 1, 0), 0)), address);
+    events(bridge.chip_event(&complete(0x1009, 0, 0, &CHIP_ADDRESS), 0));
+    // None comes: the deadline falls back.
+    assert!(bridge.command(&packet(0x0c14, &[]), 10).is_empty());
+    let answer = events(bridge.advance(10 + DEADLINE));
+    assert_eq!(answer[0][3..6], [0x14, 0x0c, 0]);
+    assert_eq!(bridge.fallen().unwrap().cause, Cause::Timeout);
 }
