@@ -54,6 +54,10 @@ pub const KEYBOARD_DOWN: u32 = 0xc5;
 pub const KEYBOARD_TOGGLE: u32 = 0xc7;
 /// `WMI_EVENT_MASK`.
 const EVENT_MASK: u64 = 0xffff;
+/// What `_WED` answers once the firmware's queue is empty: the FA608PP's
+/// `GANQ` returns Ones, masked to this (an unknown key to Linux, which
+/// reads one event per notification).
+pub const NO_EVENT: u32 = 0xffff;
 
 /// One `_WDG` block: its GUID, object ID (or notification and a reserved
 /// byte for an event), instance count and flags.
@@ -102,9 +106,8 @@ pub struct AsusWmi<'a> {
     handle: Handle<'a>,
     /// `WM` and the management block's object ID.
     method: String,
-    /// The event block's notification, where `_WDG` has the notebook
-    /// events.
-    pub notify: Option<u32>,
+    /// The notebook events' notification.
+    pub notify: u32,
     /// The device-status method: DCTS for `_UID` "ASUSWMI", else DSTS.
     status: u32,
     /// The keyboard backlight's level as last read or set (`kbd_led_wk`);
@@ -114,8 +117,8 @@ pub struct AsusWmi<'a> {
 
 impl<'a> AsusWmi<'a> {
     /// The first present WMI device whose `_WDG` has the ASUS management
-    /// methods, as asus-wmi binds where `wmi_has_guid(ASUS_WMI_MGMT_GUID)`,
-    /// with the notebook events it declares; `None` without one.
+    /// methods and the notebook events, as asus-nb-wmi binds only where
+    /// both GUIDs exist (`asus_wmi_probe`); `None` without one.
     pub fn find(session: &'a Session) -> Result<Option<Self>, acpi::Error> {
         for handle in session.devices(WMI)? {
             let wdg = match handle.evaluate(Some("_WDG"), &[]) {
@@ -131,10 +134,13 @@ impl<'a> AsusWmi<'a> {
             }) else {
                 continue;
             };
-            let notify = blocks
+            let Some(events) = blocks
                 .iter()
                 .find(|block| block.guid == EVENTS && block.flags & BLOCK_EVENT != 0)
-                .map(|block| u32::from(block.id[0]));
+            else {
+                continue;
+            };
+            let notify = u32::from(events.id[0]);
             let uid = match handle.evaluate(Some("_UID"), &[]) {
                 Ok(Some(Value::String(uid))) => uid,
                 _ => Vec::new(),
@@ -234,14 +240,29 @@ impl<'a> AsusWmi<'a> {
     /// its notification, masked (`asus_wmi_get_event_code`). Linux reads it
     /// at every notification, as a firmware queue of events needs.
     pub fn event(&self) -> Result<u32, Error> {
-        let notify = self.notify.ok_or(Error::Malformed)?;
         match self
             .handle
-            .evaluate(Some("_WED"), &[Argument::Integer(u64::from(notify))])?
+            .evaluate(Some("_WED"), &[Argument::Integer(u64::from(self.notify))])?
         {
             Some(Value::Integer(code)) => Ok((code & EVENT_MASK) as u32),
             _ => Err(Error::Malformed),
         }
+    }
+
+    /// Every event the firmware's queue holds, read through `_WED`
+    /// ([`Self::event`]) until it answers [`NO_EVENT`], at most `bound`. A
+    /// read that fails is passed on and the draining goes on: the queue
+    /// fills while events wait, and a full one costs each keypress a stall
+    /// in the firmware's EC query (the FA608PP's holds 16).
+    pub fn drain(&self, bound: usize) -> Vec<Result<u32, Error>> {
+        let mut events = Vec::new();
+        for _ in 0..bound {
+            match self.event() {
+                Ok(NO_EVENT) => break,
+                read => events.push(read),
+            }
+        }
+        events
     }
 
     /// `asus_wmi_handle_event_code` for the keyboard backlight's keys: one
@@ -432,7 +453,7 @@ mod tests {
         let mut wmi = AsusWmi::find(&session).unwrap().unwrap();
         assert_eq!(
             (wmi.path.as_str(), wmi.method(), wmi.notify),
-            ("\\_SB_.ATKD", "WMNB", Some(0xff))
+            ("\\_SB_.ATKD", "WMNB", 0xff)
         );
         assert_eq!(wmi.init(), Ok(1));
         assert_eq!(integer(&session, "\\_SB.ATKD.ATKP"), 1);
@@ -466,6 +487,8 @@ mod tests {
         unsafe { acpi_os_wait_events_complete() };
         assert_eq!(NOTIFIED.load(Ordering::Acquire), 0xff);
         assert_eq!(wmi.event(), Ok(KEYBOARD_UP));
+        // A bound ends a queue that never empties.
+        assert_eq!(wmi.drain(3), [Ok(KEYBOARD_UP); 3]);
         drop(notification);
         session.shutdown().unwrap();
     }
@@ -509,7 +532,7 @@ mod tests {
         let mut wmi = AsusWmi::find(&session).unwrap().unwrap();
         assert_eq!(
             (wmi.path.as_str(), wmi.method(), wmi.notify),
-            ("\\_SB_.ATKD", "WMNB", Some(0xff))
+            ("\\_SB_.ATKD", "WMNB", 0xff)
         );
         assert_eq!(integer(&session, "\\_SB.ATKP"), 0);
         assert_eq!(wmi.init(), Ok(1));
@@ -518,19 +541,99 @@ mod tests {
         assert_eq!(wmi.keyboard_key(KEYBOARD_UP), Ok(Some((0, 1))));
         let notification = wmi
             .handle()
-            .notify(|value| NOTIFIED.store(value, Ordering::Release))
+            .notify(|value| {
+                if value == 0xff {
+                    NOTIFIED.fetch_add(1, Ordering::AcqRel);
+                }
+            })
             .unwrap();
-        session
-            .handle("\\_SB.ATKD")
-            .unwrap()
-            .invoke(Some("IANE"), &[Argument::Integer(u64::from(KEYBOARD_DOWN))])
-            .unwrap();
+        for code in [KEYBOARD_DOWN, KEYBOARD_UP] {
+            session
+                .handle("\\_SB.ATKD")
+                .unwrap()
+                .invoke(Some("IANE"), &[Argument::Integer(u64::from(code))])
+                .unwrap();
+        }
         // SAFETY: serialized test process context outside an AML frame.
         unsafe { acpi_os_wait_events_complete() };
-        assert_eq!(NOTIFIED.load(Ordering::Acquire), 0xff);
-        assert_eq!(wmi.event(), Ok(KEYBOARD_DOWN));
+        assert_eq!(NOTIFIED.load(Ordering::Acquire), 2);
+        // Both, in order, then GANQ's Ones: the queue is empty.
+        assert_eq!(wmi.drain(32), [Ok(KEYBOARD_DOWN), Ok(KEYBOARD_UP)]);
+        assert!(wmi.drain(32).is_empty());
         assert_eq!(wmi.keyboard_key(KEYBOARD_DOWN), Ok(Some((1, 0))));
         drop(notification);
+        session.shutdown().unwrap();
+    }
+
+    /// A WMI device with the management methods and no notebook events, as
+    /// asus-nb-wmi does not bind to.
+    #[test]
+    fn a_wmi_device_without_the_notebook_events_is_not_taken() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let wdg = [&MANAGEMENT[..], b"NB", &[1, BLOCK_METHOD]].concat();
+        let body = aml::scope(
+            "\\_SB_",
+            &aml::device(
+                "ATKD",
+                &[
+                    aml::named("_HID", &aml::string(WMI)),
+                    aml::named("_WDG", &aml::buffer(&wdg)),
+                    aml::method("WMNB", 3, &aml::ret(&aml::integer(1))),
+                ]
+                .concat(),
+            ),
+        );
+        // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+        let session =
+            unsafe { Session::start(test_support::dsdt_fixture(&body), Mode::InterpreterOnly) }
+                .unwrap();
+        assert!(AsusWmi::find(&session).unwrap().is_none());
+        session.shutdown().unwrap();
+    }
+
+    /// A drain reads `_WED` until it answers the empty queue's Ones, past a
+    /// read that fails, and within its bound.
+    #[test]
+    fn a_drain_reads_until_the_queue_is_empty_past_a_bad_read() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        // _WED: a buffer at its first read, 0xC4 at its second, then Ones.
+        let increment = [&[0x75][..], &aml::name("CNT_")].concat();
+        let wed = [
+            increment,
+            aml::if_equal(
+                &aml::name("CNT_"),
+                &aml::integer(1),
+                &aml::ret(&aml::buffer(&[0])),
+            ),
+            aml::if_equal(
+                &aml::name("CNT_"),
+                &aml::integer(2),
+                &aml::ret(&aml::integer(u64::from(KEYBOARD_UP))),
+            ),
+            aml::ret(&[0xff]),
+        ]
+        .concat();
+        let body = aml::scope(
+            "\\_SB_",
+            &aml::device(
+                "ATKD",
+                &[
+                    aml::named("_HID", &aml::string(WMI)),
+                    aml::named("_WDG", &aml::buffer(&wdg())),
+                    aml::named("CNT_", &aml::integer(0)),
+                    aml::method("WMNB", 3, &aml::ret(&aml::integer(1))),
+                    aml::method("_WED", 1, &wed),
+                ]
+                .concat(),
+            ),
+        );
+        // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+        let session =
+            unsafe { Session::start(test_support::dsdt_fixture(&body), Mode::InterpreterOnly) }
+                .unwrap();
+        let wmi = AsusWmi::find(&session).unwrap().unwrap();
+        assert_eq!(wmi.drain(8), [Err(Error::Malformed), Ok(KEYBOARD_UP)]);
+        assert_eq!(integer(&session, "\\_SB.ATKD.CNT_"), 3);
         session.shutdown().unwrap();
     }
 }

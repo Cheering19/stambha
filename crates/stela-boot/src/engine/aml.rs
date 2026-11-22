@@ -1146,7 +1146,7 @@ pub struct HostAcpi {
     asus: RefCell<
         Option<(
             stela_drivers::platform::asus_wmi::AsusWmi<'static>,
-            Option<stela_drivers::platform::acpi::Notification<'static>>,
+            stela_drivers::platform::acpi::Notification<'static>,
         )>,
     >,
     ec_pending: Cell<bool>,
@@ -1178,11 +1178,13 @@ static BRIGHTNESS_KEYS: AtomicBool = AtomicBool::new(false);
 pub(super) fn follow_brightness_keys(on: bool) {
     BRIGHTNESS_KEYS.store(on, Ordering::Release);
 }
-/// The ASUS WMI event notifications since the poll took them, each one
-/// event its firmware queued ([`HostAcpi::service_asus_wmi`]).
+/// The ASUS WMI event notifications since the poll took them; any number of
+/// them has the poll drain the firmware's queue
+/// ([`HostAcpi::service_asus_wmi`]).
 static ASUS_EVENTS: AtomicU32 = AtomicU32::new(0);
-/// The events the ASUS firmware's queue holds, at most.
-const ASUS_QUEUE: u32 = 16;
+/// The ASUS WMI events one poll reads at most: twice what the FA608PP's
+/// queue holds (16), so a queue that never reads empty still ends.
+const ASUS_DRAIN: usize = 32;
 
 impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
@@ -1779,12 +1781,13 @@ impl HostAcpi {
         ));
     }
 
-    /// Linux's asus-wmi on an ASUS laptop's WMI device: a notify handler
-    /// on its event block first, then INIT, after which the firmware
-    /// reports its Fn hotkeys as events, and the keyboard backlight read
-    /// and set to that level, as asus-wmi registers its LED. Each event is
-    /// taken at the next poll ([`Self::service_asus_wmi`]). One line, where
-    /// the device exists.
+    /// Linux's asus-wmi on an ASUS laptop's WMI device that has the
+    /// notebook events: a notify handler on its event block first, and only
+    /// once it is in, INIT, after which the firmware reports its Fn hotkeys
+    /// as events into a queue that each one must be read from; then the
+    /// keyboard backlight read and set to that level, as asus-wmi registers
+    /// its LED. The events are taken at the next poll
+    /// ([`Self::service_asus_wmi`]). One line, where the device exists.
     fn attach_asus_wmi(&'static self) {
         use stela_drivers::platform::asus_wmi::AsusWmi;
         let mut wmi = match AsusWmi::find(&self.session) {
@@ -1795,23 +1798,23 @@ impl HostAcpi {
                 return;
             }
         };
-        let notification = wmi.notify.and_then(|notify| {
-            match wmi.handle().notify(move |value| {
-                if value == notify {
-                    ASUS_EVENTS.fetch_add(1, Ordering::AcqRel);
-                }
-            }) {
-                Ok(notification) => Some(notification),
-                Err(error) => {
-                    output::arguments(format_args!(
-                        "HOST ASUS WMI {}: notify handler refused: {error:?}; its hotkeys are \
-                         not taken\n",
-                        wmi.path
-                    ));
-                    None
-                }
+        let notify = wmi.notify;
+        let notification = match wmi.handle().notify(move |value| {
+            if value == notify {
+                ASUS_EVENTS.fetch_add(1, Ordering::AcqRel);
             }
-        });
+        }) {
+            Ok(notification) => notification,
+            Err(error) => {
+                // INIT would route the hotkeys into a queue nothing reads.
+                output::arguments(format_args!(
+                    "HOST ASUS WMI {}: notify handler refused: {error:?}; INIT is not called, \
+                     so its hotkeys stay as the firmware has them\n",
+                    wmi.path
+                ));
+                return;
+            }
+        };
         let init = match wmi.init() {
             Ok(answer) => alloc::format!("INIT answered {answer:#x}"),
             Err(error) => alloc::format!("INIT refused ({error:?})"),
@@ -1827,38 +1830,34 @@ impl HostAcpi {
             Ok(None) => String::from("no keyboard backlight"),
             Err(error) => alloc::format!("keyboard backlight unreadable: {error:?}"),
         };
-        let events = if notification.is_some() {
-            "its hotkey events are taken"
-        } else {
-            "no hotkey events"
-        };
         output::arguments(format_args!(
-            "HOST ASUS WMI {} ({}): {init}, {keyboard}, {events}\n",
+            "HOST ASUS WMI {} ({}): {init}, {keyboard}, its hotkey events are taken\n",
             wmi.path,
             wmi.method()
         ));
         *self.asus.borrow_mut() = Some((wmi, notification));
     }
 
-    /// Each ASUS WMI event since the last poll, read through `_WED` as
-    /// Linux reads one at every notification, so the firmware's queue
-    /// drains: a keyboard backlight key steps it, and any other code is
-    /// named.
+    /// The ASUS WMI events since the last poll: at any notification, the
+    /// firmware's whole queue read through `_WED` until it is empty
+    /// ([`stela_drivers::platform::asus_wmi::AsusWmi::drain`]), past a read
+    /// that fails, so a missed notification leaves no event behind to fill
+    /// it: a keyboard backlight key steps it, and any other code is named.
     fn service_asus_wmi(&self) {
-        let events = ASUS_EVENTS.swap(0, Ordering::AcqRel);
-        if events == 0 {
+        let notified = ASUS_EVENTS.swap(0, Ordering::AcqRel);
+        if notified == 0 {
             return;
         }
         let mut kept = self.asus.borrow_mut();
         let Some((wmi, _)) = kept.as_mut() else {
             return;
         };
-        for _ in 0..events.min(ASUS_QUEUE) {
-            let code = match wmi.event() {
+        for read in wmi.drain(ASUS_DRAIN) {
+            let code = match read {
                 Ok(code) => code,
                 Err(error) => {
                     output::arguments(format_args!("HOST ASUS WMI event unreadable: {error:?}\n"));
-                    return;
+                    continue;
                 }
             };
             match wmi.keyboard_key(code) {
