@@ -17,6 +17,7 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 use stela_boot_core::{
     options::WIFI_SAVED,
+    wifi_hardware,
     wifi_page::{self, Action, Draw, Geometry, Key, Network, Page, Save, Scene, Tone},
     wifi_saved,
 };
@@ -25,6 +26,28 @@ use uefi::{
     CString16,
     fs::{FileSystem, PathBuf},
 };
+
+/// Whether the startup menu offers Wi-Fi on this PC, from the firmware's PCI
+/// census before ExitBootServices (`stela_boot_core::wifi_hardware`); one
+/// line says which way it decided.
+pub(crate) fn offered() -> bool {
+    let hardware = match crate::pci_io::capture() {
+        Ok(census) => {
+            let functions: Vec<_> = census
+                .functions
+                .iter()
+                .map(crate::pci_io::FunctionObservation::identity)
+                .collect();
+            wifi_hardware::decide(Ok(wifi_hardware::Census {
+                functions: &functions,
+                unread: census.failures.len(),
+            }))
+        }
+        Err(error) => wifi_hardware::decide(Err(&alloc::format!("{error}"))),
+    };
+    output::arguments(format_args!("{}", hardware.line()));
+    hardware.offered()
+}
 
 /// The page until a network is chosen, the one `--wifi` names being
 /// `configured` and the one chosen before `prefer`: the chosen network's

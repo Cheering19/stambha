@@ -137,10 +137,7 @@ impl Kind {
             && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
         {
             Some(Self::RealtekWifi)
-        } else if function.vendor == 0x10ec
-            && function.class[..2] == [2, 0x80]
-            && function.device == RTL8852CE_DEVICE
-        {
+        } else if super::rtl8852ce(function) {
             Some(Self::Rtw89Wifi)
         } else if function.vendor == 0x8086 && intel_pcie::DEVICE_IDS.contains(&function.device) {
             Some(Self::IntelBluetooth)
@@ -674,9 +671,6 @@ pub(super) unsafe fn realtek_wifi(
         Err(error) => Err((Error::RealtekWifi(error), Some(kept))),
     }
 }
-
-/// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
-const RTL8852CE_DEVICE: u16 = 0xc852;
 
 /// An RTL8852CE station on its hardware: the live chip over its BAR2 window,
 /// kept connected to the `--wifi` network.
@@ -3434,6 +3428,41 @@ mod tests {
         assert_eq!(Kind::of_identity(&identity(0xc852, [2, 0, 0])), None);
         // RTL8852BE still has no driver here.
         assert_eq!(Kind::of_identity(&identity(0xb852, [2, 0x80, 0])), None);
+    }
+
+    /// A function the startup menu offers Wi-Fi for is one the scan routes
+    /// to the rtw89 station, and every device of the driver's identity
+    /// table is one; the other Wi-Fi kinds' functions are not offered.
+    #[test]
+    fn wifi_starts_only_where_rtw89_attaches() {
+        let identity = |vendor, device, class| crate::bus::pci::Identity {
+            address: address(),
+            vendor,
+            device,
+            class,
+        };
+        for device in realtek_wifi::identity::RTL8852C_DEVICES {
+            let function = identity(0x10ec, device, [2, 0x80, 0]);
+            assert!(super::super::wifi_starts(&function));
+            assert_eq!(Kind::of_identity(&function), Some(Kind::Rtw89Wifi));
+        }
+        for (vendor, device) in [(0x10ec, 0xc822), (0x8086, 0x2725), (0x14c3, 0x7925)] {
+            let function = identity(vendor, device, [2, 0x80, 0]);
+            assert!(
+                Kind::of_identity(&function).is_some(),
+                "{vendor:04x}:{device:04x}"
+            );
+            assert_ne!(Kind::of_identity(&function), Some(Kind::Rtw89Wifi));
+            assert!(
+                !super::super::wifi_starts(&function),
+                "{vendor:04x}:{device:04x}"
+            );
+        }
+        assert!(!super::super::wifi_starts(&identity(
+            0x10ec,
+            0xc852,
+            [2, 0, 0]
+        )));
     }
 
     /// The register accesses a model window has seen.

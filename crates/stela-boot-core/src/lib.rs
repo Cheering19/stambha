@@ -142,6 +142,7 @@ pub mod usb_legacy;
 pub mod vfct;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod wifi_hardware;
 pub mod wifi_page;
 pub mod wifi_saved;
 pub mod work_status;

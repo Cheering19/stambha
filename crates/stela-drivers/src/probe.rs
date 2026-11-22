@@ -50,6 +50,27 @@ pub mod typec;
 use crate::net::wifi::network::Network;
 pub use services::{NativeServices, ServiceError};
 
+/// Whether `function` is an RTL8852CE: a Wi-Fi function of
+/// `rtw8852ce_id_table` (`identity::RTL8852C_DEVICES`), which the scan
+/// brings up with rtw89 (`native::Kind::Rtw89Wifi`).
+pub fn rtl8852ce(function: &crate::bus::pci::Identity) -> bool {
+    function.vendor == 0x10ec
+        && function.class[..2] == [2, 0x80]
+        && crate::net::wifi::realtek::identity::RTL8852C_DEVICES.contains(&function.device)
+}
+
+/// Whether the scan can start a Wi-Fi station on `function` today, given a
+/// `--wifi` network: only an RTL8852CE ([`rtl8852ce`]), whose claim goes
+/// through cold preparation and so may set Bus Master. The Intel, MediaTek
+/// and RTL8822C functions the scan also routes (`native::Kind::IntelWifi`,
+/// `MediatekWifi`, `RealtekWifi`) are claimed unmastered, and the seal
+/// refuses the Bus Master their drivers set before resetting their engines,
+/// so none of them becomes a station yet. The startup menu offers Wi-Fi
+/// only on a PC that has such a function (`stela_boot_core::wifi_hardware`).
+pub fn wifi_starts(function: &crate::bus::pci::Identity) -> bool {
+    rtl8852ce(function)
+}
+
 /// A controller refusal keeps its original typed details for boot diagnostics.
 /// In particular, firmware names and integrity/target errors are never replaced
 /// by a generic unsupported-device message.
