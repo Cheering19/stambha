@@ -75,6 +75,9 @@ enum Plan {
         target: Target,
         catalog: Result<Arc<Catalog>, String>,
     },
+    /// Its xHCI's start failed, for this reason, after it may have reset
+    /// the controller.
+    Failed(String),
     /// Its xHCI was started.
     Started,
 }
@@ -289,7 +292,7 @@ pub(super) fn start(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice
         }
         Err(why) => {
             machine.bluetooth.plan =
-                Plan::Refused(format!("pci={} did not start: {why}", target.controller));
+                Plan::Failed(format!("pci={} did not start: {why}", target.controller));
             Vec::new()
         }
     }
@@ -355,8 +358,21 @@ fn bring_up(
     // descriptors show only the setting it uses, so the census cannot tell
     // which, and either way the disk gets no configuration, SCSI command or
     // settle wait. Nothing is left settling either, so none is discovered.
-    let found = xhci::begin_with_provider(&mut function, handoff, &mut dma, provider, minimum)
-        .map_err(|error| format!("its xHCI driver failed: {error}"))?
+    let started =
+        match xhci::begin_with_provider(&mut function, handoff, &mut dma, provider, minimum) {
+            Ok(started) => started,
+            Err(error) => {
+                // It may have been reset with its Bus Master on
+                // (`Function::enable_polled`): it is given up, so it can
+                // neither write memory nor interrupt.
+                let off = match function.abandon() {
+                    Ok(()) => String::from("its Bus Master is off again"),
+                    Err(why) => format!("its Bus Master could not be switched off: {why}"),
+                };
+                return Err(format!("its xHCI driver failed: {error}; {off}"));
+            }
+        };
+    let found = started
         .without_mass_storage()
         .finish_unsettled(&mut dma, provider);
     let mut devices = Devices::default();
@@ -396,6 +412,7 @@ pub(super) fn check(machine: &mut Machine) {
             return;
         }
         Plan::Refused(why) => bluetooth_check::refused(why),
+        Plan::Failed(why) => bluetooth_check::not_started(why),
         Plan::Chosen { .. } => bluetooth_check::refused(
             "no PCI access (see the cpu lines), so its xHCI was not started; nothing is started",
         ),

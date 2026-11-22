@@ -170,10 +170,25 @@ pub fn lines(
     lines
 }
 
-/// The check's lines when no controller was started at all
-/// (`bluetooth_target::choose` refused, or its xHCI did not start), for
-/// `why`.
+/// The check's lines when nothing was started at all
+/// (`bluetooth_target::choose` refused), for `why`.
 pub fn refused(why: &str) -> Vec<Line> {
+    found_failed(why, "nothing was started")
+}
+
+/// The check's lines when the chosen xHCI's start failed, for `why`: it
+/// may have been reset by then, so the later steps are skipped as never
+/// reached, not as never started.
+pub fn not_started(why: &str) -> Vec<Line> {
+    found_failed(
+        why,
+        "its xHCI did not start, so no Bluetooth controller was reached",
+    )
+}
+
+/// `bluetooth-found` failed for `why`, every later step skipped for
+/// `skipped`.
+fn found_failed(why: &str, skipped: &str) -> Vec<Line> {
     let mut lines = Vec::with_capacity(STEPS.len() + 1);
     lines.push(Line {
         name: STEPS[0],
@@ -184,7 +199,7 @@ pub fn refused(why: &str) -> Vec<Line> {
         lines.push(Line {
             name,
             verdict: Verdict::Skip,
-            detail: String::from("nothing was started"),
+            detail: String::from(skipped),
         });
     }
     lines.push(Line {

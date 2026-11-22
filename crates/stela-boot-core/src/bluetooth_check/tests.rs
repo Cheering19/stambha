@@ -552,3 +552,24 @@ fn a_refused_target_fails_found_with_its_reason_and_starts_nothing_else() {
         ]
     );
 }
+
+#[test]
+fn a_failed_xhci_start_says_no_controller_was_reached_not_that_nothing_was_started() {
+    let why = "pci=0000:05:00.4 did not start: its xHCI driver failed: timeout; its Bus Master is \
+               off again";
+    let got = not_started(why);
+    assert_eq!(
+        text(&got),
+        [
+            ("bluetooth-found", Verdict::Fail, why),
+            ("bluetooth-rom", Verdict::Skip, NOT_REACHED),
+            ("bluetooth-firmware", Verdict::Skip, NOT_REACHED),
+            ("bluetooth-download", Verdict::Skip, NOT_REACHED),
+            ("bluetooth-version", Verdict::Skip, NOT_REACHED),
+            ("bluetooth-scan", Verdict::Skip, NOT_REACHED),
+            ("bluetooth", Verdict::Fail, "failed at bluetooth-found"),
+        ]
+    );
+}
+
+const NOT_REACHED: &str = "its xHCI did not start, so no Bluetooth controller was reached";
