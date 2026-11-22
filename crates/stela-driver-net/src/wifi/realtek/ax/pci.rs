@@ -1296,11 +1296,14 @@ impl Txq<'_> {
     /// in flight; once the next `pre_init` restarts the ring no TXBD names
     /// them, so they never return (see `restart_host_indices`).
     ///
-    /// With no TXBD outstanding nothing is read. A hardware index past the
-    /// ring, or past the host index (one the host never gave, which Linux
-    /// would take as a wrap), or all ones, is refused before anything
-    /// changes. A failure to take a TXBD back leaves it and the entries
-    /// after it outstanding for the next reclaim.
+    /// The device reads only what a [`Txq::kick`] handed it, so the bound is
+    /// the host index last kicked, not the one [`Txq::submit`] advanced: an
+    /// entry written since stays the host's. With no kicked TXBD outstanding
+    /// nothing is read. A hardware index past the ring, or past the kicked
+    /// host index (one the device was never given, which Linux would take as
+    /// a wrap), or all ones, is refused before anything changes. A failure
+    /// to take a TXBD back leaves it and the entries after it outstanding
+    /// for the next reclaim.
     ///
     /// # Safety
     /// [`Ch12::submit`]'s contract, for this queue. The hardware index
@@ -1312,7 +1315,7 @@ impl Txq<'_> {
         if !rings.data_ready.get() {
             return Err(AxError::Tx("TX rings are stopped"));
         }
-        let wp = usize::from(rings.data_host[slot].get());
+        let wp = usize::from(rings.data_kicked[slot].get());
         let rp = usize::from(rings.data_hw[slot].get());
         if wp == rp {
             return Ok(());
