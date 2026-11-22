@@ -100,8 +100,8 @@ impl StandIn {
 }
 
 /// The stand-in for `id`: a byte-at-a-time leaf with the routine's C
-/// semantics, NOP-padded to the 8 words a signature needs at least. `Bail`
-/// stands for memmove's.
+/// semantics, ending in a `ret`, NOPs before that pad it to the 8 words a
+/// signature needs at least. `Bail` stands for memmove's.
 pub fn stand_in(id: Id) -> StandIn {
     let (words, exit, returns) = match id {
         Id::Memmove | Id::Bail => (
@@ -129,30 +129,30 @@ pub fn stand_in(id: Id) -> StandIn {
         ),
         Id::Bzero => (
             vec![
-                cbz(1, 5),           // cbz x1, ret
+                cbz(1, 7),           // cbz x1, ret
                 mov(3, 0),           // mov x3, x0
                 strb_post(ZR, 3, 1), // loop: strb wzr,[x3],#1
                 subs_imm(1, 1, 1),   // subs x1,x1,#1
                 b_cond(NE, -2),      // b.ne loop
-                RET,                 // ret: ret
                 NOP,
                 NOP,
+                RET, // ret: ret
             ],
-            20,
+            28,
             false,
         ),
         Id::Memset => (
             vec![
                 BTI_C,              // bti c
-                cbz(2, 5),          // cbz x2, ret
+                cbz(2, 6),          // cbz x2, ret
                 mov(3, 0),          // mov x3, x0
                 strb_post(1, 3, 1), // loop: strb w1,[x3],#1
                 subs_imm(2, 2, 1),  // subs x2,x2,#1
                 b_cond(NE, -2),     // b.ne loop
-                RET,                // ret: ret
                 NOP,
+                RET, // ret: ret
             ],
-            24,
+            28,
             true,
         ),
         Id::Memcmp => (
@@ -180,10 +180,10 @@ pub fn stand_in(id: Id) -> StandIn {
                 ldrb_pre(2, 1, 1), // loop: ldrb w2,[x1,#1]!
                 cbnz_w(2, -1),     // cbnz w2, loop
                 sub(0, 1, 0),      // done: sub x0,x1,x0
-                RET,               // ret
                 NOP,
+                RET, // ret
             ],
-            24,
+            28,
             true,
         ),
         Id::Touch => (
@@ -191,13 +191,13 @@ pub fn stand_in(id: Id) -> StandIn {
                 ldrb(8, 1),   // ldrb w8,[x1]
                 ldrb(9, 0),   // ldrb w9,[x0]
                 add(0, 8, 9), // add x0,x8,x9
-                RET,          // ret
                 NOP,
                 NOP,
                 NOP,
                 NOP,
+                RET, // ret
             ],
-            12,
+            28,
             true,
         ),
     };

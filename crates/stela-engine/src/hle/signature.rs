@@ -6,7 +6,10 @@
 //! A branch's field is masked only when its target lies outside the
 //! function: a branch inside keeps its offset, which the function's bytes
 //! decide. So masking depends on the function's length, and so does the
-//! prefix hash. ADR, ADRP and literal loads are always masked.
+//! prefix hash. ADR, ADRP and literal loads are always masked. A masked
+//! word hashes with a flag that says so: an outside branch masks to the
+//! word of a branch to itself (`b .`), which a function may hold, and the
+//! digest keeps the two apart.
 //!
 //! The phase-1 eligibility of a function ([`eligible`]) admits only
 //! self-contained leaves the native routines can replace whole, and
@@ -43,6 +46,9 @@ pub enum Ineligible {
     Length,
     /// The exit is the entry, not a word of the function, or not `ret`.
     Exit,
+    /// Its last word is neither `ret` nor a branch inside it (a `b`), so
+    /// it could run on past its end into bytes it does not hold.
+    FallsThrough,
     /// A PC-relative word: a branch out of the function, ADR, ADRP or a
     /// literal load.
     Masked { offset: u32 },
@@ -56,8 +62,14 @@ pub enum Ineligible {
     System { offset: u32 },
     /// SVC, HVC, SMC, BRK, HLT or DCPS.
     Exception { offset: u32 },
-    /// A load or store exclusive, a load-acquire or store-release, or an
-    /// LSE atomic.
+    /// A word of the reserved space (bits 31:25 clear): UDF, an Apple AMX
+    /// coprocessor word or another Apple word there, which the original
+    /// traps on or hands a coprocessor and no native routine runs.
+    Reserved { offset: u32 },
+    /// A load or store exclusive, a load-acquire or store-release (LDAR,
+    /// STLR, LDAPR, and the RCpc forms with an offset or writeback such as
+    /// LDAPUR and STLUR), an LSE or LSE128 atomic, or an MTE tag access of
+    /// the RCpc forms' class: an ordering or tag effect a plain copy lacks.
     Exclusive { offset: u32 },
     /// PAC*, AUT*, XPAC*, PACGA or LDRAA/LDRAB.
     Pointer { offset: u32 },
@@ -194,10 +206,12 @@ pub fn mask_word(word: u32, offset: u32, length: u32) -> u32 {
 
 /// Whether the function `bytes`, exiting through the `ret` at `exit`, is a
 /// self-contained leaf a phase-1 native routine can replace: it calls
-/// nothing, leaves only through that `ret` or another, reads nothing
+/// nothing, leaves only through that `ret` or another, ends in a `ret` or
+/// a branch back inside so it never runs past its last word, reads nothing
 /// PC-relative, signs or authenticates no pointer and makes no system,
-/// exception, exclusive or atomic access. The first word that refuses it
-/// names the refusal, its classes checked in this order.
+/// exception, reserved, exclusive, ordered or atomic access. The first
+/// word that refuses it names the refusal, its classes checked in this
+/// order, and then its last word.
 pub fn eligible(bytes: &[u8], exit: u16) -> Result<(), Ineligible> {
     if !bytes.len().is_multiple_of(4) || !LENGTHS.contains(&bytes.len()) {
         return Err(Ineligible::Length);
@@ -208,8 +222,14 @@ pub fn eligible(bytes: &[u8], exit: u16) -> Result<(), Ineligible> {
     if exit == 0 || !ret {
         return Err(Ineligible::Exit);
     }
+    let mut last = RET;
     for (offset, word) in words(bytes) {
         refusal(word, offset, length)?;
+        last = word;
+    }
+    // Every `b` is inside by now: one out of the function was masked.
+    if last != RET && last & 0xfc00_0000 != 0x1400_0000 {
+        return Err(Ineligible::FallsThrough);
     }
     Ok(())
 }
@@ -235,7 +255,16 @@ fn refusal(word: u32, offset: u32, length: u32) -> Result<(), Ineligible> {
     if system && !admitted {
         return Err(Ineligible::System { offset });
     }
-    if word & 0x3f00_0000 == 0x0800_0000 || word & 0x3b20_0c00 == 0x3820_0000 {
+    // UDF and the Apple words beside it: AMX (`0x00201000 | op << 5 | Rt`),
+    // GXF's and the SPTM's maintenance words.
+    if word & 0xfe00_0000 == 0 {
+        return Err(Ineligible::Reserved { offset });
+    }
+    let ordered = word & 0x3f00_0000 == 0x0800_0000 // exclusives, LDAR, STLR, CAS
+        || word & 0x3b20_0c00 == 0x3820_0000 // LSE atomics, LDAPR
+        || word & 0x3f00_0000 == 0x1900_0000 // LDAPUR, STLUR, RCpc3, LSE128, MTE tags
+        || word & 0x3f20_0c00 == 0x1d00_0800; // LDAPUR, STLUR (SIMD&FP)
+    if ordered {
         return Err(Ineligible::Exclusive { offset });
     }
     let pointer = word & 0xffff_0000 == 0xdac1_0000 // PAC*, AUT*, XPAC*
@@ -261,12 +290,16 @@ pub fn prefix_hash(head: &[u8; PREFIX_BYTES], length: u32) -> u64 {
 }
 
 /// The SHA-256 of `function`'s masked words, little-endian, each masked as
-/// a word of a function of its length.
+/// a word of a function of its length and followed by a byte that is 1
+/// when the word has a masked field: an outside branch masks to the word of
+/// a branch to itself, which the flag tells apart.
 fn digest(function: &[u8]) -> [u8; 32] {
     let length = function.len() as u32;
     let mut hasher = Sha256::new();
     for (offset, word) in words(function) {
-        hasher.update(mask_word(word, offset, length).to_le_bytes());
+        let field = pc_relative(word, offset, length);
+        hasher.update((word & !field).to_le_bytes());
+        hasher.update([u8::from(field != 0)]);
     }
     hasher.finalize().into()
 }

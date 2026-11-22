@@ -30,7 +30,7 @@ fn bytes(words: &[u32]) -> Vec<u8> {
 }
 
 /// A self-contained 64-word leaf: `add`s, an inside `b.ne` and `cbz`, its
-/// `ret` at word 60 and NOP padding.
+/// `ret` at word 60, NOP padding and a last `ret`.
 fn leaf_words() -> Vec<u32> {
     let mut words = vec![NOP; 64];
     for (index, word) in words.iter_mut().enumerate().take(60) {
@@ -39,6 +39,7 @@ fn leaf_words() -> Vec<u32> {
     words[10] = b_ne(5);
     words[20] = cbz_x3(30);
     words[60] = RET;
+    words[63] = RET;
     words
 }
 
@@ -125,6 +126,52 @@ fn an_outside_branch_is_masked_and_an_inside_one_is_not() {
 }
 
 #[test]
+fn an_outside_branch_never_matches_a_branch_to_itself() {
+    // `b .` is inside and keeps its zero offset; `b` out of the function
+    // masks to the same word, which the digest's flag tells apart.
+    let itself = replaced(b(0));
+    let signature = Signature::of(Id::Memmove, &itself, EXIT).unwrap();
+    for outside in [b(100), b(-100), b(64 - SLOT as i32)] {
+        let candidate = replaced(outside);
+        assert_eq!(
+            masked_stream(&candidate),
+            masked_stream(&itself),
+            "{outside:#010x}"
+        );
+        assert!(!signature.matches(&candidate), "{outside:#010x}");
+    }
+    // An outside B.cond, CBZ or TBZ masks to its own branch to itself too.
+    for (inside, outside) in [
+        (b_ne(0), b_ne(0x1000)),
+        (cbz_x3(0), cbz_x3(-0x1000)),
+        (0x3600_0002, 0x3600_0002 | (0x1000 << 5)), // tbz w2,#0
+    ] {
+        let signature = Signature::of(Id::Memmove, &replaced(inside), EXIT).unwrap();
+        assert!(signature.matches(&replaced(inside)), "{inside:#010x}");
+        assert!(!signature.matches(&replaced(outside)), "{outside:#010x}");
+    }
+}
+
+#[test]
+fn a_function_ends_in_ret_or_a_branch_back_inside() {
+    let mut words = leaf_words();
+    for (last, verdict) in [
+        (RET, Ok(())),
+        (b(-3), Ok(())),
+        (NOP, Err(Ineligible::FallsThrough)),
+        (add(1, 1), Err(Ineligible::FallsThrough)),
+        // A conditional branch falls through when it is not taken.
+        (b_ne(-3), Err(Ineligible::FallsThrough)),
+        (cbz_x3(-3), Err(Ineligible::FallsThrough)),
+        // Out of the function: masked before its place is looked at.
+        (b(1), Err(Ineligible::Masked { offset: 252 })),
+    ] {
+        words[63] = last;
+        assert_eq!(eligible(&bytes(&words), EXIT), verdict, "{last:#010x}");
+    }
+}
+
+#[test]
 fn every_pc_relative_form_is_masked() {
     // B/BL, B.cond and BC.cond, CBZ/CBNZ (W and X) and TBZ/TBNZ, all to
     // outside the function; ADR, ADRP and the literal loads whatever their
@@ -205,6 +252,16 @@ fn eligibility_names_each_refused_class() {
         (0xd51b_d040, Ineligible::System { offset }), // msr tpidr_el0, x0
         (0xc85f_7c20, Ineligible::Exclusive { offset }), // ldxr x0,[x1]
         (0xf820_8020, Ineligible::Exclusive { offset }), // swp x0,x0,[x1]
+        (0xc8df_fc20, Ineligible::Exclusive { offset }), // ldar x0,[x1]
+        (0xb8bf_c020, Ineligible::Exclusive { offset }), // ldapr w0,[x1]
+        (0x9940_0020, Ineligible::Exclusive { offset }), // ldapur w0,[x1]
+        (0xd900_0020, Ineligible::Exclusive { offset }), // stlur x0,[x1]
+        (0x1d00_0820, Ineligible::Exclusive { offset }), // stlur b0,[x1]
+        (0xd920_0820, Ineligible::Exclusive { offset }), // stg x0,[x1]
+        (0x0000_0000, Ineligible::Reserved { offset }), // udf #0
+        (0x0020_1000, Ineligible::Reserved { offset }), // AMX ldx x0
+        (0x0020_1143, Ineligible::Reserved { offset }), // AMX fma64 x3
+        (0x0020_1420, Ineligible::Reserved { offset }), // GXF genter
         (0xd503_237f, Ineligible::System { offset }), // pacibsp
         (0xdac1_0020, Ineligible::Pointer { offset }), // pacia x0, x1
         (0xf820_0420, Ineligible::Pointer { offset }), // ldraa x0,[x1]
