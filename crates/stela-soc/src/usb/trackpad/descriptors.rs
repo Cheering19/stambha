@@ -209,8 +209,8 @@ const A1: [u8; 7] = [0xa1, 0x00, 0x00, 0x05, 0x00, 0xfc, 0x01];
 const SEVEN_F: [u8; 5] = [0x7f, 0x00, 0x00, 0x00, 0x00];
 
 /// The answer to GET_REPORT feature `id` on the multitouch interface, for
-/// a surface mapped by `map`: VoodooInput's bytes, with the 0xD9 surface
-/// ours.
+/// a surface mapped by `map`: VoodooInput's bytes, with the pad's width and
+/// height in 0xD9 ([`Mapping::d9`]).
 pub fn feature(id: u8, map: &Mapping) -> Option<Vec<u8>> {
     Some(match id {
         0x00 => vec![0x00, 0x01],

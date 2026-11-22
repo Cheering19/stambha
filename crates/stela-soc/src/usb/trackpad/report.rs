@@ -86,6 +86,25 @@ fn rdiv(n: i64, d: i64) -> i64 {
     if n < 0 { -q } else { q }
 }
 
+/// The least and greatest X and Y feature 0xD9 states after the surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum D9Range {
+    /// VoodooInput's bytes verbatim: X -7356 to 7869 (about twice
+    /// hid-magicmouse.c's `TRACKPAD2_MIN_X`/`MAX_X`), Y -174 to 9956. Intel
+    /// macOS takes them, though they are not the range the reports carry.
+    VoodooInput,
+    /// The range the reports carry: the host surface's corners.
+    Emitted,
+}
+
+/// The range feature 0xD9 sends: VoodooInput's, the one Intel macOS is
+/// known to take, for the first boot. One edit makes it
+/// [`D9Range::Emitted`].
+pub const D9_RANGE: D9Range = D9Range::VoodooInput;
+
+/// VoodooInput's 0xD9 range bytes (`VoodooInputSimulatorDevice.cpp`).
+const VOODOO_INPUT_D9_RANGE: [u8; 8] = [0x44, 0xe3, 0x52, 0xff, 0xbd, 0x1e, 0xe4, 0x26];
+
 /// Where a host surface's positions land on the MT2's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mapping {
@@ -117,19 +136,29 @@ impl Mapping {
         )
     }
 
-    /// Feature report 0xD9, the sensor surface: its width and height in
-    /// 0.01 mm (u32), then the least and greatest X and Y the reports carry
-    /// (i16, Y upward), all little-endian.
+    /// Feature report 0xD9, the sensor surface, with [`D9_RANGE`].
     pub fn d9(&self) -> [u8; 17] {
+        self.d9_with(D9_RANGE)
+    }
+
+    /// Feature report 0xD9: the surface's width and height in 0.01 mm
+    /// (u32), then the least and greatest X and Y (i16, Y upward) of
+    /// `range`, all little-endian.
+    pub fn d9_with(&self, range: D9Range) -> [u8; 17] {
         let hundredths = |um: u32| um.saturating_add(5) / 10;
-        let (min_x, max_y) = self.to_mt2(0, 0);
-        let (max_x, min_y) = self.to_mt2(self.surface.width_um, self.surface.height_um);
         let mut report = [0u8; 17];
         report[0] = 0xd9;
         report[1..5].copy_from_slice(&hundredths(self.surface.width_um).to_le_bytes());
         report[5..9].copy_from_slice(&hundredths(self.surface.height_um).to_le_bytes());
-        for (at, value) in [(9, min_x), (11, min_y), (13, max_x), (15, max_y)] {
-            report[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        match range {
+            D9Range::VoodooInput => report[9..].copy_from_slice(&VOODOO_INPUT_D9_RANGE),
+            D9Range::Emitted => {
+                let (min_x, max_y) = self.to_mt2(0, 0);
+                let (max_x, min_y) = self.to_mt2(self.surface.width_um, self.surface.height_um);
+                for (at, value) in [(9, min_x), (11, min_y), (13, max_x), (15, max_y)] {
+                    report[at..at + 2].copy_from_slice(&value.to_le_bytes());
+                }
+            }
         }
         report
     }

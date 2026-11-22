@@ -299,11 +299,21 @@ fn corners_centre_and_aspect() {
 
 #[test]
 fn d9_is_surface_and_range() {
-    let mut expected = hex("d9 92 31 00 00 08 20 00 00");
+    let map = Mapping::mt2(ELAN);
+    // Sent: the pad's surface, then VoodooInput's range bytes verbatim
+    // (-7356, -174, 7869, 9956), which Intel macOS takes.
+    assert_eq!(D9_RANGE, D9Range::VoodooInput);
+    assert_eq!(
+        map.d9().to_vec(),
+        hex("d9 92 31 00 00 08 20 00 00 44 e3 52 ff bd 1e e4 26")
+    );
+    assert_eq!(map.d9(), map.d9_with(D9Range::VoodooInput));
+    // The variant one constant away: the range the reports carry.
+    let mut emitted = hex("d9 92 31 00 00 08 20 00 00");
     for value in [-2891i16, -1861, 3147, 1753] {
-        expected.extend(value.to_le_bytes());
+        emitted.extend(value.to_le_bytes());
     }
-    assert_eq!(Mapping::mt2(ELAN).d9().to_vec(), expected);
+    assert_eq!(map.d9_with(D9Range::Emitted).to_vec(), emitted);
 }
 
 #[test]
