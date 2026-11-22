@@ -20,7 +20,7 @@ fn finger() -> Vec<u8> {
     ]
 }
 
-fn descriptor() -> Vec<u8> {
+pub(crate) fn descriptor() -> Vec<u8> {
     let mut d = vec![0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01];
     d.extend(finger());
     d.extend(finger());
@@ -44,9 +44,9 @@ fn descriptor() -> Vec<u8> {
 }
 
 /// One finger slot: (confidence, tip, id, x, y).
-type Slot = (bool, bool, u8, u16, u16);
+pub(crate) type Slot = (bool, bool, u8, u16, u16);
 
-fn report(slots: [Slot; 2], scan: u16, count: u8, button: bool) -> Vec<u8> {
+pub(crate) fn report(slots: [Slot; 2], scan: u16, count: u8, button: bool) -> Vec<u8> {
     let mut r = vec![0x01];
     for (confidence, tip, id, x, y) in slots {
         r.push(u8::from(confidence) | u8::from(tip) << 1);
@@ -60,15 +60,15 @@ fn report(slots: [Slot; 2], scan: u16, count: u8, button: bool) -> Vec<u8> {
     r
 }
 
-const EMPTY: Slot = (false, false, 0, 0, 0);
+pub(crate) const EMPTY: Slot = (false, false, 0, 0, 0);
 
-struct Pad {
+pub(crate) struct Pad {
     translator: Translator,
-    ptp: Ptp,
+    pub(crate) ptp: Ptp,
 }
 
 impl Pad {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let translator = Translator::describe(&descriptor()).unwrap();
         let profile = Profile::select(translator.descriptor().unwrap()).unwrap();
         Self {
@@ -77,7 +77,7 @@ impl Pad {
         }
     }
 
-    fn feed(&mut self, bytes: &[u8], now_us: u64) -> Vec<Input> {
+    pub(crate) fn feed(&mut self, bytes: &[u8], now_us: u64) -> Vec<Input> {
         let mut events = Vec::new();
         let mut inputs = Vec::new();
         let Translated::Data(frame) = self.translator.translate(bytes, &mut events, &mut inputs)

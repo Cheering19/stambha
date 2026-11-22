@@ -467,6 +467,7 @@ impl Peripheral {
                 let report = self.mouse_report(0, 0, 0, detents).to_vec();
                 self.queue(MOUSE, report);
             }
+            Input::Touch(_) => return Err(refuse!("the native mouse has no touch surface")),
         }
         Ok(())
     }

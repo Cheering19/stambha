@@ -63,6 +63,18 @@ fn enumerate(p: &mut Peripheral) {
 }
 
 #[test]
+fn peripheral_refuses_touch() {
+    let mut p = Peripheral::new();
+    enumerate(&mut p);
+    let frame = stela_drivers::input::multitouch::Frame::lifted(0);
+    assert!(p.input(Input::Touch(frame)).is_err());
+    // Nothing queued on any interface.
+    for endpoint in [KEYBOARD_ENDPOINT, POINTER_ENDPOINT, MOUSE_ENDPOINT] {
+        assert_eq!(p.ready_at(endpoint), None);
+    }
+}
+
+#[test]
 fn descriptors_describe_a_composite_keyboard_and_pointer() {
     let mut p = Peripheral::new();
     let config = control(&mut p, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 9), &[]).unwrap();

@@ -17,6 +17,9 @@ struct Held {
     /// ([`Input::MouseButtons`]), as the device last reported them.
     buttons: u8,
     mouse_buttons: u8,
+    /// While the last touch frame ([`Input::Touch`]) held a contact or a
+    /// button: its time.
+    touch: Option<u64>,
 }
 
 impl Held {
@@ -36,6 +39,7 @@ impl Held {
             }
             Input::Buttons(buttons) => self.buttons = buttons,
             Input::MouseButtons(buttons) => self.mouse_buttons = buttons,
+            Input::Touch(frame) => self.touch = frame.holds().then_some(frame.time_us),
             _ => {}
         }
     }
@@ -58,6 +62,11 @@ impl Held {
         }
         if self.mouse_buttons != 0 {
             out.push(Input::MouseButtons(0));
+        }
+        // A touchpad's frames are its own surface: nothing to join with
+        // another device's.
+        if let Some(time_us) = self.touch {
+            out.push(Input::Touch(super::multitouch::Frame::lifted(time_us)));
         }
     }
 }

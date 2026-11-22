@@ -109,6 +109,41 @@ impl Lid {
     }
 }
 
+/// Cables an emulated Magic Trackpad 2 fed by the host's precision
+/// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
+/// startup choice of its own, that setup never writes (so the options
+/// revision stays 13).
+pub const TRACKPAD: &str = "--trackpad";
+
+/// The trackpad `--trackpad` cables: a Magic Trackpad 2 (05AC:0265), or
+/// the same device under the internal trackpad ID VoodooInput presents on
+/// macOS 12 and later (05AC:0281).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestTrackpad {
+    Mt2,
+    Builtin,
+}
+
+impl GuestTrackpad {
+    const NAMES: [(&'static str, Self); 2] = [("mt2", Self::Mt2), ("builtin", Self::Builtin)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, kind)| *kind)
+            .ok_or(Error::Trackpad)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, kind)| *kind == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// A `--audio-check` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCheck {
@@ -329,6 +364,10 @@ pub struct System {
     /// Cable the native USB keyboard and pointer to the last USB-C
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
+    /// Cable an emulated Magic Trackpad 2 beside the native keyboard and
+    /// pointer, fed whole frames by the host's precision touchpads, which
+    /// then no longer move the native mouse ([`TRACKPAD`], with `--input`).
+    pub trackpad: Option<GuestTrackpad>,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -484,6 +523,7 @@ impl Default for System {
             survey: false,
             idle_skip: false,
             input: false,
+            trackpad: None,
             native_cores: None,
             guest_pes: None,
             code_window: None,
@@ -651,6 +691,13 @@ impl System {
     /// What the host does with its lid: `--lid`, else nothing.
     pub fn lid(&self) -> Lid {
         self.lid.unwrap_or_default()
+    }
+
+    /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
+    /// cables, so none without host input. The hub's disk-port count and
+    /// the cabling both read this, so they agree.
+    pub fn guest_trackpad(&self) -> Option<GuestTrackpad> {
+        self.trackpad.filter(|_| self.input)
     }
 
     /// This boot starts the macOS the Preboot disk holds, which needs a GPU;
@@ -943,6 +990,7 @@ impl fmt::Display for System {
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
+        line.value(TRACKPAD, self.trackpad.map(GuestTrackpad::name))?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

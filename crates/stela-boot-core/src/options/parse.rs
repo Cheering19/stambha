@@ -187,6 +187,12 @@ impl ParseState<'_> {
                 options.timer_delay = Some(micros);
             }
             "--input" => options.input = true,
+            TRACKPAD => {
+                let kind = GuestTrackpad::parse(value().ok_or(Error::Trackpad)?)?;
+                if options.trackpad.replace(kind).is_some() {
+                    return Err(Error::DuplicateTrackpad);
+                }
+            }
             "--usb-storage" => {
                 let serial = value().ok_or(Error::MissingUsbStorage)?;
                 if options.usb_storage.iter().any(|other| other == serial) {

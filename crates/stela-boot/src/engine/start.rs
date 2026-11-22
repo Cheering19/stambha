@@ -994,7 +994,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         acpi: host_acpi,
         devices:
             HostDevices {
-                host_input,
+                mut host_input,
                 host_usb,
                 host_bluetooth,
                 host_network,
@@ -1142,6 +1142,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
+            // As the disk-port count below reads it: only with host input.
+            guest_trackpad: options
+                .guest_trackpad()
+                .and_then(|kind| Some(host_input.as_mut()?.trackpad(kind))),
         },
         board.as_ref(),
         &core_locks,
@@ -1691,6 +1695,7 @@ struct Placement<'a> {
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
+    guest_trackpad: Option<stela_soc::usb::trackpad::Config>,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -1830,6 +1835,7 @@ fn place_devices(
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
                 system_control: options.lid_sleep,
+                trackpad: placement.guest_trackpad,
             },
             scanout,
             firmware: &firmware,
@@ -3220,8 +3226,12 @@ fn start_devices(
             let owned_wifi = wifi_network(handoff, options);
             let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
-                stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
-                    .saturating_sub(owned_usb.len())
+                stela_soc::machine::UsbCables::disk_ports(
+                    options.guest_network,
+                    options.input,
+                    options.guest_trackpad().is_some(),
+                )
+                .saturating_sub(owned_usb.len())
             });
             let root = handoff.root;
             let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;

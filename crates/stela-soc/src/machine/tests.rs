@@ -4361,6 +4361,7 @@ fn a_gate_store_is_served_in_its_own_pes_step() {
 mod data_integration;
 mod passive;
 mod pc_sampler;
+mod trackpad;
 
 /// Host nanoseconds per modelled NOR SPI register access through a board
 /// shared between PEs, the PIO loop's STATUS read, STATUS write and FIFO

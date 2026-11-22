@@ -120,6 +120,24 @@ impl InputDevice {
         }
     }
 
+    /// Set frames mode on an I²C-HID precision touchpad: whole contact
+    /// frames ([`Input::Touch`]) in place of mouse motion. Whether the
+    /// device is one; every other device is left as it is.
+    pub fn set_touch_frames(&mut self, on: bool) -> bool {
+        match self {
+            Self::I2cHid(device) => device.set_touch_frames(on),
+            _ => false,
+        }
+    }
+
+    /// The surface an I²C-HID precision touchpad's frames span.
+    pub fn touch_surface(&self) -> Option<super::multitouch::Surface> {
+        match self {
+            Self::I2cHid(device) => device.touch_surface(),
+            _ => None,
+        }
+    }
+
     /// Show `leds` on the device's keyboard LEDs: bit 0 Num Lock, bit 1
     /// Caps Lock, bit 2 Scroll Lock, then the other input LED codes. A
     /// device without LEDs ignores it.
