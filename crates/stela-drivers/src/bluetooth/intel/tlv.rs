@@ -23,7 +23,7 @@ const LIMITED_CCE: u8 = 0x2e;
 const SBE: u8 = 0x2f;
 const OTP_ADDRESS: u8 = 0x30;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TlvIdentity {
     pub transport: TransportIdentity,
     pub cnvi_top: u32,
@@ -41,6 +41,37 @@ pub struct TlvIdentity {
     pub address: Option<[u8; 6]>,
     pub firmware_id: Option<String>,
     fields: Vec<(u8, Vec<u8>)>,
+}
+/// An identity prints its OTP address as its vendor half and last byte and
+/// each TLV as its type and length: the address is the controller's own,
+/// and a failure line (`Error::RejectedBoot`, `Error::Stages`) reaches the
+/// boot log (`crate::bluetooth::redacted`).
+impl core::fmt::Debug for TlvIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::{Address, Bytes};
+        let fields: Vec<(u8, Bytes<'_>)> = self
+            .fields
+            .iter()
+            .map(|(kind, value)| (*kind, Bytes(value)))
+            .collect();
+        f.debug_struct("TlvIdentity")
+            .field("transport", &self.transport)
+            .field("cnvi_top", &self.cnvi_top)
+            .field("cnvr_top", &self.cnvr_top)
+            .field("cnvi_bt", &self.cnvi_bt)
+            .field("cnvr_bt", &self.cnvr_bt)
+            .field("device_revision", &self.device_revision)
+            .field("image_type", &self.image_type)
+            .field("build", &self.build)
+            .field("build_number", &self.build_number)
+            .field("secure_boot", &self.secure_boot)
+            .field("minimum_build", &self.minimum_build)
+            .field("secure_engine", &self.secure_engine)
+            .field("address", &self.address.as_ref().map(Address))
+            .field("firmware_id", &self.firmware_id)
+            .field("fields", &fields)
+            .finish()
+    }
 }
 impl TlvIdentity {
     // Legacy operational firmware may answer the FF query with TLVs but its

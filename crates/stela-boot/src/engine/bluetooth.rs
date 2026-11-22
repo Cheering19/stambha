@@ -80,7 +80,7 @@ impl HostController for Controller {
                 transport
                     .send(kind, bytes)
                     .map(|_| true)
-                    .map_err(|error| format!("{error:?}"))
+                    .map_err(|error| format!("{error}"))
             }
             (Controller::Modeled, _) => Ok(true),
             (Controller::Broadcom(transport), packet) => {
@@ -91,7 +91,7 @@ impl HostController for Controller {
                 match transport.send(kind, bytes) {
                     Ok(_) => Ok(true),
                     Err(bcm4377::Error::QueueFull(_)) => Ok(false),
-                    Err(error) => Err(format!("{error:?}")),
+                    Err(error) => Err(format!("{error}")),
                 }
             }
         }
@@ -113,7 +113,7 @@ impl HostController for Controller {
                         })
                         .collect()
                 })
-                .map_err(|error| format!("{error:?}")),
+                .map_err(|error| format!("{error}")),
             Controller::Broadcom(transport) => transport
                 .poll()
                 .map(|observations| {
@@ -126,7 +126,7 @@ impl HostController for Controller {
                         })
                         .collect()
                 })
-                .map_err(|error| format!("{error:?}")),
+                .map_err(|error| format!("{error}")),
         }
     }
 }

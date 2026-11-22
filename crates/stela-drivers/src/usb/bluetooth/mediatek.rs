@@ -159,7 +159,11 @@ impl From<super::Error> for Error {
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "MediaTek Bluetooth initialization {self:?}")
+        write!(
+            f,
+            "MediaTek Bluetooth initialization {}",
+            crate::bluetooth::redacted::Lists(self)
+        )
     }
 }
 impl core::error::Error for Error {}

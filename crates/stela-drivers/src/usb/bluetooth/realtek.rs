@@ -98,7 +98,6 @@ pub struct OwnedReport {
     pub v2: Option<V2Metadata>,
     pub download: Vec<DownloadResponse>,
 }
-#[derive(Debug)]
 pub enum Error {
     Unsupported(&'static str),
     Protocol {
@@ -141,9 +140,53 @@ impl From<super::Error> for Error {
         Self::Transport(e)
     }
 }
+/// The failure line prints no byte of a malformed or refused response, which
+/// can be a version or address read: its length alone
+/// (`crate::bluetooth::redacted`).
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Realtek Bluetooth initialization {self:?}")
+        let error = crate::bluetooth::redacted::Lists(self);
+        write!(f, "Realtek Bluetooth initialization {error}")
+    }
+}
+impl core::fmt::Debug for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::Bytes;
+        match self {
+            Self::Unsupported(what) => f.debug_tuple("Unsupported").field(what).finish(),
+            Self::Protocol {
+                requirement,
+                observed,
+            } => f
+                .debug_struct("Protocol")
+                .field("requirement", requirement)
+                .field("observed", &Bytes(observed))
+                .finish(),
+            Self::Format(error) => f.debug_tuple("Format").field(error).finish(),
+            Self::Resource(error) => f.debug_tuple("Resource").field(error).finish(),
+            Self::Controller {
+                opcode,
+                status,
+                parameters,
+            } => f
+                .debug_struct("Controller")
+                .field("opcode", opcode)
+                .field("status", status)
+                .field("parameters", &Bytes(parameters))
+                .finish(),
+            Self::Timeout(what) => f.debug_tuple("Timeout").field(what).finish(),
+            Self::Transport(error) => f.debug_tuple("Transport").field(error).finish(),
+            Self::Attempt { cause, observation } => f
+                .debug_struct("Attempt")
+                .field("cause", cause)
+                .field("observation", observation)
+                .finish(),
+            Self::Cleanup { cause, cleanup } => f
+                .debug_struct("Cleanup")
+                .field("cause", cause)
+                .field("cleanup", cleanup)
+                .finish(),
+        }
     }
 }
 impl core::error::Error for Error {}

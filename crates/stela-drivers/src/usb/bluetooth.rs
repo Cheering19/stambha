@@ -187,9 +187,12 @@ pub struct Error {
     /// Preserved separately when stopping the failed transport also failed.
     pub cleanup: Option<BlockError>,
 }
+/// The failure line prints no byte a controller sent: a controller dump's
+/// packet shows its length alone (`crate::bluetooth::redacted`).
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "USB Bluetooth {:?}", self.kind)?;
+        let kind = crate::bluetooth::redacted::Lists(&self.kind);
+        write!(f, "USB Bluetooth {kind}")?;
         if let Some(cleanup) = &self.cleanup {
             write!(f, "; cancellation failed: {cleanup}")?;
         }
@@ -204,13 +207,28 @@ fn error(kind: ErrorKind) -> Error {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Packet {
     Event(Vec<u8>),
     Acl(Vec<u8>),
     /// Original vendor diagnostic frame, including its original ACL header.
     /// This must never be delivered as ordinary Bluetooth ACL data.
     Diagnostic(Vec<u8>),
+}
+
+/// A packet prints its kind and length, never its bytes: a diagnostic frame
+/// is controller RAM, an event can name a neighbour.
+impl fmt::Debug for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, bytes) = match self {
+            Self::Event(bytes) => ("Event", bytes),
+            Self::Acl(bytes) => ("Acl", bytes),
+            Self::Diagnostic(bytes) => ("Diagnostic", bytes),
+        };
+        f.debug_tuple(kind)
+            .field(&crate::bluetooth::redacted::Bytes(bytes))
+            .finish()
+    }
 }
 
 /// Raw legacy HCI transport over a validated USB binding.

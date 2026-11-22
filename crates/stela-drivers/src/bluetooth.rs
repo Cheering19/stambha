@@ -4,3 +4,4 @@ pub mod bcm4377;
 pub(crate) mod hci;
 pub mod intel;
 pub mod intel_pcie;
+pub(crate) mod redacted;

@@ -12,7 +12,7 @@ pub enum Kind {
     Event = 4,
     Iso = 5,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Packet {
     pub kind: Kind,
     pub bytes: Vec<u8>,
@@ -20,6 +20,20 @@ pub struct Packet {
     pub receive_header: [u8; 8],
     pub completion: u32,
     pub diagnostic: bool,
+}
+/// A packet prints its framing and lengths, never its bytes.
+impl core::fmt::Debug for Packet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::Bytes;
+        f.debug_struct("Packet")
+            .field("kind", &self.kind)
+            .field("bytes", &Bytes(&self.bytes))
+            .field("padding", &Bytes(&self.padding))
+            .field("receive_header", &self.receive_header)
+            .field("completion", &self.completion)
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
 }
 pub(super) fn length(kind: Kind, bytes: &[u8]) -> Result<usize> {
     let (header, data) = match kind {

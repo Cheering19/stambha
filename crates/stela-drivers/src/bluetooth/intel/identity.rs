@@ -157,12 +157,26 @@ impl Identity {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BootParameters {
     pub device_revision: u16,
     pub minimum_build: [u8; 3],
     pub address: [u8; 6],
     raw: [u8; 23],
+}
+/// The parameters print the controller's address as its vendor half and
+/// last byte, and the raw read, which holds it, as its length
+/// (`crate::bluetooth::redacted`).
+impl core::fmt::Debug for BootParameters {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::{Address, Bytes};
+        f.debug_struct("BootParameters")
+            .field("device_revision", &self.device_revision)
+            .field("minimum_build", &self.minimum_build)
+            .field("address", &Address(&self.address))
+            .field("raw", &Bytes(&self.raw))
+            .finish()
+    }
 }
 impl BootParameters {
     #[expect(
@@ -244,5 +258,22 @@ mod tests {
         let mut unknown = device;
         unknown.descriptor[10] = 0xff;
         assert!(Identity::usb(&unknown).is_err());
+    }
+
+    /// The boot parameters hold the controller's own address: printed, it
+    /// keeps its vendor half and last byte, and the raw read its length.
+    #[test]
+    fn boot_parameters_print_no_address_middle_or_raw_byte() {
+        let mut bytes = [0; 23];
+        bytes[6] = 1;
+        // 32:31:30:b8:a7:10, a synthetic address, in HCI order.
+        bytes[12..18].copy_from_slice(&[0x10, 0xa7, 0xb8, 0x30, 0x31, 0x32]);
+        let boot = BootParameters::parse(&bytes).unwrap();
+        let text = format!("{boot:?}");
+        assert!(text.contains("address: 32:31:30:..:..:10"), "{text}");
+        assert!(text.contains("raw: <23 bytes>"), "{text}");
+        for secret in ["167", "184", "a7", "b8"] {
+            assert!(!text.contains(secret), "{text}");
+        }
     }
 }

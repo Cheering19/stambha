@@ -28,7 +28,7 @@ pub enum End {
 }
 
 /// A collected controller memory dump with the devcoredump header facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Coredump {
     /// btmtk_coredump_hdr's "Controller Name": the chip's device ID.
     pub device_id: u32,
@@ -37,6 +37,20 @@ pub struct Coredump {
     pub data: Vec<u8>,
     pub frames: usize,
     pub end: End,
+}
+
+/// A dump prints its header facts and length, never the controller's
+/// memory, which can hold link keys (`crate::bluetooth::redacted`).
+impl core::fmt::Debug for Coredump {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Coredump")
+            .field("device_id", &self.device_id)
+            .field("firmware_version", &self.firmware_version)
+            .field("data", &crate::bluetooth::redacted::Bytes(&self.data))
+            .field("frames", &self.frames)
+            .field("end", &self.end)
+            .finish()
+    }
 }
 
 struct Active {
