@@ -58,7 +58,9 @@ pub const DNS: &str = "--dns";
 pub const MAX_DNS_SERVERS: usize = 3;
 
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
-/// touchpads (`--trackpad mt2|builtin`).
+/// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
+/// startup choice of its own, that setup never writes (so the options
+/// revision stays 13).
 pub const TRACKPAD: &str = "--trackpad";
 
 /// The trackpad `--trackpad` cables: a Magic Trackpad 2 (05AC:0265), or

@@ -44,9 +44,10 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// `--dns SERVERS` set the mount network's addresses by hand. Revision 12:
 /// `--usb4-approve UUID` admits a USB4 device's PCIe tunnel without an IOMMU.
 /// Revision 13: `--tss` is gone; every `--install` signs with Apple's
-/// signing service. Revision 14: `--trackpad mt2|builtin` cables an
-/// emulated Magic Trackpad 2 fed by the host precision touchpad.
-pub const OPTIONS_REVISION: u32 = 14;
+/// signing service. The fork's `--trackpad mt2|builtin`, which cables an
+/// emulated Magic Trackpad 2, is a hand-written opt-in setup never writes:
+/// no line setup writes changes meaning, so it keeps revision 13.
+pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.
 pub const CHOICES_FILE: &str = "\\EFI\\stela\\choices.cfg";
@@ -391,6 +392,14 @@ impl Choices {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn options_revision_stays_13_beside_the_hand_written_trackpad_option() {
+        // The fork's `--trackpad` is a hand-written opt-in setup never
+        // writes, so a revision-13 setup and this stela.efi still accept
+        // each other's interface.
+        assert_eq!(OPTIONS_REVISION, 13);
+    }
 
     #[test]
     fn the_chosen_disk_stands_in_for_every_word_that_names_it() {
