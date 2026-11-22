@@ -22,11 +22,26 @@ pub const TRACE_LINE: &str = "BLUETOOTH TRACE the guest's Bluetooth packets are 
      until it has been checked\n";
 
 /// Why a boot that asks to lend the host's controller (`--bluetooth-lend`)
-/// gives the guest the model instead, as its log line; `None` when nothing
-/// stops it. Under `--idle-skip` the guest's clock leaps over waits to the
-/// next deadline, and the bridge's wait for the controller's answer is one
-/// in guest time, so every forwarded command would fall back at once.
-pub fn lend_refusal(idle_skip: bool) -> Option<&'static str> {
+/// does not, as its log line; `None` when nothing stops it, so the flag is
+/// never ignored without a word. A boot without `--input` gives the guest
+/// no Bluetooth controller at all; a host with no controller that started
+/// has none to lend; and under `--idle-skip` the guest's clock leaps over
+/// waits to the next deadline, and the bridge's wait for the controller's
+/// answer is one in guest time, so every forwarded command would fall back
+/// at once.
+pub fn lend_refusal(input: bool, host_controller: bool, idle_skip: bool) -> Option<&'static str> {
+    if !input {
+        return Some(
+            "BLUETOOTH LEND not lent: the boot has no --input, so the guest has no Bluetooth \
+             controller\n",
+        );
+    }
+    if !host_controller {
+        return Some(
+            "BLUETOOTH LEND not lent: no host Bluetooth controller started, so the model \
+             answers alone\n",
+        );
+    }
     idle_skip.then_some(
         "BLUETOOTH LEND not lent: --idle-skip leaps the guest's clock over the bridge's wait \
          for the controller's answers, so the model answers alone\n",
@@ -73,16 +88,39 @@ mod tests {
     }
 
     /// Under `--idle-skip` the guest's clock leaps to the next deadline, the
-    /// bridge's 1 s wait for the controller among them, so a lent
-    /// controller would fall back at once: it is not lent, and the log says
-    /// why.
+    /// bridge's wait for the controller among them, so a lent controller
+    /// would fall back at once: it is not lent, and the log says why.
     #[test]
     fn idle_skip_keeps_the_controller_from_being_lent_and_says_why() {
-        assert_eq!(lend_refusal(false), None);
-        let line = lend_refusal(true).expect("refused");
+        assert_eq!(lend_refusal(true, true, false), None);
+        let line = lend_refusal(true, true, true).expect("refused");
         assert!(line.starts_with("BLUETOOTH LEND not lent: --idle-skip "));
         assert!(line.contains("model"));
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+    }
+
+    /// `--bluetooth-lend` is never dropped without a word: a boot without
+    /// host input, or a host with no controller that started, says why
+    /// nothing is lent, before `--idle-skip` is weighed.
+    #[test]
+    fn a_lend_with_no_input_or_no_controller_says_why_it_is_not_lent() {
+        for idle_skip in [false, true] {
+            let line = lend_refusal(false, true, idle_skip).expect("refused");
+            assert!(line.starts_with("BLUETOOTH LEND not lent: the boot has no --input"));
+            assert_eq!(lend_refusal(false, false, idle_skip), Some(line));
+            let line = lend_refusal(true, false, idle_skip).expect("refused");
+            assert!(line.starts_with("BLUETOOTH LEND not lent: no host Bluetooth controller"));
+            assert!(line.contains("model"));
+        }
+        for input in [false, true] {
+            for host_controller in [false, true] {
+                for idle_skip in [false, true] {
+                    let line = lend_refusal(input, host_controller, idle_skip);
+                    assert_eq!(line.is_none(), input && host_controller && !idle_skip);
+                    assert!(line.is_none_or(|l| l.ends_with('\n') && l.matches('\n').count() == 1));
+                }
+            }
+        }
     }
 
     /// `--bluetooth-trace` says once what its lines hide and that the log
