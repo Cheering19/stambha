@@ -185,6 +185,49 @@ fn an_attached_relay_drains_the_smcs_requests_every_2_s() {
 }
 
 #[test]
+fn the_attach_line_says_where_the_battery_comes_from_and_what_follows_it() {
+    use alloc::{format, string::ToString};
+    let snapshot = PowerSnapshot::synthetic(80, TestState::Charging);
+    let line = |source| {
+        Attached {
+            snapshot: &snapshot,
+            source,
+        }
+        .to_string()
+    };
+    let start = format!("{snapshot} warning=480 mAh low=144 mAh (the SMC's battery from ");
+    assert_eq!(
+        line(Source::Test),
+        format!("{start}--test-battery: one pack, this reading for the whole boot)")
+    );
+    let host = "the host's ACPI battery: one pack for the whole boot, which keeps its last \
+                reading if the battery is removed; ";
+    assert_eq!(
+        line(Source::Host { follows: true }),
+        format!("{start}{host}read again every 30 s and at each notification)")
+    );
+    assert_eq!(
+        line(Source::Host { follows: false }),
+        format!("{start}{host}ACPI hardware mode is off, so no reading follows this one)")
+    );
+}
+
+#[test]
+fn a_change_line_with_no_battery_says_the_smc_keeps_the_last_reading() {
+    use alloc::string::ToString;
+    let gone = PowerSnapshot {
+        ac_online: Some(true),
+        battery: None,
+    };
+    assert_eq!(
+        Change(&gone).to_string(),
+        "battery none ac=1 (the SMC keeps its last reading and its one pack)"
+    );
+    let reading = reading(70);
+    assert_eq!(Change(&reading).to_string(), reading.to_string());
+}
+
+#[test]
 fn the_reading_at_attach_counts_as_the_guests() {
     let relay = Relay::new();
     assert_eq!(relay.take(), None);

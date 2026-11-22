@@ -10,6 +10,7 @@
 use super::power_snapshot::PowerSnapshot;
 use core::{
     cell::UnsafeCell,
+    fmt,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
@@ -316,6 +317,67 @@ impl Relay {
 impl Default for Relay {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Where the guest's battery comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The host's ACPI battery; `follows` when ACPI hardware mode runs, so
+    /// later readings follow.
+    Host { follows: bool },
+    /// `--test-battery`.
+    Test,
+}
+
+/// The line that attaches the battery: the reading, its thresholds, and
+/// what the SMC does with it for the rest of the boot.
+pub struct Attached<'a> {
+    pub snapshot: &'a PowerSnapshot,
+    pub source: Source,
+}
+
+impl fmt::Display for Attached<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.snapshot)?;
+        if let Some(battery) = &self.snapshot.battery {
+            write!(f, " {}", battery.thresholds())?;
+        }
+        f.write_str(" (the SMC's battery from ")?;
+        match self.source {
+            Source::Test => {
+                f.write_str("--test-battery: one pack, this reading for the whole boot)")
+            }
+            Source::Host { follows } => {
+                f.write_str(
+                    "the host's ACPI battery: one pack for the whole boot, which keeps its last \
+                     reading if the battery is removed; ",
+                )?;
+                if follows {
+                    write!(
+                        f,
+                        "read again every {} s and at each notification)",
+                        REFRESH_MILLIS / 1000
+                    )
+                } else {
+                    f.write_str("ACPI hardware mode is off, so no reading follows this one)")
+                }
+            }
+        }
+    }
+}
+
+/// A later reading's line: one with no battery says the SMC keeps showing
+/// the last one it had.
+pub struct Change<'a>(pub &'a PowerSnapshot);
+
+impl fmt::Display for Change<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        if self.0.battery.is_none() {
+            f.write_str(" (the SMC keeps its last reading and its one pack)")?;
+        }
+        Ok(())
     }
 }
 

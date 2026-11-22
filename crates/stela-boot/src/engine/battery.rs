@@ -17,7 +17,7 @@ use super::{aml::HostAcpi, host, output, parallel};
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use stela_boot_core::options::Battery;
 use stela_drivers::platform::{
-    power_relay::{self, Mode, Relay},
+    power_relay::{self, Attached, Change, Mode, Relay, Source},
     power_snapshot::{BatteryState, PowerSnapshot, Readings},
 };
 
@@ -87,7 +87,7 @@ pub(super) fn attach(
         Some(Battery::Test { percent, state }) => {
             let snapshot = PowerSnapshot::synthetic(percent, state);
             match devices.with(|devices| devices.add_battery(&snapshot)) {
-                Ok(()) => attached(&snapshot, "--test-battery"),
+                Ok(()) => attached(&snapshot, Source::Test),
                 Err(error) => output::arguments(format_args!(
                     "POWER battery refused: {error}; the SMC answers as the Mac mini's\n"
                 )),
@@ -129,7 +129,10 @@ fn missing(reading: Option<&PowerSnapshot>) -> Option<&'static str> {
 fn attach_host(devices: &parallel::Board, reading: &PowerSnapshot) {
     match devices.with(|devices| devices.add_battery(reading)) {
         Ok(()) => {
-            attached(reading, "the host's ACPI battery");
+            // SAFETY: the AML host is leaked for the whole program.
+            let follows = unsafe { ACPI.load(Ordering::Acquire).as_ref() }
+                .is_some_and(HostAcpi::hardware_active);
+            attached(reading, Source::Host { follows });
             RELAY.attached();
         }
         Err(error) => {
@@ -141,13 +144,8 @@ fn attach_host(devices: &parallel::Board, reading: &PowerSnapshot) {
     }
 }
 
-fn attached(snapshot: &PowerSnapshot, source: &str) {
-    if let Some(battery) = &snapshot.battery {
-        output::arguments(format_args!(
-            "POWER {snapshot} {} (the SMC's battery, one pack, from {source})\n",
-            battery.thresholds()
-        ));
-    }
+fn attached(snapshot: &PowerSnapshot, source: Source) {
+    output::arguments(format_args!("POWER {}\n", Attached { snapshot, source }));
     RELAY.changed(snapshot);
 }
 
@@ -217,6 +215,6 @@ pub(super) fn serve(devices: &parallel::Board) {
     if let Some(reading) = turn.reading
         && RELAY.changed(&reading)
     {
-        output::arguments(format_args!("POWER {reading}\n"));
+        output::arguments(format_args!("POWER {}\n", Change(&reading)));
     }
 }
