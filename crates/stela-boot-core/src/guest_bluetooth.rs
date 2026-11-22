@@ -21,6 +21,18 @@ pub const TRACE_LINE: &str = "BLUETOOTH TRACE the guest's Bluetooth packets are 
      the log still names nearby devices' classes and signal strengths, so keep it private \
      until it has been checked\n";
 
+/// Why a boot that asks to lend the host's controller (`--bluetooth-lend`)
+/// gives the guest the model instead, as its log line; `None` when nothing
+/// stops it. Under `--idle-skip` the guest's clock leaps over waits to the
+/// next deadline, and the bridge's wait for the controller's answer is one
+/// in guest time, so every forwarded command would fall back at once.
+pub fn lend_refusal(idle_skip: bool) -> Option<&'static str> {
+    idle_skip.then_some(
+        "BLUETOOTH LEND not lent: --idle-skip leaps the guest's clock over the bridge's wait \
+         for the controller's answers, so the model answers alone\n",
+    )
+}
+
 /// The line for a boot that lends the host's controller at `location` to
 /// the guest behind Apple's module.
 pub fn lend_line(location: &str) -> String {
@@ -58,6 +70,19 @@ mod tests {
             assert!(line.contains("finds no devices and has none paired"));
             assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
         }
+    }
+
+    /// Under `--idle-skip` the guest's clock leaps to the next deadline, the
+    /// bridge's 1 s wait for the controller among them, so a lent
+    /// controller would fall back at once: it is not lent, and the log says
+    /// why.
+    #[test]
+    fn idle_skip_keeps_the_controller_from_being_lent_and_says_why() {
+        assert_eq!(lend_refusal(false), None);
+        let line = lend_refusal(true).expect("refused");
+        assert!(line.starts_with("BLUETOOTH LEND not lent: --idle-skip "));
+        assert!(line.contains("model"));
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
     }
 
     /// `--bluetooth-trace` says once what its lines hide and that the log

@@ -247,11 +247,20 @@ impl HostBluetooth {
     /// function would carry the host's vendor commands and replies, which
     /// BlueTool's chip boot and bluetoothd's bring-up do not take. With
     /// `--bluetooth-lend` it is lent behind the module, which answers those
-    /// itself and falls back to the model on any failure. One not kept is
-    /// released in the loader's root by its drop.
+    /// itself and falls back to the model on any failure, unless the boot
+    /// leaps the guest's clock (`--idle-skip`). One not kept is released in
+    /// the loader's root by its drop.
     pub fn guest(controller: Option<Self>, options: &System, root: u64) -> Option<Self> {
+        let refused = options
+            .bluetooth_lend
+            .then(|| stela_boot_core::guest_bluetooth::lend_refusal(options.idle_skip))
+            .flatten();
+        if let Some(line) = refused {
+            output::arguments(format_args!("{line}"));
+        }
+        let lend = options.input && options.bluetooth_lend && refused.is_none();
         let mut guest = match controller {
-            Some(mut lent) if options.input && options.bluetooth_lend => {
+            Some(mut lent) if lend => {
                 let line = stela_boot_core::guest_bluetooth::lend_line(&lent.location);
                 output::arguments(format_args!("{line}"));
                 lent.lent = true;
