@@ -389,6 +389,7 @@ impl KmsScanout {
                 }
                 let watched = display.watch();
                 report_watched(name, display, watched);
+                crate::engine::lid::shown_externally(!panels_only(display));
                 report_listings(name, display);
                 if let Some(error) = watched.error
                     && !core::mem::replace(&mut self.reported, true)

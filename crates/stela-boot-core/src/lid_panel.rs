@@ -48,6 +48,28 @@ impl LidRequest {
     }
 }
 
+/// What a move of the lid's request asks of the guest (`--lid-sleep`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestRequest {
+    /// A HID System Sleep.
+    Sleep,
+    /// The power button's wake, where the guest sleeps.
+    Wake,
+}
+
+/// What the lid's request moving to `dark` asks of the guest, an external
+/// monitor showing its display where `external`: to sleep when the panel
+/// goes dark, unless an external monitor shows the guest, as a Mac closed
+/// on an external display keeps running (clamshell mode); to wake when the
+/// panel lights again.
+pub fn guest_request(dark: bool, external: bool) -> Option<GuestRequest> {
+    match (dark, external) {
+        (true, true) => None,
+        (true, false) => Some(GuestRequest::Sleep),
+        (false, _) => Some(GuestRequest::Wake),
+    }
+}
+
 /// What a lid request does to the guest's display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LidPower {
@@ -199,6 +221,16 @@ mod tests {
         assert!(panel.lit());
         assert_eq!(panel.lid(false, false), None);
         assert!(panel.lit());
+    }
+
+    #[test]
+    fn a_dark_panel_asks_the_guest_to_sleep_unless_an_external_monitor_shows_it() {
+        assert_eq!(guest_request(true, false), Some(GuestRequest::Sleep));
+        // Clamshell: a Mac closed on an external display keeps running.
+        assert_eq!(guest_request(true, true), None);
+        for external in [false, true] {
+            assert_eq!(guest_request(false, external), Some(GuestRequest::Wake));
+        }
     }
 
     #[test]

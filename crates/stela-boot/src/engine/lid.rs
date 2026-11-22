@@ -4,8 +4,9 @@
 //! follows (`gpu::display`); with `--lid-sleep` each move also asks the
 //! guest to sleep or to wake ([`take_request`]). With `--lid ignore`, the
 //! default, nothing here moves.
+use crate::output;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use stela_boot_core::lid_panel::LidRequest;
+use stela_boot_core::lid_panel::{GuestRequest, LidRequest, guest_request};
 
 /// `--lid method`.
 static METHOD: AtomicBool = AtomicBool::new(false);
@@ -13,6 +14,8 @@ static METHOD: AtomicBool = AtomicBool::new(false);
 static SLEEP: AtomicBool = AtomicBool::new(false);
 /// The lid asks the built-in panel dark.
 static DARK: AtomicBool = AtomicBool::new(false);
+/// An external monitor shows the guest's display (`gpu::display`).
+static EXTERNAL: AtomicBool = AtomicBool::new(false);
 /// The guest's request a move left for the next service turn.
 static REQUEST: AtomicU8 = AtomicU8::new(NONE);
 const NONE: u8 = 0;
@@ -20,12 +23,13 @@ const SLEEP_REQUEST: u8 = 1;
 const WAKE_REQUEST: u8 = 2;
 
 /// What a move of the lid's request asks of the guest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::engine) enum Request {
-    /// The panel went dark: a HID System Sleep.
-    Sleep,
-    /// The panel lit again: the power button's wake, where the guest sleeps.
-    Wake,
+pub(in crate::engine) type Request = GuestRequest;
+
+/// Whether an external monitor shows the guest's display, as the scanout
+/// last found: a darkening lid then asks the guest nothing.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(in crate::engine) fn shown_externally(external: bool) {
+    EXTERNAL.store(external, Ordering::Release);
 }
 
 /// Follow the lid (`--lid method`), and with it the guest's sleep
@@ -68,8 +72,13 @@ fn step(change: impl Fn(&mut LidRequest) -> Option<bool>) -> Option<bool> {
     if let Some(dark) = changed
         && SLEEP.load(Ordering::Acquire)
     {
-        let request = if dark { SLEEP_REQUEST } else { WAKE_REQUEST };
-        REQUEST.store(request, Ordering::Release);
+        match guest_request(dark, EXTERNAL.load(Ordering::Acquire)) {
+            Some(GuestRequest::Sleep) => REQUEST.store(SLEEP_REQUEST, Ordering::Release),
+            Some(GuestRequest::Wake) => REQUEST.store(WAKE_REQUEST, Ordering::Release),
+            None => output::arguments(format_args!(
+                "POWER lid: an external monitor shows macOS, so it is not asked to sleep\n"
+            )),
+        }
     }
     changed
 }
