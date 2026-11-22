@@ -3516,6 +3516,7 @@ mod tests {
     /// passphrase is hashed.
     fn test_network(country: Option<[u8; 2]>) -> crate::net::wifi::network::Network {
         crate::net::wifi::network::Network {
+            alternates: Default::default(),
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(&[b'0'; 64]).unwrap(),
             country,

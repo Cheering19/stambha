@@ -35,6 +35,7 @@ impl Entropy for NoEntropy {
 /// The plan's test network, in `country`.
 fn network(country: Option<[u8; 2]>) -> Network {
     Network {
+        alternates: Default::default(),
         ssid: b"test".to_vec(),
         secret: Secret::Psk(Zeroizing::new([0; 32])),
         country,

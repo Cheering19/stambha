@@ -61,6 +61,8 @@ pub enum Error {
     DuplicateWifi,
     MissingWifiKey,
     DuplicateWifiKey,
+    MissingWifiPrefer,
+    DuplicateWifiPrefer,
     WifiCountry,
     DuplicateWifiCountry,
     Trackpad,
@@ -198,6 +200,8 @@ impl Error {
             Self::DuplicateWifi => "duplicate --wifi",
             Self::MissingWifiKey => "--wifi-key needs an ESP path",
             Self::DuplicateWifiKey => "duplicate --wifi-key",
+            Self::MissingWifiPrefer => "--wifi-prefer needs a network name",
+            Self::DuplicateWifiPrefer => "duplicate --wifi-prefer",
             Self::WifiCountry => "--wifi-country needs a two-letter country",
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
             Self::Trackpad => "--trackpad takes mt2 or builtin",
@@ -262,7 +266,9 @@ impl Constraint {
                 "--restore-study requires --bundle, --storage, --restore-source, --restore-manifest and --restore-identity; refuses --preboot/--survey"
             }
             Self::UnexpectedRestoreInputs => "restore inputs require explicit --restore-study",
-            Self::WifiDependency => "--wifi-key and --wifi-country configure a --wifi network",
+            Self::WifiDependency => {
+                "--wifi-key, --wifi-country and --wifi-prefer configure a --wifi network"
+            }
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",
             Self::InstallSourceDependency => {
                 "--install-source names the partition of an --install medium"

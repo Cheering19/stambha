@@ -374,6 +374,7 @@ const LOCAL: Mac = Mac([2, 0x11, 0x22, 0x33, 0x44, 0x55]);
 
 fn kept<R: Radio>(radio: R) -> Keeper<R> {
     let network = Network {
+        alternates: Default::default(),
         ssid: b"test".to_vec(),
         secret: Secret::Psk(Zeroizing::new([0; 32])),
         country: None,
@@ -408,4 +409,52 @@ fn other_keepers_keep_the_wired_carrier_wait() {
 fn into_radio_returns_the_radio() {
     let radio = kept(Tuned { mac: LOCAL }).into_radio();
     assert_eq!(radio.mac, LOCAL);
+}
+
+/// The preferred network wins over any alternate, however weak; among
+/// alternates, and among one network's BSSes, the stronger signal wins.
+#[test]
+fn the_preferred_network_outranks_alternates_and_signal_ranks_the_rest() {
+    use super::outranks;
+    assert!(outranks((0, -85), (2, -40)));
+    assert!(!outranks((2, -40), (0, -85)));
+    assert!(outranks((1, -50), (2, -60)));
+    assert!(outranks((2, -50), (1, -60)));
+    assert!(outranks((0, -50), (0, -60)));
+    assert!(!outranks((1, -60), (1, -60)));
+}
+
+/// A keeper starts on the preferred network and keeps each alternate once,
+/// one that repeats the preferred network's name left out.
+#[test]
+fn a_keeper_keeps_the_preferred_network_first_and_each_alternate_once() {
+    let network = Network {
+        ssid: b"home".to_vec(),
+        secret: Secret::Psk(Zeroizing::new([1; 32])),
+        country: Some(*b"IN"),
+        alternates: vec![
+            crate::wifi::network::Alternate {
+                ssid: b"phone".to_vec(),
+                secret: Secret::Psk(Zeroizing::new([2; 32])),
+            },
+            crate::wifi::network::Alternate {
+                ssid: b"home".to_vec(),
+                secret: Secret::Psk(Zeroizing::new([3; 32])),
+            },
+        ],
+    };
+    let clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    let keeper = Keeper::keep(Tuned { mac: LOCAL }, network, Arc::new(NoEntropy), clock);
+    let names: Vec<&[u8]> = keeper
+        .candidates
+        .iter()
+        .map(|(network, _)| &network.ssid[..])
+        .collect();
+    assert_eq!(names, [&b"home"[..], &b"phone"[..]]);
+    assert_eq!(*keeper.candidates[1].1, [2; 32]);
+    assert_eq!(keeper.candidates[1].0.country, Some(*b"IN"));
+    assert_eq!(keeper.network.ssid, b"home");
+    assert!(keeper.network.alternates.is_empty());
 }

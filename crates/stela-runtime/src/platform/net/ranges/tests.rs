@@ -279,6 +279,24 @@ fn reads_past_the_end_are_refused() {
     read(&mut reader, LEN - 10, 10).unwrap();
 }
 
+/// The waits between a range's attempts double from a second to at most
+/// 30 s, and all of them together outlast a router's or Wi-Fi extender's
+/// restart (two or three minutes), where seven attempts gave up after about
+/// a minute and ended an install at 97 %.
+#[test]
+fn a_ranges_retries_outlast_a_router_restart() {
+    assert_eq!(backoff_ms(1), 1000);
+    assert_eq!(backoff_ms(2), 2000);
+    assert_eq!(backoff_ms(5), 16_000);
+    assert_eq!(backoff_ms(6), BACKOFF_CAP_MS);
+    assert_eq!(backoff_ms(ATTEMPTS), BACKOFF_CAP_MS);
+    assert_eq!(backoff_ms(u32::MAX), BACKOFF_CAP_MS);
+    // A wait follows each failure but the last, which fails the read.
+    let total: u64 = (1..ATTEMPTS).map(backoff_ms).sum();
+    assert!(total >= 5 * 60 * 1000, "{total} ms");
+    assert!(total <= 10 * 60 * 1000, "{total} ms");
+}
+
 /// An unbounded read waits out the backoff after a failed range through
 /// the transport, which serves the network meanwhile (the other stream's
 /// connection, the link's own traffic), where it spun without a look at
@@ -319,10 +337,11 @@ fn a_failed_range_says_what_it_got_and_a_failed_read_ahead_is_noted() {
         .push_back(NetError::Timeout("TCP transfer"));
     read(&mut reader, 6000, 6000).unwrap();
     let source = reader.source();
-    let line =
-        "REMOTE IMAGE range at 8192 failed (1/7): timed out: TCP transfer; got=8192 next=8192\n";
+    let line = alloc::format!(
+        "REMOTE IMAGE range at 8192 failed (1/{ATTEMPTS}): timed out: TCP transfer; got=8192 next=8192\n"
+    );
     assert!(
-        source.notes.iter().any(|note| note == line),
+        source.notes.iter().any(|note| *note == line),
         "{:?}",
         source.notes
     );

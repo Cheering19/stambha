@@ -76,6 +76,7 @@ fn the_station_scans_joins_and_opens_the_port_after_the_4_way_handshake() {
     .unwrap()
     .with_vector();
     let network = Network {
+        alternates: Default::default(),
         ssid: b"x".to_vec(),
         secret: Secret::parse(b"correct horse battery").unwrap(),
         country: None,
@@ -190,6 +191,7 @@ fn a_passphrase_network_offering_sae_authenticates_by_it_before_the_handshake() 
     .unwrap();
     let password = b"correct horse battery";
     let network = Network {
+        alternates: Default::default(),
         ssid: b"x".to_vec(),
         secret: Secret::parse(password).unwrap(),
         country: None,
@@ -302,6 +304,7 @@ fn a_protected_psk_association_opens_its_port_once_the_igtk_installs() {
     )
     .unwrap();
     let network = Network {
+        alternates: Default::default(),
         ssid: b"x".to_vec(),
         secret: Secret::parse(b"correct horse battery").unwrap(),
         country: None,
@@ -387,6 +390,7 @@ fn a_scan_listens_where_its_channels_bar_probes_and_finds_the_ap_there() {
     }));
     assert!(!link.probes(CHANNEL));
     let network = Network {
+        alternates: Default::default(),
         ssid: b"x".to_vec(),
         secret: Secret::parse(b"correct horse battery").unwrap(),
         country: None,
@@ -441,6 +445,7 @@ fn a_reported_six_ghz_ap_is_scanned_and_joined_by_sae_hash_to_element() {
     .unwrap();
     let password = b"correct horse battery";
     let network = Network {
+        alternates: Default::default(),
         ssid: b"x".to_vec(),
         secret: Secret::parse(password).unwrap(),
         country: None,

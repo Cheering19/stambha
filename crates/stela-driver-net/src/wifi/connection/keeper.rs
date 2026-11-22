@@ -278,6 +278,19 @@ fn failure_delay_us(failures: u32) -> u64 {
     seconds * 1_000_000
 }
 
+/// Whether a usable BSS of candidate `a` (its index among the keeper's
+/// candidates, the preferred network at 0, and its signal in dBm) beats one
+/// of candidate `b`: the preferred network beats every alternate, whatever
+/// the signals; otherwise, among BSSes of alternates or of one network, the
+/// stronger signal wins, the earlier BSS on a tie.
+pub(crate) fn outranks(a: (usize, i8), b: (usize, i8)) -> bool {
+    match (a.0 == 0, b.0 == 0) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => a.1 > b.1,
+    }
+}
+
 /// `cfg80211_6ghz_power_type_valid`: whether a client may use the 6 GHz
 /// `bss` under the flags its channel has among `channels`.
 fn power_type_usable(bss: &Bss, channels: &[(Channel, u32)]) -> bool {
@@ -453,8 +466,12 @@ const COUNTERMEASURES_US: u64 = 60_000_000;
 /// A radio kept connected to one network.
 pub struct Keeper<R: Radio> {
     link: R,
+    /// The network joined or being joined, one of `candidates`, and its PMK.
     network: Network,
     pmk: Zeroizing<[u8; 32]>,
+    /// The preferred network first, then each alternate, with its PMK
+    /// derived once: [`Keeper::choose`] picks among them at every scan.
+    candidates: Vec<(Network, Zeroizing<[u8; 32]>)>,
     entropy: Arc<dyn Entropy>,
     clock: Clock,
     state: State<R::Handle, R::Management>,
@@ -474,10 +491,36 @@ impl<R: Radio> Keeper<R> {
     /// SNonce.
     pub fn keep(link: R, network: Network, entropy: Arc<dyn Entropy>, clock: Clock) -> Self {
         let pmk = network.secret.pmk(&network.ssid);
+        let mut candidates = vec![(
+            Network {
+                alternates: Vec::new(),
+                ..network.clone()
+            },
+            pmk.clone(),
+        )];
+        for alternate in &network.alternates {
+            if candidates
+                .iter()
+                .any(|(saved, _)| saved.ssid == alternate.ssid)
+            {
+                continue;
+            }
+            candidates.push((
+                Network {
+                    ssid: alternate.ssid.clone(),
+                    secret: alternate.secret.clone(),
+                    country: network.country,
+                    alternates: Vec::new(),
+                },
+                alternate.secret.pmk(&alternate.ssid),
+            ));
+        }
+        let network = candidates[0].0.clone();
         Self {
             link,
             network,
             pmk,
+            candidates,
             entropy,
             clock,
             state: State::Waiting { at: 0 },
@@ -644,7 +687,14 @@ impl<R: Radio> Keeper<R> {
     fn scan(&mut self, now: u64) {
         let mut ssids = vec![Vec::new()];
         if self.directed {
-            ssids.push(self.network.ssid.clone());
+            // The wildcard and as many saved names as a scan carries,
+            // preferred first.
+            ssids.extend(
+                self.candidates
+                    .iter()
+                    .map(|(network, _)| network.ssid.clone())
+                    .take(crate::wifi::scan::MAX_SSIDS - 1),
+            );
         }
         let parts = [&[Band::Ghz2, Band::Ghz5][..], &[Band::Ghz6]]
             .into_iter()
@@ -717,47 +767,76 @@ impl<R: Radio> Keeper<R> {
         };
     }
 
-    /// Join the strongest BSS of the network whose security the station
-    /// supports, after an SAE exchange when that is the security. A 6 GHz
-    /// BSS whose power type its channel bars is not one cfg80211 connects to.
+    /// Join the strongest BSS whose security the station supports of the
+    /// preferred network, or, when no BSS of it is usable, of the saved
+    /// alternate with the strongest such BSS ([`outranks`]); after an SAE
+    /// exchange when that is the security. A 6 GHz BSS whose power type its
+    /// channel bars is not one cfg80211 connects to. A failure names the
+    /// preferred network only: an alternate is "saved network N".
     fn choose(&mut self, now: u64) {
-        let mut best: Option<(R::Handle, &Bss, Security)> = None;
-        let mut refusal = None;
-        let passphrase = matches!(self.network.secret, Secret::Passphrase(_));
+        // The candidate index, the BSS and its security.
+        let mut best: Option<(usize, R::Handle, &Bss, Security)> = None;
+        // The candidate index and why its BSS was refused, the preferred
+        // network's reason first.
+        let mut refusal: Option<(usize, String)> = None;
         let six = self.link.channels(Band::Ghz6);
         let observed = self.link.bss();
         for &(handle, bss) in &observed {
-            if bss.ssid.as_deref() != Some(&self.network.ssid[..]) {
+            let Some(index) = self
+                .candidates
+                .iter()
+                .position(|(network, _)| bss.ssid.as_deref() == Some(&network.ssid[..]))
+            else {
                 continue;
-            }
+            };
+            let refuse = |refusal: &mut Option<(usize, String)>, reason: String| {
+                if refusal.as_ref().is_none_or(|(at, _)| index < *at) {
+                    *refusal = Some((index, reason));
+                }
+            };
             if bss.channel.band == Band::Ghz6 && !power_type_usable(bss, &six) {
-                refusal = Some(format!(
-                    "is on 6 GHz channel {} only as an AP whose power type the channel bars",
-                    bss.channel.number
-                ));
+                refuse(
+                    &mut refusal,
+                    format!(
+                        "is on 6 GHz channel {} only as an AP whose power type the channel bars",
+                        bss.channel.number
+                    ),
+                );
                 continue;
             }
+            let passphrase = matches!(self.candidates[index].0.secret, Secret::Passphrase(_));
             match Security::select_on(bss.channel.band, &bss.elements, passphrase) {
                 Ok(security) => {
                     let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
-                    if best
-                        .as_ref()
-                        .is_none_or(|(_, b, _)| signal(bss) > signal(b))
-                    {
-                        best = Some((handle, bss, security));
+                    if best.as_ref().is_none_or(|&(at, _, b, _)| {
+                        outranks((index, signal(bss)), (at, signal(b)))
+                    }) {
+                        best = Some((index, handle, bss, security));
                     }
                 }
                 Err(reason) => {
-                    refusal = Some(format!("offers no supported security: {reason:?}"));
+                    refuse(
+                        &mut refusal,
+                        format!("offers no supported security: {reason:?}"),
+                    );
                 }
             }
         }
-        let ssid = String::from_utf8_lossy(&self.network.ssid).into_owned();
         self.directed = best.is_none() && refusal.is_none();
-        let Some((handle, bss, security)) = best else {
-            self.fail(match refusal {
-                Some(reason) => format!("{}: {ssid} {reason}", R::NAME),
-                None => format!("{}: {ssid} not found", R::NAME),
+        let Some((index, handle, bss, security)) = best else {
+            let preferred = String::from_utf8_lossy(&self.candidates[0].0.ssid).into_owned();
+            let others = self.candidates.len() - 1;
+            self.fail(match (refusal, others) {
+                (Some((0, reason)), _) => format!("{}: {preferred} {reason}", R::NAME),
+                (Some((at, reason)), _) => format!(
+                    "{}: {preferred} not found, and saved network {at} {reason}",
+                    R::NAME
+                ),
+                (None, 0) => format!("{}: {preferred} not found", R::NAME),
+                (None, others) => format!(
+                    "{}: {preferred} not found, nor any of the {others} other saved networks",
+                    R::NAME
+                ),
             });
             self.state = State::Waiting {
                 at: now + SCAN_INTERVAL_US,
@@ -766,6 +845,10 @@ impl<R: Radio> Keeper<R> {
         };
         let bss = bss.clone();
         drop(observed);
+        // The rest of the attempt (SAE, association, the handshake) is the
+        // chosen network's.
+        self.network = self.candidates[index].0.clone();
+        self.pmk = self.candidates[index].1.clone();
         let started = if security.akm == Akm::Sae {
             self.authenticate(handle, bss, security)
                 .map(State::Authenticating)

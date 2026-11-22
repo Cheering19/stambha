@@ -17,6 +17,10 @@ pub struct Network {
     /// An ISO 3166 alpha-2 country code in uppercase ASCII; none leaves the
     /// adapter firmware's default regulatory domain.
     pub country: Option<[u8; 2]>,
+    /// The other saved networks (`wifi.saved`), joined when this one, the
+    /// preferred network, is not in range: the strongest of them a scan
+    /// finds. Their names never appear in a failure the keeper reports.
+    pub alternates: Vec<Alternate>,
 }
 
 impl fmt::Debug for Network {
@@ -28,7 +32,51 @@ impl fmt::Debug for Network {
                 "country",
                 &self.country.map(|code| [code[0] as char, code[1] as char]),
             )
+            .field("alternates", &self.alternates.len())
             .finish()
+    }
+}
+
+/// A saved network other than the preferred one.
+#[derive(Clone)]
+pub struct Alternate {
+    /// One to [`SSID_BYTES`] bytes.
+    pub ssid: Vec<u8>,
+    pub secret: Secret,
+}
+
+impl fmt::Debug for Alternate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Alternate")
+            .field("ssid", &"..")
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+impl Network {
+    /// Make the saved alternate named `ssid` the preferred network, the one
+    /// preferred until now its first alternate; whether `ssid` names this
+    /// network or one of its alternates. A name neither carries changes
+    /// nothing.
+    pub fn prefer(&mut self, ssid: &[u8]) -> bool {
+        if self.ssid == ssid {
+            return true;
+        }
+        let Some(index) = self
+            .alternates
+            .iter()
+            .position(|alternate| alternate.ssid == ssid)
+        else {
+            return false;
+        };
+        let chosen = self.alternates.remove(index);
+        let previous = Alternate {
+            ssid: core::mem::replace(&mut self.ssid, chosen.ssid),
+            secret: core::mem::replace(&mut self.secret, chosen.secret),
+        };
+        self.alternates.insert(0, previous);
+        true
     }
 }
 
@@ -178,11 +226,54 @@ mod tests {
     #[test]
     fn debug_output_hides_the_secret() {
         let config = Network {
+            alternates: Default::default(),
             ssid: b"Home".to_vec(),
             secret: Secret::parse(b"hunter22").unwrap(),
             country: Some(*b"US"),
         };
         let shown = alloc::format!("{config:?}");
         assert!(shown.contains("Home") && !shown.contains("hunter22"));
+    }
+
+    fn psk(byte: u8) -> Secret {
+        Secret::Psk(Zeroizing::new([byte; 32]))
+    }
+
+    fn named(network: &Network) -> Vec<&[u8]> {
+        core::iter::once(&network.ssid[..])
+            .chain(
+                network
+                    .alternates
+                    .iter()
+                    .map(|alternate| &alternate.ssid[..]),
+            )
+            .collect()
+    }
+
+    /// The menu's choice becomes the preferred network, the one before it
+    /// the first alternate; a name no network carries changes nothing.
+    #[test]
+    fn preferring_a_saved_network_puts_it_first() {
+        let mut network = Network {
+            ssid: b"home".to_vec(),
+            secret: psk(1),
+            country: None,
+            alternates: alloc::vec![
+                Alternate {
+                    ssid: b"cafe".to_vec(),
+                    secret: psk(2),
+                },
+                Alternate {
+                    ssid: b"phone".to_vec(),
+                    secret: psk(3),
+                },
+            ],
+        };
+        assert!(network.prefer(b"phone"));
+        assert_eq!(named(&network), [&b"phone"[..], &b"home"[..], &b"cafe"[..]]);
+        assert!(matches!(&network.secret, Secret::Psk(key) if **key == [3; 32]));
+        assert!(network.prefer(b"phone"));
+        assert!(!network.prefer(b"elsewhere"));
+        assert_eq!(named(&network), [&b"phone"[..], &b"home"[..], &b"cafe"[..]]);
     }
 }

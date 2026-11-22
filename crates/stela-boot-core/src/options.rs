@@ -64,9 +64,15 @@ pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
+/// The saved network to prefer this boot over the `--wifi` one, as the
+/// startup menu's Wi-Fi page chose it (`choice::wifi`).
+pub const WIFI_PREFER: &str = "--wifi-prefer";
 pub const USB4_APPROVE: &str = "--usb4-approve";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
+/// The saved networks a boot with `--wifi` also joins when its network is
+/// not in range (`wifi_saved`); none when the file is absent.
+pub const WIFI_SAVED: &str = "\\EFI\\stela\\wifi.saved";
 /// IEEE 802.11 SSIDs are 1 to 32 octets.
 const SSID_BYTES: core::ops::RangeInclusive<usize> = 1..=32;
 pub const IPV4: &str = "--ipv4";
@@ -455,6 +461,10 @@ pub struct System {
     /// The ESP file holding the network's passphrase or PSK (`--wifi-key
     /// PATH`); `DEFAULT_WIFI_KEY` when `--wifi` is set without it.
     pub wifi_key: Option<String>,
+    /// The saved network (`WIFI_SAVED`) to join first this boot, before the
+    /// `--wifi` one (`--wifi-prefer SSID`, written as `--wifi` is): the
+    /// startup menu's choice. A name no network carries changes nothing.
+    pub wifi_prefer: Option<String>,
     /// The ISO 3166-1 alpha-2 regulatory country, uppercase
     /// (`--wifi-country XX`).
     pub wifi_country: Option<String>,
@@ -550,6 +560,7 @@ impl Default for System {
             guest_network: false,
             ssid: None,
             wifi_key: None,
+            wifi_prefer: None,
             wifi_country: None,
             ipv4: None,
             ipv4_gateway: None,
@@ -658,6 +669,11 @@ fn ssid(word: &str) -> Result<String, Error> {
         return Err(MALFORMED);
     }
     String::from_utf8(bytes).map_err(|_| MALFORMED)
+}
+
+/// `name` as one `--wifi` word, as the startup menu writes `--wifi-prefer`.
+pub fn wifi_word(name: &str) -> String {
+    alloc::format!("{}", Ssid(name))
 }
 
 /// An SSID as one `--wifi` word: `%`, whitespace and control characters as
@@ -986,6 +1002,7 @@ impl fmt::Display for System {
                 .filter(|&path| path != DEFAULT_WIFI_KEY),
         )?;
         line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
+        line.value(WIFI_PREFER, self.wifi_prefer.as_deref().map(Ssid))?;
         line.value(IPV4, self.ipv4)?;
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;

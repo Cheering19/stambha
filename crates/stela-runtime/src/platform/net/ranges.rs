@@ -40,8 +40,20 @@ pub const KEEP: usize = 8 << 20;
 /// socket's worth), so its ring rarely grows.
 pub const SLACK: usize = 8 << 20;
 /// Consecutive failures of one range's progress before a read fails; the
-/// waits between them double from a second, about a minute in all.
-pub const ATTEMPTS: u32 = 7;
+/// waits between them double from a second up to [`BACKOFF_CAP_MS`], about
+/// seven and a half minutes in all: a router or Wi-Fi extender that loses
+/// power and restarts takes two or three minutes, which a minute's budget
+/// turned into a failed install at 97 %.
+pub const ATTEMPTS: u32 = 20;
+/// The longest wait between two attempts at one range, so that a network
+/// that comes back is used again within half a minute.
+pub const BACKOFF_CAP_MS: u64 = 30_000;
+
+/// The wait before a range's next attempt after `failures` consecutive
+/// failures (at least one): a second, doubling, at most [`BACKOFF_CAP_MS`].
+fn backoff_ms(failures: u32) -> u64 {
+    (1000u64 << failures.saturating_sub(1).min(15)).min(BACKOFF_CAP_MS)
+}
 /// The longest one wait for an open range's next frame lasts.
 pub const WAIT_US: u64 = 100_000;
 /// The longest a bounded read waits for the network, and so holds the
@@ -324,7 +336,7 @@ impl<S: RangeSource> Ranges<S> {
             looked = true;
             let (failures, failed_at) = (self.streams[at].failures, self.streams[at].failed_at);
             if failures > 0 {
-                let backoff = 1000 << (failures - 1);
+                let backoff = backoff_ms(failures);
                 if self.source.millis().saturating_sub(failed_at) < backoff {
                     if self.bounded {
                         return Err(self.block("the range waits before it is asked again"));

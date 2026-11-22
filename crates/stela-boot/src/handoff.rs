@@ -120,6 +120,13 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// Exclusive firmware RAM below 4 GiB for 32-bit device DMA on a
+    /// passthrough domain (`native_memory::reserve_low_dma`).
+    pub(crate) low_dma: Region,
+    /// The saved networks file's bytes (`options::WIFI_SAVED`), read from the
+    /// ESP beside the key; empty without `--wifi` or the file. The engine
+    /// parses and wipes them, as it does the key's.
+    pub(crate) wifi_saved: Region,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,
