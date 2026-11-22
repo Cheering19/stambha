@@ -8,8 +8,8 @@
 //! bytes cut, which [`Captured::parse`] reads back. Packets carry no H4
 //! indicator: the USB transport has none (Bluetooth Core v5.4 Vol 4 Part
 //! B 2), so the kind names it. The capture holds at most
-//! [`CAPTURED_PACKETS`] packets per configuration, and none unless the owner
-//! asks for it.
+//! [`CAPTURED_PACKETS`] packets per configuration, of the boot's first
+//! [`CAPTURED_CONFIGURATIONS`], and none unless the owner asks for it.
 //!
 //! A packet is masked as it is captured ([`Captured::new`], `mask`), so no
 //! raw byte leaves the function: its headers and the parameters that say
@@ -185,6 +185,23 @@ pub fn read(text: &str) -> Result<Vec<Captured>, usize> {
         .collect()
 }
 
+/// Configurations captured in a boot. Each refills the budget of
+/// [`CAPTURED_PACKETS`]; a guest that configures the function again and
+/// again (a daemon restarting, a reset loop) would otherwise fill the boot
+/// log without end.
+pub const CAPTURED_CONFIGURATIONS: u8 = 4;
+
+/// Where the capture stopped, for the owner's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum End {
+    /// This configuration's packets were taken; the next configuration
+    /// starts again.
+    Configuration,
+    /// The boot's last configuration to be captured ended, or one came
+    /// after it.
+    Boot,
+}
+
 /// What the function captures, and what it holds until the owner takes it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Capture {
@@ -192,6 +209,10 @@ pub(super) struct Capture {
     enabled: bool,
     /// Packets still captured in this configuration.
     left: u16,
+    /// Configurations captured so far.
+    configurations: u8,
+    /// Whether the boot's capture is over and the log was told.
+    over: bool,
     held: Vec<Captured>,
 }
 
@@ -202,30 +223,58 @@ impl Capture {
         if !self.enabled {
             self.enabled = true;
             if configured {
-                self.left = CAPTURED_PACKETS;
+                self.start();
             }
         }
     }
 
-    /// The guest set the configuration to `value` (0: unconfigured).
-    pub(super) fn configured(&mut self, value: u8) {
-        self.left = if self.enabled && value != 0 {
-            CAPTURED_PACKETS
-        } else {
-            0
-        };
+    /// A configuration's budget, while the boot has one left.
+    fn start(&mut self) -> Option<End> {
+        if self.configurations < CAPTURED_CONFIGURATIONS {
+            self.configurations += 1;
+            self.left = CAPTURED_PACKETS;
+            return None;
+        }
+        self.left = 0;
+        self.over().then_some(End::Boot)
     }
 
-    /// Captures `packet`; true when it was this configuration's last.
-    pub(super) fn record(&mut self, direction: Direction, kind: Kind, packet: &[u8]) -> bool {
+    /// Whether the boot's capture is over just now, said once.
+    fn over(&mut self) -> bool {
+        !core::mem::replace(&mut self.over, true)
+    }
+
+    /// The guest set the configuration to `value` (0: unconfigured); `Some`
+    /// when the capture is over for the boot, once.
+    pub(super) fn configured(&mut self, value: u8) -> Option<End> {
+        if !self.enabled || value == 0 {
+            self.left = 0;
+            return None;
+        }
+        self.start()
+    }
+
+    /// Captures `packet`; `Some` when it was this configuration's last.
+    pub(super) fn record(
+        &mut self,
+        direction: Direction,
+        kind: Kind,
+        packet: &[u8],
+    ) -> Option<End> {
         if self.left == 0 {
-            return false;
+            return None;
         }
         self.left -= 1;
         if self.held.len() < usize::from(CAPTURED_PACKETS) {
             self.held.push(Captured::new(direction, kind, packet));
         }
-        self.left == 0
+        if self.left != 0 {
+            return None;
+        }
+        if self.configurations < CAPTURED_CONFIGURATIONS {
+            return Some(End::Configuration);
+        }
+        self.over().then_some(End::Boot)
     }
 
     pub(super) fn take(&mut self) -> Vec<Captured> {
@@ -507,18 +556,33 @@ mod tests {
     #[test]
     fn the_capture_holds_its_bound_per_configuration_and_only_once_asked() {
         let mut capture = Capture::default();
-        capture.configured(1);
-        assert!(!capture.record(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]));
+        assert_eq!(capture.configured(1), None);
+        assert_eq!(
+            capture.record(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]),
+            None
+        );
         assert!(capture.take().is_empty());
         capture.enable(true);
         for _ in 1..CAPTURED_PACKETS {
-            assert!(!capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]));
+            assert_eq!(
+                capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]),
+                None
+            );
         }
-        assert!(capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]));
-        assert!(!capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]));
+        assert_eq!(
+            capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]),
+            Some(End::Configuration)
+        );
+        assert_eq!(
+            capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]),
+            None
+        );
         assert_eq!(capture.take().len(), usize::from(CAPTURED_PACKETS));
-        capture.configured(0);
-        assert!(!capture.record(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]));
+        assert_eq!(capture.configured(0), None);
+        assert_eq!(
+            capture.record(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]),
+            None
+        );
         capture.configured(1);
         capture.record(Direction::FromGuest, Kind::Command, &[3, 0x0c, 0]);
         assert_eq!(
@@ -529,5 +593,48 @@ mod tests {
                 &[3, 0x0c, 0]
             )]
         );
+    }
+
+    /// A guest that configures the function again and again gets its first
+    /// [`CAPTURED_CONFIGURATIONS`] captured, then none: the budget refills
+    /// per configuration, but not without end, and the end is said once.
+    #[test]
+    fn the_capture_refills_for_a_bounded_number_of_configurations() {
+        let mut capture = Capture::default();
+        capture.enable(true);
+        let command = [3, 0x0c, 0];
+        for _ in 1..CAPTURED_CONFIGURATIONS {
+            capture.record(Direction::FromGuest, Kind::Command, &command);
+            assert_eq!(capture.configured(1), None);
+        }
+        // The last configuration captured: its budget's end is the boot's.
+        for _ in 1..CAPTURED_PACKETS {
+            capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]);
+        }
+        assert_eq!(
+            capture.record(Direction::ToGuest, Kind::Event, &[0x0e, 0]),
+            Some(End::Boot)
+        );
+        assert_eq!(capture.configured(1), None, "said once");
+        assert_eq!(
+            capture.record(Direction::FromGuest, Kind::Command, &command),
+            None
+        );
+        let held = capture.take();
+        assert_eq!(held.len(), usize::from(CAPTURED_PACKETS));
+        // Reconfigured before the last budget ran out: the next
+        // configuration says the end.
+        let mut capture = Capture::default();
+        capture.enable(true);
+        for _ in 1..CAPTURED_CONFIGURATIONS {
+            assert_eq!(capture.configured(1), None);
+        }
+        assert_eq!(capture.configured(1), Some(End::Boot));
+        assert_eq!(capture.configured(1), None);
+        assert_eq!(
+            capture.record(Direction::FromGuest, Kind::Command, &command),
+            None
+        );
+        assert!(capture.take().is_empty());
     }
 }

@@ -146,6 +146,10 @@ pub enum Traced {
     Ended,
     /// The capture (`capture`) took its packets for this configuration.
     CaptureEnded,
+    /// The capture took its packets of the boot's last configuration it
+    /// captures (`capture::CAPTURED_CONFIGURATIONS`), or another came after
+    /// it.
+    CaptureOver,
 }
 
 /// The event that answered a traced command.
@@ -252,6 +256,13 @@ impl core::fmt::Display for Traced {
                 f,
                 "capture ends after {} packets until the next configuration",
                 capture::CAPTURED_PACKETS
+            ),
+            Self::CaptureOver => write!(
+                f,
+                "capture ends for this boot: at most {} packets of each of its first {} \
+                 configurations",
+                capture::CAPTURED_PACKETS,
+                capture::CAPTURED_CONFIGURATIONS
             ),
         }
     }
@@ -691,8 +702,15 @@ impl State {
     }
 
     fn captured(&mut self, direction: capture::Direction, kind: capture::Kind, packet: &[u8]) {
-        if self.capture.record(direction, kind, packet) {
-            self.trace(Traced::CaptureEnded);
+        let end = self.capture.record(direction, kind, packet);
+        self.capture_ended(end);
+    }
+
+    fn capture_ended(&mut self, end: Option<capture::End>) {
+        match end {
+            Some(capture::End::Configuration) => self.trace(Traced::CaptureEnded),
+            Some(capture::End::Boot) => self.trace(Traced::CaptureOver),
+            None => {}
         }
     }
 
@@ -921,7 +939,8 @@ impl Requests for State {
         } else {
             (TRACED_COMMANDS, TRACED_BRING_UPS)
         };
-        self.capture.configured(value);
+        let end = self.capture.configured(value);
+        self.capture_ended(end);
         self.halted = [false; 3];
         self.sco_setting = 0;
         self.outbound.clear();
@@ -1593,6 +1612,26 @@ mod tests {
         let mut hci = configured(hci);
         command(&mut hci, &[0x09, 0x10, 0]).unwrap();
         assert_eq!(hci.take_captured().len(), 2, "still asked for");
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        // That was the third configuration captured; the fourth is the
+        // boot's last, and the fifth says so.
+        hci.take_trace();
+        for _ in 0..3 {
+            transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+        }
+        let traced = hci.take_trace();
+        assert_eq!(
+            traced.iter().filter(|&&t| t == Traced::CaptureOver).count(),
+            1,
+            "{traced:?}"
+        );
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert!(hci.take_captured().is_empty());
+        assert_eq!(
+            Traced::CaptureOver.to_string(),
+            "capture ends for this boot: at most 1024 packets of each of its first 4 \
+             configurations"
+        );
     }
 
     /// A packet longer than the capture shows keeps its first bytes and
