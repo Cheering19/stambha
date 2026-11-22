@@ -592,6 +592,13 @@ fn flag(set: &mut bool, duplicate: Error) -> Result<(), Error> {
 }
 
 impl System {
+    /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
+    /// cables, so none without host input. The hub's disk-port count and
+    /// the cabling both read this, so they agree.
+    pub fn guest_trackpad(&self) -> Option<GuestTrackpad> {
+        self.trackpad.filter(|_| self.input)
+    }
+
     /// This boot starts the macOS the Preboot disk holds, which needs a GPU;
     /// its recoveryOS and a staged update's installer show on the firmware's
     /// display, as a restore does.

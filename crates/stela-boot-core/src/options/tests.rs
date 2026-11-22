@@ -26,6 +26,28 @@ fn native_pci_ioapic_handoff_round_trips_and_refuses_diagnostic_paths() {
 use alloc::{format, string::ToString, vec};
 
 #[test]
+fn the_trackpad_is_cabled_only_beside_host_input() {
+    // The disk-port count and the cabling both read this: no port is kept
+    // for a trackpad there is no host input to cable.
+    let cabled = System {
+        input: true,
+        trackpad: Some(GuestTrackpad::Mt2),
+        ..System::default()
+    };
+    assert_eq!(cabled.guest_trackpad(), Some(GuestTrackpad::Mt2));
+    let no_input = System {
+        input: false,
+        ..cabled.clone()
+    };
+    assert_eq!(no_input.guest_trackpad(), None);
+    let no_flag = System {
+        trackpad: None,
+        ..cabled
+    };
+    assert_eq!(no_flag.guest_trackpad(), None);
+}
+
+#[test]
 fn options_round_trip_trackpad() {
     for (word, kind) in [
         ("mt2", GuestTrackpad::Mt2),

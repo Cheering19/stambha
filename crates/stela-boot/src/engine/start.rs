@@ -1125,9 +1125,9 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
-            // `--trackpad` needs `--input`, so the host input is there.
+            // As the disk-port count below reads it: only with host input.
             guest_trackpad: options
-                .trackpad
+                .guest_trackpad()
                 .and_then(|kind| Some(host_input.as_mut()?.trackpad(kind))),
         },
         board.as_ref(),
@@ -3205,7 +3205,7 @@ fn start_devices(
                 stela_soc::machine::UsbCables::disk_ports(
                     options.guest_network,
                     options.input,
-                    options.trackpad.is_some(),
+                    options.guest_trackpad().is_some(),
                 )
                 .saturating_sub(owned_usb.len())
             });
