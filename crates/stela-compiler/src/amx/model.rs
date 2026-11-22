@@ -138,7 +138,7 @@ pub const fn effective_address(operand: u64) -> u64 {
 /// align to an element; ordinary vector operands align to the full row.
 /// This is the pinned vecfp.c/vecint.c mask, including the OR when the index
 /// block exceeds one row; it is not a guessed stricter alignment rule.
-fn aligned_multiple_offset(
+pub(crate) fn aligned_multiple_offset(
     offset: u64,
     element_bytes: usize,
     z_step: u64,
@@ -169,7 +169,7 @@ fn load_pool(pool: &[Row; 8], offset: u64) -> Row {
 }
 
 /// `xy_shuffle`.
-fn shuffle(row: &mut Row, shuffle: u64, element_bytes: usize) {
+pub(crate) fn shuffle(row: &mut Row, shuffle: u64, element_bytes: usize) {
     if shuffle == 0 {
         return;
     }
@@ -234,7 +234,7 @@ pub(crate) fn write_mask(value: u64, group: u32, mask_bits: u32) -> u64 {
 
 /// `load_xy_reg_indexed`: expand packed `index_bits` lane indices from the
 /// start of `row` into `element_bits` lanes of `table`.
-fn load_indexed(row: &mut Row, table: &Row, index_bits: u32, element_bits: u32) {
+pub(crate) fn load_indexed(row: &mut Row, table: &Row, index_bits: u32, element_bits: u32) {
     let mut indices = [0u8; 48];
     indices[..40].copy_from_slice(&row[..40]);
     let element_bytes = (element_bits / 8) as usize;
