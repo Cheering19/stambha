@@ -490,7 +490,7 @@ fn native_moves_find_the_file_only_where_moves_run() {
 fn profiled_register_operations_count_by_form_and_path() {
     use super::forms::{self, AmxForms};
     use stela_compiler::amx::{AmxOperation, Generation};
-    const MATFP: u32 = 0x0020_12a0;
+    const VECINT: u32 = 0x0020_1240;
     let host = TargetCpu::detect();
     let mut machine = machine(&[]);
     machine.target = host;
@@ -505,12 +505,12 @@ fn profiled_register_operations_count_by_form_and_path() {
     machine.enter_amx_cell();
     assert_eq!(machine.cpu.amx.native.cell.routine, counting);
     let fused = forms::key(AmxOperation::Fma32, 0, Generation::M2).unwrap();
-    let matfp = forms::key(AmxOperation::MatrixFloat, 4 << 42, Generation::M2).unwrap();
-    // A matrix fma32 runs natively wherever the host has a tier; matfp on
+    let vecint = forms::key(AmxOperation::VectorInteger, 0, Generation::M2).unwrap();
+    // A matrix fma32 runs natively wherever the host has a tier; vecint on
     // the model.
     let fused_path = usize::from(Native::select(host) == Native::MODEL);
     let cell = &raw mut machine.cpu.amx.native.cell;
-    for (number, operand) in [(12, 0), (12, 0), (21, 4 << 42)] {
+    for (number, operand) in [(12, 0), (12, 0), (18, 0)] {
         // SAFETY: the cell names the PE's live register file, which nothing
         // else touches during the call.
         assert_eq!(unsafe { forms::routine(cell, number, operand) }, 1);
@@ -519,7 +519,10 @@ fn profiled_register_operations_count_by_form_and_path() {
     let mut expected = [[0; 2]; 2];
     expected[0][fused_path] = 2;
     expected[1][1] = 1;
-    assert_eq!([amx.forms.counts[fused], amx.forms.counts[matfp]], expected);
+    assert_eq!(
+        [amx.forms.counts[fused], amx.forms.counts[vecint]],
+        expected
+    );
     assert_eq!(amx.cell.kernels[12][fused_path], 2, "the compiler's count");
     assert_eq!(
         amx.forms.sampled[fused][fused_path][1], 1,
@@ -530,17 +533,17 @@ fn profiled_register_operations_count_by_form_and_path() {
     assert_eq!(counts.forms, amx.forms);
     machine.fold_amx_kernels();
     assert_eq!(machine.cpu.amx.native.forms, AmxForms::ZERO);
-    assert_eq!(machine.statistics.amx_forms.counts[matfp], [0, 1]);
+    assert_eq!(machine.statistics.amx_forms.counts[vecint], [0, 1]);
     assert_eq!(machine.amx_counts(), counts, "folding moves counts");
     // The service counts the register operations it completes.
-    machine.cpu.state.x[3] = 4 << 42;
-    machine.amx(MATFP | 3).unwrap();
-    assert_eq!(machine.statistics.amx_forms.counts[matfp], [0, 2]);
+    machine.cpu.state.x[3] = 0;
+    machine.amx(VECINT | 3).unwrap();
+    assert_eq!(machine.statistics.amx_forms.counts[vecint], [0, 2]);
     assert_eq!(machine.amx_counts().operations, [3, 1]);
     machine.set_step_timing(false);
-    machine.amx(MATFP | 3).unwrap();
+    machine.amx(VECINT | 3).unwrap();
     assert_eq!(
-        machine.statistics.amx_forms.counts[matfp],
+        machine.statistics.amx_forms.counts[vecint],
         [0, 2],
         "only under step timing"
     );

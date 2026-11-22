@@ -24,4 +24,5 @@ mod fused;
 mod half;
 mod harness;
 mod mac16;
+mod matfp;
 mod refusals;

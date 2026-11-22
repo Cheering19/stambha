@@ -38,6 +38,12 @@
 //!   selection of bits 29:28, the shift of bits 59:55, with or without Z
 //!   (bit 27), every lane-enable mode. Integer lanes in i32 with Z's wrap,
 //!   so exact.
+//! - `matfp` on IEEE types on the multiply-add tiers: f32 and f64 (types 4
+//!   and 7) through the FMA kernels, f16 (and its widening into f32, type
+//!   3) through the f16 and widened rows with F16C, modes 0/1 (`z ± x*y`);
+//!   mode 4 (`x <= 0 ? 0 : y`, IEEE order on the bits) and the lane value
+//!   that writes zeros as bit selections; every lane mode. Not bf16, the
+//!   no-op modes, bits 56:54, indexed loads or shuffles.
 //! - On every tier, the model's too, the fused operations' copies and
 //!   constants (bits 29:27 = 3, 5, 6, 7), which need no arithmetic, except
 //!   copies of f16-widened halves, whose NaN payloads the model rewrites.
@@ -167,6 +173,8 @@ impl Native {
             }
             #[cfg(target_arch = "x86_64")]
             AmxOperation::Mac16 => self.tier == Tier::Avx512 && x86::mac16(registers, operand),
+            #[cfg(target_arch = "x86_64")]
+            AmxOperation::MatrixFloat => x86::matrix_float(self, generation, registers, operand),
             _ => false,
         }
     }
@@ -1887,6 +1895,294 @@ mod x86 {
                 clobber_abi("sysv64"),
                 options(nostack),
             );
+        }
+    }
+
+    const FLOAT_INDEXED_LOAD: u64 = 1 << 53;
+
+    /// `vecfp`/`matfp`'s element types (bits 45:42) as the model reads
+    /// them (`vector_float::types`): X/Y bits, Z bits, bf16.
+    fn float_types(generation: Generation, operand: u64) -> (usize, usize, bool) {
+        match (operand >> 42) & 0xf {
+            0 if generation.m2_extensions() => (16, 16, true),
+            1 if generation.m2_extensions() => (16, 32, true),
+            3 => (16, 32, false),
+            4 => (32, 32, false),
+            7 => (64, 64, false),
+            _ => (16, 16, false),
+        }
+    }
+
+    /// IEEE `x <= 0` on a lane's bits, false for NaN (`float::not_positive`):
+    /// a zero of either sign, or a negative value that is not NaN.
+    const fn not_positive(bits: u64, bytes: usize) -> bool {
+        let sign = 1u64 << (8 * bytes - 1);
+        let magnitude = bits & (sign - 1);
+        let infinity = match bytes {
+            2 => 0x7c00,
+            4 => 0x7f80_0000,
+            _ => 0x7ff0_0000_0000_0000,
+        };
+        magnitude == 0 || bits & sign != 0 && magnitude <= infinity
+    }
+
+    /// Lane `lane` of `bytes`-byte lanes of a row.
+    fn lane(row: &Row, bytes: usize, lane: usize) -> u64 {
+        let mut value = [0u8; 8];
+        value[..bytes].copy_from_slice(&row[lane * bytes..lane * bytes + bytes]);
+        u64::from_le_bytes(value)
+    }
+
+    /// Z's bytes where `mask` is set become `values`'.
+    fn merge(z: &mut Row, values: &Row, mask: &Row) {
+        let z = z.as_chunks_mut::<8>().0;
+        let values = values.as_chunks::<8>().0;
+        let mask = mask.as_chunks::<8>().0;
+        for ((z, value), mask) in z.iter_mut().zip(values).zip(mask) {
+            let (old, value, mask) = (
+                u64::from_le_bytes(*z),
+                u64::from_le_bytes(*value),
+                u64::from_le_bytes(*mask),
+            );
+            *z = (old & !mask | value & mask).to_le_bytes();
+        }
+    }
+
+    /// `matfp` (`matfp.c`) on IEEE types: f32 (type 4) and f64 (7) with the
+    /// FMA kernels, f16 (types 2, 5, 6, 8-15, and 0/1 on M1) through the
+    /// f16 rows (F16C), f16 into f32 (type 3) through the widened rows
+    /// (F16C), modes 0 (`z + x*y`) and 1 (`z - x*y`); mode 4 (`x <= 0 ? 0 :
+    /// y`) and the lane-enable value 3 (zeros) as bit selections; the
+    /// values 4 and 5 (a zero X or Y) feeding a zero row. Every lane mode.
+    /// Refused, before anything is written: bits 56:54 (the model's no-op),
+    /// indexed loads (bit 53), shuffles (bits 30:27), other modes (no-ops),
+    /// bf16 (types 0/1 from the M2), and the model tier.
+    pub(super) fn matrix_float(
+        native: Native,
+        generation: Generation,
+        registers: &mut AmxRegisters,
+        operand: u64,
+    ) -> bool {
+        // The model ignores bits 37 and 63.
+        let operand = operand & !(1 << 37 | 1 << 63);
+        let mode = (operand >> 47) & 0x3f;
+        let (xy_bits, z_bits, bf16) = float_types(generation, operand);
+        if native.tier == Tier::Model
+            || (operand >> 54) & 7 != 0
+            || operand & FLOAT_INDEXED_LOAD != 0
+            || (operand >> 27) & 0xf != 0
+            || !matches!(mode, 0 | 1 | 4)
+            || bf16
+        {
+            return false;
+        }
+        let bytes = xy_bits / 8;
+        let widened = z_bits != xy_bits;
+        let x_enable = write_mask(operand >> 32, bytes as u32, 9);
+        let y_enable = write_mask(((operand >> 23) & 7) << 6 | operand >> 58, bytes as u32, 9);
+        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
+        let mut y = registers.y_operand(operand & 0x1ff);
+        let mut write = true;
+        if (operand >> 38) & 7 == 0 {
+            match (operand >> 32) & 0x3f {
+                3 => write = false,
+                4 | 5 => x = [0; ROW_BYTES],
+                _ => {}
+            }
+        }
+        if (operand >> 23) & 7 == 0 {
+            match (operand >> 58) & 0x3f {
+                3 => write = false,
+                4 | 5 => y = [0; ROW_BYTES],
+                _ => {}
+            }
+        }
+        let z_row = ((operand >> 20) & 7) as usize;
+        let lanes = 64 / bytes;
+        if !write || mode == 4 {
+            // Bit selections: Y lane j (widened from f16 for type 3) where
+            // X lane i is positive or NaN, else 0; nothing kept writes zeros.
+            if widened && write && !native.f16c {
+                return false;
+            }
+            let keep = if write {
+                (0..lanes).fold(0u32, |keep, i| {
+                    keep | u32::from(!not_positive(lane(&x, bytes, i), bytes)) << i
+                })
+            } else {
+                0
+            };
+            let values = if widened && write {
+                // SAFETY: F16C exists as checked; MXCSR is restored after.
+                let wide = unsafe {
+                    let saved = enter();
+                    let wide = widen_halves(&y);
+                    leave(saved);
+                    wide
+                };
+                // FCVT's default NaN for a NaN.
+                wide.map(|value| {
+                    if value & 0x7fff_ffff > 0x7f80_0000 {
+                        0x7fc0_0000
+                    } else {
+                        u64::from(value)
+                    }
+                })
+            } else {
+                core::array::from_fn(|j| if j < lanes { lane(&y, bytes, j) } else { 0 })
+            };
+            select_matrix(
+                registers, bytes, widened, keep, &values, x_enable, y_enable, z_row,
+            );
+            return true;
+        }
+        let subtract = mode == 1;
+        match (xy_bits, widened) {
+            (32 | 64, _) => {
+                let double = xy_bits == 64;
+                let form = if subtract { Form::Subtract } else { Form::Add };
+                let mut mask = [0u8; ROW_BYTES];
+                let mut opmask = 0u32;
+                for i in (0..lanes).filter(|&i| on(x_enable, i, bytes)) {
+                    mask[i * bytes..i * bytes + bytes].fill(0xff);
+                    opmask |= 1 << i;
+                }
+                let rows = (0..lanes).fold(0u32, |rows, j| {
+                    rows | u32::from(on(y_enable, j, bytes)) << j
+                });
+                // Y lane j into Z row j*g + z_row%g, g = 64/lanes.
+                let g = 64 / lanes;
+                let matrix = Matrix {
+                    z: registers.z[z_row & (g - 1)].as_mut_ptr(),
+                    stride: g * ROW_BYTES,
+                    rows,
+                    lanes,
+                };
+                // SAFETY: `select` chose the tier from a target whose
+                // features the host admits; every pointer is to a live row;
+                // MXCSR is restored after.
+                unsafe {
+                    let saved = enter();
+                    match native.tier {
+                        Tier::Avx512 => matrix_avx512(double, form, matrix, &x, &y, opmask),
+                        _ => matrix_fma(double, form, matrix, &x, &y, &mask),
+                    }
+                    leave(saved);
+                }
+            }
+            _ if !native.f16c => return false,
+            (_, false) => {
+                let lanes = HalfLanes::of(x_enable);
+                // SAFETY: F16C as checked, and the tier's own features; every
+                // pointer is to a live row; MXCSR is restored after.
+                unsafe {
+                    let saved = enter();
+                    for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
+                        let half = u64::from(u16::from_le_bytes([y[2 * j], y[2 * j + 1]]));
+                        let lane = splat(half, 2);
+                        let z = &mut registers.z[(j * 2) | (z_row & 1)];
+                        half_row(native.tier, z, &x, &lane, &lanes, subtract, false);
+                    }
+                    leave(saved);
+                }
+            }
+            (_, true) => {
+                // SAFETY: F16C as checked; MXCSR is restored after.
+                unsafe {
+                    let saved = enter();
+                    widened_rows(registers, &x, &y, x_enable, y_enable, subtract, false);
+                    leave(saved);
+                }
+            }
+        }
+        true
+    }
+
+    /// The 32 f16 lanes of a row widened to f32 exactly (NaNs stay NaN).
+    ///
+    /// # Safety
+    /// F16C exists.
+    unsafe fn widen_halves(row: &Row) -> [u32; 32] {
+        let mut packed = [0u8; 2 * ROW_BYTES];
+        // SAFETY: F16C; 64 bytes of halves into 128 of singles.
+        unsafe {
+            asm!(
+                "vcvtph2ps ymm0, xmmword ptr [{h}]",
+                "vcvtph2ps ymm1, xmmword ptr [{h} + 16]",
+                "vcvtph2ps ymm2, xmmword ptr [{h} + 32]",
+                "vcvtph2ps ymm3, xmmword ptr [{h} + 48]",
+                "vmovups ymmword ptr [{w}], ymm0",
+                "vmovups ymmword ptr [{w} + 32], ymm1",
+                "vmovups ymmword ptr [{w} + 64], ymm2",
+                "vmovups ymmword ptr [{w} + 96], ymm3",
+                "vzeroupper",
+                h = in(reg) row.as_ptr(),
+                w = in(reg) packed.as_mut_ptr(),
+                clobber_abi("sysv64"),
+                options(nostack),
+            );
+        }
+        let singles = packed.as_chunks::<4>().0;
+        core::array::from_fn(|j| u32::from_le_bytes(singles[j]))
+    }
+
+    /// `matfp` lanes that need no arithmetic: for every enabled X lane i
+    /// and Y lane j, Z lane (i, j) of the row map becomes `values[j]` where
+    /// bit i of `keep` is set, else 0. The row map is `matfp`'s: row
+    /// `j*g | z_row % g` (g the lane bytes), lane i; or for the widened
+    /// type row `2j | i % 2`, f32 lane i/2.
+    #[allow(clippy::too_many_arguments)]
+    fn select_matrix(
+        registers: &mut AmxRegisters,
+        bytes: usize,
+        widened: bool,
+        keep: u32,
+        values: &[u64; 32],
+        x_enable: u64,
+        y_enable: u64,
+        z_row: usize,
+    ) {
+        let lanes = 64 / bytes;
+        if !widened {
+            let mut kept = [0u8; ROW_BYTES];
+            let mut written = [0u8; ROW_BYTES];
+            for i in (0..lanes).filter(|&i| on(x_enable, i, bytes)) {
+                written[i * bytes..i * bytes + bytes].fill(0xff);
+                if keep >> i & 1 != 0 {
+                    kept[i * bytes..i * bytes + bytes].fill(0xff);
+                }
+            }
+            for j in (0..lanes).filter(|&j| on(y_enable, j, bytes)) {
+                let mut row = splat(values[j], bytes);
+                for (byte, kept) in row.iter_mut().zip(kept) {
+                    *byte &= kept;
+                }
+                merge(
+                    &mut registers.z[(j * bytes) | (z_row & (bytes - 1))],
+                    &row,
+                    &written,
+                );
+            }
+            return;
+        }
+        // X lane i into f32 lane i/2 of the row of its parity.
+        let mut kept = [[0u8; ROW_BYTES]; 2];
+        let mut written = [[0u8; ROW_BYTES]; 2];
+        for i in (0..32).filter(|&i| on(x_enable, i, 2)) {
+            let at = (i >> 1) * 4..(i >> 1) * 4 + 4;
+            written[i & 1][at.clone()].fill(0xff);
+            if keep >> i & 1 != 0 {
+                kept[i & 1][at].fill(0xff);
+            }
+        }
+        for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
+            for parity in 0..2 {
+                let mut row = splat(values[j], 4);
+                for (byte, kept) in row.iter_mut().zip(kept[parity]) {
+                    *byte &= kept;
+                }
+                merge(&mut registers.z[(2 * j) | parity], &row, &written[parity]);
+            }
         }
     }
 }

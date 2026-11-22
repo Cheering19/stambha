@@ -321,7 +321,7 @@ fn fma16_matches_the_model_bit_for_bit() {
 /// Special halves: zeros, denormals and their limits, ±1 and its
 /// neighbours, the largest finite values, infinities and NaNs, and values
 /// whose exact sums fall on, near and between f16 rounding points.
-const HALVES: [u16; 24] = [
+pub const HALVES: [u16; 24] = [
     0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x3c01, 0x3bff, 0x7bff, 0xfbff,
     0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x1400, 0x1001, 0x5bff, 0x2400, 0x0200, 0x6800, 0xe800, 0x0c00,
 ];

@@ -111,7 +111,7 @@ fn every_native_tier_matches_the_model_bit_for_bit() {
 /// largest finite values, infinities, quiet, signalling and negative NaNs,
 /// and 1's neighbours with the steps 2^-24 and 2^-23 that tie or round
 /// against them, and 2^24.
-const SINGLES: [u32; 20] = [
+pub const SINGLES: [u32; 20] = [
     0,
     0x8000_0000,
     0x3f80_0000,
@@ -135,7 +135,7 @@ const SINGLES: [u32; 20] = [
 ];
 
 /// The f64 counterparts of [`SINGLES`].
-const DOUBLES: [u64; 18] = [
+pub const DOUBLES: [u64; 18] = [
     0,
     1 << 63,
     0x3ff0_0000_0000_0000,
