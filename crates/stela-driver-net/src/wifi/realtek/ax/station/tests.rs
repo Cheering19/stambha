@@ -231,11 +231,15 @@ struct Air {
     kicks: usize,
     /// The AP has no HT: it carries neither HT element.
     no_ht: bool,
-    /// The AP answers the station's unprotected ADDBA Requests with success
-    /// at the request's window, or at `addba_window` when set; it never
-    /// answers when `addba_silent`.
+    /// The AP answers the station's unprotected ADDBA Requests with
+    /// `addba_status` (0, success) at the request's window, or at
+    /// `addba_window` when set; it never answers when `addba_silent`.
     addba_window: Option<u16>,
+    addba_status: u16,
     addba_silent: bool,
+    /// Every frame in the order the AP hears it: a management frame as the
+    /// chip takes it, data as a kick hands it over.
+    heard: Vec<Vec<u8>>,
 }
 
 impl Air {
@@ -306,7 +310,7 @@ impl Air {
                     }
                 }
                 0xd0 if bytes[1] & 0x40 == 0 && bytes[24..26] == [3, 0] && !self.addba_silent => {
-                    self.hear(addba_response(&bytes, self.addba_window));
+                    self.hear(addba_response(&bytes, self.addba_window, self.addba_status));
                 }
                 _ => {}
             }
@@ -499,6 +503,7 @@ impl Chip for Model {
         }
         air.calls
             .push(Call::Management(frame.bytes.to_vec(), frame.basic_rates));
+        air.heard.push(frame.bytes.to_vec());
         let token = air.token();
         air.unanswered.push_back((token, frame.bytes.to_vec()));
         Ok(Some(token))
@@ -585,6 +590,8 @@ impl Chip for Model {
         if !air.unkicked.is_empty() {
             air.kicks += 1;
             let kicked = core::mem::take(&mut air.unkicked);
+            air.heard
+                .extend(kicked.iter().map(|(_, bytes)| bytes.clone()));
             air.unanswered.extend(kicked);
         }
         Ok(())
@@ -2366,12 +2373,13 @@ fn addba(dialog: u8, tid: u8, window: u16, ssn: u16) -> Vec<u8> {
 }
 
 /// The AP's ADDBA Response to the station's ADDBA Request `request`, in the
-/// clear: its dialog, success, its parameters at a window of `window` (the
+/// clear: its dialog, `status`, its parameters at a window of `window` (the
 /// request's own when `None`), and its timeout.
-fn addba_response(request: &[u8], window: Option<u16>) -> Vec<u8> {
+fn addba_response(request: &[u8], window: Option<u16>, status: u16) -> Vec<u8> {
     let asked = u16::from_le_bytes([request[27], request[28]]);
     let parameters = window.map_or(asked, |window| asked & 0x3f | window << 6);
-    let mut body = vec![3, 1, request[26], 0, 0];
+    let mut body = vec![3, 1, request[26]];
+    body.extend(status.to_le_bytes());
     body.extend(parameters.to_le_bytes());
     body.extend_from_slice(&request[29..31]);
     management(0xd0, &body)
@@ -3421,6 +3429,30 @@ fn first_qos_data_starts_an_agreement() {
 }
 
 #[test]
+fn the_ap_hears_the_data_before_the_request_it_started() {
+    // rtw89_core_txq_push writes the frame, rtw89_core_txq_schedule kicks
+    // it (core.c:4743-4767, :4854-4858), and only then does ba_work send the
+    // ADDBA Request whose SSN follows it. The batched kick (M4 spec S9.1)
+    // must not let the request, on CH8 at once, overtake that frame, often a
+    // DHCP Discover, on ACH0: an AP would take it for one before the window.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().heard.len();
+    wifi.transmit(&ip(1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    let air = model.0.borrow();
+    let heard = &air.heard[from..];
+    let data = heard
+        .iter()
+        .position(|f| f[0] == 0x88 && eapol(f).is_none() && f[36] == 1)
+        .unwrap();
+    let request = heard
+        .iter()
+        .position(|f| f[0] == 0xd0 && f[24..26] == [3, 0])
+        .unwrap();
+    assert!(data < request, "data {data}, request {request}");
+}
+
+#[test]
 fn an_agreement_takes_the_responses_window_up_to_128() {
     // __ieee80211_start_tx_ba_session's agreement takes min(the response's
     // window, the 128 of TRANSMIT_WINDOW) (agg-tx.c:992-1000), and
@@ -3515,6 +3547,7 @@ fn eapol_stops_the_session_and_forbids_it_for_4_s() {
     assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 7)));
     // The AP's group rekey: the station's answer is EAPOL on TID 7.
     let from = model.0.borrow().calls.len();
+    let heard_from = model.0.borrow().heard.len();
     let group = protected_as(LOCAL, 2, 0, 1, [0x88, 0x8e], &ap.group_message_1());
     model.0.borrow_mut().hear_as(group, true, false);
     assert!(run(&mut wifi, &model, |_, air| !block_acks(air, 2).is_empty()));
@@ -3555,6 +3588,14 @@ fn eapol_stops_the_session_and_forbids_it_for_4_s() {
             7 << 12 | 1 << 11
         );
         assert_eq!(frame[28..30], 37u16.to_le_bytes());
+        // The AP hears the answer, written before the DELBA, first.
+        let heard = &air.heard[heard_from..];
+        let answer = heard.iter().position(|f| eapol(f).is_some()).unwrap();
+        let delete = heard
+            .iter()
+            .position(|f| f[0] == 0xd0 && f[24..26] == [3, 2])
+            .unwrap();
+        assert!(answer < delete, "answer {answer}, DELBA {delete}");
     }
     // Within the 4 s, TID 7's data starts nothing and goes singly.
     let from = model.0.borrow().calls.len();
@@ -3647,7 +3688,7 @@ fn pmf_addba_goes_under_the_ptk() {
     model
         .0
         .borrow_mut()
-        .hear_as(sealed(addba_response(&clear, None), 1), true, false);
+        .hear_as(sealed(addba_response(&clear, None, 0), 1), true, false);
     assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
     assert_eq!(aggregations(&model.0.borrow(), from), [(0, Some(64))]);
 }

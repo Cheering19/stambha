@@ -1416,7 +1416,15 @@ impl<C: Chip> Rtl8852c<C> {
     /// chip's management queue at once, as `ieee80211_tx_skb` sends an ADDBA
     /// or a DELBA, sealed under PMF, as Block Ack action frames are robust;
     /// false when the chip has no room. An ADDBA Request taken is counted.
+    ///
+    /// The data written since the pass's last kick is kicked first. rtw89
+    /// kicks a TID's frames as it pushes them (`rtw89_core_txq_schedule`,
+    /// `core.c:4854-4858`) and `ba_work` sends the ADDBA only after, so the
+    /// AP hears the frame that started the agreement before the request
+    /// whose SSN follows it, and a DELBA after the frames before it; here the
+    /// management queue's at-once kick would otherwise let it overtake them.
     fn send_agreement_frame(&mut self, bytes: &[u8]) -> Result<bool, Error> {
+        Self::chip(self.chip.kick())?;
         let context = self.context.clone().ok_or(Error::Refused("no context"))?;
         let frame = if context.pmf().is_some() {
             let mut robust = bytes.to_vec();
