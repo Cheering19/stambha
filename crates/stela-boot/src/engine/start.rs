@@ -3042,12 +3042,24 @@ fn wifi_network(
         .wifi_country
         .as_deref()
         .and_then(|code| code.as_bytes().try_into().ok());
-    Some(stela_drivers::net::wifi::network::Network {
+    let mut network = stela_drivers::net::wifi::network::Network {
         ssid: ssid.as_bytes().to_vec(),
         secret,
         country,
         alternates: saved_networks(handoff),
-    })
+    };
+    // The startup menu's Wi-Fi choice for this boot, named in no line.
+    if let Some(prefer) = options.wifi_prefer.as_deref() {
+        let known = network.prefer(prefer.as_bytes());
+        output::arguments(format_args!(
+            "HOST Wi-Fi network chosen at the menu: {}\n",
+            match known {
+                true => "joined first this boot",
+                false => "not saved, so the --wifi network is joined first",
+            }
+        ));
+    }
+    Some(network)
 }
 
 /// The other saved networks (`options::WIFI_SAVED`) the loader read, whose
@@ -3470,24 +3482,27 @@ fn start_devices(
                 Some(Err(_)) | None => None,
             });
             let guest_network = match options.guest_network {
-                true => network::GuestNetwork::open(&mut links, options.ssid.as_deref())
-                    .inspect_err(|error| {
-                        output::arguments(format_args!("guest network refusal: {error}\n"));
-                        ident::set(
-                            ident::Kind::Network,
-                            format_args!(
-                                "none: {}",
-                                error.to_string().lines().next().unwrap_or_default()
-                            ),
-                        );
-                        network::guest_absent(&error.to_string(), &adapters);
-                        // Optional: macOS boots without it.
-                        crate::status::info(
-                            "macOS starts without a network: no supported network \
+                true => network::GuestNetwork::open(
+                    &mut links,
+                    options.wifi_prefer.as_deref().or(options.ssid.as_deref()),
+                )
+                .inspect_err(|error| {
+                    output::arguments(format_args!("guest network refusal: {error}\n"));
+                    ident::set(
+                        ident::Kind::Network,
+                        format_args!(
+                            "none: {}",
+                            error.to_string().lines().next().unwrap_or_default()
+                        ),
+                    );
+                    network::guest_absent(&error.to_string(), &adapters);
+                    // Optional: macOS boots without it.
+                    crate::status::info(
+                        "macOS starts without a network: no supported network \
                              adapter is free for it",
-                        );
-                    })
-                    .ok(),
+                    );
+                })
+                .ok(),
                 false => {
                     adapters.extend(links.devices.iter().map(|device| {
                         network::adapter_account(device.location(), "started, not used")

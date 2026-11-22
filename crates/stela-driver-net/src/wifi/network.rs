@@ -54,6 +54,32 @@ impl fmt::Debug for Alternate {
     }
 }
 
+impl Network {
+    /// Make the saved alternate named `ssid` the preferred network, the one
+    /// preferred until now its first alternate; whether `ssid` names this
+    /// network or one of its alternates. A name neither carries changes
+    /// nothing.
+    pub fn prefer(&mut self, ssid: &[u8]) -> bool {
+        if self.ssid == ssid {
+            return true;
+        }
+        let Some(index) = self
+            .alternates
+            .iter()
+            .position(|alternate| alternate.ssid == ssid)
+        else {
+            return false;
+        };
+        let chosen = self.alternates.remove(index);
+        let previous = Alternate {
+            ssid: core::mem::replace(&mut self.ssid, chosen.ssid),
+            secret: core::mem::replace(&mut self.secret, chosen.secret),
+        };
+        self.alternates.insert(0, previous);
+        true
+    }
+}
+
 /// A WPA2-PSK or WPA3-SAE credential.
 #[derive(Clone)]
 pub enum Secret {
@@ -207,5 +233,47 @@ mod tests {
         };
         let shown = alloc::format!("{config:?}");
         assert!(shown.contains("Home") && !shown.contains("hunter22"));
+    }
+
+    fn psk(byte: u8) -> Secret {
+        Secret::Psk(Zeroizing::new([byte; 32]))
+    }
+
+    fn named(network: &Network) -> Vec<&[u8]> {
+        core::iter::once(&network.ssid[..])
+            .chain(
+                network
+                    .alternates
+                    .iter()
+                    .map(|alternate| &alternate.ssid[..]),
+            )
+            .collect()
+    }
+
+    /// The menu's choice becomes the preferred network, the one before it
+    /// the first alternate; a name no network carries changes nothing.
+    #[test]
+    fn preferring_a_saved_network_puts_it_first() {
+        let mut network = Network {
+            ssid: b"home".to_vec(),
+            secret: psk(1),
+            country: None,
+            alternates: alloc::vec![
+                Alternate {
+                    ssid: b"cafe".to_vec(),
+                    secret: psk(2),
+                },
+                Alternate {
+                    ssid: b"phone".to_vec(),
+                    secret: psk(3),
+                },
+            ],
+        };
+        assert!(network.prefer(b"phone"));
+        assert_eq!(named(&network), [&b"phone"[..], &b"home"[..], &b"cafe"[..]]);
+        assert!(matches!(&network.secret, Secret::Psk(key) if **key == [3; 32]));
+        assert!(network.prefer(b"phone"));
+        assert!(!network.prefer(b"elsewhere"));
+        assert_eq!(named(&network), [&b"phone"[..], &b"home"[..], &b"cafe"[..]]);
     }
 }

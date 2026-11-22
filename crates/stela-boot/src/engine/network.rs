@@ -367,7 +367,8 @@ impl HostNetwork {
             let link = RootLink::new(
                 links.devices.remove(next),
                 links.root,
-                options.ssid.as_deref(),
+                // The network joined first, whose name failures say.
+                options.wifi_prefer.as_deref().or(options.ssid.as_deref()),
             );
             let driver = link.device.driver();
             let wireless = link.device.wireless();
@@ -922,7 +923,11 @@ impl GuestNetwork {
             ));
         }
         let carriers = links.carriers();
-        let wireless: Vec<bool> = links.devices.iter().map(|device| device.wireless()).collect();
+        let wireless: Vec<bool> = links
+            .devices
+            .iter()
+            .map(|device| device.wireless())
+            .collect();
         let index = network_link::guest_adapter(&carriers, &wireless, ssid.is_some());
         let device = links.devices.remove(index);
         output::arguments(format_args!(

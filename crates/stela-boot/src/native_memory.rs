@@ -161,8 +161,9 @@ impl PageSource for DriverPages {
         physical_end_exclusive: u64,
     ) -> Result<PinnedPages, MemoryError> {
         match SOURCE.allocate_below(bytes, alignment, attribute, physical_end_exclusive) {
-            Err(MemoryError::OutOfMemory) if low_dma_range().is_some() => LOW_DMA
-                .allocate_below(bytes, alignment, attribute, physical_end_exclusive),
+            Err(MemoryError::OutOfMemory) if low_dma_range().is_some() => {
+                LOW_DMA.allocate_below(bytes, alignment, attribute, physical_end_exclusive)
+            }
             other => other,
         }
     }

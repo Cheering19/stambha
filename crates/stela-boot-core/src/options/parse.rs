@@ -156,6 +156,12 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateWifi);
                 }
             }
+            WIFI_PREFER => {
+                let ssid = ssid(value().ok_or(Error::MissingWifiPrefer)?)?;
+                if options.wifi_prefer.replace(ssid).is_some() {
+                    return Err(Error::DuplicateWifiPrefer);
+                }
+            }
             WIFI_KEY => {
                 let path = value().ok_or(Error::MissingWifiKey)?;
                 if options.wifi_key.replace(String::from(path)).is_some() {
