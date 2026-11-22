@@ -10,10 +10,13 @@
 //! `f16c`, comma separated), which leaves its paths out with a note
 //! ([`harness::tiers`]).
 //!
-//! Run: `cargo test -p stela-compiler --test amx_native`.
+//! Run: `cargo test -p stela-compiler --test amx_native`; what each form
+//! costs on this host ([`costs`]): `cargo test -p stela-compiler --release
+//! --test amx_native costs -- --ignored --nocapture`.
 #![cfg(target_arch = "x86_64")]
 
 mod checks;
+mod costs;
 mod fused;
 mod half;
 mod harness;
