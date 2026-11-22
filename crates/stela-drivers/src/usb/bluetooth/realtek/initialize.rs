@@ -28,7 +28,7 @@ const DROP_US: u64 = 200_000;
 /// The events of that wait kept whole; the rest are counted.
 const DROP_EVENTS: usize = 4;
 /// `HCI_INIT_TIMEOUT` (hci.h:482), which every btrtl command waits.
-const COMMAND_US: u64 = 10_000_000;
+const INIT_COMMAND_US: u64 = 10_000_000;
 const ATTEMPT_US: u64 = 120_000_000;
 
 #[expect(
@@ -42,7 +42,7 @@ pub(super) fn run<B: Io>(hci: &mut Hci<B>, provider: &dyn Provider) -> Result<Ow
     }
     hci.open()?;
     let deadline = hci.io.now_us().saturating_add(ATTEMPT_US);
-    let mut engine = Engine::new(hci, deadline, 1);
+    let mut engine = Engine::new(hci, deadline, 1, INIT_COMMAND_US);
     match engine.run(usb, provider) {
         Ok(r) => Ok(r),
         Err(cause) => {
@@ -67,6 +67,8 @@ pub(super) struct Engine<'a, B: Io> {
     pub(super) hci: &'a mut Hci<B>,
     pending: VecDeque<Vec<u8>>,
     deadline: u64,
+    /// How long each command's completion is waited for.
+    command_us: u64,
     attempt: Attempt,
     /// HCI commands the controller will take now (one after reset).
     credits: u8,
@@ -76,12 +78,14 @@ pub(super) struct Engine<'a, B: Io> {
 }
 impl<'a, B: Io> Engine<'a, B> {
     /// An exchange over `hci` until `deadline`, which the controller will
-    /// take `credits` commands of now.
-    pub(super) fn new(hci: &'a mut Hci<B>, deadline: u64, credits: u8) -> Self {
+    /// take `credits` commands of now, each command's completion waited
+    /// for `command_us` at most.
+    pub(super) fn new(hci: &'a mut Hci<B>, deadline: u64, credits: u8, command_us: u64) -> Self {
         Self {
             hci,
             pending: VecDeque::new(),
             deadline,
+            command_us,
             attempt: Attempt::default(),
             credits,
             outside: None,
@@ -178,7 +182,7 @@ impl<B: Io> Engine<'_, B> {
             command::packet(opcode, parameters).map_err(|why| Error::protocol(why, parameters))?;
         let deadline = core::cmp::min(
             self.deadline,
-            self.hci.io.now_us().saturating_add(COMMAND_US),
+            self.hci.io.now_us().saturating_add(self.command_us),
         );
         let mut sent = false;
         loop {

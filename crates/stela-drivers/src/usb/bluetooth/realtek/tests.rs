@@ -1337,3 +1337,20 @@ fn an_unanswered_command_is_waited_for_as_long_as_btrtls_hci_init_timeout() {
     let waited = hci.io.time.get() - trace.borrow().sent_at;
     assert!((10_000_000..11_000_000).contains(&waited), "{waited} us");
 }
+
+#[test]
+fn an_unanswered_scan_command_is_waited_for_as_long_as_hci_cmd_timeout() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    scan_steps(&mut hci, &[]);
+    // LE Set Scan Parameters is never answered.
+    hci.io.steps[3].response.clear();
+    let e = scan(&mut hci, 1_000_000).unwrap_err();
+    assert!(matches!(e, Error::Timeout("genuine command completion")));
+    // HCI_CMD_TIMEOUT, 2 s (hci.h:483), which hci_sync's scan commands and
+    // btrtl's shutdown Reset use, not btrtl's own 10 s.
+    let waited = hci.io.time.get() - trace.borrow().sent_at;
+    assert!((2_000_000..2_500_000).contains(&waited), "{waited} us");
+    assert_eq!(hci.state(), State::Closed);
+}

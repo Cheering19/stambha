@@ -47,6 +47,10 @@ const NO_RSSI: i8 = 127;
 pub const MAX_ADVERTISERS: usize = 256;
 /// What the scan's commands may take beyond its window.
 const COMMANDS_US: u64 = 30_000_000;
+/// `HCI_CMD_TIMEOUT` (hci.h:483), which each of these commands waits in
+/// Linux: hci_sync.c:3812, :4330, :4593, :3153 and :2316, and the shutdown
+/// Reset (btrtl.c:1394).
+const COMMAND_US: u64 = 2_000_000;
 
 /// What a passive LE scan heard. It holds no address.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -139,7 +143,7 @@ pub fn scan<B: Io>(hci: &mut Hci<B>, window_us: u64) -> Result<ScanReport> {
         .now_us()
         .saturating_add(window_us)
         .saturating_add(COMMANDS_US);
-    let mut engine = Engine::new(hci, deadline, credits);
+    let mut engine = Engine::new(hci, deadline, credits, COMMAND_US);
     let mut heard = Heard::default();
     let result = run(&mut engine, window_us, &mut heard);
     let closed = if engine.hci.state() == State::Open {
