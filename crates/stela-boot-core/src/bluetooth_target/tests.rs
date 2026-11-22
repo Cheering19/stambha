@@ -225,3 +225,38 @@ fn the_stick_on_another_controller_is_not_said_to_be_reset() {
             .contains("the boot stick is on another controller")
     );
 }
+
+#[test]
+fn two_realtek_bluetooth_controllers_start_nothing_and_both_are_named() {
+    let functions = census();
+    // A Realtek dongle on the other xHCI too, its two interfaces.
+    let mut listed = interfaces();
+    for interface in ["USB(0x4,0x0)", "USB(0x4,0x1)"] {
+        listed.push(usb(
+            "0000:05:00.3",
+            interface,
+            (0x0bda, 0x8771),
+            BLUETOOTH,
+            false,
+        ));
+    }
+    assert_eq!(
+        choose(&functions, Ok(&listed)).unwrap_err(),
+        "the firmware's USB stack lists 2 Bluetooth controllers a Realtek setup takes, 13d3:3612 \
+         at pci=0000:05:00.4 USB(0x1,0x0)/USB(0x2,0x0) and 0bda:8771 at pci=0000:05:00.3 \
+         USB(0x4,0x0), so the check cannot tell which to start; nothing is started"
+    );
+    // A second one on the same xHCI is refused alike.
+    let mut listed = interfaces();
+    listed.push(usb(
+        "0000:05:00.4",
+        "USB(0x1,0x0)/USB(0x4,0x0)",
+        (0x0bda, 0x8771),
+        BLUETOOTH,
+        false,
+    ));
+    let both = choose(&functions, Ok(&listed)).unwrap_err();
+    assert!(both.contains("lists 2 Bluetooth controllers"), "{both}");
+    // The RTL8852CE's two interfaces are one controller's.
+    assert!(choose(&functions, Ok(&interfaces())).is_ok());
+}

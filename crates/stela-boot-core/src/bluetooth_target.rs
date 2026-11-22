@@ -8,14 +8,15 @@
 //! (the PC's NVMe and SATA disks, network and Wi-Fi cards, GPUs, USB4 hosts,
 //! the other xHCIs and the bridges) gets no driver, no BAR access and no Bus
 //! Master. A controller that also holds another USB disk, which its start
-//! would reset, or a firmware USB inventory that could not all be read, so
-//! that the check cannot tell, starts nothing.
+//! would reset, a firmware USB inventory that could not all be read, so
+//! that the check cannot tell, or a second Realtek Bluetooth controller, so
+//! that it cannot tell which one to start, starts nothing.
 //!
 //! On this PC the Bluetooth controller's xHCI (0000:05:00.4) also holds the
 //! boot stick. Its start resets the controller, so the stick is enumerated
 //! again; nothing writes to it, as the check's lines go to the screen and,
 //! with `--keep-lines`, the firmware's variables.
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use stela_drivers::{
     bus::pci::Address,
     usb::{bluetooth::Setup, xhci},
@@ -113,15 +114,44 @@ pub fn choose(
             ));
         }
     };
-    let Some(bluetooth) = usb.iter().find(|interface| {
+    // One entry per controller: its first Bluetooth interface, as a
+    // controller has two or more (btusb.c takes interface 0, and 1 for SCO).
+    let mut controllers: Vec<&UsbInterface> = Vec::new();
+    for interface in usb.iter().filter(|interface| {
         interface.class == BLUETOOTH
             && Setup::of(interface.vendor, interface.product, false) == Some(Setup::Realtek)
-    }) else {
-        return refuse(format!(
-            "the firmware's USB stack lists no Bluetooth controller a Realtek setup takes, among \
-             {} USB interfaces",
-            usb.len()
-        ));
+    }) {
+        if !controllers.iter().any(|seen| same_device(seen, interface)) {
+            controllers.push(interface);
+        }
+    }
+    let bluetooth = match controllers.as_slice() {
+        [] => {
+            return refuse(format!(
+                "the firmware's USB stack lists no Bluetooth controller a Realtek setup takes, \
+                 among {} USB interfaces",
+                usb.len()
+            ));
+        }
+        [one] => *one,
+        several => {
+            let mut named: Vec<String> = several
+                .iter()
+                .map(|interface| {
+                    format!(
+                        "{:04x}:{:04x} at pci={} {}",
+                        interface.vendor, interface.product, interface.controller, interface.path
+                    )
+                })
+                .collect();
+            let last = named.pop().unwrap_or_default();
+            return refuse(format!(
+                "the firmware's USB stack lists {} Bluetooth controllers a Realtek setup takes, \
+                 {} and {last}, so the check cannot tell which to start",
+                several.len(),
+                named.join(", ")
+            ));
+        }
     };
     let controller = bluetooth.controller;
     let Some(function) = functions
@@ -162,6 +192,22 @@ pub fn choose(
             .map(|stick| stick.path.clone()),
         interfaces: on().count(),
     })
+}
+
+/// Whether two interfaces are of one device: on one controller, at one
+/// path but for the last USB node's interface number (`USB(port,interface)`).
+/// A path that does not end in a USB node is its own device's alone.
+fn same_device(a: &UsbInterface, b: &UsbInterface) -> bool {
+    a.controller == b.controller && device_path(&a.path) == device_path(&b.path)
+}
+
+/// `path` without its last USB node's interface number.
+fn device_path(path: &str) -> &str {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    match path.rsplit_once(',') {
+        Some((device, _)) if last.starts_with("USB(") && last.ends_with(')') => device,
+        _ => path,
+    }
 }
 
 #[cfg(test)]
