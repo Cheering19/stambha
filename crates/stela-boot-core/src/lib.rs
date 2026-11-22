@@ -108,6 +108,7 @@ pub mod posted_call;
 pub mod power_button;
 pub mod prediction_lines;
 pub mod process_fault;
+pub mod psf;
 pub mod ram;
 pub mod random;
 pub mod record;
