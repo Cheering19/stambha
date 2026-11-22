@@ -1538,6 +1538,41 @@ fn reclaim_refuses_an_index_the_host_never_gave() {
 }
 
 #[test]
+fn reclaim_stops_at_the_index_the_device_was_given() {
+    // The device reads only the TXBDs a kick handed it: an entry written
+    // since the last kick is the host's, and a hardware index past the
+    // kicked one is no proof it was read.
+    let (m, mut rings, mut pools, mut io) = running_with_pools();
+    let ch = TxChannel::Ach0;
+    for _ in 0..2 {
+        transmit(&mut rings, &mut pools, &mut io, ch, &head(0), &[1]).unwrap();
+    }
+    submit(&mut rings, &mut pools, &mut io, ch, &head(0), &[2]).unwrap();
+    io.trace.clear();
+    let before = syncs(&m);
+    tx_hardware_index(&mut io, 0, 3);
+    assert_eq!(
+        reclaim(&mut rings, &mut pools, &mut io, ch),
+        Err(AxError::Tx("TX hardware index past the host index"))
+    );
+    assert_eq!(syncs(&m), before);
+    assert!((0..3).all(|seq| !page(&pools, ch, seq).bd_done));
+    // The kicked two are taken back, the third stays the host's.
+    tx_hardware_index(&mut io, 0, 2);
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert_eq!(
+        (0..3)
+            .map(|seq| page(&pools, ch, seq).bd_done)
+            .collect::<Vec<_>>(),
+        [true, true, false]
+    );
+    // With nothing kicked outstanding nothing is read.
+    io.trace.clear();
+    reclaim(&mut rings, &mut pools, &mut io, ch).unwrap();
+    assert!(io.trace.is_empty());
+}
+
+#[test]
 fn submit_wraps_the_bd_ring_and_reuses_entries_only_once_passed() {
     // CH8's 16-entry ring; ACH0's 256 wrap in `a_data_ring_wraps_at_256`.
     let (m, mut rings, mut pools, mut io) = running_with_pools();
