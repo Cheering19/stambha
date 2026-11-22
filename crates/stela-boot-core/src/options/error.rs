@@ -181,7 +181,7 @@ impl Error {
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
             Self::DuplicateBattery => "duplicate --battery or --test-battery",
             Self::TestBattery => {
-                "--test-battery needs PERCENT,STATE: 0 to 100, then charging, discharging or full (at 100 only)"
+                "--test-battery needs PERCENT,STATE: 0 to 100, then charging, discharging (at 5 or more) or full (at 100 only)"
             }
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",

@@ -414,7 +414,8 @@ fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
     );
     for (text, percent, state) in [
         ("80,charging", 80, TestState::Charging),
-        ("0,discharging", 0, TestState::Discharging),
+        ("0,charging", 0, TestState::Charging),
+        ("5,discharging", 5, TestState::Discharging),
         ("100,full", 100, TestState::Full),
     ] {
         let line = format!("--system {TEST_BATTERY} {text}");
@@ -446,6 +447,10 @@ fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
         "80,charging,more",
         "80,Charging",
         ",charging",
+        // Discharging below 5% the test battery is at or near its 3% low
+        // capacity: critical at boot, and macOS shuts down.
+        "4,discharging",
+        "0,discharging",
     ] {
         let text = format!("--system --test-battery {value}");
         assert_eq!(
