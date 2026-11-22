@@ -123,15 +123,16 @@ pub(super) fn prepare(resources: &crate::host_firmware::Resources) -> Check {
         }
     };
     let interfaces = usb_interfaces();
-    let target = match bluetooth_target::choose(&functions, interfaces.as_deref()) {
-        Ok(target) => target,
-        Err(why) => {
-            return Check {
-                plan: Plan::Refused(why),
-                ..Check::off()
-            };
-        }
-    };
+    let target =
+        match bluetooth_target::choose(&functions, interfaces.as_deref().map_err(String::as_str)) {
+            Ok(target) => target,
+            Err(why) => {
+                return Check {
+                    plan: Plan::Refused(why),
+                    ..Check::off()
+                };
+            }
+        };
     crate::output::arguments(format_args!("{}\n", target.line()));
     // SAFETY: every immutable host-firmware page stays reserved LOADER_DATA,
     // and the host check's tables identity-map all such RAM for the rest of
@@ -149,19 +150,42 @@ pub(super) fn prepare(resources: &crate::host_firmware::Resources) -> Check {
 
 /// Every USB interface the firmware's USB stack holds: the PCI function its
 /// device path leaves the PCI tree at, its path below, its device's IDs, its
-/// class and whether the disk Stela started from lies on it. `None` when
-/// any of them cannot be read, so the check cannot tell what a controller
-/// holds.
-fn usb_interfaces() -> Option<Vec<UsbInterface>> {
+/// class and whether the disk Stela started from lies on it. When any of
+/// them cannot be read, so the check cannot tell what a controller holds,
+/// what could not: the step and the handle, or the disk Stela started from,
+/// without whose path the boot stick could not be told from another disk.
+fn usb_interfaces() -> Result<Vec<UsbInterface>, String> {
     let started = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
         .ok()
         .and_then(|image| image.device())
-        .and_then(crate::payload::device_path);
+        .and_then(crate::payload::device_path)
+        .ok_or_else(|| {
+            String::from(
+                "the device path of the disk Stela started from, without which the boot stick \
+                 cannot be told from another USB disk",
+            )
+        })?;
+    let handles = match boot::find_handles::<UsbIo>() {
+        Ok(handles) => handles,
+        // The firmware's USB stack holds no interface.
+        Err(error) if error.status() == uefi::Status::NOT_FOUND => Vec::new(),
+        Err(error) => return Err(format!("the list of UsbIo handles ({:?})", error.status())),
+    };
+    let count = handles.len();
     let mut interfaces = Vec::new();
-    for handle in boot::find_handles::<UsbIo>().ok()? {
-        let location = crate::pci_io::disk_location(handle)?;
-        let (controller, path) = location.split_once(' ')?;
-        let full = crate::payload::device_path(handle)?;
+    for (index, handle) in handles.into_iter().enumerate() {
+        let name = format!("UsbIo handle {} of {count}", index + 1);
+        let location = crate::pci_io::disk_location(handle).ok_or_else(|| {
+            format!("{name}: the PCI function its device path leaves the tree at")
+        })?;
+        let unread = |what: &str| format!("{name} at {location}: {what}");
+        let (controller, path) = location
+            .split_once(' ')
+            .ok_or_else(|| unread("its path below its PCI function"))?;
+        let controller =
+            Address::parse(controller).ok_or_else(|| unread("its PCI function's address"))?;
+        let full =
+            crate::payload::device_path(handle).ok_or_else(|| unread("its device path as text"))?;
         // SAFETY: descriptors are only read, while no driver changes them.
         let mut io = unsafe {
             boot::open_protocol::<UsbIo>(
@@ -173,11 +197,15 @@ fn usb_interfaces() -> Option<Vec<UsbInterface>> {
                 OpenProtocolAttributes::GetProtocol,
             )
         }
-        .ok()?;
-        let device = io.device_descriptor().ok()?;
-        let interface = io.interface_descriptor().ok()?;
+        .map_err(|error| unread(&format!("its UsbIo protocol ({:?})", error.status())))?;
+        let device = io
+            .device_descriptor()
+            .map_err(|error| unread(&format!("its device descriptor ({:?})", error.status())))?;
+        let interface = io
+            .interface_descriptor()
+            .map_err(|error| unread(&format!("its interface descriptor ({:?})", error.status())))?;
         interfaces.push(UsbInterface {
-            controller: Address::parse(controller)?,
+            controller,
             path: path.into(),
             vendor: device.id_vendor,
             product: device.id_product,
@@ -186,12 +214,10 @@ fn usb_interfaces() -> Option<Vec<UsbInterface>> {
                 interface.interface_subclass,
                 interface.interface_protocol,
             ],
-            boot: started
-                .as_deref()
-                .is_some_and(|disk| disk == full || disk.starts_with(&format!("{full}/"))),
+            boot: started == full || started.starts_with(&format!("{full}/")),
         });
     }
-    Some(interfaces)
+    Ok(interfaces)
 }
 
 /// The firmware the controller's devices get: for USB Bluetooth requests

@@ -94,7 +94,7 @@ fn interfaces() -> Vec<UsbInterface> {
 fn only_the_bluetooth_controllers_xhci_is_admitted_among_every_other_function() {
     let functions = census();
     let usb = interfaces();
-    let target = choose(&functions, Some(&usb)).unwrap();
+    let target = choose(&functions, Ok(&usb)).unwrap();
     assert_eq!(target.controller, at("0000:05:00.4"));
     assert_eq!((target.vendor, target.device), (0x1022, 0x15b7));
     assert_eq!(
@@ -127,13 +127,19 @@ fn only_the_bluetooth_controllers_xhci_is_admitted_among_every_other_function() 
 #[test]
 fn a_controller_with_another_disk_or_an_unreadable_census_is_never_started() {
     let functions = census();
-    let unknown = choose(&functions, None).unwrap_err();
-    assert!(unknown.contains("cannot tell"), "{unknown}");
-    assert!(unknown.ends_with("nothing is started"), "{unknown}");
+    // What could not be read is named.
+    let unread = "UsbIo handle 3 of 7 at 0000:05:00.4 USB(0x1,0x0): its interface descriptor \
+                  (DEVICE_ERROR)";
+    assert_eq!(
+        choose(&functions, Err(unread)).unwrap_err(),
+        "the firmware's USB devices could not all be read (UsbIo handle 3 of 7 at 0000:05:00.4 \
+         USB(0x1,0x0): its interface descriptor (DEVICE_ERROR)), so the check cannot tell what \
+         else the Bluetooth controller's xHCI holds; nothing is started"
+    );
     // A USB disk beside the stick on the same controller.
     let mut usb = interfaces();
     usb.push(usb_disk_on_target());
-    let other = choose(&functions, Some(&usb)).unwrap_err();
+    let other = choose(&functions, Ok(&usb)).unwrap_err();
     assert_eq!(
         other,
         "the Bluetooth controller's xHCI pci=0000:05:00.4 also holds the USB disk 152d:0583 at \
@@ -141,7 +147,7 @@ fn a_controller_with_another_disk_or_an_unreadable_census_is_never_started() {
     );
     // The stick alone is no other disk, wherever it is; a disk on another
     // controller is not reset.
-    assert!(choose(&functions, Some(&interfaces())).is_ok());
+    assert!(choose(&functions, Ok(&interfaces())).is_ok());
 }
 
 fn usb_disk_on_target() -> UsbInterface {
@@ -165,7 +171,7 @@ fn no_realtek_bluetooth_or_a_controller_that_is_no_listed_xhci_starts_nothing() 
         BLUETOOTH,
         false,
     )];
-    let none = choose(&functions, Some(&mediatek)).unwrap_err();
+    let none = choose(&functions, Ok(&mediatek)).unwrap_err();
     assert_eq!(
         none,
         "the firmware's USB stack lists no Bluetooth controller a Realtek setup takes, among 1 \
@@ -179,7 +185,7 @@ fn no_realtek_bluetooth_or_a_controller_that_is_no_listed_xhci_starts_nothing() 
         [0xff, 0, 0],
         false,
     )];
-    assert!(choose(&functions, Some(&wrong)).is_err());
+    assert!(choose(&functions, Ok(&wrong)).is_err());
     // Its controller absent from the census, or no xHCI.
     let usb = interfaces();
     let missing: Vec<PciFunction> = functions
@@ -188,7 +194,7 @@ fn no_realtek_bluetooth_or_a_controller_that_is_no_listed_xhci_starts_nothing() 
         .filter(|function| function.address != at("0000:05:00.4"))
         .collect();
     assert_eq!(
-        choose(&missing, Some(&usb)).unwrap_err(),
+        choose(&missing, Ok(&usb)).unwrap_err(),
         "the Bluetooth controller's controller pci=0000:05:00.4 is not in the firmware's PCI \
          census; nothing is started"
     );
@@ -199,7 +205,7 @@ fn no_realtek_bluetooth_or_a_controller_that_is_no_listed_xhci_starts_nothing() 
         }
     }
     assert_eq!(
-        choose(&ehci, Some(&usb)).unwrap_err(),
+        choose(&ehci, Ok(&usb)).unwrap_err(),
         "the Bluetooth controller's controller pci=0000:05:00.4 is of class 0c0320, not an \
          xHCI; nothing is started"
     );
@@ -210,7 +216,7 @@ fn the_stick_on_another_controller_is_not_said_to_be_reset() {
     let functions = census();
     let mut usb = interfaces();
     usb[0].controller = at("0000:05:00.3");
-    let target = choose(&functions, Some(&usb)).unwrap();
+    let target = choose(&functions, Ok(&usb)).unwrap();
     assert_eq!(target.stick, None);
     assert_eq!(target.interfaces, 3);
     assert!(

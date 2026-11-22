@@ -97,15 +97,21 @@ impl Target {
 }
 
 /// The function to start among `functions`, the firmware's PCI census, from
-/// `usb`, the firmware's USB interfaces (`None` when not all could be read);
+/// `usb`, the firmware's USB interfaces, or what of them could not be read;
 /// or why nothing is started.
-pub fn choose(functions: &[PciFunction], usb: Option<&[UsbInterface]>) -> Result<Target, String> {
+pub fn choose(
+    functions: &[PciFunction],
+    usb: Result<&[UsbInterface], &str>,
+) -> Result<Target, String> {
     let refuse = |why: String| Err(format!("{why}; nothing is started"));
-    let Some(usb) = usb else {
-        return refuse(String::from(
-            "the firmware's USB devices could not all be read, so the check cannot tell what else \
-             the Bluetooth controller's xHCI holds",
-        ));
+    let usb = match usb {
+        Ok(usb) => usb,
+        Err(unread) => {
+            return refuse(format!(
+                "the firmware's USB devices could not all be read ({unread}), so the check cannot \
+                 tell what else the Bluetooth controller's xHCI holds"
+            ));
+        }
     };
     let Some(bluetooth) = usb.iter().find(|interface| {
         interface.class == BLUETOOTH
