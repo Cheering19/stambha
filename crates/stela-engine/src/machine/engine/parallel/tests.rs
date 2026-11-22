@@ -1043,7 +1043,10 @@ fn a_merge_bridges_global_pages_at_the_pes_smallest_global_leaf() {
     let large = span.now();
     assert_eq!(large.map(|globals| globals.leaf), Some(0x4000));
     for (held, new) in [(0x1000, 0x3000), (0x3000, 0x1000), (0, 0x4000)] {
-        assert!(!bridges(large, (held, held), (new, new)), "{held:#x} {new:#x}");
+        assert!(
+            !bridges(large, (held, held), (new, new)),
+            "{held:#x} {new:#x}"
+        );
     }
     // A 16 KiB global leaf between the two TLBIs' leaves is a bridge.
     assert!(!bridges(large, (0, 0), (0x8000, 0x8000)));

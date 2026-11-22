@@ -783,7 +783,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if actual == ACK && actual & mask != value & mask {
             // Some embedded controllers acknowledge the CTR write with an ACK
             // that comes ahead of the CTR (Lenovo IdeaPad Pro 5 16AKP10).
-            actual = self.response(Port::Keyboard, self.timer.start(), self.config.io_timeout_us)?;
+            actual = self.response(
+                Port::Keyboard,
+                self.timer.start(),
+                self.config.io_timeout_us,
+            )?;
         }
         if actual & mask != value & mask {
             return Err(ErrorKind::ControllerReply {
