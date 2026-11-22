@@ -106,15 +106,32 @@ fn retry_keeps_codec_failures() {
             );
         }
     }
+    // Linux's azx_probe_continue retries a codec's configuration only while
+    // the controller reports a codec: with none, or with the only one gone
+    // silent at its vendor ID, one attempt, and no delay.
     let mut fixture = Fixture::new();
     let model = graph_model();
     model.borrow_mut().advertised_codecs = 0;
     let mut controller = create(&model, &mut fixture, retry_config(2)).unwrap();
+    let start = model.borrow().clock.now_us();
     let failure = controller.discover_codecs().unwrap_err();
-    assert_eq!(failure.attempts, 2);
+    assert_eq!(failure.attempts, 1);
     assert_eq!(failure.error, Error::CodecAbsent);
     assert!(failure.failures.is_empty());
     assert!(model.borrow().commands.is_empty());
+    assert!(model.borrow().clock.now_us() - start < 80);
+    let mut fixture = Fixture::new();
+    let model = graph_model();
+    model
+        .borrow_mut()
+        .codec_vendor_overrides
+        .insert(0, u32::MAX);
+    let mut controller = create(&model, &mut fixture, retry_config(3)).unwrap();
+    let start = model.borrow().clock.now_us();
+    let failure = controller.discover_codecs().unwrap_err();
+    assert_eq!(failure.attempts, 1);
+    assert_eq!(failure.failures.len(), 1);
+    assert!(model.borrow().clock.now_us() - start < 80);
 }
 
 #[test]

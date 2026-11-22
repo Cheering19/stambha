@@ -749,7 +749,7 @@ fn finish(machine: &mut Machine, keyboards: &mut [InputDevice]) -> ! {
         if key(keyboards).is_some() {
             power.restart();
         }
-        if power.pressed() {
+        if power.pressed().is_some() {
             power.power_off();
         }
         core::hint::spin_loop();

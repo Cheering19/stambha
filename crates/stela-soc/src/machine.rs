@@ -389,6 +389,9 @@ pub struct UsbCables {
     pub network: Option<Mac>,
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
+    /// The keyboard also has a HID System Control interface, for the
+    /// host's request that the guest sleep ([`AppleDevices::system_sleep`]).
+    pub system_control: bool,
 }
 
 /// The USB Bluetooth controller on the native hub.

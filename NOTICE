@@ -372,6 +372,15 @@ crates/stela-driver-base/src/platform/: Smart Battery System native SMBus
   transport
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-or-later
     drivers/acpi/sbs.c
+crates/stela-driver-base/src/platform/: ACPI control-method power button
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/acpi/button.c
+crates/stela-driver-base/src/platform/: ASUS WMI hotkey events and keyboard
+  backlight
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 ; GPL-2.0-or-later
+    drivers/platform/wmi/core.c, drivers/platform/x86/asus-nb-wmi.c,
+    drivers/platform/x86/asus-wmi.c,
+    include/linux/platform_data/x86/asus-wmi.h
 crates/stela-driver-gpu/src/: GPU sources and patch series
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; Apache-2.0 ; Apache-2.0
     WITH LLVM-exception ; BSD-3-Clause OR GPL-2.0 ; GPL-2.0-only ;
@@ -887,6 +896,9 @@ crates/stela-drivers/src/input/: AMD SFH v2
 crates/stela-drivers/src/input/ish/: Intel ISH resident-firmware transport
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     drivers/hid/intel-ish-hid/, include/linux/intel-ish-client-if.h
+crates/stela-drivers/src/probe/: ACPI video brightness switching
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/acpi/acpi_video.c
 crates/stela-drivers/src/usb/: USB SuperSpeed endpoint contexts
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0 ; GPL-2.0-only
     drivers/usb/host/xhci-mem.c, include/uapi/linux/usb/ch9.h

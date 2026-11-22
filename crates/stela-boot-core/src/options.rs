@@ -75,6 +75,40 @@ pub const DNS: &str = "--dns";
 /// The most `--dns` servers, as glibc's resolver keeps (`MAXNS`).
 pub const MAX_DNS_SERVERS: usize = 3;
 
+/// What the host does with its lid (`--lid`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Lid {
+    /// Nothing, the default: Linux's kernel only reports the lid, its
+    /// userspace decides, and a wrong `_LID` reading is common enough that
+    /// Linux keeps DMI quirks for it.
+    #[default]
+    Ignore,
+    /// A close the firmware notifies darkens a display on built-in panels
+    /// alone, and the next lid notification or built-in input lights it
+    /// ([`crate::lid_panel`]).
+    Method,
+}
+
+impl Lid {
+    const NAMES: [(&'static str, Self); 2] = [("ignore", Self::Ignore), ("method", Self::Method)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, lid)| *lid)
+            .ok_or(Error::Lid)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, lid)| *lid == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// A `--audio-check` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCheck {
@@ -339,6 +373,19 @@ pub struct System {
     /// Time the engine's phases and report them with each heartbeat
     /// (`--profile`).
     pub profile: bool,
+    /// What the host does with its lid (`--lid`); [`Lid::Ignore`] unless
+    /// given ([`Self::lid`]).
+    pub lid: Option<Lid>,
+    /// Ask macOS to sleep when the lid darkens the panel, with a HID System
+    /// Sleep on the guest keyboard's System Control interface, and wake it
+    /// with its power button when the panel lights again (`--lid-sleep`,
+    /// with `--lid method`).
+    pub lid_sleep: bool,
+    /// Step a display output with `_BCL` and `_BCM` in the firmware's
+    /// `_DOD` at its brightness notifications (`--brightness-keys`): Linux
+    /// does only where ACPI video owns the backlight, which Stela cannot
+    /// tell.
+    pub brightness_keys: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -449,6 +496,9 @@ impl Default for System {
             native_rounds: false,
             parallel: true,
             profile: false,
+            lid: None,
+            lid_sleep: false,
+            brightness_keys: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -598,6 +648,11 @@ fn flag(set: &mut bool, duplicate: Error) -> Result<(), Error> {
 }
 
 impl System {
+    /// What the host does with its lid: `--lid`, else nothing.
+    pub fn lid(&self) -> Lid {
+        self.lid.unwrap_or_default()
+    }
+
     /// This boot starts the macOS the Preboot disk holds, which needs a GPU;
     /// its recoveryOS and a staged update's installer show on the firmware's
     /// display, as a restore does.
@@ -909,6 +964,9 @@ impl fmt::Display for System {
             self.native_rounds || self.native_shared_check || self.native_bootstrap_check;
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile)?;
+        line.value("--lid", self.lid.map(Lid::name))?;
+        line.flag("--lid-sleep", self.lid_sleep)?;
+        line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

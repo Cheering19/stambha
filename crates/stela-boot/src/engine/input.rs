@@ -306,6 +306,14 @@ impl HostInput {
             reported.times.delivered += pending.len().saturating_sub(before) as u64;
             if pending.len() != before {
                 reported.active = now;
+                // A laptop's own keyboard or touchpad lights a panel the
+                // lid darkened, whatever its `_LID` reads (`--lid method`).
+                if built_in(device) && super::lid::built_in_input() == Some(false) {
+                    output::arguments(format_args!(
+                        "HOST lid: input of {}: the panel lights again\n",
+                        device.name()
+                    ));
+                }
             }
             controller_change(&*device, reported);
             if let Err(error) = polled {
@@ -405,6 +413,19 @@ impl HostInput {
 
 /// Why a device stopped, for its removal's line: the cause the device
 /// holds, else its last polling failure, else that neither is known.
+/// Whether `device` is a laptop's own: its i8042 keyboard or touchpad, an
+/// I2C HID device, an ELAN or Cypress touchpad or an ISH client, where a
+/// USB or virtio device is plugged in.
+fn built_in(device: &InputDevice) -> bool {
+    matches!(
+        device,
+        InputDevice::Ps2(_)
+            | InputDevice::I2cHid(_)
+            | InputDevice::Touchpad(_)
+            | InputDevice::Ish(_)
+    )
+}
+
 fn stop_cause(
     held: Option<alloc::string::String>,
     last_failure: Option<alloc::string::String>,

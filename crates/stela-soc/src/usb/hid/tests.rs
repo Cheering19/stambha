@@ -68,7 +68,7 @@ fn descriptors_describe_a_composite_keyboard_and_pointer() {
     let config = control(&mut p, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 9), &[]).unwrap();
     assert_eq!(config[..5], [9, CONFIGURATION, 84, 0, 3]);
     let full = control(&mut p, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 255), &[]).unwrap();
-    assert_eq!(full, configuration_descriptor());
+    assert_eq!(full, configuration_descriptor(false));
     // The HID descriptors name each report descriptor's length.
     for (n, report) in [
         &KEYBOARD_REPORT_DESCRIPTOR[..],
@@ -103,6 +103,56 @@ fn descriptors_describe_a_composite_keyboard_and_pointer() {
     assert!(control(&mut p, setup(0x80, GET_DESCRIPTOR, 0x600, 0, 10), &[]).is_err());
     // A STALL clears at the next SETUP.
     assert!(control(&mut p, setup(0x80, GET_STATUS, 0, 0, 2), &[]).is_ok());
+}
+
+#[test]
+fn a_system_control_interface_is_opt_in_and_sends_sleep_as_a_press_and_release() {
+    // The default device has none: its fourth interface and endpoint stall.
+    let mut plain = Peripheral::new();
+    enumerate(&mut plain);
+    assert!(control(&mut plain, setup(0x81, GET_DESCRIPTOR, 0x2200, 3, 255), &[]).is_err());
+    assert_eq!(plain.packet(0x84, Token::In, &mut [0; 8]), Ok(Reply::Stall));
+    assert!(plain.system_sleep().is_err());
+    let mut p = Peripheral::with_system_control();
+    let full = control(&mut p, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 255), &[]).unwrap();
+    assert_eq!(full[..5], [9, CONFIGURATION, 109, 0, 4]);
+    // The keyboard and pointers are described as on the default device.
+    assert_eq!(full[9..84], configuration_descriptor(false)[9..]);
+    assert_eq!(full[84..93], [9, 4, 3, 0, 1, 3, 0, 0, 0]);
+    assert_eq!(
+        full[93..102],
+        hid_descriptor(SYSTEM_REPORT_DESCRIPTOR.len())
+    );
+    assert_eq!(full[102..109], [7, 5, 0x84, 3, 1, 0, 1]);
+    let report = control(&mut p, setup(0x81, GET_DESCRIPTOR, 0x2200, 3, 255), &[]).unwrap();
+    assert_eq!(report, SYSTEM_REPORT_DESCRIPTOR);
+    // Generic Desktop System Control, usages System Power Down to Wake Up.
+    assert_eq!(
+        report[..10],
+        [0x05, 0x01, 0x09, 0x80, 0xa1, 0x01, 0x19, 0x81, 0x29, 0x83]
+    );
+    // Unconfigured, a request reaches nothing.
+    p.system_sleep().unwrap();
+    enumerate(&mut p);
+    let mut packet = [0; 8];
+    assert_eq!(p.packet(0x84, Token::In, &mut packet), Ok(Reply::Nak));
+    p.system_sleep().unwrap();
+    // Sleep (82h) is the second usage: pressed, then released.
+    for expected in [0x02, 0x00] {
+        assert_eq!(p.packet(0x84, Token::In, &mut packet), Ok(Reply::Ack(1)));
+        assert_eq!(packet[0], expected);
+    }
+    assert_eq!(p.packet(0x84, Token::In, &mut packet), Ok(Reply::Nak));
+    let current = control(&mut p, setup(0xa1, GET_REPORT, 0x100, 3, 1), &[]).unwrap();
+    assert_eq!(current, [0]);
+    // The keyboard still works beside it.
+    p.input(Input::Key {
+        usage: 0x04,
+        pressed: true,
+    })
+    .unwrap();
+    assert_eq!(p.packet(0x81, Token::In, &mut packet), Ok(Reply::Ack(8)));
+    assert_eq!(packet[2], 0x04);
 }
 
 #[test]

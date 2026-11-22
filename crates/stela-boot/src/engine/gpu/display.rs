@@ -106,6 +106,9 @@ struct KmsScanout {
     vblank_tsc: Option<u64>,
     /// The display's frames its GPU composes.
     composition: composition::Composition,
+    /// The outputs' power as the guest's display sleep and the lid's
+    /// request ask ([`Self::follow_lid`]).
+    panel: stela_boot_core::lid_panel::PanelPower,
 }
 
 impl Scanout for KmsScanout {
@@ -224,7 +227,8 @@ impl Scanout for KmsScanout {
 
     fn queued(&self) -> bool {
         let looking = self.display.is_some() || !self.waiting.is_empty();
-        (looking && host::rdtsc() >= self.next_look)
+        let lid = self.display.is_some() && crate::engine::lid::dark() != self.panel.request();
+        lid || (looking && host::rdtsc() >= self.next_look)
             || self
                 .display
                 .as_ref()
@@ -238,6 +242,7 @@ impl Scanout for KmsScanout {
             let flushed = display.flush();
             finish_present(display, flushed)?;
         }
+        self.follow_lid();
         self.look();
         Ok(())
     }
@@ -249,21 +254,72 @@ impl Scanout for KmsScanout {
         self.blank
     }
 
+    /// A display the lid darkened stays dark through a wake
+    /// ([`Self::follow_lid`]).
     fn set_power(&mut self, on: bool) -> Result<()> {
+        // A sleeping display may have passed no flush since the lid moved.
+        self.follow_lid();
+        let lit = self.panel.guest(on);
         let Some((_, display)) = &mut self.display else {
             return Ok(());
         };
-        display.set_power(on).map_err(|error| {
+        display.set_power(lit).map_err(|error| {
             refuse!(
                 "the GPU's display refused to turn its outputs {state}: {error}",
-                state = if on { "on" } else { "off" },
+                state = if lit { "on" } else { "off" },
                 error = format!("{error:?}")
             )
         })
     }
 }
 
+/// Whether every output showing `display` is a built-in panel.
+fn panels_only(display: &Display<Node>) -> bool {
+    display.ports().all(|port| port.panel())
+}
+
 impl KmsScanout {
+    /// Follow a move of the lid's request ([`crate::engine::lid`],
+    /// `--lid method`) on the display taken, as the guest's display
+    /// sleep's power is applied ([`stela_boot_core::lid_panel::PanelPower`]):
+    /// a request for dark darkens a display shown on built-in panels alone,
+    /// and its end lights the display again unless the guest's display
+    /// sleeps. A display taken later follows the request at its first
+    /// flush.
+    fn follow_lid(&mut self) {
+        use stela_boot_core::lid_panel::LidPower;
+        let Some((name, display)) = &mut self.display else {
+            return;
+        };
+        let dark = crate::engine::lid::dark();
+        let Some(power) = self.panel.lid(dark, panels_only(display)) else {
+            return;
+        };
+        let (lit, what) = match power {
+            LidPower::Off => (false, "built-in panel off"),
+            LidPower::On => (true, "built-in panel on"),
+            LidPower::StaysOff => {
+                output::arguments(format_args!(
+                    "GPU {name}: lid: built-in panel stays off while the guest's display sleeps\n"
+                ));
+                return;
+            }
+            LidPower::KeptLit => {
+                output::arguments(format_args!(
+                    "GPU {name}: lid: the display shows on an external monitor too, so it stays \
+                     as the guest's display sleep has it\n"
+                ));
+                return;
+            }
+        };
+        match display.set_power(lit) {
+            Ok(()) => output::arguments(format_args!("GPU {name}: lid: {what}\n")),
+            Err(error) => output::arguments(format_args!(
+                "GPU {name}: lid: the display refused to turn its outputs {}: {error:?}\n",
+                if lit { "on" } else { "off" }
+            )),
+        }
+    }
     fn new(
         mode: ScanoutMode,
         refresh_millihertz: u32,
@@ -286,6 +342,7 @@ impl KmsScanout {
             reported: false,
             vblank_tsc: None,
             composition: composition::Composition::default(),
+            panel: stela_boot_core::lid_panel::PanelPower::new(),
         }
     }
 
@@ -308,8 +365,31 @@ impl KmsScanout {
                     let ticks = age * u128::from(self.tsc_hz) / 1_000_000_000;
                     Some(tsc.saturating_sub(u64::try_from(ticks).ok()?))
                 });
+                // A monitor connected under a closed lid, as a dock's: the
+                // display lights, so this look shows the picture there.
+                if self.panel.lid_dark() && display.external_waiting() {
+                    use stela_boot_core::lid_panel::LidPower;
+                    match self.panel.external() {
+                        Some(LidPower::On) => match display.set_power(true) {
+                            Ok(()) => output::arguments(format_args!(
+                                "GPU {name}: lid: an external monitor connected, so the display \
+                                 lights to show on it\n"
+                            )),
+                            Err(error) => output::arguments(format_args!(
+                                "GPU {name}: lid: an external monitor connected, but the display \
+                                 refused to light: {error:?}\n"
+                            )),
+                        },
+                        Some(_) => output::arguments(format_args!(
+                            "GPU {name}: lid: an external monitor connected; the display lights \
+                             at the guest's wake\n"
+                        )),
+                        None => {}
+                    }
+                }
                 let watched = display.watch();
                 report_watched(name, display, watched);
+                crate::engine::lid::shown_externally(!panels_only(display));
                 report_listings(name, display);
                 if let Some(error) = watched.error
                     && !core::mem::replace(&mut self.reported, true)

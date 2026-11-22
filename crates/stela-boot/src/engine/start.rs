@@ -1829,6 +1829,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                system_control: options.lid_sleep,
             },
             scanout,
             firmware: &firmware,
@@ -2704,6 +2705,12 @@ fn start_platform(
     // A freeze here was a screen that stopped after the step before with
     // nothing named (issue 36), so this is a step and names its parts.
     crate::status::begin("Taking over the PC's devices from the firmware");
+    super::aml::follow_brightness_keys(options.brightness_keys);
+    // Before the lid's device is found, which reports what follows it.
+    super::lid::configure(
+        options.lid() == stela_boot_core::options::Lid::Method,
+        options.lid_sleep,
+    );
     // The step watchdog runs for this whole step, each part named for its
     // stop. It was armed only inside the kernel work's own calls (the
     // firmware's AML), so a part outside them that never returned, the PCI

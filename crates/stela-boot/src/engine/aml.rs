@@ -1130,6 +1130,25 @@ pub struct HostAcpi {
     installed_ec: RefCell<Option<stela_drivers::platform::ec::capability::Installed<'static>>>,
     power: RefCell<stela_drivers::probe::Power>,
     notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
+    /// The control-method power buttons whose presses set [`BUTTON_NOTIFIED`].
+    buttons: RefCell<Vec<stela_drivers::platform::button::PowerButton<'static>>>,
+    /// The lid's notify handler, which counts in [`LID_NOTIFIED`].
+    lid_notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
+    /// The display outputs whose brightness notifications set [`BRIGHTNESS`].
+    backlights: RefCell<
+        Vec<(
+            stela_drivers::probe::backlight::Control<'static>,
+            stela_drivers::platform::acpi::Notification<'static>,
+        )>,
+    >,
+    /// The ASUS WMI device, and the notify handler that counts its events
+    /// in [`ASUS_EVENTS`].
+    asus: RefCell<
+        Option<(
+            stela_drivers::platform::asus_wmi::AsusWmi<'static>,
+            stela_drivers::platform::acpi::Notification<'static>,
+        )>,
+    >,
     ec_pending: Cell<bool>,
     hardware: AtomicBool,
     ec_failed: AtomicBool,
@@ -1138,6 +1157,34 @@ pub struct HostAcpi {
 static EC_EVENT: AtomicBool = AtomicBool::new(false);
 static POWER_CHANGED: AtomicBool = AtomicBool::new(false);
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
+/// A control-method power button's (PNP0C0C) notifications since the power
+/// control took them: a FADT with PWR_BUTTON set reports presses so.
+static BUTTON_NOTIFIED: AtomicU32 = AtomicU32::new(0);
+/// The lid's STATUS notifications since the poll took them
+/// ([`HostAcpi::service_lid`]).
+static LID_NOTIFIED: AtomicU32 = AtomicU32::new(0);
+/// The display outputs with `_BCL` and `_BCM` whose brightness keys are
+/// followed, at most.
+const BACKLIGHTS: usize = 8;
+/// Each followed output's last brightness notification since the poll
+/// took it, 0 for none ([`HostAcpi::service_brightness`]).
+static BRIGHTNESS: [AtomicU32; BACKLIGHTS] = [const { AtomicU32::new(0) }; BACKLIGHTS];
+/// The last brightness notification of any device since the poll took it.
+static BRIGHTNESS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// `--brightness-keys`: the brightness notifications are followed.
+static BRIGHTNESS_KEYS: AtomicBool = AtomicBool::new(false);
+
+/// Follow the brightness notifications (`--brightness-keys`).
+pub(super) fn follow_brightness_keys(on: bool) {
+    BRIGHTNESS_KEYS.store(on, Ordering::Release);
+}
+/// The ASUS WMI event notifications since the poll took them; any number of
+/// them has the poll drain the firmware's queue
+/// ([`HostAcpi::service_asus_wmi`]).
+static ASUS_EVENTS: AtomicU32 = AtomicU32::new(0);
+/// The ASUS WMI events one poll reads at most: twice what the FA608PP's
+/// queue holds (16), so a queue that never reads empty still ends.
+const ASUS_DRAIN: usize = 32;
 
 impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
@@ -1307,6 +1354,10 @@ impl HostAcpi {
             installed_ec: RefCell::new(None),
             power: RefCell::new(Default::default()),
             notification: RefCell::new(None),
+            buttons: RefCell::new(Vec::new()),
+            lid_notification: RefCell::new(None),
+            backlights: RefCell::new(Vec::new()),
+            asus: RefCell::new(None),
             ec_pending: Cell::new(false),
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
@@ -1370,7 +1421,32 @@ impl HostAcpi {
             output::arguments(format_args!(
                 "UNSUPPORTED ACPI hardware activation: continuation unavailable: {error}\n"
             ));
+            return;
         }
+        if self.hardware_active() {
+            self.attach_laptop_controls();
+        }
+    }
+
+    /// Once the ACPI events are on, the brightness keys' outputs and the
+    /// ASUS WMI device, each in its own bounded firmware call ([`bounded`])
+    /// after the activation's, whose bound ends what was left of it: their
+    /// methods (`_BCL`, `_BCM`, INIT and the keyboard backlight's) are the
+    /// firmware's to make slow, and so can cost only what they attach, not
+    /// the notifications and GPEs every device's events need.
+    fn attach_laptop_controls(&'static self) {
+        self.firmware(
+            "brightness key attachment",
+            "the outputs it reached are followed",
+            false,
+            move |_| self.attach_backlights(),
+        );
+        self.firmware(
+            "ASUS WMI attachment",
+            "its hotkeys are followed as far as it got",
+            false,
+            move |_| self.attach_asus_wmi(),
+        );
     }
     fn activate_entered(&'static self, prepared_sci: Option<sci::Prepared>) {
         // SAFETY: this permanent provider is held by the leaked Session.
@@ -1409,10 +1485,13 @@ impl HostAcpi {
                 ) {
                     output::arguments(format_args!("HOST ACPI power button refused: {error:?}\n"));
                 }
-                match self
-                    .session
-                    .notify_all(|_, _| POWER_CHANGED.store(true, Ordering::Release))
-                {
+                self.attach_power_buttons();
+                match self.session.notify_all(|_, value| {
+                    POWER_CHANGED.store(true, Ordering::Release);
+                    if stela_drivers::probe::backlight::switches(value) {
+                        BRIGHTNESS_SEEN.store(value, Ordering::Release);
+                    }
+                }) {
                     Ok(notification) => *self.notification.borrow_mut() = Some(notification),
                     Err(error) => {
                         output::arguments(format_args!("HOST ACPI notify refused: {error:?}\n"))
@@ -1512,14 +1591,76 @@ impl HostAcpi {
         let provider = unsafe { &*self.provider };
         provider.reach(physical, bytes).and_then(NonNull::new)
     }
+    /// Keep the power devices; the lid's STATUS notifications are counted
+    /// for [`Self::service_lid`], as Linux's `acpi_lid_notify` takes them.
+    /// The reading the lid starts with counts for nothing
+    /// ([`stela_boot_core::lid_panel`]). One line for the lid.
     pub(super) fn retain_power(&self, power: stela_drivers::probe::Power) {
+        use stela_drivers::platform::lid::NOTIFY_STATUS;
+        if let Some(lid) = &power.lid {
+            let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+            let follows = if super::lid::method() {
+                "--lid method: a close it notifies darkens a display on built-in panels alone"
+            } else {
+                "--lid ignore: nothing follows it"
+            };
+            match lid.handle().notify(|value| {
+                if value == NOTIFY_STATUS {
+                    LID_NOTIFIED.fetch_add(1, Ordering::AcqRel);
+                }
+            }) {
+                Ok(notification) => {
+                    output::arguments(format_args!("HOST ACPI lid {path}: {follows}\n"));
+                    *self.lid_notification.borrow_mut() = Some(notification);
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI lid {path}: notify handler refused: {error:?}; nothing follows it\n"
+                )),
+            }
+        }
         *self.power.borrow_mut() = power;
     }
     pub(super) fn hardware_active(&self) -> bool {
         self.hardware.load(Ordering::Acquire)
     }
-    pub(super) fn take_power_button(&self) -> bool {
-        POWER_BUTTON.swap(false, Ordering::AcqRel)
+    /// What the power button did since the last call: whether its fixed
+    /// event fired, and how many notifications its control-method buttons
+    /// had, which the power control debounces (`engine::power`).
+    pub(super) fn take_power_button(&self) -> (bool, u32) {
+        (
+            POWER_BUTTON.swap(false, Ordering::AcqRel),
+            BUTTON_NOTIFIED.swap(0, Ordering::AcqRel),
+        )
+    }
+
+    /// Linux's `acpi_button` on each control-method power button (PNP0C0C),
+    /// whose presses a firmware with PWR_BUTTON set in its FADT sends as
+    /// notifications rather than the fixed event: each counts, and the
+    /// power control takes them as presses (`engine::power`). One line for
+    /// each button.
+    fn attach_power_buttons(&'static self) {
+        use stela_drivers::platform::button;
+        let found = match button::attach_power_buttons(&self.session, &BUTTON_NOTIFIED) {
+            Ok(found) => found,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI power button search refused: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        for (path, error) in &found.refused {
+            output::arguments(format_args!(
+                "HOST ACPI power button {path}: notify handler refused: {error:?}\n"
+            ));
+        }
+        for button in &found.buttons {
+            output::arguments(format_args!(
+                "HOST ACPI power button {}: control method, its presses reach the guest\n",
+                button.path
+            ));
+        }
+        *self.buttons.borrow_mut() = found.buttons;
     }
 
     pub(super) fn poll(&'static self) {
@@ -1622,6 +1763,279 @@ impl HostAcpi {
         // unrelated fixed events and GPEs to keep making SCI progress.
         if unsafe { drain_work(self.provider.cast_mut().cast()) } != AE_OK {
             output::fatal("ACPI deferred work completion failed");
+        }
+        self.service_lid();
+        self.service_brightness();
+        self.service_asus_wmi();
+    }
+
+    /// The lid's STATUS notifications since the last poll: `_LID` read
+    /// anew, as Linux's `acpi_lid_notify` reads it, and with `--lid method`
+    /// the lid's request moved ([`super::lid::notified`]). One line for
+    /// each poll that saw some, so a boot's log counts them.
+    fn service_lid(&self) {
+        let notified = LID_NOTIFIED.swap(0, Ordering::AcqRel);
+        if notified == 0 {
+            return;
+        }
+        let mut power = self.power.borrow_mut();
+        let Some(lid) = &mut power.lid else {
+            return;
+        };
+        let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+        let open = match lid.refresh() {
+            Ok(open) => open,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI lid {path}: {notified} notification(s), _LID failed: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        let what = match super::lid::notified(open) {
+            _ if !super::lid::method() => "--lid ignore, so nothing follows",
+            Some(true) => "a display on built-in panels alone goes dark",
+            Some(false) => "the panel lights again",
+            None => "nothing changes",
+        };
+        output::arguments(format_args!(
+            "HOST ACPI lid {path}: {notified} notification(s), _LID reads {}: {what}\n",
+            if open { "open" } else { "closed" }
+        ));
+    }
+
+    /// Linux's asus-wmi on an ASUS laptop's WMI device that has the
+    /// notebook events: a notify handler on its event block first, and only
+    /// once it is in, INIT, after which the firmware reports its Fn hotkeys
+    /// as events into a queue that each one must be read from; then the
+    /// keyboard backlight read and set to that level, as asus-wmi registers
+    /// its LED. The events are taken at the next poll
+    /// ([`Self::service_asus_wmi`]). One line, where the device exists.
+    fn attach_asus_wmi(&'static self) {
+        use stela_drivers::platform::asus_wmi::AsusWmi;
+        let mut wmi = match AsusWmi::find(&self.session) {
+            Ok(Some(wmi)) => wmi,
+            Ok(None) => return,
+            Err(error) => {
+                output::arguments(format_args!("HOST ASUS WMI search refused: {error:?}\n"));
+                return;
+            }
+        };
+        let notify = wmi.notify;
+        let notification = match wmi.handle().notify(move |value| {
+            if value == notify {
+                ASUS_EVENTS.fetch_add(1, Ordering::AcqRel);
+            }
+        }) {
+            Ok(notification) => notification,
+            Err(error) => {
+                // INIT would route the hotkeys into a queue nothing reads.
+                output::arguments(format_args!(
+                    "HOST ASUS WMI {}: notify handler refused: {error:?}; INIT is not called, \
+                     so its hotkeys stay as the firmware has them\n",
+                    wmi.path
+                ));
+                return;
+            }
+        };
+        let init = match wmi.init() {
+            Ok(answer) => alloc::format!("INIT answered {answer:#x}"),
+            Err(error) => alloc::format!("INIT refused ({error:?})"),
+        };
+        let keyboard = match wmi.read_keyboard() {
+            Ok(Some(level)) => match wmi.set_keyboard(i32::from(level)) {
+                Ok(_) => alloc::format!(
+                    "keyboard backlight at {level} of {}, which its keys step",
+                    stela_drivers::platform::asus_wmi::KEYBOARD_MAX
+                ),
+                Err(error) => alloc::format!("keyboard backlight refused its level: {error:?}"),
+            },
+            Ok(None) => String::from("no keyboard backlight"),
+            Err(error) => alloc::format!("keyboard backlight unreadable: {error:?}"),
+        };
+        output::arguments(format_args!(
+            "HOST ASUS WMI {} ({}): {init}, {keyboard}, its hotkey events are taken\n",
+            wmi.path,
+            wmi.method()
+        ));
+        *self.asus.borrow_mut() = Some((wmi, notification));
+    }
+
+    /// The ASUS WMI events since the last poll: at any notification, the
+    /// firmware's whole queue read through `_WED` until it is empty
+    /// ([`stela_drivers::platform::asus_wmi::AsusWmi::drain`]), past a read
+    /// that fails, so a missed notification leaves no event behind to fill
+    /// it: a keyboard backlight key steps it, and any other code is named.
+    fn service_asus_wmi(&self) {
+        let notified = ASUS_EVENTS.swap(0, Ordering::AcqRel);
+        if notified == 0 {
+            return;
+        }
+        let mut kept = self.asus.borrow_mut();
+        let Some((wmi, _)) = kept.as_mut() else {
+            return;
+        };
+        for read in wmi.drain(ASUS_DRAIN) {
+            let code = match read {
+                Ok(code) => code,
+                Err(error) => {
+                    output::arguments(format_args!("HOST ASUS WMI event unreadable: {error:?}\n"));
+                    continue;
+                }
+            };
+            match wmi.keyboard_key(code) {
+                Ok(Some((from, to))) => output::arguments(format_args!(
+                    "HOST ASUS WMI keyboard backlight {from} -> {to} of {} (event {code:#x})\n",
+                    stela_drivers::platform::asus_wmi::KEYBOARD_MAX
+                )),
+                Ok(None) => {
+                    output::arguments(format_args!("HOST ASUS WMI event {code:#x}: not taken\n"))
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ASUS WMI keyboard backlight refused (event {code:#x}): {error:?}\n"
+                )),
+            }
+        }
+    }
+
+    /// With `--brightness-keys`, Linux's ACPI video driver on each display
+    /// output device with `_BCL` and `_BCM` its video bus's `_DOD` lists
+    /// ([`stela_drivers::probe::backlight::controls`]): its level set as at
+    /// registration, the level a press without `_BQC` starts from, and its
+    /// brightness notifications, which a laptop's brightness keys send,
+    /// stepping it ([`Self::service_brightness`]). Linux does this only
+    /// where ACPI video owns the backlight, which Stela cannot tell, so it
+    /// is asked for. One line for each device, or one saying none was found.
+    fn attach_backlights(&'static self) {
+        use stela_drivers::probe::backlight;
+        if !BRIGHTNESS_KEYS.load(Ordering::Acquire) {
+            return;
+        }
+        let found = match backlight::controls(&self.session) {
+            Ok(found) => found,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight search refused: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        for path in &found.unlisted {
+            output::arguments(format_args!(
+                "HOST ACPI backlight {path}: _BCL lists no levels, so the brightness keys leave it\n"
+            ));
+        }
+        for path in &found.undeclared {
+            output::arguments(format_args!(
+                "HOST ACPI backlight {path}: its video bus's _DOD does not list it (or it has no \
+                 _ADR), so the brightness keys leave it\n"
+            ));
+        }
+        if found.controls.is_empty() {
+            output::arguments(format_args!(
+                "HOST ACPI backlight: no display output in _DOD has _BCL and _BCM, so the \
+                 brightness keys find no backlight control\n"
+            ));
+        }
+        let mut kept = self.backlights.borrow_mut();
+        for (index, mut control) in found.controls.into_iter().enumerate() {
+            if index >= BACKLIGHTS {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight {}: past the first {BACKLIGHTS} outputs, its brightness \
+                     keys are not followed\n",
+                    control.path
+                ));
+                continue;
+            }
+            let set = match control.initialize() {
+                Ok(set) => alloc::format!("set to {} of {}", set.level, set.max),
+                Err(error) => alloc::format!(
+                    "_BCM refused its first level (status {:#x}), so a first press starts from \
+                     the middle",
+                    error.0
+                ),
+            };
+            let path = &control.path;
+            if index >= BACKLIGHTS {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: past the first {BACKLIGHTS} outputs, its brightness \
+                     keys are not followed\n"
+                ));
+                continue;
+            }
+            let notified = control.handle().notify(move |value| {
+                if backlight::switches(value) {
+                    BRIGHTNESS[index].store(value, Ordering::Release);
+                }
+            });
+            match notified {
+                Ok(notification) => {
+                    output::arguments(format_args!(
+                        "HOST ACPI backlight {path}: _BCL lists {} levels up to {}, {set}, and \
+                         the brightness keys step it through _BCM\n",
+                        control.levels.count(),
+                        control.levels.max()
+                    ));
+                    kept.push((control, notification));
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: notify handler refused: {error:?}\n"
+                )),
+            }
+        }
+    }
+
+    /// Each followed output's brightness notification since the last poll:
+    /// its next level set through its `_BCM`, with a line. A brightness
+    /// notification no followed output took is named too.
+    fn service_brightness(&self) {
+        use stela_drivers::probe::backlight;
+        let what = |event| match event {
+            backlight::NOTIFY_INC => "up",
+            backlight::NOTIFY_DEC => "down",
+            backlight::NOTIFY_CYCLE => "cycled",
+            backlight::NOTIFY_ZERO => "to zero",
+            _ => "off",
+        };
+        let seen = BRIGHTNESS_SEEN.swap(0, Ordering::AcqRel);
+        if !BRIGHTNESS_KEYS.load(Ordering::Acquire) {
+            return;
+        }
+        let mut taken = false;
+        for (index, (control, _)) in self.backlights.borrow_mut().iter_mut().enumerate() {
+            let event = BRIGHTNESS[index].swap(0, Ordering::AcqRel);
+            if event == 0 {
+                continue;
+            }
+            taken = true;
+            let switched = control.switch(event);
+            let path = &control.path;
+            match switched {
+                Ok(switched) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: brightness {} {} -> {} of {} through _BCM ({})\n",
+                    what(event),
+                    switched.from,
+                    switched.to,
+                    switched.max,
+                    if switched.read {
+                        "from the level _BQC read"
+                    } else {
+                        "from the level last set"
+                    }
+                )),
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI backlight {path}: brightness {} refused by _BCM (status {:#x})\n",
+                    what(event),
+                    error.0
+                )),
+            }
+        }
+        if seen != 0 && !taken {
+            output::arguments(format_args!(
+                "HOST ACPI brightness {}: no display output with _BCL and _BCM took it, so no \
+                 backlight control found\n",
+                what(seen)
+            ));
         }
     }
 

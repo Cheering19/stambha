@@ -72,6 +72,8 @@ pub enum Error {
     Dns,
     DuplicateDns,
     DuplicateAudioCheck,
+    Lid,
+    DuplicateLid,
     DuplicateAudioHpet,
     DuplicateNativePciIoapic,
     MissingAudioMode,
@@ -141,6 +143,7 @@ pub enum Constraint {
     DramAlignment,
     AudioHpetDependency,
     NativePciIoapicExclusive,
+    LidSleepDependency,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -203,6 +206,8 @@ impl Error {
             Self::Dns => "--dns needs 1 to 3 distinct server addresses separated by commas",
             Self::DuplicateDns => "duplicate --dns",
             Self::DuplicateAudioCheck => "duplicate audio check",
+            Self::Lid => "--lid takes ignore or method",
+            Self::DuplicateLid => "duplicate --lid",
             Self::DuplicateAudioHpet => "duplicate audio HPET handoff",
             Self::DuplicateNativePciIoapic => "duplicate native PCI IOAPIC handoff",
             Self::MissingAudioMode => "missing audio check mode",
@@ -280,6 +285,7 @@ impl Constraint {
             Self::NativePciIoapicExclusive => {
                 "--native-pci-own-ioapic requires the normal system platform path"
             }
+            Self::LidSleepDependency => "--lid-sleep requires --lid method",
         }
     }
 }

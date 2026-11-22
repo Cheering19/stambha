@@ -573,3 +573,169 @@ pub fn reduced_hardware_fixture(extra_aml: &[u8]) -> Services {
     services.capabilities = FULL_CAPABILITIES;
     services
 }
+
+/// The DSDT a platform driver's test names in `STELA_TEST_DSDT`, a whole
+/// table as firmware gives it (a machine's own, read where it is and never
+/// copied into the tree), as an interpreter-only fixture; `None`, for the
+/// test to skip, when the variable is unset. Its SystemMemory and SystemIO
+/// regions read zero and drop writes, as no device answers: a refused
+/// region access while the table loads (an operation region's address
+/// read from NVS) makes ACPICA continue the load with the rest of the
+/// table parsed in the wrong scope, where firmware's memory always answers.
+pub fn named_dsdt_fixture() -> Option<Services> {
+    let path = std::env::var_os("STELA_TEST_DSDT")?;
+    let table = std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}"));
+    assert!(
+        table.len() > 36 && &table[..4] == b"DSDT",
+        "{path:?} is no DSDT"
+    );
+    let mut services = dsdt_fixture(&table[36..]);
+    services.read_memory = zero_memory;
+    services.write_memory = dropped_memory;
+    services.read_port = zero_port;
+    services.write_port = dropped_port;
+    Some(services)
+}
+unsafe extern "C" fn zero_memory(_: *mut c_void, _: u64, value: *mut u64, _: u32) -> Status {
+    // SAFETY: ACPICA passes a valid out pointer.
+    unsafe { value.write(0) };
+    0
+}
+unsafe extern "C" fn dropped_memory(_: *mut c_void, _: u64, _: u64, _: u32) -> Status {
+    0
+}
+unsafe extern "C" fn zero_port(_: *mut c_void, _: u64, value: *mut u32, _: u32) -> Status {
+    // SAFETY: ACPICA passes a valid out pointer.
+    unsafe { value.write(0) };
+    0
+}
+unsafe extern "C" fn dropped_port(_: *mut c_void, _: u64, _: u32, _: u32) -> Status {
+    0
+}
+
+/// Hand-encoded AML terms (ACPI 6.5 section 20.2) for fixture tables.
+pub mod aml {
+    use alloc::{vec, vec::Vec};
+
+    pub const ARG0: u8 = 0x68;
+    pub const ARG1: u8 = 0x69;
+    pub const ARG2: u8 = 0x6a;
+    pub const LOCAL0: u8 = 0x60;
+
+    /// A NameString: `\` for an absolute `path`, then its four-character
+    /// segments joined by `.`.
+    pub fn name(path: &str) -> Vec<u8> {
+        let (root, rest) = match path.strip_prefix('\\') {
+            Some(rest) => (true, rest),
+            None => (false, path),
+        };
+        let segments: Vec<&str> = rest.split('.').filter(|s| !s.is_empty()).collect();
+        let mut out = Vec::new();
+        if root {
+            out.push(b'\\');
+        }
+        match segments.len() {
+            0 => out.push(0),
+            1 => {}
+            2 => out.push(0x2e),
+            count => out.extend([0x2f, count as u8]),
+        }
+        for segment in segments {
+            assert_eq!(segment.len(), 4, "{segment}");
+            out.extend_from_slice(segment.as_bytes());
+        }
+        out
+    }
+
+    /// `op`, a PkgLength of everything after `op`, then `body`.
+    pub fn package(op: &[u8], body: &[u8]) -> Vec<u8> {
+        let length = body.len();
+        let encoded = if length + 1 < 0x40 {
+            vec![(length + 1) as u8]
+        } else if length + 2 < 0x1000 {
+            let total = length + 2;
+            vec![0x40 | (total & 15) as u8, (total >> 4) as u8]
+        } else {
+            let total = length + 3;
+            assert!(total < 0x10_0000);
+            vec![
+                0x80 | (total & 15) as u8,
+                (total >> 4) as u8,
+                (total >> 12) as u8,
+            ]
+        };
+        [op, &encoded, body].concat()
+    }
+
+    pub fn scope(path: &str, body: &[u8]) -> Vec<u8> {
+        package(&[0x10], &[name(path), body.to_vec()].concat())
+    }
+
+    pub fn device(path: &str, body: &[u8]) -> Vec<u8> {
+        package(&[0x5b, 0x82], &[name(path), body.to_vec()].concat())
+    }
+
+    /// A method of `arguments` arguments, not serialized.
+    pub fn method(path: &str, arguments: u8, body: &[u8]) -> Vec<u8> {
+        package(
+            &[0x14],
+            &[name(path), vec![arguments], body.to_vec()].concat(),
+        )
+    }
+
+    /// `Name (path, data)`.
+    pub fn named(path: &str, data: &[u8]) -> Vec<u8> {
+        [vec![0x08], name(path), data.to_vec()].concat()
+    }
+
+    pub fn string(text: &str) -> Vec<u8> {
+        [&[0x0d], text.as_bytes(), &[0]].concat()
+    }
+
+    pub fn integer(value: u64) -> Vec<u8> {
+        match value {
+            0 => vec![0],
+            1 => vec![1],
+            2..=0xff => vec![0x0a, value as u8],
+            0x100..=0xffff => [&[0x0b][..], &(value as u16).to_le_bytes()].concat(),
+            0x1_0000..=0xffff_ffff => [&[0x0c][..], &(value as u32).to_le_bytes()].concat(),
+            _ => [&[0x0e][..], &value.to_le_bytes()].concat(),
+        }
+    }
+
+    /// `Package () { elements }`.
+    pub fn package_of(elements: &[Vec<u8>]) -> Vec<u8> {
+        package(
+            &[0x12],
+            &[vec![elements.len() as u8], elements.concat()].concat(),
+        )
+    }
+
+    /// `Buffer () { bytes }`.
+    pub fn buffer(bytes: &[u8]) -> Vec<u8> {
+        package(
+            &[0x11],
+            &[integer(bytes.len() as u64), bytes.to_vec()].concat(),
+        )
+    }
+
+    /// `Notify (target, value)`.
+    pub fn notify(target: &str, value: &[u8]) -> Vec<u8> {
+        [vec![0x86], name(target), value.to_vec()].concat()
+    }
+
+    /// `Return (term)`.
+    pub fn ret(term: &[u8]) -> Vec<u8> {
+        [&[0xa4], term].concat()
+    }
+
+    /// `Store (source, target)`.
+    pub fn store(source: &[u8], target: &[u8]) -> Vec<u8> {
+        [&[0x70], source, target].concat()
+    }
+
+    /// `If (LEqual (left, right)) { body }`.
+    pub fn if_equal(left: &[u8], right: &[u8], body: &[u8]) -> Vec<u8> {
+        package(&[0xa0], &[&[0x93], left, right, body].concat())
+    }
+}

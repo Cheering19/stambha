@@ -11,6 +11,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     if options.audio_own_hpet && options.audio_check.is_none() {
         return Err(Error::Constraint(Constraint::AudioHpetDependency));
     }
+    if options.lid_sleep && options.lid() != Lid::Method {
+        return Err(Error::Constraint(Constraint::LidSleepDependency));
+    }
     if options.native_pci_own_ioapic
         && (options.audio_check.is_some()
             || options.native_bootstrap_check
