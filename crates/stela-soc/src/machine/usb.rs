@@ -151,8 +151,8 @@ impl AppleDevices {
     /// this machine being the downstream-facing port that sources VBUS: the
     /// HPM reports the attach and the controller's host personality finds
     /// the hub on its USB2 port. The keyboard and pointer sit on the hub's
-    /// first port, and `cables` names the trackpad, USB Ethernet adapter,
-    /// Bluetooth controller and mass storage devices on the next ones. The
+    /// first port, and `cables` names the USB Ethernet adapter, Bluetooth
+    /// controller, mass storage devices and trackpad on the next ones. The
     /// trackpad's serial number is the board's, from its ECID, as the
     /// Bluetooth model's address is. A build without the trackpad model
     /// (stela-soc's `trackpad` feature) refuses one.

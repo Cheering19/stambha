@@ -49,11 +49,19 @@ fn trackpad_cabled_on_full_speed_port() {
     assert_eq!(ports.count(), 4);
     assert!(ports.count() <= hub::MAX_PORTS);
     let speeds: Vec<Speed> = (0..ports.count()).map(|port| ports.speed(port)).collect();
-    assert_eq!(speeds, [Speed::Full, Speed::Full, Speed::High, Speed::High]);
-    // Port 1 the keyboard and pointer, port 2 the trackpad, then the rest
-    // in their order.
-    assert_eq!(vendor(ports.function(0)), 0x1209);
-    assert_eq!(vendor(ports.function(1)), 0x05ac);
+    assert_eq!(speeds, [Speed::Full, Speed::High, Speed::High, Speed::Full]);
+    // The trackpad takes the last port: the keyboard and pointer, the
+    // network adapter and Bluetooth keep the ports they have without it, so
+    // macOS sees no new network interface.
+    let mut without = attachments(false, true, true);
+    for port in 0..3 {
+        assert_eq!(vendor(ports.function(port)), vendor(without.function(port)));
+    }
+    assert_eq!(vendor(ports.function(3)), 0x05ac);
+    // Alone beside the keyboard and pointer, it is the second.
+    let mut alone = attachments(true, false, false);
+    assert_eq!((alone.count(), alone.speed(1)), (2, Speed::Full));
+    assert_eq!(vendor(alone.function(1)), 0x05ac);
     assert_eq!(
         UsbCables::disk_ports(true, true, true),
         UsbCables::disk_ports(true, true, false) - 1

@@ -393,7 +393,7 @@ pub struct UsbCables {
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
     /// An emulated Magic Trackpad 2 fed the host's touch frames, on the
-    /// hub's second port at full speed; refused by a build without
+    /// hub's last port at full speed; refused by a build without
     /// stela-soc's `trackpad` feature.
     pub trackpad: Option<trackpad::Config>,
 }
@@ -418,9 +418,10 @@ impl UsbCables {
 }
 
 /// The functions on the native hub's ports: the keyboard and pointer on
-/// port 1, the trackpad on port 2 when there is one, then the Ethernet
-/// adapter and Bluetooth controller when there are any, then one mass
-/// storage device per host disk.
+/// port 1, then the Ethernet adapter and Bluetooth controller when there
+/// are any, then one mass storage device per host disk, then the trackpad
+/// when there is one, last so the others keep the ports they have without
+/// it.
 struct Attachments {
     input: Peripheral,
     /// Only a build with the trackpad model has one to cable.
@@ -467,7 +468,7 @@ impl hub::Ports for Attachments {
     fn speed(&self, port: usize) -> Speed {
         // The keyboard and pointer and the trackpad are full-speed HID
         // functions behind the hub's transaction translator.
-        if port == 0 || (port == 1 && self.has_trackpad()) {
+        if port == 0 || (self.has_trackpad() && port + 1 == self.count()) {
             Speed::Full
         } else {
             Speed::High
@@ -483,10 +484,10 @@ impl hub::Ports for Attachments {
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
         let mut functions = input
-            .chain(trackpad)
             .chain(network)
             .chain(bluetooth)
-            .chain(disks);
+            .chain(disks)
+            .chain(trackpad);
         functions.nth(port).expect("a port of the hub's count")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
@@ -499,10 +500,10 @@ impl hub::Ports for Attachments {
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
         let mut functions = input
-            .chain(trackpad)
             .chain(network)
             .chain(bluetooth)
-            .chain(disks);
+            .chain(disks)
+            .chain(trackpad);
         functions.nth(port).expect("a port of the hub's count")
     }
 }
