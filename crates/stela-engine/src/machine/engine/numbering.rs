@@ -164,10 +164,16 @@ pub(super) struct Numbering {
 }
 
 impl Numbering {
+    /// Registries whose stored reads begin with the user thread pointers
+    /// ([`super::mirrors::USER_THREAD_POINTERS`]).
     pub(super) fn new() -> Self {
+        let stored_reads = Arc::new(Registry::new(super::mirrors::STORED_CELLS));
+        for encoding in super::mirrors::USER_THREAD_POINTERS {
+            stored_reads.find_or_add(encoding, || true);
+        }
         Self {
             variants: Arc::new(Registry::new(VARIANTS)),
-            stored_reads: Arc::new(Registry::new(super::mirrors::STORED_CELLS)),
+            stored_reads,
             stored_writes: Arc::new(Registry::new(super::mirrors::STORED_WRITES)),
         }
     }

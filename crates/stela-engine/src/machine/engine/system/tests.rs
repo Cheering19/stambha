@@ -2177,6 +2177,47 @@ fn pstate_fields_vector_bases_and_context_ids_keep_only_their_bits() {
     assert_eq!(esr, 0x01 << 26 | 1 << 25 | 1 << 24 | 0xe << 20 | 1);
 }
 
+/// The user thread pointers, TPIDRRO_EL0 and TPIDR_EL0, hold the first
+/// stored cells of every board, so blocks read them inside themselves
+/// (`x86_64::mirrored_read`) from the same cell whatever a boot installed
+/// first; a plain read at EL0 opens the cell on the register's storage,
+/// which then reads what a later write left there.
+#[test]
+fn the_user_thread_pointers_read_inside_blocks_from_fixed_stored_cells() {
+    use super::super::{MIRRORED, USER_THREAD_POINTERS, cell_place, read_word};
+    const POINTER: u64 = 0x0000_0001_6f80_4000;
+    let reads = super::super::regime_state::inline_mirrored_reads();
+    let mut machine = machine(&[]);
+    for (index, &encoding) in USER_THREAD_POINTERS.iter().enumerate() {
+        let read = reads
+            .reads
+            .iter()
+            .flatten()
+            .find(|read| read.word == read_word(encoding))
+            .copied()
+            .expect("an inline read");
+        let cell = MIRRORED.len() + index;
+        assert!(read.stored, "{encoding:?}");
+        assert_eq!(read.cell as usize, cell_place(cell).offset, "{encoding:?}");
+        assert_eq!(machine.stored_reads.find(&encoding), Some(index));
+        let register = [Register::TPIDRRO_EL0, Register::TPIDR_EL0][index];
+        machine.cpu.registers.set(register, 0, POINTER);
+        machine.cpu.pstate = Pstate::reset(0);
+        machine.cpu.pc = BASE;
+        assert_eq!(machine.mirrors[cell].readable, 0, "{encoding:?}");
+        machine
+            .system_instruction(access(true, encoding, 1))
+            .unwrap();
+        assert_eq!(machine.cpu.state.x[1], POINTER, "{encoding:?}");
+        let opened = machine.mirrors[cell];
+        assert_eq!(opened.readable, 1, "{encoding:?}");
+        machine.cpu.registers.set(register, 0, POINTER + 0x40);
+        // SAFETY: the open cell names the register's storage in `machine`.
+        let stored = unsafe { (opened.value as *const u64).read() };
+        assert_eq!(stored, POINTER + 0x40, "{encoding:?}");
+    }
+}
+
 #[test]
 fn whole_register_state_holds_what_software_writes() {
     const STATE: &[(u8, Encoding)] = &[

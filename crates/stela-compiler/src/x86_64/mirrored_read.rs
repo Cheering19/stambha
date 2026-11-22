@@ -15,6 +15,11 @@
 //! before it, and the engine completes the MRS as it completes the exit of a
 //! block ending at it. Nothing else changes: the read touches no guest
 //! memory, flags or other registers. RAX and host flags are clobbered.
+//!
+//! A stored cell ([`Read::stored`], `register_read::stored_thunk`) holds
+//! the address of the register's live storage instead of its value, which
+//! the read loads: a register the kernel writes at each thread switch, such
+//! as the user thread pointer, reads what it wrote, with no cell update.
 use super::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Rm, Size};
 use crate::{Anchor, GuestAddress, Place, aarch64::Register, block::ExitKind};
 
@@ -24,8 +29,9 @@ const RT: u32 = 31;
 const READABLE: i32 = core::mem::offset_of!(super::register_read::Cell, readable) as i32;
 const VALUE: i32 = core::mem::offset_of!(super::register_read::Cell, value) as i32;
 
-/// One register: the MRS of it (Rt is ignored) and the offset of its cell
-/// from [`Anchor::Cells`].
+/// One register: the MRS of it (Rt is ignored), the offset of its cell
+/// from [`Anchor::Cells`], and whether the cell's value is the address of
+/// the register's storage (`stored`) rather than what it reads.
 #[derive(
     Debug,
     Clone,
@@ -42,10 +48,11 @@ const VALUE: i32 = core::mem::offset_of!(super::register_read::Cell, value) as i
 pub struct Read {
     pub word: u32,
     pub cell: u32,
+    pub stored: bool,
 }
 
 /// At most this many registers complete inside blocks.
-pub const READS: usize = 4;
+pub const READS: usize = 6;
 
 /// The registers whose MRS a block completes inside itself.
 #[derive(
@@ -71,14 +78,13 @@ impl Reads {
         reads: [None; READS],
     };
 
-    /// The offset of the cell of the register MRS `word` reads, if blocks
-    /// complete it.
-    pub fn cell(&self, word: u32) -> Option<u32> {
+    /// The register MRS `word` reads and its cell, if blocks complete it.
+    pub fn cell(&self, word: u32) -> Option<Read> {
         self.reads
             .iter()
             .flatten()
             .find(|read| read.word & !RT == word & !RT)
-            .map(|read| read.cell)
+            .copied()
     }
 }
 
@@ -97,7 +103,7 @@ pub(crate) struct Slow {
     closed: Patch,
 }
 
-/// The inline completion of MRS `word` at `pc` from the cell at `cell`:
+/// The inline completion of MRS `word` at `pc` from the cell `read` names:
 ///
 /// ```text
 /// mov rax,[rdi+anchors.cells]; cmp qword [rax+cell],0; je closed
@@ -105,9 +111,10 @@ pub(crate) struct Slow {
 /// ```
 ///
 /// (through RAX when Xt is in the frame; no load for XZR, whose read can
-/// still be UNDEFINED).
-pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, cell: u32) -> Slow {
-    let cell = i32::try_from(cell).expect("a cell within reach of a displacement");
+/// still be UNDEFINED). A stored cell's value is the address the register
+/// is loaded from: `mov rax,[rax+cell+8]; mov xt,[rax]`.
+pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, read: Read) -> Slow {
+    let cell = i32::try_from(read.cell).expect("a cell within reach of a displacement");
     let mut asm = code.asm();
     asm.place(Gpr::Rax, Place::new(Anchor::Cells, 0));
     asm.alu_imm8(
@@ -117,8 +124,16 @@ pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, cell: u32) -> S
         0,
     );
     let closed = asm.jcc(Cond::E);
-    let value = Mem::base(Gpr::Rax, cell + VALUE);
-    match asm.guest(destination(word)) {
+    let value = if read.stored {
+        Mem::base(Gpr::Rax, 0)
+    } else {
+        Mem::base(Gpr::Rax, cell + VALUE)
+    };
+    let xt = asm.guest(destination(word));
+    if read.stored && xt.is_some() {
+        asm.mov_load(Size::Qword, Gpr::Rax, Mem::base(Gpr::Rax, cell + VALUE));
+    }
+    match xt {
         None => {}
         Some(Rm::Reg(host)) => asm.mov_load(Size::Qword, host, value),
         Some(storage) => {
