@@ -1782,9 +1782,6 @@ fn place_devices(
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();
-    if options.lid_sleep {
-        super::lid::enable_sleep();
-    }
     let (mut devices, restore_usb) = match devices(
         board,
         mount::Inputs {
@@ -2691,6 +2688,11 @@ fn start_platform(
     // A freeze here was a screen that stopped after the step before with
     // nothing named (issue 36), so this is a step and names its parts.
     crate::status::begin("Taking over the PC's devices from the firmware");
+    // Before the lid's device is found, which reports what follows it.
+    super::lid::configure(
+        options.lid() == stela_boot_core::options::Lid::Method,
+        options.lid_sleep,
+    );
     // The step watchdog runs for this whole step, each part named for its
     // stop. It was armed only inside the kernel work's own calls (the
     // firmware's AML), so a part outside them that never returned, the PCI

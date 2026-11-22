@@ -1117,17 +1117,6 @@ unsafe extern "C" fn fatal(_: *mut c_void, status: Status) -> ! {
     ))
 }
 
-/// Publish the lid's state `open` for the scanout and the guest
-/// ([`super::lid`]), with a line saying it: a move since the last reading
-/// where `changed`, else the state it starts in.
-fn lid_changed(lid: &stela_drivers::platform::lid::Lid<'_>, open: bool, changed: bool) {
-    super::lid::set(open, changed);
-    let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
-    let state = if open { "open" } else { "closed" };
-    let when = if changed { "" } else { " at start" };
-    output::arguments(format_args!("HOST ACPI lid {path}: {state}{when}\n"));
-}
-
 /// The firmware's ACPI namespace, for the host's power transitions.
 /// One namespace serves the whole program: [`HostAcpi::start`] leaks it, and
 /// the host drivers and power transitions borrow it for `'static`.
@@ -1143,6 +1132,8 @@ pub struct HostAcpi {
     notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
     /// The control-method power buttons whose presses set [`BUTTON_NOTIFIED`].
     buttons: RefCell<Vec<stela_drivers::platform::button::PowerButton<'static>>>,
+    /// The lid's notify handler, which counts in [`LID_NOTIFIED`].
+    lid_notification: RefCell<Option<stela_drivers::platform::acpi::Notification<'static>>>,
     /// The display outputs whose brightness notifications set [`BRIGHTNESS`].
     backlights: RefCell<
         Vec<(
@@ -1169,6 +1160,9 @@ static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
 /// A control-method power button's (PNP0C0C) notifications since the power
 /// control took them: a FADT with PWR_BUTTON set reports presses so.
 static BUTTON_NOTIFIED: AtomicU32 = AtomicU32::new(0);
+/// The lid's STATUS notifications since the poll took them
+/// ([`HostAcpi::service_lid`]).
+static LID_NOTIFIED: AtomicU32 = AtomicU32::new(0);
 /// The display outputs with `_BCL` and `_BCM` whose brightness keys are
 /// followed, at most.
 const BACKLIGHTS: usize = 8;
@@ -1352,6 +1346,7 @@ impl HostAcpi {
             power: RefCell::new(Default::default()),
             notification: RefCell::new(None),
             buttons: RefCell::new(Vec::new()),
+            lid_notification: RefCell::new(None),
             backlights: RefCell::new(Vec::new()),
             asus: RefCell::new(None),
             ec_pending: Cell::new(false),
@@ -1564,12 +1559,32 @@ impl HostAcpi {
         let provider = unsafe { &*self.provider };
         provider.reach(physical, bytes).and_then(NonNull::new)
     }
+    /// Keep the power devices; the lid's STATUS notifications are counted
+    /// for [`Self::service_lid`], as Linux's `acpi_lid_notify` takes them.
+    /// The reading the lid starts with counts for nothing
+    /// ([`stela_boot_core::lid_panel`]). One line for the lid.
     pub(super) fn retain_power(&self, power: stela_drivers::probe::Power) {
-        // The state the lid starts in counts, as Linux reports it.
-        if let Some(lid) = &power.lid
-            && let Some(open) = lid.open()
-        {
-            lid_changed(lid, open, false);
+        use stela_drivers::platform::lid::NOTIFY_STATUS;
+        if let Some(lid) = &power.lid {
+            let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+            let follows = if super::lid::method() {
+                "--lid method: a close it notifies darkens a display on built-in panels alone"
+            } else {
+                "--lid ignore: nothing follows it"
+            };
+            match lid.handle().notify(|value| {
+                if value == NOTIFY_STATUS {
+                    LID_NOTIFIED.fetch_add(1, Ordering::AcqRel);
+                }
+            }) {
+                Ok(notification) => {
+                    output::arguments(format_args!("HOST ACPI lid {path}: {follows}\n"));
+                    *self.lid_notification.borrow_mut() = Some(notification);
+                }
+                Err(error) => output::arguments(format_args!(
+                    "HOST ACPI lid {path}: notify handler refused: {error:?}; nothing follows it\n"
+                )),
+            }
         }
         *self.power.borrow_mut() = power;
     }
@@ -1704,14 +1719,10 @@ impl HostAcpi {
             {
                 output::arguments(format_args!("HOST ACPI AC refresh failed: {error:?}\n"));
             }
-            if let Some(lid) = &mut power.lid {
-                match lid.change() {
-                    Ok(Some(open)) => lid_changed(lid, open, true),
-                    Ok(None) => {}
-                    Err(error) => {
-                        output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"))
-                    }
-                }
+            if let Some(lid) = &mut power.lid
+                && let Err(error) = lid.refresh()
+            {
+                output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"));
             }
         }
         self.service_ucsi();
@@ -1721,8 +1732,44 @@ impl HostAcpi {
         if unsafe { drain_work(self.provider.cast_mut().cast()) } != AE_OK {
             output::fatal("ACPI deferred work completion failed");
         }
+        self.service_lid();
         self.service_brightness();
         self.service_asus_wmi();
+    }
+
+    /// The lid's STATUS notifications since the last poll: `_LID` read
+    /// anew, as Linux's `acpi_lid_notify` reads it, and with `--lid method`
+    /// the lid's request moved ([`super::lid::notified`]). One line for
+    /// each poll that saw some, so a boot's log counts them.
+    fn service_lid(&self) {
+        let notified = LID_NOTIFIED.swap(0, Ordering::AcqRel);
+        if notified == 0 {
+            return;
+        }
+        let mut power = self.power.borrow_mut();
+        let Some(lid) = &mut power.lid else {
+            return;
+        };
+        let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+        let open = match lid.refresh() {
+            Ok(open) => open,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "HOST ACPI lid {path}: {notified} notification(s), _LID failed: {error:?}\n"
+                ));
+                return;
+            }
+        };
+        let what = match super::lid::notified(open) {
+            _ if !super::lid::method() => "--lid ignore, so nothing follows",
+            Some(true) => "a display on built-in panels alone goes dark",
+            Some(false) => "the panel lights again",
+            None => "nothing changes",
+        };
+        output::arguments(format_args!(
+            "HOST ACPI lid {path}: {notified} notification(s), _LID reads {}: {what}\n",
+            if open { "open" } else { "closed" }
+        ));
     }
 
     /// Linux's asus-wmi on an ASUS laptop's WMI device: a notify handler

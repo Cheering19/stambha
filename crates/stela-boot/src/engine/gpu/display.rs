@@ -106,10 +106,9 @@ struct KmsScanout {
     vblank_tsc: Option<u64>,
     /// The display's frames its GPU composes.
     composition: composition::Composition,
-    /// The power the guest's display last asked of the outputs.
-    guest_on: bool,
-    /// The lid state the display last followed ([`Self::follow_lid`]).
-    lid_closed: bool,
+    /// The outputs' power as the guest's display sleep and the lid's
+    /// request ask ([`Self::follow_lid`]).
+    panel: stela_boot_core::lid_panel::PanelPower,
 }
 
 impl Scanout for KmsScanout {
@@ -228,7 +227,7 @@ impl Scanout for KmsScanout {
 
     fn queued(&self) -> bool {
         let looking = self.display.is_some() || !self.waiting.is_empty();
-        let lid = self.display.is_some() && crate::engine::lid::closed() != self.lid_closed;
+        let lid = self.display.is_some() && crate::engine::lid::dark() != self.panel.request();
         lid || (looking && host::rdtsc() >= self.next_look)
             || self
                 .display
@@ -255,16 +254,15 @@ impl Scanout for KmsScanout {
         self.blank
     }
 
-    /// A closed lid keeps a display on built-in panels alone dark through
-    /// a wake ([`Self::follow_lid`]).
+    /// A display the lid darkened stays dark through a wake
+    /// ([`Self::follow_lid`]).
     fn set_power(&mut self, on: bool) -> Result<()> {
-        self.guest_on = on;
+        // A sleeping display may have passed no flush since the lid moved.
+        self.follow_lid();
+        let lit = self.panel.guest(on);
         let Some((_, display)) = &mut self.display else {
             return Ok(());
         };
-        // A sleeping display may have passed no flush since the lid moved.
-        self.lid_closed = crate::engine::lid::closed();
-        let lit = stela_boot_core::lid_panel::lit(on, self.lid_closed, panels_only(display));
         display.set_power(lit).map_err(|error| {
             refuse!(
                 "the GPU's display refused to turn its outputs {state}: {error}",
@@ -281,38 +279,43 @@ fn panels_only(display: &Display<Node>) -> bool {
 }
 
 impl KmsScanout {
-    /// Follow a change of the host's lid ([`crate::engine::lid`]) on the
-    /// display taken, as the guest's display sleep's power is applied: a
-    /// closed lid darkens a display shown on built-in panels alone, and an
-    /// open one lights it again unless the guest's display sleeps. A
-    /// display taken later follows the lid at its first flush.
+    /// Follow a move of the lid's request ([`crate::engine::lid`],
+    /// `--lid method`) on the display taken, as the guest's display
+    /// sleep's power is applied ([`stela_boot_core::lid_panel::PanelPower`]):
+    /// a request for dark darkens a display shown on built-in panels alone,
+    /// and its end lights the display again unless the guest's display
+    /// sleeps. A display taken later follows the request at its first
+    /// flush.
     fn follow_lid(&mut self) {
+        use stela_boot_core::lid_panel::LidPower;
         let Some((name, display)) = &mut self.display else {
             return;
         };
-        let closed = crate::engine::lid::closed();
-        if closed == self.lid_closed {
+        let dark = crate::engine::lid::dark();
+        let Some(power) = self.panel.lid(dark, panels_only(display)) else {
             return;
-        }
-        self.lid_closed = closed;
-        let state = if closed { "closed" } else { "open" };
-        if !panels_only(display) {
-            output::arguments(format_args!(
-                "GPU {name}: lid {state}: the display shows on an external monitor too, so it \
-                 stays as the guest's display sleep has it\n"
-            ));
-            return;
-        }
-        let lit = stela_boot_core::lid_panel::lit(self.guest_on, closed, true);
-        let what = match (closed, lit) {
-            (true, _) => "built-in panel off",
-            (false, true) => "built-in panel on",
-            (false, false) => "built-in panel stays off while the guest's display sleeps",
+        };
+        let (lit, what) = match power {
+            LidPower::Off => (false, "built-in panel off"),
+            LidPower::On => (true, "built-in panel on"),
+            LidPower::StaysOff => {
+                output::arguments(format_args!(
+                    "GPU {name}: lid: built-in panel stays off while the guest's display sleeps\n"
+                ));
+                return;
+            }
+            LidPower::KeptLit => {
+                output::arguments(format_args!(
+                    "GPU {name}: lid: the display shows on an external monitor too, so it stays \
+                     as the guest's display sleep has it\n"
+                ));
+                return;
+            }
         };
         match display.set_power(lit) {
-            Ok(()) => output::arguments(format_args!("GPU {name}: lid {state}: {what}\n")),
+            Ok(()) => output::arguments(format_args!("GPU {name}: lid: {what}\n")),
             Err(error) => output::arguments(format_args!(
-                "GPU {name}: lid {state}: the display refused to turn its outputs {}: {error:?}\n",
+                "GPU {name}: lid: the display refused to turn its outputs {}: {error:?}\n",
                 if lit { "on" } else { "off" }
             )),
         }
@@ -339,8 +342,7 @@ impl KmsScanout {
             reported: false,
             vblank_tsc: None,
             composition: composition::Composition::default(),
-            guest_on: true,
-            lid_closed: false,
+            panel: stela_boot_core::lid_panel::PanelPower::new(),
         }
     }
 

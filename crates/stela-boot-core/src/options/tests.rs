@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn the_lid_is_ignored_unless_asked_and_its_sleep_needs_the_method() {
+    // The default does nothing with the lid, and writes nothing.
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.lid(), Lid::Ignore);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, lid) in [
+        ("--system --lid ignore", Lid::Ignore),
+        ("--system --lid method", Lid::Method),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.lid(), lid);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --lid", Error::Lid),
+        ("--system --lid close", Error::Lid),
+        ("--system --lid method --lid ignore", Error::DuplicateLid),
+        (
+            "--system --lid-sleep",
+            Error::Constraint(Constraint::LidSleepDependency),
+        ),
+        (
+            "--system --lid ignore --lid-sleep",
+            Error::Constraint(Constraint::LidSleepDependency),
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+    assert!(System::parse("--system --lid method --lid-sleep").is_ok());
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),
@@ -181,7 +213,8 @@ fn every_option_survives_a_round_trip() {
         "--system --storage {DISK} --nor {DISK} --bundle b --install p.json \
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
-         --native-artifacts --serialized --profile --lid-sleep --monitor-trace --display-trace \
+         --native-artifacts --serialized --profile --lid method --lid-sleep --monitor-trace \
+         --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
          --load 0x10000004000 --entry 0x10000008000 --x0 7 --budget 99 --break 0x10 \
          --trace 0x20 --watch 0x30,0x40 --dump x21-0x8,0x10 --dump 0x50,0x60"
@@ -193,6 +226,7 @@ fn every_option_survives_a_round_trip() {
     assert!(!System::default().display_trace);
     assert!(options.lid_sleep);
     assert!(!System::default().lid_sleep);
+    assert_eq!(options.lid(), Lid::Method);
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(

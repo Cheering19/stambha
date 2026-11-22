@@ -34,22 +34,21 @@ impl<'a> Lid<'a> {
         self.open
     }
 
-    /// [`Self::refresh`], and what it read where that differs from the
-    /// state known before: Linux's `acpi_lid_notify_state` reports the lid
-    /// switch at every notification, and its input layer passes a change
-    /// on alone. The first reading is one, as Linux reports the state the
-    /// lid starts in (`lid_init_state=method`, its default).
-    pub fn change(&mut self) -> Result<Option<bool>, acpi::Error> {
-        let before = self.open;
-        let open = self.refresh()?;
-        Ok((before != Some(open)).then_some(open))
-    }
-
     /// The lid device's absolute path.
     pub fn path(&self) -> Result<alloc::string::String, acpi::Error> {
         self.handle.path()
     }
+
+    /// The lid device, for a handler of its notifications: Linux's
+    /// `acpi_lid_notify` reads `_LID` at each STATUS (0x80) notification
+    /// and reports what it read, which is all its kernel does with the lid.
+    pub fn handle(&self) -> Handle<'a> {
+        self.handle
+    }
 }
+
+/// `ACPI_BUTTON_NOTIFY_STATUS`: the lid moved, or the firmware says so.
+pub const NOTIFY_STATUS: u32 = 0x80;
 
 /// `_LID`'s answer: nonzero is open.
 fn state(value: Option<Value<'_>>) -> Result<bool, acpi::Error> {
@@ -100,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_is_reported_once_and_the_first_reading_is_one() {
+    fn each_refresh_reads_lid_anew() {
         let _serial = TEST_SERIAL.lock().unwrap();
         // SAFETY: the fixture owns every ACPICA service; serialized singleton.
         let session = unsafe {
@@ -113,19 +112,14 @@ mod tests {
         let handle = session.devices("PNP0C0D").unwrap().remove(0);
         let mut lid = Lid::attach(handle).unwrap();
         assert_eq!(lid.path().unwrap(), "\\_SB_.LID0");
-        let set = |open: u64| {
-            handle
-                .invoke(Some("SETL"), &[Argument::Integer(open)])
-                .unwrap()
-        };
-        assert_eq!(lid.change(), Ok(Some(true)));
-        assert_eq!(lid.change(), Ok(None));
-        set(0);
-        assert_eq!(lid.change(), Ok(Some(false)));
-        assert_eq!(lid.change(), Ok(None));
+        assert_eq!(lid.handle(), handle);
+        assert_eq!(lid.open(), None);
+        assert_eq!(lid.refresh(), Ok(true));
+        handle
+            .invoke(Some("SETL"), &[Argument::Integer(0)])
+            .unwrap();
+        assert_eq!(lid.refresh(), Ok(false));
         assert_eq!(lid.open(), Some(false));
-        set(1);
-        assert_eq!(lid.change(), Ok(Some(true)));
         session.shutdown().unwrap();
     }
 
@@ -155,8 +149,8 @@ mod tests {
             .unwrap();
         // SAFETY: serialized test process context outside an AML frame.
         unsafe { acpi_os_wait_events_complete() };
-        assert_eq!(NOTIFIED.load(Ordering::Acquire), 0x80);
-        assert_eq!(lid.change(), Ok(Some(true)));
+        assert_eq!(NOTIFIED.load(Ordering::Acquire), NOTIFY_STATUS);
+        assert_eq!(lid.refresh(), Ok(true));
         drop(notification);
         session.shutdown().unwrap();
     }
