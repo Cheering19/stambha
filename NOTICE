@@ -44,7 +44,7 @@ FreeBSD e1000 driver               BSD-3-Clause                       stela.efi
 MediaTek mt76 Wi-Fi, btmtk and     BSD-3-Clause-Clear, ISC            stela.efi
 wireless regulatory ports
 Asahi Linux hci_bcm4377            GPL-2.0-only OR MIT (MIT used)     stela.efi
-VoodooInput (acidanthera), the     GPL-2.0-only                       stela.efi, stela
+VoodooInput (acidanthera), the     GPL-2.0-only                       stela.efi
 emulated Magic Trackpad 2's
 reports and descriptors
 Intel drm_eld.h definitions        MIT                                stela.efi

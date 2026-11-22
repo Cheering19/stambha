@@ -18,6 +18,18 @@ mod setup;
 
 pub use setup::InstallMedium;
 
+// The CLI is GPL-3.0-or-later and links stela-soc, so it must not carry
+// stela-soc's GPL-2.0-only Magic Trackpad 2 model, which only stela.efi
+// enables (the `trackpad` feature, set in crates/stela-boot/Cargo.toml).
+// An `--all-features` gate (`cargo xtask check`) unifies that feature into
+// this crate and sets `workspace-check` beside it; a shipped build
+// (`xtask dist`, `-p stela-cli`) sets neither.
+#[cfg(not(feature = "workspace-check"))]
+const _: () = assert!(
+    !stela_soc::usb::TRACKPAD,
+    "the stela CLI must not link stela-soc's GPL-2.0-only trackpad"
+);
+
 /// The help's examples, with this computer's spelling of a whole disk.
 fn examples() -> String {
     let disk = setup::host::DISK_EXAMPLE;

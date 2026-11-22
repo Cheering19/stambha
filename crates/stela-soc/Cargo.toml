@@ -15,6 +15,11 @@ workspace = true
 default = ["std"]
 # Fixtures the runtime's restore tests drive the USB session through.
 test-support = []
+# The emulated Magic Trackpad 2's device model, descriptors and report
+# encoder (usb::trackpad), which take GPL-2.0-only VoodooInput material:
+# stela.efi alone enables it (crates/stela-boot/Cargo.toml), never the
+# GPL-3.0-or-later CLI. stela-soc's own tests build it regardless.
+trackpad = []
 native-profile = ["stela-contracts/native-profile", "stela-engine/native-profile"]
 std = ["stela-soc-data/std", "stela-engine/std", "stela-contracts/std", "stela-formats/std", "stela-compiler/std"]
 

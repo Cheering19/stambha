@@ -154,7 +154,8 @@ impl AppleDevices {
     /// first port, and `cables` names the trackpad, USB Ethernet adapter,
     /// Bluetooth controller and mass storage devices on the next ones. The
     /// trackpad's serial number is the board's, from its ECID, as the
-    /// Bluetooth model's address is.
+    /// Bluetooth model's address is. A build without the trackpad model
+    /// (stela-soc's `trackpad` feature) refuses one.
     pub fn attach_input(&mut self, connector: u32, cables: UsbCables) -> Result<()> {
         let UsbCables {
             disks,
@@ -162,6 +163,12 @@ impl AppleDevices {
             bluetooth,
             trackpad,
         } = cables;
+        #[cfg(not(any(feature = "trackpad", test)))]
+        if trackpad.is_some() {
+            return Err(refuse!(
+                "this build has no Magic Trackpad 2: stela-soc's trackpad feature is off"
+            ));
+        }
         let extras = usize::from(network.is_some())
             + usize::from(bluetooth.is_some())
             + usize::from(trackpad.is_some());
@@ -180,10 +187,11 @@ impl AppleDevices {
             .iter_mut()
             .find(|master| master.number == connector)
             .ok_or(refuse!("no USB controller on that connector"))?;
-        let serial = crate::usb::trackpad::serial(self.ecid);
         let attachments = Attachments {
             input: Peripheral::new(),
-            trackpad: trackpad.map(|config| Trackpad::new(config, &serial)),
+            #[cfg(any(feature = "trackpad", test))]
+            trackpad: trackpad
+                .map(|config| Trackpad::new(config, &crate::usb::trackpad::serial(self.ecid))),
             network,
             bluetooth: bluetooth.map(|kind| match kind {
                 UsbBluetooth::Host => Hci::new(),
@@ -329,19 +337,16 @@ impl AppleDevices {
             .find_map(|master| master.peripheral.as_mut())
             .ok_or(refuse!("no input peripheral is attached"))?
             .ports;
-        match (input, &mut ports.trackpad) {
-            (Input::Touch(frame), Some(trackpad)) => {
-                trackpad.frame(frame);
+        match input {
+            Input::Touch(frame) => {
+                ports.touch(frame);
                 Ok(())
             }
-            (Input::Touch(_), None) => {
-                ports.touch_dropped += 1;
-                Ok(())
-            }
-            (input, _) => ports.input.input(input),
+            input => ports.input.input(input),
         }
     }
 
+    #[cfg(any(feature = "trackpad", test))]
     fn usb_trackpad(&mut self) -> Option<&mut Trackpad> {
         self.usb_masters
             .iter_mut()
@@ -350,16 +355,22 @@ impl AppleDevices {
 
     /// The trackpad's trace for the owner's log since it was last taken:
     /// configurations, the mode and features the guest asked for, each
-    /// unknown request once and the frames dropped.
+    /// unknown request once and the frames dropped; empty without one.
     pub fn trackpad_trace(&mut self) -> Vec<trackpad::TrackpadEvent> {
-        self.usb_trackpad()
-            .map(Trackpad::take_trace)
-            .unwrap_or_default()
+        #[cfg(any(feature = "trackpad", test))]
+        if let Some(trackpad) = self.usb_trackpad() {
+            return trackpad.take_trace();
+        }
+        Vec::new()
     }
 
     /// The trackpad's frame counters; `None` without one.
     pub fn trackpad_counters(&mut self) -> Option<trackpad::Counters> {
-        self.usb_trackpad().map(|trackpad| trackpad.counters())
+        #[cfg(any(feature = "trackpad", test))]
+        if let Some(trackpad) = self.usb_trackpad() {
+            return Some(trackpad.counters());
+        }
+        None
     }
 
     /// The machine's power button went down or up. The SMC reports it to

@@ -20,6 +20,11 @@ path = "src/main.rs"
 # built with amdgpu (`cargo xtask boot build --amdgpu` or `--radv`); a
 # release leaves both out.
 amdgpu-port = ["stela-loader/amdgpu-port"]
+# Set only by `--all-features` gates (`cargo xtask check`), whose feature
+# unification gives stela-soc its `trackpad` here; it lifts the build's
+# refusal of a stela-soc with the GPL-2.0-only trackpad (src/lib.rs). A
+# shipped CLI (`xtask dist`, `-p stela-cli`) never sets it.
+workspace-check = []
 
 [dependencies]
 stela-gpu-maintenance.workspace = true

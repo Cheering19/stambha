@@ -13,6 +13,10 @@ pub mod session;
 pub mod storage;
 pub mod trackpad;
 
+/// Whether this build carries the emulated Magic Trackpad 2's device model
+/// (the `trackpad` feature): stela.efi does, the CLI must not.
+pub const TRACKPAD: bool = cfg!(feature = "trackpad");
+
 /// The initial transport profile has USB2 high-speed packets only.
 pub const MAX_PACKET: usize = 512;
 

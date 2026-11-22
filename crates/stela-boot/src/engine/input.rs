@@ -51,6 +51,13 @@ const MT2_SURFACE: Surface = Surface {
     height_um: 114_900,
 };
 
+// stela.efi carries the Magic Trackpad 2 model `--trackpad` cables:
+// stela-soc's `trackpad` feature, set in crates/stela-boot/Cargo.toml.
+const _: () = assert!(
+    stela_soc::usb::TRACKPAD,
+    "stela.efi needs stela-soc's trackpad feature"
+);
+
 /// What was reported of one device, each kind once, and when it was read.
 #[derive(Clone, Default)]
 struct Reported {

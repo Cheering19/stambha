@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// The expected reports follow VoodooInput's layout and constants (see the
+// parent module); `linux_decode` ports hid-magicmouse.c.
 use super::*;
 use alloc::{vec, vec::Vec};
 use stela_drivers::input::multitouch::Finger;

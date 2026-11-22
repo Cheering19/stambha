@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Linux hid-multitouch.c reference: Copyright (c) 2010-2012 Stephane
 // Chatty, Benjamin Tissoires and Ecole Nationale de l'Aviation Civile.
 // See NOTICE.

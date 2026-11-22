@@ -23,17 +23,10 @@
 //! report 0x02 that the multitouch reports reuse, a touch pad application
 //! and the vendor input report 0x44 of 1387 bytes, which makes a host size
 //! its input transfers for the longest multitouch report.
-use super::report::Mapping;
+use super::{VENDOR, report::Mapping};
 use crate::usb::control::{self, CONFIGURATION, DEVICE, Descriptors, INTERFACE};
 use alloc::{string::String, vec, vec::Vec};
 
-/// Apple's USB vendor ID (hid-ids.h `USB_VENDOR_ID_APPLE`).
-pub const VENDOR: u16 = 0x05ac;
-/// `USB_DEVICE_ID_APPLE_MAGICTRACKPAD2`.
-pub const MAGIC_TRACKPAD_2: u16 = 0x0265;
-/// The MacBookAir10,1 internal trackpad VoodooInput presents on macOS 12
-/// and later (`VoodooInputIDs.hpp`).
-pub const BUILTIN: u16 = 0x0281;
 /// One MT2 firmware's revision (`HID\VID_05AC&PID_0265&REV_0855`).
 pub const RELEASE: u16 = 0x0855;
 

@@ -19,6 +19,8 @@ pub use transfer_times::{
 
 use crate::Result;
 pub use crate::pmu::{RtcAnchor, RtcEpoch};
+#[cfg(any(feature = "trackpad", test))]
+use crate::usb::trackpad::Trackpad;
 use crate::usb::{
     Function, Speed,
     ecm::Ecm,
@@ -27,7 +29,7 @@ use crate::usb::{
     hub::{self, Hub},
     session::Session as UsbSession,
     storage::MassStorage,
-    trackpad::{self, Trackpad},
+    trackpad,
 };
 pub use crate::usb::{
     ecm::Counters as UsbNetworkCounters,
@@ -391,7 +393,8 @@ pub struct UsbCables {
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
     /// An emulated Magic Trackpad 2 fed the host's touch frames, on the
-    /// hub's second port at full speed.
+    /// hub's second port at full speed; refused by a build without
+    /// stela-soc's `trackpad` feature.
     pub trackpad: Option<trackpad::Config>,
 }
 
@@ -420,6 +423,8 @@ impl UsbCables {
 /// storage device per host disk.
 struct Attachments {
     input: Peripheral,
+    /// Only a build with the trackpad model has one to cable.
+    #[cfg(any(feature = "trackpad", test))]
     trackpad: Option<Trackpad>,
     network: Option<Ecm>,
     bluetooth: Option<Hci>,
@@ -428,9 +433,33 @@ struct Attachments {
     touch_dropped: u64,
 }
 
+impl Attachments {
+    /// Whether a trackpad is cabled.
+    #[cfg(any(feature = "trackpad", test))]
+    fn has_trackpad(&self) -> bool {
+        self.trackpad.is_some()
+    }
+
+    #[cfg(not(any(feature = "trackpad", test)))]
+    fn has_trackpad(&self) -> bool {
+        false
+    }
+
+    /// A host touch frame: the trackpad's, else dropped and counted.
+    fn touch(&mut self, frame: stela_drivers::input::multitouch::Frame) {
+        #[cfg(any(feature = "trackpad", test))]
+        if let Some(trackpad) = &mut self.trackpad {
+            trackpad.frame(frame);
+            return;
+        }
+        let _ = frame;
+        self.touch_dropped += 1;
+    }
+}
+
 impl hub::Ports for Attachments {
     fn count(&self) -> usize {
-        1 + usize::from(self.trackpad.is_some())
+        1 + usize::from(self.has_trackpad())
             + usize::from(self.network.is_some())
             + usize::from(self.bluetooth.is_some())
             + self.disks.len()
@@ -438,7 +467,7 @@ impl hub::Ports for Attachments {
     fn speed(&self, port: usize) -> Speed {
         // The keyboard and pointer and the trackpad are full-speed HID
         // functions behind the hub's transaction translator.
-        if port == 0 || (port == 1 && self.trackpad.is_some()) {
+        if port == 0 || (port == 1 && self.has_trackpad()) {
             Speed::Full
         } else {
             Speed::High
@@ -446,7 +475,10 @@ impl hub::Ports for Attachments {
     }
     fn function(&mut self, port: usize) -> &mut dyn Function {
         let input = core::iter::once(&mut self.input as &mut dyn Function);
+        #[cfg(any(feature = "trackpad", test))]
         let trackpad = self.trackpad.iter_mut().map(|f| f as &mut dyn Function);
+        #[cfg(not(any(feature = "trackpad", test)))]
+        let trackpad = core::iter::empty::<&mut dyn Function>();
         let network = self.network.iter_mut().map(|f| f as &mut dyn Function);
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
@@ -459,7 +491,10 @@ impl hub::Ports for Attachments {
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
         let input = core::iter::once(&self.input as &dyn Function);
+        #[cfg(any(feature = "trackpad", test))]
         let trackpad = self.trackpad.iter().map(|f| f as &dyn Function);
+        #[cfg(not(any(feature = "trackpad", test)))]
+        let trackpad = core::iter::empty::<&dyn Function>();
         let network = self.network.iter().map(|f| f as &dyn Function);
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
