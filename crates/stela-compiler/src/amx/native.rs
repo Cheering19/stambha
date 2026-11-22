@@ -21,10 +21,12 @@
 //!   cannot be built exactly from SSE multiplies and adds.
 //! - `vecfp` on IEEE f16 lanes, `z + x*y` and `z - x*y` (modes 0 and 1),
 //!   with a broadcast Y lane or any lane-enable mode, one Z row, no shuffle,
-//!   indexed load or multi-row form. F16C (VEX.128): the product of two f16
-//!   values is exact in f32, the f32 sum is rounded to odd from its exact
-//!   TwoSum error, and the conversion to f16 then rounds once correctly
-//!   (24 >= 11 + 2 bits). Without F16C the model.
+//!   indexed load or multi-row form. F16C (VEX.128, four lanes per step;
+//!   on the `Avx512` tier EVEX.512, sixteen lanes per step with opmask
+//!   enables): the product of two f16 values is exact in f32, the f32 sum
+//!   is rounded to odd from its exact TwoSum error, and the conversion to
+//!   f16 then rounds once correctly (24 >= 11 + 2 bits). Without F16C the
+//!   model.
 //! - `fma16` and `fms16` with F16C, in vector, f16 matrix and bit-62
 //!   widened (f32 row pairs) matrix shape, accumulating, product-only or
 //!   add-only (bits 29:27 = 0, 1, 2 or 4), every lane-enable mode: the same
@@ -152,11 +154,11 @@ impl Native {
             #[cfg(target_arch = "x86_64")]
             AmxOperation::Fma16 | AmxOperation::Fms16 => {
                 (self.f16c || copies((operand >> 27) & 7))
-                    && x86::fused_half(registers, operation, operand)
+                    && x86::fused_half(self.tier, registers, operation, operand)
             }
             #[cfg(target_arch = "x86_64")]
             AmxOperation::VectorFloat => {
-                self.f16c && x86::vector_half(generation, registers, operand)
+                self.f16c && x86::vector_half(self.tier, generation, registers, operand)
             }
             _ => false,
         }
@@ -1221,6 +1223,7 @@ mod x86 {
     /// `vecfp` on f16 lanes, modes 0/1, in the covered forms; see the
     /// module documentation. `false` for any other operand.
     pub(super) fn vector_half(
+        tier: Tier,
         generation: Generation,
         registers: &mut AmxRegisters,
         operand: u64,
@@ -1246,8 +1249,7 @@ mod x86 {
         }
         let x = registers.x_operand((operand >> 10) & 0x1ff);
         let mut y = registers.y_operand(operand & 0x1ff);
-        let mut mask = ALL_LANES;
-        if field == 1 {
+        let enable = if field == 1 {
             // Y lane (bits 36:32) in every lane, every lane on.
             let lane = ((operand >> 32) & 31) as usize;
             let half = u64::from(u16::from_le_bytes([y[2 * lane], y[2 * lane + 1]]));
@@ -1255,22 +1257,17 @@ mod x86 {
             for word in y.as_chunks_mut::<8>().0 {
                 *word = lanes.to_le_bytes();
             }
+            u64::MAX
         } else {
-            let enable = write_mask(operand >> 32, 2, 9);
-            if enable != u64::MAX {
-                for lane in 0..32 {
-                    if !on(enable, lane, 2) {
-                        mask[2 * lane..2 * lane + 2].fill(0);
-                    }
-                }
-            }
-        }
+            write_mask(operand >> 32, 2, 9)
+        };
         let row = &mut registers.z[((operand >> 20) & 63) as usize];
-        // SAFETY: the caller checked F16C (with OS-enabled AVX state); every
-        // pointer is to a live 64-byte row; MXCSR is restored after.
+        // SAFETY: the caller checked F16C (with OS-enabled AVX state), and
+        // the tier's own features; every pointer is to a live 64-byte row;
+        // MXCSR is restored after.
         unsafe {
             let saved = enter();
-            fused_half_row(&x, &y, None, row, &mask, mode == 1);
+            half_row(tier, row, &x, &y, &HalfLanes::of(enable), mode == 1, false);
             leave(saved);
         }
         true
@@ -1289,6 +1286,7 @@ mod x86 {
     /// alone (1) adds it to -0, which leaves every product unchanged (and
     /// `-0 - p` is `-p`, both zeros included), so it too rounds once.
     pub(super) fn fused_half(
+        tier: Tier,
         registers: &mut AmxRegisters,
         operation: AmxOperation,
         operand: u64,
@@ -1319,22 +1317,20 @@ mod x86 {
         unsafe {
             let saved = enter();
             if operand & VECTOR != 0 {
-                half_row(&mut registers.z[z_row], &x, &y, x_enable, subtract, product);
+                let z = &mut registers.z[z_row];
+                half_row(tier, z, &x, &y, &HalfLanes::of(x_enable), subtract, product);
             } else if operand & super::WIDEN_16_32 == 0 {
+                let lanes = HalfLanes::of(x_enable);
                 for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
+                    // Y lane j in every lane.
+                    let half = u64::from(u16::from_le_bytes([y[2 * j], y[2 * j + 1]]));
+                    let word = (half * 0x0001_0001_0001_0001).to_le_bytes();
                     let mut lane = [0u8; ROW_BYTES];
-                    for pair in lane.as_chunks_mut::<2>().0 {
-                        pair.copy_from_slice(&y[2 * j..2 * j + 2]);
+                    for chunk in lane.as_chunks_mut::<8>().0 {
+                        *chunk = word;
                     }
-                    let row = j * 2 + (z_row & 1);
-                    half_row(
-                        &mut registers.z[row],
-                        &x,
-                        &lane,
-                        x_enable,
-                        subtract,
-                        product,
-                    );
+                    let z = &mut registers.z[j * 2 + (z_row & 1)];
+                    half_row(tier, z, &x, &lane, &lanes, subtract, product);
                 }
             } else {
                 widened_rows(registers, &x, &y, x_enable, y_enable, subtract, product);
@@ -1344,21 +1340,60 @@ mod x86 {
         true
     }
 
+    /// The f16 lanes an operation writes, as each row kernel takes them.
+    struct HalfLanes {
+        /// Per byte: all ones in each written lane ([`fused_half_row`]).
+        mask: Row,
+        /// Bit i: lane i written ([`fused_half_row_avx512`]).
+        lanes: u32,
+    }
+
+    impl HalfLanes {
+        /// The lanes a per-byte enable (`write_mask`) turns on.
+        fn of(enable: u64) -> Self {
+            if enable == u64::MAX {
+                return Self {
+                    mask: ALL_LANES,
+                    lanes: u32::MAX,
+                };
+            }
+            let mut lanes = Self {
+                mask: [0; ROW_BYTES],
+                lanes: 0,
+            };
+            for lane in (0..32).filter(|&lane| on(enable, lane, 2)) {
+                lanes.mask[2 * lane..2 * lane + 2].fill(0xff);
+                lanes.lanes |= 1 << lane;
+            }
+            lanes
+        }
+    }
+
     /// One f16 row: `z ± x*y`, or `-0 ± x*y` for the `product` alone, lane
-    /// by lane where `enable` (per byte) is on.
+    /// by lane where `lanes` are on: sixteen lanes per step with opmask
+    /// enables on the AVX-512F tier, four with byte blends on F16C.
     ///
     /// # Safety
-    /// F16C and AVX exist; MXCSR holds the AMX environment.
-    unsafe fn half_row(z: &mut Row, x: &Row, y: &Row, enable: u64, subtract: bool, product: bool) {
-        let mut mask = ALL_LANES;
-        if enable != u64::MAX {
-            for lane in (0..32).filter(|&lane| !on(enable, lane, 2)) {
-                mask[2 * lane..2 * lane + 2].fill(0);
-            }
-        }
+    /// The tier's features exist (AVX-512F with its OS-enabled state for
+    /// `Avx512`, else F16C and AVX); MXCSR holds the AMX environment.
+    unsafe fn half_row(
+        tier: Tier,
+        z: &mut Row,
+        x: &Row,
+        y: &Row,
+        lanes: &HalfLanes,
+        subtract: bool,
+        product: bool,
+    ) {
         let addend = product.then_some(&HALF_NEGATIVE_ZEROS);
         // SAFETY: the caller's contract.
-        unsafe { fused_half_row(x, y, addend, z, &mask, subtract) };
+        unsafe {
+            if tier == Tier::Avx512 {
+                fused_half_row_avx512(x, y, addend, z, lanes.lanes, subtract);
+            } else {
+                fused_half_row(x, y, addend, z, &lanes.mask, subtract);
+            }
+        }
     }
 
     /// The bit-62 matrix: X lane i times Y lane j, widened to f32, into f32
@@ -1554,6 +1589,95 @@ mod x86 {
                 m = in(reg) mask.as_ptr(),
                 nan = in(reg) &raw const NAN_32,
                 subtract = in(reg) u32::from(subtract),
+                out("rax") _,
+                clobber_abi("sysv64"),
+                options(nostack),
+            );
+        }
+    }
+
+    /// [`fused_half_row`] on EVEX.512, sixteen lanes per step: the same
+    /// once-rounded `a ± x*y` (f32 product exact, f32 sum rounded to odd
+    /// from its TwoSum error, then to f16 to nearest even) and default NaN,
+    /// written to `z` where `lanes` (bit i: f16 lane i) is set. A step's
+    /// sixteen results and old Z lanes merge as dwords under the opmask
+    /// and narrow back to halves, so disabled lanes keep their bits exactly
+    /// with AVX-512F alone.
+    ///
+    /// # Safety
+    /// AVX-512F exists with OS-enabled opmask and ZMM state; MXCSR holds the
+    /// AMX environment.
+    unsafe fn fused_half_row_avx512(
+        x: &Row,
+        y: &Row,
+        addend: Option<&Row>,
+        z: &mut Row,
+        lanes: u32,
+        subtract: bool,
+    ) {
+        let z = z.as_mut_ptr();
+        let addend = addend.map_or(z.cast_const(), |row| row.as_ptr());
+        // SAFETY: five live 64-byte rows (the addend may be Z, which each
+        // step reads before it writes); the caller's contract.
+        unsafe {
+            asm!(
+                // zmm10 = 1, zmm11 = the sign bit, zmm12 = the default NaN,
+                // zmm13 = the product's sign flip, zmm14 = 0, in each lane.
+                "vpternlogd zmm10, zmm10, zmm10, 0xff",
+                "vpsrld zmm10, zmm10, 31",
+                "vpslld zmm11, zmm10, 31",
+                "vpbroadcastd zmm12, dword ptr [{nan}]",
+                "vpxord zmm13, zmm13, zmm13",
+                "vpxord zmm14, zmm14, zmm14",
+                "test {subtract:e}, {subtract:e}",
+                "jz 2f",
+                "vmovdqa32 zmm13, zmm11",
+                "2:",
+                "xor eax, eax",
+                "3:",
+                "kmovw k1, ecx",
+                "shr ecx, 16",
+                "vcvtph2ps zmm0, ymmword ptr [{x} + rax]",
+                "vcvtph2ps zmm1, ymmword ptr [{y} + rax]",
+                "vcvtph2ps zmm2, ymmword ptr [{a} + rax]",
+                // p = x*y, exact; negated for a - x*y.
+                "vmulps zmm3, zmm0, zmm1",
+                "vpxord zmm3, zmm3, zmm13",
+                // s = p + a and its TwoSum error e.
+                "vaddps zmm4, zmm3, zmm2",
+                "vsubps zmm5, zmm4, zmm3",
+                "vsubps zmm6, zmm4, zmm5",
+                "vsubps zmm6, zmm3, zmm6",
+                "vsubps zmm7, zmm2, zmm5",
+                "vaddps zmm6, zmm6, zmm7",
+                // Inexact (ordered, nonzero e) and even: step toward s + e.
+                "vcmpps k2, zmm6, zmm14, 12",
+                "vptestnmd k3, zmm4, zmm10",
+                "kandw k2, k2, k3",
+                "vpxord zmm9, zmm4, zmm6",
+                "vpsrad zmm9, zmm9, 31",
+                "vpord zmm9, zmm9, zmm10",
+                "vpaddd zmm4 {{k2}}, zmm4, zmm9",
+                // NaN sums become the default NaN.
+                "vcmpps k2, zmm4, zmm4, 3",
+                "vmovaps zmm4 {{k2}}, zmm12",
+                "vcvtps2ph ymm4, zmm4, 0",
+                // Disabled lanes keep Z: merge as dwords, then narrow.
+                "vpmovzxwd zmm4, ymm4",
+                "vpmovzxwd zmm5, ymmword ptr [{z} + rax]",
+                "vmovdqa32 zmm5 {{k1}}, zmm4",
+                "vpmovdw ymmword ptr [{z} + rax], zmm5",
+                "add eax, 32",
+                "cmp eax, 64",
+                "jb 3b",
+                "vzeroupper",
+                x = in(reg) x.as_ptr(),
+                y = in(reg) y.as_ptr(),
+                a = in(reg) addend,
+                z = in(reg) z,
+                nan = in(reg) &raw const NAN_32,
+                subtract = in(reg) u32::from(subtract),
+                inout("ecx") lanes => _,
                 out("rax") _,
                 clobber_abi("sysv64"),
                 options(nostack),

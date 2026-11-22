@@ -1,6 +1,6 @@
 //! `fma16`/`fms16` and `vecfp` on f16 lanes, which need F16C.
 use crate::harness::{self, Case, Form, GENERATIONS, Paths, Random, check, differential, native};
-use stela_compiler::amx::{AmxOperation, AmxRegisters, Generation};
+use stela_compiler::amx::{AmxOperation, AmxRegisters, Generation, native::Tier};
 
 const VECTOR: u64 = 1 << 63;
 /// `fma16`/`fms16` bit 62: f32 accumulation into interleaved row pairs.
@@ -93,6 +93,57 @@ const VECFP_HALF: Case = Case {
 #[test]
 fn vecfp_half_matches_the_model_bit_for_bit() {
     differential(&VECFP_HALF, &native);
+}
+
+/// The EVEX.512 f16 row (the `Avx512` tier) and the VEX.128 one (`Fma`)
+/// give the same bytes over the ties table, in vecfp's and fma16's rows,
+/// with every lane and with scattered lanes enabled.
+#[test]
+fn both_f16_row_kernels_give_the_same_bytes_at_ties() {
+    let tiers = harness::tiers();
+    let path = |tier: Tier| {
+        tiers
+            .iter()
+            .find(|paths| paths.tier() == tier && paths.f16c)
+            .unwrap_or_else(|| panic!("no {} path with F16C", tier.name()))
+    };
+    let (evex, vex) = (path(Tier::Avx512), path(Tier::Fma));
+    for (index, &x) in HALVES.iter().enumerate() {
+        let mut registers = AmxRegisters::zeroed();
+        for lane in 0..32 {
+            let y = HALVES[lane % HALVES.len()];
+            let z = HALVES[(lane * 7 + index) % HALVES.len()];
+            registers.x[0][2 * lane..2 * lane + 2].copy_from_slice(&x.to_le_bytes());
+            registers.y[0][2 * lane..2 * lane + 2].copy_from_slice(&y.to_le_bytes());
+            for row in [3, 8, 9] {
+                registers.z[row][2 * lane..2 * lane + 2].copy_from_slice(&z.to_le_bytes());
+            }
+        }
+        for (operation, operand) in [
+            (AmxOperation::VectorFloat, 2 << 42 | 3 << 20),
+            (
+                AmxOperation::VectorFloat,
+                2 << 42 | 1 << 47 | 3 << 20 | 1 << 32,
+            ),
+            (AmxOperation::Fma16, VECTOR | 3 << 20 | 3 << 46 | 5 << 41),
+            (AmxOperation::Fms16, 1 << 20 | 1 << 27),
+            (AmxOperation::Fma16, 4 << 27 | 2 << 37 | 4 << 32),
+        ] {
+            let run = |paths: &Paths| {
+                let mut registers = registers.clone();
+                assert!(
+                    paths
+                        .native
+                        .execute(Generation::M2, &mut registers, operation, operand)
+                );
+                registers
+            };
+            assert!(
+                run(evex) == run(vex),
+                "x {x:#06x} {operation:?} {operand:#x}"
+            );
+        }
+    }
 }
 
 /// The fused-operation operands, mostly with bits 29:27 clear.
