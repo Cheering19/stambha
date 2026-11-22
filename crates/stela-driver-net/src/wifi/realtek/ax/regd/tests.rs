@@ -158,3 +158,16 @@ fn real_8852c_fw_2_regd_map_selects_as_linux_does() {
     let (gb, _) = pick(None, Some(*b"GB"));
     assert_eq!((gb.g2, gb.txpwr(HwBand::G2)), (Regd::Uk, Regd::Etsi));
 }
+
+/// `rtw89_regd_setup_unii4` without ACPI (`regd.c:359-409`): the DSM
+/// evaluation fails, `val` becomes `RTW89_ACPI_CONF_UNII4_US` alone, so only
+/// US is cleared from `block_unii4`; CA needs the DSM's bit, and the world
+/// regd has no index (`rtw89_regd_get_index`, `regd.c:327-338`), so both
+/// stay blocked (`rtw89_regd_apply_policy_unii4`, `regd.c:770-797`).
+#[test]
+fn unii4_is_us_only_without_acpi() {
+    assert!(unii4_allowed(*b"US"));
+    for alpha2 in [*b"CA", *b"IN", *b"00", *b"DE", *b"us"] {
+        assert!(!unii4_allowed(alpha2), "{alpha2:?}");
+    }
+}

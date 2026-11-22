@@ -390,7 +390,7 @@ fn vif_init_sends_five_h2cs_after_the_tables() {
         b.macid_pause(MAC_ID, false),
         b.role_maintain(MAC_ID, PORT, 0),
         b.join_info_disconnect(MAC_ID, PORT),
-        b.addr_cam(TEST_MAC, MAC_ID, PORT),
+        b.addr_cam_unassociated(TEST_MAC, MAC_ID, PORT),
         b.default_cmac_tbl(MAC_ID),
     ];
     for (n, (seq, packet)) in want.iter().enumerate() {

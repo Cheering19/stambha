@@ -8,13 +8,20 @@
 //! the station installs and the key each data frame names, and hands back
 //! the AP's protected frames as the hardware leaves them, marked decrypted
 //! with their CCMP header and MIC in place.
-use super::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
+use super::chip::{
+    Association, Chip, Data, HardwareKey, Incoming, LinkCounts, Management, Received, Token,
+    TxCounts,
+};
 use super::*;
 use crate::LinkError;
 use crate::wifi::connection::security::Security;
 use crate::wifi::intel::policy::tests::regdb;
 use crate::wifi::network::{Network, Secret};
+use crate::wifi::realtek::ax::c2h::RaReport;
+use crate::wifi::realtek::ax::regd::Regd;
+use crate::wifi::realtek::ax::rx::{Rate, RateMode};
 use crate::wifi::realtek::ccmp;
+use crate::wifi::regulatory::channel::NO_IR;
 use crate::wifi::sae::{self, Derivation, Exchange};
 use crate::wifi::station::multi_link::Mld;
 use crate::wifi::station::phy::AccessCategory;
@@ -158,6 +165,9 @@ struct Air {
     mute_on_assoc: bool,
     /// The AP has no WMM.
     no_wmm: bool,
+    /// The AP's association response grants the short slot (capability
+    /// b10), which its beacon does not.
+    short_slot_response: bool,
     /// The scan's beacon fails its FCS.
     bad_fcs: bool,
     /// The chip has no room for management or for data frames.
@@ -200,6 +210,13 @@ struct Air {
     /// The chip reports beacon loss during a scan, before the beacon it
     /// hears, and with the AP's answer to an authentication.
     lost_unassociated: bool,
+    /// The rate and A-MPDU bit the chip hears the AP's frames at (M4 spec S3.1).
+    rx_rate: Option<Rate>,
+    rx_ampdu: bool,
+    /// Elements the AP's beacon carries past its HT ones.
+    beacon_extra: Vec<u8>,
+    /// What the chip counts (M4 spec S3.2, S3.4).
+    link: LinkCounts,
 }
 
 impl Air {
@@ -218,6 +235,8 @@ impl Air {
             decrypted,
             icv_error,
             fcs_error: false,
+            rate: self.rx_rate,
+            ampdu: self.rx_ampdu,
         }));
     }
 
@@ -250,9 +269,13 @@ impl Air {
                     }
                 }
                 0x00 if !self.mute_on_assoc => {
-                    let mut body = vec![0x11, 0, 0, 0, 1, 0xc0];
-                    body.extend(RATES);
-                    body.extend(HT);
+                    let slot = if self.short_slot_response { 0x04 } else { 0 };
+                    let mut body = vec![0x11, slot, 0, 0, 1, 0xc0];
+                    body.extend(rates(self.channel.unwrap()));
+                    // HT Operation's primary channel, as the beacon's.
+                    let mut ht = HT;
+                    ht[30] = self.channel.unwrap().number as u8;
+                    body.extend(ht);
                     if !self.no_wmm {
                         body.extend(WMM);
                     }
@@ -402,6 +425,7 @@ impl Chip for Model {
             }
             if channels.contains(&channel) {
                 let bad = air.bad_fcs;
+                let rate = air.rx_rate;
                 let bytes = beacon(&air);
                 air.incoming.push_back(Incoming::Frame(Received {
                     bytes,
@@ -411,6 +435,8 @@ impl Chip for Model {
                     decrypted: false,
                     icv_error: false,
                     fcs_error: bad,
+                    rate,
+                    ampdu: false,
                 }));
             }
             air.incoming
@@ -543,10 +569,22 @@ impl Chip for Model {
     fn diagnostic(&self) -> String {
         "chip".into()
     }
+    fn link_counts(&self) -> LinkCounts {
+        self.0.borrow().link
+    }
 }
 
 /// The AP's rates on 2.4 GHz: 1 Mb/s (basic) and 6 Mb/s.
 const RATES: [u8; 4] = [1, 2, 0x82, 0x0c];
+
+/// The AP's rates on `channel`: [`RATES`] on 2.4 GHz, 6 Mb/s (basic) and 9 Mb/s
+/// elsewhere.
+fn rates(channel: Channel) -> [u8; 4] {
+    match channel.band {
+        Band::Ghz2 => RATES,
+        _ => [1, 2, 0x8c, 0x12],
+    }
+}
 
 /// An AP's management frame to the station.
 fn management(subtype: u8, body: &[u8]) -> Vec<u8> {
@@ -607,7 +645,7 @@ fn beacon(air: &Air) -> Vec<u8> {
     frame[34] = 0x11;
     frame.extend([0, SSID.len() as u8]);
     frame.extend(SSID);
-    frame.extend(RATES);
+    frame.extend(rates(air.channel.unwrap()));
     // DS parameter set, then a TIM with DTIM period 2.
     frame.extend([3, 1, channel, 5, 4, 0, 2, 0, 0]);
     frame.extend(if air.sae {
@@ -621,6 +659,7 @@ fn beacon(air: &Air) -> Vec<u8> {
     // HT Operation's primary channel.
     let at = frame.len() - 22;
     frame[at] = channel;
+    frame.extend(&air.beacon_extra);
     if !air.no_wmm {
         frame.extend(WMM);
     }
@@ -646,7 +685,19 @@ fn data(receiver: [u8; 6], sequence: u16, kind: [u8; 2], body: &[u8]) -> Vec<u8>
 /// hardware hands it on decrypted: its CCMP header after the MAC header,
 /// the plaintext, then the MIC (zeros here).
 fn protected(receiver: [u8; 6], sequence: u16, keyid: u8, pn: u64, body: &[u8]) -> Vec<u8> {
-    let mut frame = data(receiver, sequence, [8, 0], body);
+    protected_as(receiver, sequence, keyid, pn, [8, 0], body)
+}
+
+/// [`protected`] with the LLC's EtherType `kind`.
+fn protected_as(
+    receiver: [u8; 6],
+    sequence: u16,
+    keyid: u8,
+    pn: u64,
+    kind: [u8; 2],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut frame = data(receiver, sequence, kind, body);
     frame[1] |= 0x40;
     let [p0, p1, p2, p3, p4, p5, _, _] = pn.to_le_bytes();
     let header = [p0, p1, 0, 0x20 | keyid << 6, p2, p3, p4, p5];
@@ -747,6 +798,14 @@ fn run(
     }
     false
 }
+
+/// The progress line's link fields (M4 spec S3.4) before any join, and for
+/// the model's AP on 2.4 GHz channel 1 at HT20: no RA report, rate or TX
+/// count yet.
+const LINK_IDLE: &str = "ap -, regd -, rx -, ampdu -, rxq full 0, tx ra -, \
+     kicks 0 rel 0 (-/kick), addba 0/0, agg -";
+const LINK_CH1: &str = "ap ht20 ch 1 (c 1), regd -, rx -, ampdu -, rxq full 0, tx ra -, \
+     kicks 0 rel 0 (-/kick), addba 0/0, agg -";
 
 /// The radio's progress line.
 fn progress(wifi: &mut Wifi<Model>) -> String {
@@ -989,6 +1048,31 @@ fn an_ap_without_wmm_leaves_its_edca_to_the_chip() {
 }
 
 #[test]
+fn the_slot_is_the_association_responses_not_the_beacons() {
+    // At association the slot is the response's, not the scan beacon's:
+    // mac80211 keeps the response's capability as `assoc_capability`
+    // (`mlme.c:6339`) and takes the slot from it
+    // (`ieee80211_handle_bss_capability`, `mlme.c:4344`). mac80211 then
+    // follows changed beacons (`mlme.c:8395`), which this radio does not.
+    let (mut wifi, model) = wifi_with(|air| air.short_slot_response = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(beacon(&air)[35] & 0x04, 0);
+    let joined = air
+        .calls
+        .iter()
+        .find_map(|c| match c {
+            Call::Associate(joined) => Some(joined),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(joined.channel.band, Band::Ghz2);
+    assert!(joined.short_slot);
+}
+
+#[test]
 fn eapol_flows_both_ways_before_any_key() {
     let (mut wifi, model) = handshaken();
     let air = model.0.borrow();
@@ -1088,7 +1172,8 @@ fn progress_reports_each_stage() {
     assert_eq!(
         progress(&mut wifi),
         alloc::format!(
-            "scans 0 (0 networks, target -), auth -, assoc -, eapol -, keys -, port closed{chip}"
+            "scans 0 (0 networks, target -), auth -, assoc -, eapol -, keys -, port closed, \
+             {LINK_IDLE}{chip}"
         )
     );
     // The scan found the target, and the join began.
@@ -1099,7 +1184,7 @@ fn progress_reports_each_stage() {
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 0/0 status -, assoc -, \
-             eapol -, keys -, port closed{chip}"
+             eapol -, keys -, port closed, {LINK_CH1}{chip}"
         )
     );
     // Authenticated; the association request is out.
@@ -1110,7 +1195,7 @@ fn progress_reports_each_stage() {
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
-             assoc 1/0 status - aid -, eapol -, keys -, port closed{chip}"
+             assoc 1/0 status - aid -, eapol -, keys -, port closed, {LINK_CH1}{chip}"
         )
     );
     // Associated.
@@ -1122,7 +1207,7 @@ fn progress_reports_each_stage() {
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
              assoc 1/1 status 0 aid 1, eapol rx 0 tx 0 acked 0, keys -, port closed, \
-             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
+             {LINK_CH1}, rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
     // The handshake, its two keys and the port (M3b's pass).
@@ -1133,7 +1218,7 @@ fn progress_reports_each_stage() {
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
              assoc 1/1 status 0 aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, \
-             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
+             {LINK_CH1}, rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
 }
@@ -1339,9 +1424,10 @@ fn beacon_loss_while_associated_reconnects() {
     );
     let line = progress(&mut wifi);
     assert!(
-        line.contains(
-            ", port closed, rx data 0 sealed 0 nokey 0 refused 0, tx data 0, beacon lost 1; "
-        ),
+        line.contains(&alloc::format!(
+            ", port closed, {LINK_CH1}, rx data 0 sealed 0 nokey 0 refused 0, tx data 0, \
+             beacon lost 1; "
+        )),
         "{line}"
     );
     assert!(run(&mut wifi, &model, |_, air| scans(air) > before));
@@ -1595,6 +1681,8 @@ fn a_frame_failing_its_icv_or_fcs_leaves_no_sequence_for_its_retry() {
         decrypted: true,
         icv_error: false,
         fcs_error: true,
+        rate: None,
+        ampdu: false,
     }));
     air.hear_as(retried(11, 2, 0x46), true, false);
     drop(air);
@@ -1613,8 +1701,10 @@ fn the_progress_line_counts_data_both_ways() {
     drop((wifi, model));
     let (mut wifi, model) = connected();
     assert!(
-        progress(&mut wifi)
-            .contains(", keys 2, port open, rx data 0 sealed 0 nokey 0 refused 0, tx data 0; chip"),
+        progress(&mut wifi).contains(&alloc::format!(
+            ", keys 2, port open, {LINK_CH1}, rx data 0 sealed 0 nokey 0 refused 0, \
+                 tx data 0; chip"
+        )),
         "{}",
         progress(&mut wifi)
     );
@@ -1643,7 +1733,9 @@ fn the_progress_line_counts_data_both_ways() {
     wifi.transmit(&ip(2)).unwrap();
     let line = progress(&mut wifi);
     assert!(
-        line.contains(", port open, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "),
+        line.contains(&alloc::format!(
+            ", port open, {LINK_CH1}, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "
+        )),
         "{line}"
     );
 }
@@ -1972,6 +2064,126 @@ fn a_rekey_the_firmware_refuses_closes_the_port_until_its_key_is_installed() {
     let before = model.0.borrow().data().len();
     wifi.radio_mut().transmit(&ip(2)).unwrap();
     assert_eq!(model.0.borrow().data()[before].1, Some((0, 0, 1)));
+}
+
+#[test]
+fn under_pmf_a_deauthentication_without_its_ptk_never_leaves_in_the_clear() {
+    // A pairwise rekey the chip refuses has deleted the old PTK first, while
+    // the station layer still holds the port authorized under PMF. The
+    // deauthentication that follows is robust and protected, with no PTK
+    // left to seal it: it is dropped and reported to the keeper once, never
+    // sent with the Protected bit over a plain body. Only "never in the
+    // clear" is the property; the drop itself is a known gap (mac80211
+    // would send it protected under a software key).
+    let (mut wifi, model) = connected_with_pmf();
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(wifi.radio().station().protected_port_authorized());
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    let air = model.0.borrow();
+    let sent: Vec<&Vec<u8>> = air.calls[from..]
+        .iter()
+        .filter_map(|c| match c {
+            Call::Management(bytes, _) => Some(bytes),
+            _ => None,
+        })
+        .collect();
+    assert!(sent.is_empty(), "{sent:02x?}");
+    drop(air);
+    let unsealed = |e: &keeper::Event| {
+        matches!(
+            e,
+            keeper::Event::Unsupported("a protected management frame without its key")
+        )
+    };
+    assert_eq!(
+        wifi.radio().events.iter().filter(|e| unsealed(e)).count(),
+        1
+    );
+}
+
+#[test]
+fn the_keepers_group_key_handshake_installs_the_new_gtk_under_the_ptk() {
+    // After the 4-way handshake the AP rotates its group key: group message
+    // 1, EAPOL under the PTK, is answered with message 2 under the PTK, and
+    // the GTK of index 2 goes in beside index 1, receive-only, the port
+    // open throughout.
+    let (mut wifi, model) = associated();
+    let mut ap = authenticator();
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
+    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    ap.message_2(&model.0.borrow().eapol()[0]);
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.eapol().len() > 1 && progress(wifi).contains("acked 2")
+    }));
+    assert!(wifi.carrier());
+    let from = model.0.borrow().calls.len();
+    let group = protected_as(LOCAL, 2, 0, 1, [0x88, 0x8e], &ap.group_message_1());
+    model.0.borrow_mut().hear_as(group, true, false);
+    assert!(run(&mut wifi, &model, |_, air| air.eapol().len() > 2));
+    {
+        let air = model.0.borrow();
+        // MIC | SECURE, at the request's replay counter, under the KCK.
+        ap.signed_reply(&air.eapol()[2], 0x300);
+        let answer = air.calls[from..]
+            .iter()
+            .find_map(|c| match c {
+                Call::Data {
+                    bytes,
+                    eapol: true,
+                    key,
+                    ..
+                } if eapol(bytes).is_some() => Some(*key),
+                _ => None,
+            })
+            .unwrap();
+        // Under the PTK's CAM entry 0, key ID 0.
+        assert!(matches!(answer, Some((0, 0, _))), "{answer:?}");
+        assert!(air.calls[from..].iter().any(|c| matches!(
+            c,
+            Call::AddKey {
+                pairwise: false,
+                index: 2,
+                ..
+            }
+        )));
+        assert!(
+            !air.calls[from..]
+                .iter()
+                .any(|c| matches!(c, Call::RemoveKey(_)))
+        );
+    }
+    assert!(wifi.carrier());
+    // The authenticator hands every key RSC 7, so each GTK takes PN 8 on.
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(protected([0xff; 6], 3, 2, 8, &[0x5a; 46]));
+    hear(protected([0xff; 6], 4, 1, 8, &[0x5b; 46]));
+    hear(protected([0xff; 6], 5, 2, 7, &[0x5c; 46]));
+    wifi.carrier();
+    // The new GTK's frame is delivered and its replay refused. So is the
+    // old GTK's: the shared station layer authorizes the port on the GTK
+    // last installed alone, where mac80211 takes either index until the
+    // AP's switch. That is a known gap in the shared station layer, outside
+    // this radio, pinned here so a fix there shows up as this test failing.
+    assert_eq!(delivered(&mut wifi), [0x5a]);
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(&alloc::format!(
+            ", keys 3, port open, {LINK_CH1}, rx data 1 sealed 0 nokey 0 refused 2, "
+        )),
+        "{line}"
+    );
 }
 
 /// Fragment `number` of frame `sequence` under the PTK at packet number
@@ -2556,11 +2768,11 @@ fn an_sae_network_authenticates_associates_and_keys() {
     assert!(wifi.radio().integrity.is_some());
     let line = progress(&mut wifi);
     assert!(
-        line.starts_with(
+        line.starts_with(&alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), sae 2/2, assoc 1/1 status 0 \
-             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, rx data 0 sealed 0 nokey 0 \
-             refused 0, tx data 0; "
-        ),
+             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, {LINK_CH1}, rx data 0 \
+             sealed 0 nokey 0 refused 0, tx data 0; "
+        )),
         "{line}"
     );
 }
@@ -2801,4 +3013,188 @@ fn the_progress_line_names_the_last_joins_authentication() {
         line.contains(", auth 4/1 status 0, assoc 1/1 status 0"),
         "{line}"
     );
+}
+
+/// A rate the model hears the AP's frames at: VHT, two streams.
+fn vht(mcs: u8, bw: u8, sgi: bool) -> Rate {
+    Rate {
+        mode: RateMode::Vht,
+        nss: 2,
+        mcs,
+        bw,
+        sgi,
+    }
+}
+
+#[test]
+fn histogram_counts_delivered_data_only() {
+    // M4 spec S3.1: every data frame the chip hands on addressed to the
+    // station, with its rate and A-MPDU bit; nothing else.
+    let (mut wifi, model) = associated();
+    let body = [0x45; 46];
+    let mut air = model.0.borrow_mut();
+    air.rx_rate = Some(vht(9, 2, true));
+    air.rx_ampdu = true;
+    air.hear(data(LOCAL, 1, [8, 0], &body));
+    air.hear(data(LOCAL, 2, [8, 0], &body));
+    air.rx_ampdu = false;
+    air.rx_rate = Some(vht(7, 2, true));
+    air.hear(data(LOCAL, 3, [8, 0], &body));
+    // A beacon, another station's data, and a frame without a rate.
+    let beacon = beacon(&air);
+    air.hear(beacon);
+    air.hear(data(OTHER_STATION, 4, [8, 0], &body));
+    air.rx_rate = None;
+    air.hear(data(LOCAL, 5, [8, 0], &body));
+    drop(air);
+    wifi.carrier();
+    let histogram = wifi.radio().rx_rates();
+    assert_eq!((histogram.total, histogram.ampdu), (3, 2));
+    assert_eq!(histogram.counts.len(), 2);
+    assert_eq!(histogram.top(), Some((vht(9, 2, true), 2)));
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", rx vht80 2ss mcs9 sgi 66% (3), ampdu 66%, "),
+        "{line}"
+    );
+}
+
+#[test]
+fn progress_line_has_the_m4_fields() {
+    // M4 spec S3.4 on 5 GHz channel 157: the AP's VHT operation is 80 MHz
+    // around 155, while the station (HT, M3) joins at 20 MHz.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.channel = Some(channel(157));
+        air.beacon_extra = vec![192, 5, 1, 155, 0, 0xfc, 0xff];
+        air.link = LinkCounts {
+            regd: Some((*b"IN", Regd::Etsi)),
+            rxq_full: 0,
+            tx: TxCounts {
+                kicks: [4, 0, 0, 0, 0],
+                released: [10, 0, 0, 0, 0],
+                ..TxCounts::default()
+            },
+        };
+    });
+    // Before the join, what is not known yet prints `-`.
+    let line = progress(&mut wifi);
+    assert!(
+        line.ends_with(
+            ", port closed, ap -, regd IN ETSI, rx -, ampdu -, rxq full 0, tx ra -, \
+             kicks 4 rel 10 (2.5/kick), addba 0/0, agg -; chip"
+        ),
+        "{line}"
+    );
+    let joined = run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    });
+    assert!(joined, "{}", progress(&mut wifi));
+    let mut air = model.0.borrow_mut();
+    air.rx_rate = Some(vht(8, 0, false));
+    air.hear(data(LOCAL, 1, [8, 0], &[0x45; 46]));
+    // The firmware's RA report: VHT 2SS MCS 7, short GI, 20 MHz.
+    air.incoming.push_back(Incoming::RaReport(RaReport {
+        macid: 0,
+        mode: 2,
+        rate: 0x17,
+        giltf: 1,
+        bw: 0,
+    }));
+    drop(air);
+    wifi.carrier();
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(
+            ", ap vht80 ch 157 (c 155), regd IN ETSI, rx vht20 2ss mcs8 100% (1), ampdu 0%, \
+             rxq full 0, tx ra vht20 2ss mcs7 sgi retry -, kicks 4 rel 10 (2.5/kick), \
+             addba 0/0, agg -, rx data "
+        ),
+        "{line}"
+    );
+    assert!(!names_an_address(&line), "{line}");
+}
+
+/// wireless-regdb's IN rules (M4 spec S14.1: 5725-5875 MHz at 80 MHz, so
+/// 149-173 by the rules), and a US-like 5 GHz whose 5835-5895 MHz rule is
+/// NO-IR, as [`regdb`] builds rules (regulatory.db's flags: DFS 1 << 2,
+/// NO-IR 1 << 3).
+const IN_RULES: [(u32, u32, u8, u16); 5] = [
+    (2_402_000, 2_482_000, 0, 3000),
+    (5_150_000, 5_250_000, 0, 3000),
+    (5_250_000, 5_350_000, 1 << 2, 2400),
+    (5_470_000, 5_725_000, 1 << 2, 2400),
+    (5_725_000, 5_875_000, 0, 3000),
+];
+const UNII4_RULES: [(u32, u32, u8, u16); 3] = [
+    (2_402_000, 2_472_000, 0, 3000),
+    (5_735_000, 5_835_000, 0, 3000),
+    (5_835_000, 5_895_000, 1 << 3, 2700),
+];
+
+/// The 5 GHz channel numbers `channels` offers, and their flags.
+fn five_ghz(offered: &[(Channel, u32)]) -> Vec<(u16, u32)> {
+    offered
+        .iter()
+        .filter(|(c, _)| c.band == Band::Ghz5)
+        .map(|(c, flags)| (c.number, *flags))
+        .collect()
+}
+
+#[test]
+fn unii4_is_us_only_without_acpi() {
+    // rtw89_regd_apply_policy_unii4 (regd.c:770-797) disables channels 169,
+    // 173 and 177 (from RTW89_5GHZ_UNII4_START_INDEX 25, core.h:6991-6992)
+    // for every regd but US, whatever the country's rules allow.
+    // A database's countries are in alpha2 order.
+    let database = regdb(&[
+        (*b"CA", &UNII4_RULES[..]),
+        (*b"IN", &IN_RULES[..]),
+        (*b"US", &UNII4_RULES[..]),
+    ]);
+    let india = channels(&database.clone().select(*b"IN").unwrap(), *b"IN");
+    assert!(five_ghz(&india).iter().all(|&(n, _)| n < 169), "{india:?}");
+    let us = five_ghz(&channels(&database.clone().select(*b"US").unwrap(), *b"US"));
+    let unii4: Vec<u16> = us.iter().map(|&(n, _)| n).filter(|&n| n >= 169).collect();
+    assert_eq!(unii4, [169, 173, 177]);
+    // Each keeps its rule's flags (NO-IR here).
+    assert!(
+        us.iter()
+            .filter(|&&(n, _)| n >= 169)
+            .all(|&(_, f)| f & NO_IR != 0)
+    );
+    let canada = channels(&database.clone().select(*b"CA").unwrap(), *b"CA");
+    assert!(five_ghz(&canada).iter().all(|&(n, _)| n < 169));
+    // The world regd, and a US channel plan under the world regd's index.
+    let world = channels(&database.clone().select(*b"US").unwrap(), *b"00");
+    assert!(five_ghz(&world).iter().all(|&(n, _)| n < 169));
+    // The radio takes the regd its chip found (Live::regds' alpha2).
+    let model = |alpha2: [u8; 2]| {
+        Model(Rc::new(RefCell::new(Air {
+            link: LinkCounts {
+                regd: Some((alpha2, Regd::Fcc)),
+                ..LinkCounts::default()
+            },
+            ..Air::default()
+        })))
+    };
+    for (alpha2, unii4) in [(*b"US", 3), (*b"IN", 0)] {
+        let country = database.clone().select(*b"US").unwrap();
+        let radio = Rtl8852c::new(model(alpha2), Mac(LOCAL), country, CLOCK).unwrap();
+        let offered = radio.channels(Band::Ghz5);
+        let past = offered.iter().filter(|(c, _)| c.number >= 169).count();
+        assert_eq!(past, unii4, "{alpha2:?}");
+    }
+}
+
+#[test]
+fn in_keeps_149_to_165() {
+    let database = regdb(&[(*b"IN", &IN_RULES[..])]);
+    let india = five_ghz(&channels(&database.clone().select(*b"IN").unwrap(), *b"IN"));
+    let upper: Vec<u16> = india
+        .iter()
+        .map(|&(n, _)| n)
+        .filter(|&n| n >= 149)
+        .collect();
+    assert_eq!(upper, [149, 153, 157, 161, 165]);
+    assert!(india.iter().all(|&(_, f)| f & NO_IR == 0));
 }

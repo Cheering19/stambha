@@ -213,7 +213,7 @@ impl Authenticator {
         )
     }
 
-    fn group_message_1(&mut self) -> Vec<u8> {
+    pub(crate) fn group_message_1(&mut self) -> Vec<u8> {
         self.signed(ACK | MIC | SECURE | ENCRYPTED, &gtk_kde(2, &[0x66; 16]))
     }
 

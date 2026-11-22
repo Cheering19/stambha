@@ -1654,6 +1654,30 @@ fn a_pre_init_failing_after_the_index_clear_restarts_the_rx_host_indices() {
     assert_eq!(io.trace, [Op::R32(0x1218), Op::R32(0x121C)]);
 }
 
+#[test]
+fn a_deinit_whose_index_clear_fails_keeps_the_rx_host_indices() {
+    let (_m, mut rings, mut io) = running();
+    hardware_index(&mut io, 2);
+    io.on_read(0x121C, Box::new(|_m: &mut RegisterModel| 3 << 16));
+    let mut seen = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(2));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(3));
+    // rtw89_pci_clr_idx_all_ax fails at its first TX clear, so the RX index
+    // clear never runs and the hardware RX indices stay at 2 and 3.
+    io.fail_reads_of(0x1014);
+    assert_eq!(deinit(&mut io, &rings, false), Err(READ_FAILED));
+    assert!(!io.writes().contains(&Op::W32(0x1200, 0x3)));
+    assert!(rings.ch12_stopped());
+    // Against host indices restarted at 0 that would be 2 RXQ and 3 RPQ
+    // entries filled, each already consumed.
+    io.trace.clear();
+    seen.clear();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(0));
+    assert_eq!(drain_rpq(&mut rings, &mut io, &mut seen), Ok(0));
+    assert!(seen.is_empty());
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::R32(0x121C)]);
+}
+
 /// An RPQ buffer as the device writes it: the RX BD info word (FS | LS |
 /// WRITE_SIZE), a long RX descriptor with `drv_info` 8-byte units of driver
 /// info after it, then one RPP dword per entry of `rpps`.

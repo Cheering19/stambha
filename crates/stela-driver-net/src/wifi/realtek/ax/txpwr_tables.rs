@@ -152,8 +152,8 @@ pub struct Taken {
 }
 
 /// The tables `rtw89_load_rfe_data_from_fw` builds for one RFE type, each
-/// starting zeroed and boxed.
-#[derive(Clone)]
+/// starting zeroed and boxed. Not `Clone`: a copy would be one 40 KB value
+/// on the stack in a debug build.
 pub struct TxPowerTables {
     /// `rtwdev->byr[band][bw]`.
     pub byr: Box<[[ByRate; BYR_BW_NUM]; BAND_NUM]>,

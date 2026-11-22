@@ -967,6 +967,52 @@ fn frames_before_scanofld_is_acked_are_kept() {
 }
 
 #[test]
+fn frames_past_the_early_bound_are_dropped() {
+    // 66 beacons, each with its PPDU status, right after ADD_SCANOFLD_CH's
+    // acks: drained during SCANOFLD's wait, before `Scanner::submitted`,
+    // the first MAX_EARLY wait for it and the two past are dropped.
+    let s = scan(|fw| {
+        let mut batch = Vec::new();
+        for n in 0..66u8 {
+            let bssid = [0x02, 0xBB, 0, 0, 0, n];
+            batch.extend(frame_with_status(
+                0x80,
+                BROADCAST,
+                bssid,
+                b"Early",
+                Some(1),
+                n % 8,
+                0x70,
+            ));
+        }
+        fw.after(9, 0x16, batch);
+    });
+    let r = s.report();
+    assert_eq!(MAX_EARLY, 64);
+    assert_eq!((r.frames, r.dropped, r.networks_total), (64, 2, 64));
+}
+
+#[test]
+fn a_bssid_past_the_table_bound_is_dropped() {
+    // 513 BSSIDs over the listed channels: the table keeps the first 512
+    // heard, and the 513th's beacon is dropped.
+    let s = scan(|fw| {
+        for n in 0..513u16 {
+            let [hi, lo] = n.to_be_bytes();
+            fw.beacon(
+                usize::from(n) % 38,
+                [0x02, 0xBB, 0, 0, hi, lo],
+                b"Net",
+                0x70,
+            );
+        }
+    });
+    let r = s.report();
+    assert_eq!(MAX_NETWORKS, 512);
+    assert_eq!((r.frames, r.dropped, r.networks_total), (512, 1, 512));
+}
+
+#[test]
 fn frames_after_end_scan_are_drained_then_flushed() {
     // After END_SCAN: a beacon, its PPDU status in the next batch, then a
     // beacon whose status never comes. Both are on channel 165, the last

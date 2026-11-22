@@ -5,10 +5,10 @@
 //! rtw8852c_rfk.c, with the DRCK and DACK tables from rtw8852c_rfk_table.c:
 //! - [`rck`] is `rtw8852c_rck` (rtw8852c_rfk.c:4133-4139), `_rck`
 //!   (:1455-1489) on path A and then B: the RF RC filter calibration;
-//! - [`drck`] is `_drck` (:568-586) with `rtw8852c_drck_defs`
+//! - `drck` is `_drck` (:568-586) with `rtw8852c_drck_defs`
 //!   (rtw8852c_rfk_table.c:50-55): the DAC reference clock;
-//! - [`addck`] is `_addck` (:369-405): the ADC DC offset of S0 and S1;
-//! - [`addck_reload`] is `_addck_backup` (:218-233) then `_addck_reload`
+//! - `addck` is `_addck` (:369-405): the ADC DC offset of S0 and S1;
+//! - `addck_reload` is `_addck_backup` (:218-233) then `_addck_reload`
 //!   (:235-249);
 //! - [`dack`] is `rtw8852c_dack` (:4141-4148): the coex RFK notify
 //!   ([`coex::rfk_notify`]) around `_dac_cal` (:588-626), which runs the
@@ -379,10 +379,10 @@ pub(super) fn addck_reload<I: AxIo + ?Sized>(io: &mut I) -> Result<[(u16, u16); 
 /// each on the path it happened on (index 0 is path A/S0, 1 is B/S1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dack {
-    /// The DRCK code, as [`drck`] returns it.
+    /// The DRCK code, as `drck` returns it.
     pub drck: u8,
     pub drck_timed_out: bool,
-    /// Each side's ADDCK `(A0, A1)` result, as [`addck_reload`] returns it.
+    /// Each side's ADDCK `(A0, A1)` result, as `addck_reload` returns it.
     pub addck: [(u16, u16); 2],
     pub addck_timed_out: [bool; 2],
     /// Whether each side's `_check_dack_done` poll timed out. Linux records
@@ -392,8 +392,8 @@ pub struct Dack {
 
 /// `rtw8852c_dack` (rtw8852c_rfk.c:4141-4148): the coex RFK START, then
 /// `_dac_cal` (:588-626), then the coex RFK STOP. `_dac_cal` saves both
-/// paths' `RR_MOD`, runs [`drck`], clears `RR_RSV1_RST` and sets
-/// `RR_MOD` to 0x337E1 on both paths, runs [`addck`] and [`addck_reload`],
+/// paths' `RR_MOD`, runs `drck`, clears `RR_RSV1_RST` and sets
+/// `RR_MOD` to 0x337E1 on both paths, runs `addck` and `addck_reload`,
 /// clears `RR_MODOPT` on both paths, runs DACK on S0 and then S1, and
 /// restores `RR_MOD` and sets `RR_RSV1_RST` on both paths. A timed-out poll
 /// is recorded and the sequence carries on, as in Linux. An I/O error (an

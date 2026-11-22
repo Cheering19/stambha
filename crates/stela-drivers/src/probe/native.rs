@@ -1285,7 +1285,7 @@ pub unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
 /// the domain just bound, the chip cut, the staged firmware file and the
 /// host input, and [`bring_up`]'s contract holds for the window, the pages
 /// and the domain while it runs. The host check's station check runs
-/// [`realtek_wifi::ax::attach`] and its keeper there. Returns what `run`
+/// [`realtek_wifi::ax::attach()`] and its keeper there. Returns what `run`
 /// returned and whether the MAC was on, as [`rtw89_attach`] does.
 ///
 /// # Safety

@@ -689,7 +689,7 @@ fn leave_runs_linux_order() {
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, false).1,
         b.addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0).1,
-        b.addr_cam(LOCAL, 0, 0).1,
+        b.addr_cam_unassociated(LOCAL, 0, 0).1,
     ];
     want.extend(edcas(&mut b, &wmm(), false, HwBand::G5));
     let defaults = [
@@ -785,7 +785,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, false).1,
         b.addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0).1,
-        b.addr_cam(LOCAL, 0, 0).1,
+        b.addr_cam_unassociated(LOCAL, 0, 0).1,
     ];
     want.extend(edcas(&mut b, &qos_defaults(false), false, HwBand::G5));
     let defaults = [
@@ -805,7 +805,10 @@ fn clear_bssid_sends_the_unassociated_cam() {
         clear_bssid(io, s, LOCAL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
-    assert_eq!(ran.packets, [H2c::at(18).addr_cam(LOCAL, 0, 0).1]);
+    assert_eq!(
+        ran.packets,
+        [H2c::at(18).addr_cam_unassociated(LOCAL, 0, 0).1]
+    );
     // DIG stays as it was: Linux resumes it only at association.
     assert!(!ran.io.trace.iter().any(|o| matches!(o, Op::R32(0x1481C))));
 }

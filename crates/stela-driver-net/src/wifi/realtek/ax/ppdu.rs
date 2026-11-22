@@ -11,7 +11,7 @@
 //! the IE walk of `rtw89_core_rx_parse_phy_sts` (`core.c:2310-2357`) with the
 //! AX IE lengths of `rtw89_phy_gen_ax` (`phy.c:9045-9047`) and the IE01
 //! channel index of `rtw89_core_parse_phy_status_ie01` (`core.c:2124`).
-//! [`frame_key`], [`ppdu_key`] and [`matches`] are the rate, GI and
+//! [`frame_key`], [`ppdu_key`] and [`matches()`] are the rate, GI and
 //! bandwidth of `rtw89_core_update_rx_status` (`core.c:4408-4445`) and
 //! `rtw89_core_rx_ppdu_match` (`core.c:2437-2471`), with
 //! `rtw89_rxdesc_to_nl_he_gi` (`core.c:2374-2393`) and
@@ -111,7 +111,7 @@ pub struct PhyPpdu {
 }
 
 /// The fields `rtw89_core_rx_ppdu_match` compares: `rate_idx` is the raw
-/// hardware index (legacy [3:0], HT [4:0], VHT/HE [3:0]), `gi` a [`GI_0_8`]
+/// hardware index (legacy `[3:0]`, HT `[4:0]`, VHT/HE `[3:0]`), `gi` a [`GI_0_8`]
 /// .. [`GI_NONE`] value and `bw` a [`BW_20`] .. [`BW_160`] value. `legacy` is
 /// `RX_ENC_LEGACY`, which the match does not compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

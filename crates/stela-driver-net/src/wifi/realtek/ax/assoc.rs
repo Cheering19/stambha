@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2019-2020  Realtek Corporation
+// The QoS defaults and the WMM parameter checks are adapted from pinned Linux
+// net/mac80211/util.c (ieee80211_set_wmm_default) and mlme.c
+// (_ieee80211_sta_wmm_params): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2003-2008, Jouni Malinen; 2005-2006, Devicescape Software, Inc.; 2006-2007
+// Jiri Benc; 2007 Johannes Berg; 2007 Michael Wu; 2013-2014 Intel Mobile
+// Communications GmbH; 2015-2017 Intel Deutschland GmbH; 2018-2026 Intel
+// Corporation. See NOTICE.
 //! A station's join, association and leaving on an RTL8852C (M3 spec S9-S11),
 //! as Linux's mac80211 drives rtw89 through them, each step the H2Cs and
 //! register accesses of the rtw89 callback mac80211 calls there, in that
@@ -94,14 +101,14 @@ use crate::wifi::station::phy::AccessCategory;
 pub use super::vif::PortConfig;
 
 /// The address CAM's security fields (`cam.c:906-927`): the key IDs of
-/// w9 [31:18] in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
+/// w9 `[31:18]` in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
 /// holds them; 0 before any key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CamKeys {
-    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 [31:18]; other bits are
+    /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 `[31:18]`; other bits are
     /// ignored.
     pub keyids: u32,
-    /// w10: `SEC_ENT_VALID` [7:0], `SEC_ENT0` to `SEC_ENT2`.
+    /// w10: `SEC_ENT_VALID` `[7:0]`, `SEC_ENT0` to `SEC_ENT2`.
     pub valid_and_ents: u32,
     /// w11: `SEC_ENT3` to `SEC_ENT6`.
     pub ents_hi: u32,
@@ -344,8 +351,8 @@ pub fn ra_info(peer: &RaPeer, band: HwBand) -> RaInfo {
 }
 
 /// `____rtw89_conf_tx_edca`'s word for one access category (M3 spec S10.8):
-/// TXOPLMT [26:16] = `txop_32us`, CWMAX [15:12] and CWMIN [11:8] the
-/// exponents, AIFS [7:0] = `aifsn * slot + sifs` with slot 9 (short) or 20
+/// TXOPLMT `[26:16]` = `txop_32us`, CWMAX `[15:12]` and CWMIN `[11:8]` the
+/// exponents, AIFS `[7:0]` = `aifsn * slot + sifs` with slot 9 (short) or 20
 /// and SIFS 10 on 2.4 GHz, else 16 (`rtw89_aifsn_to_aifs`,
 /// `mac80211.c:393-412`, which returns it as a u8). mac80211 hands rtw89
 /// `cw = 2^ecw - 1`, of which rtw89 takes `ilog2(cw + 1)`, the exponent
@@ -618,7 +625,7 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 /// (`rtw89_cam_fill_addr_cam_info` reads the vif's entry, `cam.c:906-927`);
 /// the association's EDCA parameters ([`AssocInputs::params`]) with the
 /// long slot (`BSS_CHANGED_ERP_SLOT`, which `ieee80211_reset_erp_info`
-/// always raises), the GID table cleared, then [`wmm_defaults`] with the
+/// always raises), the GID table cleared, then `wmm_defaults` with the
 /// long slot. Nothing of the port or DIG.
 ///
 /// # Safety
