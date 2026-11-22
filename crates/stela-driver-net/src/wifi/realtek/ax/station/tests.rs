@@ -3452,6 +3452,177 @@ fn the_ap_hears_the_data_before_the_request_it_started() {
     assert!(data < request, "data {data}, request {request}");
 }
 
+/// The position among `heard` of the first frame `want` takes.
+fn heard_at(heard: &[Vec<u8>], want: impl Fn(&[u8]) -> bool) -> usize {
+    heard.iter().position(|f| want(f)).unwrap()
+}
+
+/// Whether `f` is the station's data whose first payload byte is `fill`.
+fn data_of(f: &[u8], fill: u8) -> bool {
+    f[0] == 0x88 && eapol(f).is_none() && f[36] == fill
+}
+
+/// Whether `f` is a Block Ack action frame of action `action`.
+fn block_ack_of(f: &[u8], action: u8) -> bool {
+    f[0] == 0xd0 && f[24..26] == [3, action]
+}
+
+#[test]
+fn a_silent_ap_times_the_request_out() {
+    // ieee80211_addba_resp_timer_expired: no answer within
+    // ADDBA_RESP_INTERVAL, 1 s, stops the session with a DELBA
+    // (ieee80211_stop_tx_ba_session: TX_STOP, then the DELBA); the frame
+    // that waited leaves after it, singly, and asks again as the next
+    // frame of a TID with no session (rtw89_core_txq_check_agg).
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().addba_silent = true;
+    let (from, heard_from) = {
+        let air = model.0.borrow();
+        (air.calls.len(), air.heard.len())
+    };
+    let start = CLOCK.now_us();
+    for fill in 1..=2 {
+        wifi.transmit(&ip(fill)).unwrap();
+    }
+    assert!(run(&mut wifi, &model, |_, air| !block_acks(air, 2).is_empty()));
+    let waited = CLOCK.now_us() - start;
+    assert!((1_000_000..1_100_000).contains(&waited), "{waited}");
+    assert!(run(&mut wifi, &model, |_, air| block_acks(air, 0).len() == 2));
+    let air = model.0.borrow();
+    assert_eq!(aggregations(&air, from), [(0, None)]);
+    assert_eq!(aggregates(&air, from), [(1, 0, None), (2, 0, None)]);
+    let [frame] = &block_acks(&air, 2)[..] else {
+        panic!("{} DELBAs", block_acks(&air, 2).len())
+    };
+    // The initiator's, on TID 0.
+    assert_eq!(u16::from_le_bytes([frame[26], frame[27]]), 1 << 11);
+    let heard = &air.heard[heard_from..];
+    let second = heard
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| block_ack_of(f, 0))
+        .nth(1)
+        .unwrap()
+        .0;
+    let order = [
+        heard_at(heard, |f| data_of(f, 1)),
+        heard_at(heard, |f| block_ack_of(f, 0)),
+        heard_at(heard, |f| block_ack_of(f, 2)),
+        heard_at(heard, |f| data_of(f, 2)),
+        second,
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+}
+
+#[test]
+fn a_declined_request_leaves_the_tid_single() {
+    // ieee80211_process_addba_resp with a failure status:
+    // ___ieee80211_stop_tx_ba_session(AGG_STOP_DECLINED), TX_STOP and no
+    // DELBA (tx_stop is for a local request only); the data goes singly.
+    // Each next frame asks again until HT_AGG_BURST_RETRIES (3) requests
+    // are past: then ieee80211_start_tx_ba_session is -EBUSY for
+    // HT_AGG_RETRIES_PERIOD, 15 s from the last (agg-tx.c), and asks again
+    // after it.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().addba_status = 37;
+    let from = model.0.borrow().calls.len();
+    for fill in 1..=6u8 {
+        wifi.transmit(&ip(fill)).unwrap();
+        assert!(run(&mut wifi, &model, |wifi, air| {
+            aggregates(air, from).len() == usize::from(fill)
+                && !wifi.radio().station().tx_block_ack_blocks_data(0)
+        }));
+    }
+    {
+        let air = model.0.borrow();
+        assert_eq!(block_acks(&air, 0).len(), 4);
+        assert_eq!(aggregations(&air, from), [(0, None); 4]);
+        assert!(block_acks(&air, 2).is_empty());
+        assert!(aggregates(&air, from).iter().all(|(_, _, a)| a.is_none()));
+    }
+    let line = progress(&mut wifi);
+    assert!(line.contains(", addba 0/4, agg -, "), "{line}");
+    crate::test_clock::advance(CLOCK, 15_000_000);
+    wifi.carrier();
+    wifi.transmit(&ip(7)).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| block_acks(air, 0).len() == 5));
+}
+
+/// The AP's DELBA of the station's agreement on `tid`, as its recipient
+/// (initiator b11 clear), reason 37.
+fn recipient_delba(tid: u8) -> Vec<u8> {
+    let mut body = vec![3, 2];
+    body.extend((u16::from(tid) << 12).to_le_bytes());
+    body.extend(37u16.to_le_bytes());
+    management(0xd0, &body)
+}
+
+#[test]
+fn the_aps_delba_ends_the_agreement() {
+    // ieee80211_process_delba from the recipient:
+    // __ieee80211_stop_tx_ba_session(AGG_STOP_PEER_REQUEST), TX_STOP and no
+    // DELBA of the station's. The next frame goes singly and, the TID
+    // neither forbidden nor blocked, asks again (rtw89_core_txq_check_agg).
+    let (mut wifi, model) = connected();
+    wifi.transmit(&ip(1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(recipient_delba(0));
+    assert!(run(&mut wifi, &model, |wifi, _| !agreed(wifi, 0)
+        && !wifi.radio().station().tx_block_ack_blocks_data(0)));
+    {
+        let air = model.0.borrow();
+        assert_eq!(aggregations(&air, from), [(0, None)]);
+        assert!(block_acks(&air, 2).is_empty());
+    }
+    wifi.transmit(&ip(2)).unwrap();
+    assert_eq!(aggregates(&model.0.borrow(), from), [(2, 0, None)]);
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        block_acks(air, 0).len() == 2 && agreed(wifi, 0)
+    }));
+    assert_eq!(
+        aggregations(&model.0.borrow(), from),
+        [(0, None), (0, Some(64))]
+    );
+}
+
+#[test]
+fn a_reassociation_makes_a_fresh_agreement() {
+    // The departure ends the agreement (TX_STOP_FLUSH); the next
+    // association configures its own limits and its first data asks again.
+    let (mut wifi, model) = connected();
+    wifi.transmit(&ip(1)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.count(|c| matches!(c, Call::Associate(_))) == 2
+            && wifi.radio().station().phase() == Peering::Associated
+    }));
+    // The new association's 4-way handshake, counted from here.
+    model.0.borrow_mut().calls.clear();
+    let mut ap = authenticator();
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
+    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    ap.message_2(&model.0.borrow().eapol()[0]);
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
+    assert!(run(&mut wifi, &model, |wifi, _| wifi.radio().port_open));
+    wifi.transmit(&ip(2)).unwrap();
+    assert!(run(&mut wifi, &model, |wifi, _| agreed(wifi, 0)));
+    let air = model.0.borrow();
+    assert_eq!(block_acks(&air, 0).len(), 1);
+    assert_eq!(aggregations(&air, 0), [(0, Some(64))]);
+    drop(air);
+    let line = progress(&mut wifi);
+    assert!(!line.contains("Block Ack limits"), "{line}");
+    assert!(line.contains(", addba 2/2, agg 0, "), "{line}");
+}
+
 #[test]
 fn an_agreement_takes_the_responses_window_up_to_128() {
     // __ieee80211_start_tx_ba_session's agreement takes min(the response's
