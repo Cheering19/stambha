@@ -109,6 +109,31 @@ fn unknown_values_remain_unknown_and_state_flags_are_not_policy() {
 }
 
 #[test]
+fn a_charge_firmwares_signed_16_bit_rate_is_corrected_and_others_are_kept() {
+    let state = |rate| State {
+        flags: 1,
+        rate,
+        remaining_capacity: Some(1),
+        voltage_mv: Some(2),
+    };
+    // Linux's DSDT correction: a negative 16-bit rate is its magnitude.
+    assert_eq!(
+        corrected(state(Some(0xfc18)), Unit::Charge),
+        state(Some(1_000))
+    );
+    assert_eq!(
+        corrected(state(Some(1_000)), Unit::Charge),
+        state(Some(1_000))
+    );
+    assert_eq!(corrected(state(None), Unit::Charge), state(None));
+    // mW rates are kept verbatim.
+    assert_eq!(
+        corrected(state(Some(0xfc18)), Unit::Energy),
+        state(Some(0xfc18))
+    );
+}
+
+#[test]
 fn identity_bounds_preserve_raw_bytes_without_utf8_or_termination_assumptions() {
     assert_eq!(
         text(Value::String(vec![0xff; 100]), Method::Information).unwrap(),

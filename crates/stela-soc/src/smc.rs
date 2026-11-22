@@ -69,8 +69,9 @@
 //!   T6050 kernel's `_shutdownGated` writes it on its other path (mac17j
 //!   `.cold.3`, 0xfffffe0009ad9c88, after the RTC wake alarm is cleared)
 //!   and panics "SMCFW failed to handle shutdown request" a second later.
-//!   `lpem` (low-power emergency mode, on battery systems) refuses: the
-//!   board has no battery.
+//!   `lpem` (low-power emergency mode, on battery systems) powers off an
+//!   SMC given the host's battery ([`Smc::add_battery`]), as `susp` does;
+//!   any other refuses: the board has no battery.
 //! - `slpa` puts the SoC to sleep and `hiba` into hibernation: the key
 //!   endpoint writes one itself when its power state drops to 0
 //!   (`AppleSMCKeysEndpoint::_powerStateActionGated` file 0x2da492c,
@@ -155,23 +156,26 @@
 //! `NESN`, `MBSW`, `MESS`, `D1Vn`, `aDC#`, `aDC?` and `TP<n>d` are inferred
 //! from their sizes and uses; no client reads them. Every key the 26A434
 //! J473AP kernel's SMC clients and the restore ramdisk use was censused; a key
-//! absent here is one none of them needs.
+//! absent here is one none of them needs. The battery's keys ([`battery`])
+//! join them only when the SMC is given the host's battery.
 //!
 //! A source-declared primary RTC helper can additionally bind CLKM to the
 //! PMU oscillator. Its recovered six-byte hex_ / attributes0x94 key
 //! profile follows the original firmware.
 //! Missing counter publication refuses before SRAM/reply effects; this path
 //! owns no second calendar offset and makes no Apple reset-epoch assumption.
+mod battery;
 mod rtc;
 use crate::Result;
 use rtc::RtcBinding;
 use stela_contracts::refuse;
+use stela_drivers::platform::power_snapshot::PowerSnapshot;
 use stela_soc_data::smc::RtcKeyProfile;
 
 use super::asc::TransitionRequest;
 use super::rtkit::Endpoint;
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
     vec,
     vec::Vec,
@@ -275,6 +279,61 @@ pub struct WriteLog {
     pub reply: Result<u64>,
     /// Older observations lost to the bounded queue before this entry.
     pub dropped_before: usize,
+}
+
+/// What macOS asked of an SMC given a battery that the log says once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// A read of a key the SMC does not have.
+    Read,
+    /// GET_KEY_INFO of a key it does not have.
+    Information,
+    /// A write.
+    Write,
+    /// More than [`REQUEST_LIMIT`] were asked; the rest are not kept.
+    More,
+}
+
+/// One request [`Asked`] about: the key, the size asked, and the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRequest {
+    pub asked: Asked,
+    pub key: u32,
+    pub size: u8,
+    pub result: u8,
+}
+
+/// The distinct requests one SMC keeps.
+pub const REQUEST_LIMIT: usize = 256;
+
+impl core::fmt::Display for KeyRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = self.key.to_be_bytes().map(|byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte
+            } else {
+                b'?'
+            }
+        });
+        let name = core::str::from_utf8(&name).unwrap_or("????");
+        let bytes = if self.size == 1 { "byte" } else { "bytes" };
+        match self.asked {
+            Asked::Read => write!(f, "read SMC key {name} ({} {bytes}): ", self.size)?,
+            Asked::Information => write!(f, "asked for SMC key {name}'s information: ")?,
+            Asked::Write => write!(f, "wrote SMC key {name} ({} {bytes}): ", self.size)?,
+            Asked::More => return f.write_str("asked for more SMC keys than are said"),
+        }
+        let result = match self.result {
+            SUCCESS => return f.write_str("success"),
+            KEY_NOT_FOUND => "not found",
+            NOT_READABLE => "not readable",
+            NOT_WRITABLE => "not writable",
+            SIZE_MISMATCH => "size mismatch",
+            BAD_ARGUMENT => "bad argument",
+            _ => "error",
+        };
+        write!(f, "{result} ({:#04x})", self.result)
+    }
 }
 
 /// The 32-bit form of a four-character key or type code.
@@ -422,6 +481,16 @@ pub struct Smc {
     waking_press: bool,
     write_log: VecDeque<WriteLog>,
     dropped_writes: usize,
+    /// The host's battery, when the SMC was given it.
+    battery: Option<battery::Battery>,
+    /// The AP read the key count or a key by its index: the table it
+    /// caches (`_smcInitKeyTableCache`) is this one.
+    table_read: bool,
+    /// With a battery: the requests the log was given ([`Self::ask`]),
+    /// those it has not taken yet, and whether the limit was reached.
+    asked: BTreeSet<(u8, u32, u8, u8)>,
+    requests: VecDeque<KeyRequest>,
+    asked_full: bool,
 }
 
 impl Smc {
@@ -462,6 +531,11 @@ impl Smc {
             waking_press: false,
             write_log: VecDeque::new(),
             dropped_writes: 0,
+            battery: None,
+            table_read: false,
+            asked: BTreeSet::new(),
+            requests: VecDeque::new(),
+            asked_full: false,
         })
     }
 
@@ -508,6 +582,82 @@ impl Smc {
         }
         u32::try_from(self.keys.len() + 1).map_err(|_| refuse!("too many SMC keys"))?;
         Ok(())
+    }
+
+    /// Give the SMC the host's battery, as `snapshot` read it: the battery's
+    /// keys ([`battery`]) join the table, before the AP first reads it.
+    /// Refused once the AP has read the table, which it keeps; without a
+    /// reading of a battery with a percentage and a remaining and full
+    /// capacity, which would read 0, empty, to macOS, or with one at 0
+    /// (`BatteryState::missing`); or a second time.
+    pub fn add_battery(&mut self, snapshot: &PowerSnapshot) -> Result<()> {
+        if self.battery.is_some() {
+            return Err(refuse!("the SMC already has the host's battery"));
+        }
+        if self.table_read {
+            return Err(refuse!(
+                "the AP already read the SMC's key table, which it keeps"
+            ));
+        }
+        let Some(reading) = snapshot.battery else {
+            return Err(refuse!(
+                "an SMC battery needs a reading of the host's battery"
+            ));
+        };
+        if let Some(missing) = reading.missing() {
+            return Err(refuse!(
+                "the host's battery reading has no {missing}",
+                missing
+            ));
+        }
+        let keys = battery::keys(snapshot);
+        if keys
+            .iter()
+            .any(|(name, _)| self.keys.contains_key(name) || *name == rtc::KEY)
+        {
+            return Err(refuse!("an SMC battery key duplicates a board key"));
+        }
+        let count = u32::try_from(self.keys.len() + keys.len() + usize::from(self.rtc.is_some()))
+            .map_err(|_| refuse!("too many SMC keys"))?;
+        self.keys.extend(keys);
+        self.keys
+            .get_mut(&KEY_COUNT)
+            .expect("key count owner")
+            .value = count.to_be_bytes().to_vec();
+        self.battery = Some(battery::Battery::new(snapshot));
+        Ok(())
+    }
+
+    /// The host's battery and AC adapter read anew, at `now_ms` on the
+    /// host's clock in milliseconds: the battery's keys take the reading, and
+    /// a change macOS acts on queues its notification ([`battery`]). Returns
+    /// when a notification that waits is due ([`Self::power_due`]). An SMC
+    /// with no battery takes nothing.
+    pub fn power(&mut self, snapshot: &PowerSnapshot, now_ms: u64) -> Option<u64> {
+        let battery = self.battery.as_mut()?;
+        for (name, value) in battery.update(snapshot) {
+            self.keys
+                .get_mut(&name)
+                .expect("the battery's keys are in the table")
+                .value = value;
+        }
+        self.power_due(now_ms)
+    }
+
+    /// The latest reading fell to 0 without the firmware's critical bit, and
+    /// the battery's keys show the one before it until the next confirms it
+    /// ([`battery`]).
+    pub fn battery_held(&self) -> bool {
+        self.battery.as_ref().is_some_and(battery::Battery::held)
+    }
+
+    /// Queue the battery's notifications due at `now_ms`; when the next
+    /// that waits is due.
+    pub fn power_due(&mut self, now_ms: u64) -> Option<u64> {
+        let (enabled, asleep) = (self.notifications_enabled(), self.asleep());
+        let (events, next) = self.battery.as_mut()?.due(now_ms, enabled, asleep);
+        self.events.extend(events);
+        next
     }
 
     fn key_info(&self, name: u32) -> Option<(usize, u32, u8)> {
@@ -567,6 +717,41 @@ impl Smc {
     #[cfg(test)]
     pub fn notice(&self) -> Option<u32> {
         self.notice
+    }
+
+    /// The next distinct missing key or write macOS asked of an SMC given a
+    /// battery, for the log; none without a battery.
+    pub fn take_key_request(&mut self) -> Option<KeyRequest> {
+        self.requests.pop_front()
+    }
+
+    /// Keep `request` for the log, once each: a missing key once per kind,
+    /// a write once per key, size and result, and no more than
+    /// [`REQUEST_LIMIT`] of them, the last one saying so.
+    fn ask(&mut self, request: KeyRequest) {
+        if self.battery.is_none() || self.asked_full {
+            return;
+        }
+        let distinct = match request.asked {
+            Asked::Read => (0, request.key, 0, 0),
+            Asked::Information => (1, request.key, 0, 0),
+            Asked::Write | Asked::More => (2, request.key, request.size, request.result),
+        };
+        if self.asked.contains(&distinct) {
+            return;
+        }
+        if self.asked.len() == REQUEST_LIMIT {
+            self.asked_full = true;
+            self.requests.push_back(KeyRequest {
+                asked: Asked::More,
+                key: 0,
+                size: 0,
+                result: 0,
+            });
+            return;
+        }
+        self.asked.insert(distinct);
+        self.requests.push_back(request);
     }
 
     /// Drains one bounded protocol observation without altering its reply.
@@ -718,6 +903,12 @@ impl Smc {
                     "MBSE shutdown command: system power-off",
                 ));
             }
+            LOW_POWER_EMERGENCY if self.battery.is_some() => {
+                self.transition = Some(transition(
+                    Transition::PowerOff,
+                    "MBSE low-power emergency command: system power-off",
+                ));
+            }
             LOW_POWER_EMERGENCY => {
                 return Err(refuse!(
                     "SMC low-power emergency mode needs a battery the board does not have"
@@ -752,6 +943,7 @@ impl Endpoint for Smc {
         let size = usize::from((payload >> 16) as u8);
         let write_size = usize::from((payload >> 24) as u8);
         let name = (payload >> 32) as u32;
+        self.table_read |= kind == KEY_BY_INDEX || (kind == READ && name == KEY_COUNT);
         let mut answers = Vec::new();
         let system_event = (name == SYSTEM_EVENT
             && matches!((kind, size, write_size), (WRITE, 4, _) | (READ_WRITE, _, 4)))
@@ -789,6 +981,24 @@ impl Endpoint for Smc {
             };
             Ok(reply)
         })();
+        if let Ok(&reply) = result.as_ref() {
+            let code = reply as u8;
+            let asked = match kind {
+                READ if code == KEY_NOT_FOUND => Some((Asked::Read, size)),
+                KEY_INFO if code == KEY_NOT_FOUND => Some((Asked::Information, 0)),
+                WRITE => Some((Asked::Write, size)),
+                READ_WRITE => Some((Asked::Write, write_size)),
+                _ => None,
+            };
+            if let Some((asked, size)) = asked {
+                self.ask(KeyRequest {
+                    asked,
+                    key: name,
+                    size: size as u8,
+                    result: code,
+                });
+            }
+        }
         if matches!(kind, WRITE | READ_WRITE) {
             if self.write_log.len() == WRITE_LOG_LIMIT {
                 self.write_log.pop_front();

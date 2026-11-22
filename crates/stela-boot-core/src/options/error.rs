@@ -67,6 +67,8 @@ pub enum Error {
     DuplicateWifiCountry,
     Trackpad,
     DuplicateTrackpad,
+    DuplicateBattery,
+    TestBattery,
     Usb4Approve,
     DuplicateUsb4Approve,
     Ipv4,
@@ -206,6 +208,10 @@ impl Error {
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
             Self::Trackpad => "--trackpad takes mt2 or builtin",
             Self::DuplicateTrackpad => "duplicate --trackpad",
+            Self::DuplicateBattery => "duplicate --battery or --test-battery",
+            Self::TestBattery => {
+                "--test-battery needs PERCENT,STATE: 1 to 100, then charging, discharging (at 5 or more) or full (at 100 only)"
+            }
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",
             Self::Ipv4 => "--ipv4 needs a host ADDRESS/PREFIX, such as 192.168.1.20/24",

@@ -1156,6 +1156,8 @@ pub struct HostAcpi {
 }
 static EC_EVENT: AtomicBool = AtomicBool::new(false);
 static POWER_CHANGED: AtomicBool = AtomicBool::new(false);
+/// A timed reading of the batteries' state and the AC adapter is due.
+static POWER_POLL: AtomicBool = AtomicBool::new(false);
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
 /// A control-method power button's (PNP0C0C) notifications since the power
 /// control took them: a FADT with PWR_BUTTON set reports presses so.
@@ -1618,7 +1620,16 @@ impl HostAcpi {
                 )),
             }
         }
+        super::battery::publish(&power);
         *self.power.borrow_mut() = power;
+    }
+    /// Read the batteries' state (`_BST`) and the AC adapter (`_PSR`) again
+    /// at the next poll, as Linux polls them, while hardware mode runs; a
+    /// battery's information and the lid wait for their notifications.
+    pub(super) fn refresh_power(&self) {
+        if self.hardware_active() {
+            POWER_POLL.store(true, Ordering::Release);
+        }
     }
     pub(super) fn hardware_active(&self) -> bool {
         self.hardware.load(Ordering::Acquire)
@@ -1737,6 +1748,8 @@ impl HostAcpi {
                 }
             }
         }
+        // A notification's full refresh reads the state a timed one would.
+        let timed = POWER_POLL.swap(false, Ordering::AcqRel);
         if POWER_CHANGED.swap(false, Ordering::AcqRel) {
             let mut power = self.power.borrow_mut();
             for battery in &mut power.batteries {
@@ -1756,6 +1769,25 @@ impl HostAcpi {
             {
                 output::arguments(format_args!("HOST ACPI lid refresh failed: {error:?}\n"));
             }
+            super::battery::publish(&power);
+        } else if timed {
+            let started = host::fresh_counter();
+            let mut power = self.power.borrow_mut();
+            let mut failure = None;
+            for battery in &mut power.batteries {
+                if let Err(error) = battery.refresh_state() {
+                    failure = Some(alloc::format!("battery {error:?}"));
+                }
+            }
+            if let Some(ac) = &mut power.ac
+                && let Err(error) = ac.refresh()
+            {
+                failure = Some(alloc::format!("AC adapter {error:?}"));
+            }
+            super::battery::publish(&power);
+            drop(power);
+            let took = host::fresh_counter().wrapping_sub(started) / (host::COUNTER_HZ / 1000);
+            super::battery::polled(failure.as_deref(), took);
         }
         self.service_ucsi();
         // SAFETY: run Notify/_Q work queued by device methods on the BSP.

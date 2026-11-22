@@ -422,6 +422,45 @@ impl AppleDevices {
         self.smc().ok()?.take_log()
     }
 
+    /// Give the SMC the host's battery, as `snapshot` read it, before the
+    /// guest starts (`Smc::add_battery`).
+    pub fn add_battery(
+        &mut self,
+        snapshot: &stela_drivers::platform::power_snapshot::PowerSnapshot,
+    ) -> Result<()> {
+        self.smc()?.add_battery(snapshot)
+    }
+
+    /// The host's battery and AC adapter read anew at `now_ms`, host
+    /// milliseconds: the SMC's battery keys follow, and the AP is notified
+    /// of a change it acts on, no more often than the SMC's spacing allows.
+    /// Returns when a waiting notification is due ([`Self::power_due`]).
+    pub fn power_update(
+        &mut self,
+        snapshot: &stela_drivers::platform::power_snapshot::PowerSnapshot,
+        now_ms: u64,
+    ) -> Result<Option<u64>> {
+        Ok(self.smc()?.power(snapshot, now_ms))
+    }
+
+    /// The last reading [`Self::power_update`] gave fell to 0 without the
+    /// firmware's critical bit, and the SMC holds it back until the next
+    /// confirms it (`Smc::battery_held`).
+    pub fn power_held(&mut self) -> bool {
+        self.smc().is_ok_and(|smc| smc.battery_held())
+    }
+
+    /// The next distinct missing key or write macOS asked of an SMC given
+    /// the host's battery, for the log.
+    pub fn take_smc_key_request(&mut self) -> Option<smc::KeyRequest> {
+        self.smc().ok()?.take_key_request()
+    }
+
+    /// Send the battery notifications due at `now_ms`; when the next is.
+    pub fn power_due(&mut self, now_ms: u64) -> Result<Option<u64>> {
+        Ok(self.smc()?.power_due(now_ms))
+    }
+
     /// Choose per-swap display tracing or bounded presentation reports.
     pub fn set_display_swap_tracing(&mut self, enabled: bool) {
         for master in &self.dcp_masters {

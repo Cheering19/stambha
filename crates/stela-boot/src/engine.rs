@@ -16,6 +16,7 @@ use stela_contracts::refuse;
 mod start;
 pub(crate) use start::entry;
 mod aml;
+mod battery;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
@@ -1267,6 +1268,12 @@ fn run_machine<H: Host>(
         host_acpi,
         mut boot_progress,
     } = io;
+    battery::attach(
+        &machine.devices,
+        options.battery,
+        host_acpi,
+        options.battery_withheld(restore.is_some()),
+    );
     crate::status::begin(match restore {
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",

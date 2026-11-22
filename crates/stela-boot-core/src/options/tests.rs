@@ -247,6 +247,48 @@ fn no_boot_that_starts_metal_clients_sees_the_agx_model_and_restore_ramdisks_kee
 }
 
 #[test]
+fn an_install_a_restore_a_staged_update_a_recovery_os_and_a_repair_get_no_battery() {
+    use stela_loader::boot_selection::{
+        BUNDLE_REPAIR_OPTION, PAIRED_RECOVERY_OPTION, SAFE_BOOT_OPTION, SYSTEM_RECOVERY_OPTION,
+        UPGRADE_OPTION,
+    };
+    let withheld = |line: &str| round_trip(line).battery_withheld(false);
+    // The installed macOS takes the battery, in single-user and safe mode
+    // too.
+    for flag in ["", SINGLE_USER, SAFE_BOOT_OPTION] {
+        let line = format!("--system --battery --preboot {DISK} {flag}");
+        assert_eq!(withheld(&line), None, "{line}");
+    }
+    // A staged update runs the restore ramdisk; a recoveryOS and the repair
+    // mend the installed system.
+    for (flag, boot) in [
+        (UPGRADE_OPTION, "a staged macOS update"),
+        (PAIRED_RECOVERY_OPTION, "recoveryOS"),
+        (SYSTEM_RECOVERY_OPTION, "recoveryOS"),
+        (BUNDLE_REPAIR_OPTION, "the Metal plugin repair"),
+    ] {
+        let line = format!("--system --battery --preboot {DISK} {flag}");
+        assert_eq!(withheld(&line), Some(boot), "{line}");
+    }
+    // An install and a restore study, by their options or by the restore the
+    // engine runs.
+    let install = format!(
+        "--system --test-battery 80,charging --storage {DISK} --nor {DISK} --bundle b \
+         --install p.json"
+    );
+    let study = format!(
+        "--system --battery --bundle b --storage {DISK} --restore-study --restore-source {DISK} \
+         --restore-manifest m.plist --restore-identity 2"
+    );
+    for line in [install, study] {
+        assert_eq!(withheld(&line), Some("the macOS installer"), "{line}");
+    }
+    let plain = round_trip("--system --battery");
+    assert_eq!(plain.battery_withheld(false), None);
+    assert_eq!(plain.battery_withheld(true), Some("the macOS installer"));
+}
+
+#[test]
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);
@@ -629,6 +671,69 @@ fn invalid_lines_refuse() {
         "--system --storage-ram 1 --storage-ram 2",
     ] {
         assert!(System::parse(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
+    assert_eq!(System::default().battery, None);
+    assert!(!System::default().to_string().contains("battery"));
+    assert_eq!(
+        round_trip("--system --battery").battery,
+        Some(Battery::Host)
+    );
+    assert_eq!(
+        System::parse("--system --battery").unwrap().to_string(),
+        "--system --battery"
+    );
+    for (text, percent, state) in [
+        ("80,charging", 80, TestState::Charging),
+        ("1,charging", 1, TestState::Charging),
+        ("5,discharging", 5, TestState::Discharging),
+        ("100,full", 100, TestState::Full),
+    ] {
+        let line = format!("--system {TEST_BATTERY} {text}");
+        assert_eq!(
+            round_trip(&line).battery,
+            Some(Battery::Test { percent, state })
+        );
+        assert_eq!(System::parse(&line).unwrap().to_string(), line);
+    }
+    for text in [
+        "--system --battery --battery",
+        "--system --battery --test-battery 1,charging",
+        "--system --test-battery 1,charging --battery",
+        "--system --test-battery 1,charging --test-battery 2,charging",
+    ] {
+        assert_eq!(
+            System::parse(text).unwrap_err(),
+            Error::DuplicateBattery,
+            "{text}"
+        );
+    }
+    for value in [
+        "",
+        "80",
+        "101,charging",
+        "-1,charging",
+        "80,full",
+        "80,idle",
+        "80,charging,more",
+        "80,Charging",
+        ",charging",
+        // Discharging below 5% the test battery is at or near its 3% low
+        // capacity: critical at boot, and macOS shuts down.
+        "4,discharging",
+        "0,discharging",
+        // At 0 the SMC takes no battery: macOS shuts down on an empty one.
+        "0,charging",
+    ] {
+        let text = format!("--system --test-battery {value}");
+        assert_eq!(
+            System::parse(&text).unwrap_err(),
+            Error::TestBattery,
+            "{text}"
+        );
     }
 }
 

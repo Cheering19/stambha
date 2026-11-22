@@ -15,6 +15,8 @@ pub mod ec_smbus;
 pub mod image;
 #[cfg(feature = "native-acpi")]
 pub mod lid;
+pub mod power_relay;
+pub mod power_snapshot;
 pub mod sbs;
 pub mod wait;
 pub mod work;

@@ -435,6 +435,7 @@ impl Service {
             if let Some(request) = super::lid::take_request() {
                 devices.serve(|devices| lid_request(devices, request));
             }
+            super::battery::serve(devices);
             lap.part_of(Part::Nor, |_| drivers);
         }
         if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, &mut turn)) {
