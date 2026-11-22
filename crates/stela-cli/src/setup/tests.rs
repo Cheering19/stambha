@@ -7117,10 +7117,7 @@ fn journey_c_an_older_stick_offers_the_update_and_quit_changes_nothing() {
     result.unwrap();
     assert!(done, "{shown}");
     assert!(shown.contains(&question), "{shown}");
-    assert!(
-        shown.contains("● Stela 0.3 or older · Offline"),
-        "{shown}"
-    );
+    assert!(shown.contains("● Stela 0.3 or older · Offline"), "{shown}");
     assert!(shown.contains("● Updates Stambha on the stick"), "{shown}");
     assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
     assert_eq!(stick_files(&f), before);
