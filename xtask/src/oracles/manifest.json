@@ -5271,6 +5271,30 @@
   },
   {
     "package": "stela-engine",
+    "test": "run_loop_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/run_overhead.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the run loop's fixed cost per native run, on one PE and on parallel hubs of one, two and four PEs; run in release on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "every_direct_word_skips_every_decoder_before_the_integer_one",
+    "source": "crates/stela-compiler/src/aarch64/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "every 32-bit word at five PCs against the lift's decoders that the direct integer path goes past; run in release on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "every_direct_word_skips_the_block_decoders",
+    "source": "crates/stela-compiler/src/block/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "every 32-bit word at five PCs against the block parse's own decoders that the direct integer path goes past; run in release on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "reinstall_cost",
     "source": "crates/stela-engine/src/machine/engine/tests/reinstall_cost.rs",
     "kind": "manual",

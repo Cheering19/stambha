@@ -14,6 +14,117 @@ fn simd_and_fp_decoders_claim_only_words_with_bit_26() {
         );
     }
 }
+
+/// Whether a decoder [`Decoder::lift`] tries before [`lift_integer`] takes
+/// `word`.
+fn taken_before_integer(pc: GuestAddress, word: u32) -> bool {
+    let simd_fp = word & SIMD_FP != 0;
+    word == 0xd65f03c0
+        || word == 0xd503201f
+        || system::synchronization::decode(word).is_some()
+        || exclusive::decode(word).is_some()
+        || constrained::decode(word).is_some()
+        || pc_relative::decode(pc, word).is_some()
+        || bitfield::decode(word).is_some()
+        || conditional_select::decode(word).is_some()
+        || conditional_select::decode_compare(word).is_some()
+        || crc::decode(word).is_some()
+        || checked_pointer::decode(word).is_some()
+        || flags::decode(word).is_some()
+        || (simd_fp && fp_register::decode(word).is_some())
+        || integer_unary::decode(word).is_some()
+        || integer_minmax::decode(word).is_some()
+        || tag_arithmetic::decode(word).is_some()
+        || integer_math::decode(word).is_some()
+        || (simd_fp && FloatingPointOperation::decode(word).is_some())
+        || ordered::decode(word).is_some()
+        || atomic::decode(word).is_some()
+        || non_temporal::decode(word).is_some()
+        || unprivileged::decode(word).is_some()
+        || prefetch::decode(pc, word).is_some()
+        || literal::decode(pc, word).is_some()
+        || (simd_fp && simd::decode(word).is_some())
+        || register_offset::decode(word).is_some()
+}
+
+/// The words [`skips_decoders`] sends to [`lift_integer`] directly are
+/// ones no earlier decoder takes, so the lift is the one it would make in
+/// order. Every word of these classes was checked once; this samples them.
+#[test]
+fn direct_classes_skip_no_decoder() {
+    let classes = DIRECT.into_iter().chain([
+        (0x3f00_0000, 0x3900_0000),
+        (0x3e00_0000, 0x2800_0000),
+        (0x3f20_0000, 0x3800_0000),
+    ]);
+    let pc = GuestAddress(0x1000);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for (mask, class) in classes {
+        let mut direct = 0;
+        for _ in 0..100_000 {
+            state = state.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
+            let word = (state >> 32) as u32 & !mask | class;
+            if skips_decoders(pc, word) {
+                direct += 1;
+                assert!(!taken_before_integer(pc, word), "{word:#010x}");
+            }
+        }
+        assert!(direct > 50_000, "{mask:#010x} {class:#010x}");
+    }
+}
+
+/// The PCs the checks of every word run at: the lowest, a page's, a user
+/// one, a kernel one and the highest, where branch and literal targets
+/// overflow.
+pub(crate) const EVERY_WORD_PCS: [u64; 5] = [
+    0,
+    0x1000,
+    0x1_0000_4000,
+    0xffff_fe00_0bbc_0000,
+    u64::MAX - 3,
+];
+
+/// The first word at each of [`EVERY_WORD_PCS`] that `wrong` holds for, of
+/// every 32-bit word, on all of the host's threads.
+pub(crate) fn first_wrong_word(
+    wrong: impl Fn(GuestAddress, u32) -> bool + Sync,
+) -> Option<(u64, u32)> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = (1u64 << 32).div_ceil(threads as u64);
+    let wrong = &wrong;
+    EVERY_WORD_PCS.into_iter().find_map(|pc| {
+        std::thread::scope(|scope| {
+            let workers: alloc::vec::Vec<_> = (0..threads as u64)
+                .map(|thread| {
+                    scope.spawn(move || {
+                        let end = ((thread + 1) * chunk).min(1 << 32);
+                        (thread * chunk..end)
+                            .map(|word| word as u32)
+                            .find(|&word| wrong(GuestAddress(pc), word))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .min()
+                .map(|word| (pc, word))
+        })
+    })
+}
+
+/// [`direct_classes_skip_no_decoder`] for every word at each of
+/// [`EVERY_WORD_PCS`]: no decoder before [`lift_integer`] takes a word
+/// [`skips_decoders`] sends there. Opt-in, in release: `cargo test -p
+/// stela-compiler --release --lib every_direct_word -- --ignored`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn every_direct_word_skips_every_decoder_before_the_integer_one() {
+    let wrong =
+        first_wrong_word(|pc, word| skips_decoders(pc, word) && taken_before_integer(pc, word));
+    assert_eq!(wrong, None);
+}
+
 #[test]
 fn synchronization_admits_only_context_independent_effects() {
     const YIELD_WORD: u32 = 0xd503_203f;
