@@ -2561,6 +2561,12 @@ fn phy_failure_names_step_and_powers_off() {
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA48));
     assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
 
+    // phy report: RF 0x18 cannot be read through path A's direct window
+    // (DDV), so the error carries no RF 0x18 and no WIFI RF18 line.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0x1E060));
+    assert_eq!(err, BringUpError::new("phy report", READ_FAILED));
+    assert_eq!((err.rf18, err.rf18_lines().count()), (None, 0));
+
     // coex init: the grant sample before it fails; coex never ran, so
     // nothing of it is undone.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xDA4C));

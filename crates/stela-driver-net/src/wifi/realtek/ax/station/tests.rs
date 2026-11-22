@@ -158,6 +158,9 @@ struct Air {
     mute_on_assoc: bool,
     /// The AP has no WMM.
     no_wmm: bool,
+    /// The AP's association response grants the short slot (capability
+    /// b10), which its beacon does not.
+    short_slot_response: bool,
     /// The scan's beacon fails its FCS.
     bad_fcs: bool,
     /// The chip has no room for management or for data frames.
@@ -250,7 +253,8 @@ impl Air {
                     }
                 }
                 0x00 if !self.mute_on_assoc => {
-                    let mut body = vec![0x11, 0, 0, 0, 1, 0xc0];
+                    let slot = if self.short_slot_response { 0x04 } else { 0 };
+                    let mut body = vec![0x11, slot, 0, 0, 1, 0xc0];
                     body.extend(RATES);
                     body.extend(HT);
                     if !self.no_wmm {
@@ -646,7 +650,19 @@ fn data(receiver: [u8; 6], sequence: u16, kind: [u8; 2], body: &[u8]) -> Vec<u8>
 /// hardware hands it on decrypted: its CCMP header after the MAC header,
 /// the plaintext, then the MIC (zeros here).
 fn protected(receiver: [u8; 6], sequence: u16, keyid: u8, pn: u64, body: &[u8]) -> Vec<u8> {
-    let mut frame = data(receiver, sequence, [8, 0], body);
+    protected_as(receiver, sequence, keyid, pn, [8, 0], body)
+}
+
+/// [`protected`] with the LLC's EtherType `kind`.
+fn protected_as(
+    receiver: [u8; 6],
+    sequence: u16,
+    keyid: u8,
+    pn: u64,
+    kind: [u8; 2],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut frame = data(receiver, sequence, kind, body);
     frame[1] |= 0x40;
     let [p0, p1, p2, p3, p4, p5, _, _] = pn.to_le_bytes();
     let header = [p0, p1, 0, 0x20 | keyid << 6, p2, p3, p4, p5];
@@ -986,6 +1002,31 @@ fn an_ap_without_wmm_leaves_its_edca_to_the_chip() {
         })
         .unwrap();
     assert_eq!(joined.edca, None);
+}
+
+#[test]
+fn the_slot_is_the_association_responses_not_the_beacons() {
+    // At association the slot is the response's, not the scan beacon's:
+    // mac80211 keeps the response's capability as `assoc_capability`
+    // (`mlme.c:6339`) and takes the slot from it
+    // (`ieee80211_handle_bss_capability`, `mlme.c:4344`). mac80211 then
+    // follows changed beacons (`mlme.c:8395`), which this radio does not.
+    let (mut wifi, model) = wifi_with(|air| air.short_slot_response = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(beacon(&air)[35] & 0x04, 0);
+    let joined = air
+        .calls
+        .iter()
+        .find_map(|c| match c {
+            Call::Associate(joined) => Some(joined),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(joined.channel.band, Band::Ghz2);
+    assert!(joined.short_slot);
 }
 
 #[test]
@@ -1972,6 +2013,124 @@ fn a_rekey_the_firmware_refuses_closes_the_port_until_its_key_is_installed() {
     let before = model.0.borrow().data().len();
     wifi.radio_mut().transmit(&ip(2)).unwrap();
     assert_eq!(model.0.borrow().data()[before].1, Some((0, 0, 1)));
+}
+
+#[test]
+fn under_pmf_a_deauthentication_without_its_ptk_never_leaves_in_the_clear() {
+    // A pairwise rekey the chip refuses has deleted the old PTK first, while
+    // the station layer still holds the port authorized under PMF. The
+    // deauthentication that follows is robust and protected, with no PTK
+    // left to seal it: it is dropped and reported to the keeper once, never
+    // sent with the Protected bit over a plain body. Only "never in the
+    // clear" is the property; the drop itself is a known gap (mac80211
+    // would send it protected under a software key).
+    let (mut wifi, model) = connected_with_pmf();
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(wifi.radio().station().protected_port_authorized());
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    let air = model.0.borrow();
+    let sent: Vec<&Vec<u8>> = air.calls[from..]
+        .iter()
+        .filter_map(|c| match c {
+            Call::Management(bytes, _) => Some(bytes),
+            _ => None,
+        })
+        .collect();
+    assert!(sent.is_empty(), "{sent:02x?}");
+    drop(air);
+    let unsealed = |e: &keeper::Event| {
+        matches!(
+            e,
+            keeper::Event::Unsupported("a protected management frame without its key")
+        )
+    };
+    assert_eq!(
+        wifi.radio().events.iter().filter(|e| unsealed(e)).count(),
+        1
+    );
+}
+
+#[test]
+fn the_keepers_group_key_handshake_installs_the_new_gtk_under_the_ptk() {
+    // After the 4-way handshake the AP rotates its group key: group message
+    // 1, EAPOL under the PTK, is answered with message 2 under the PTK, and
+    // the GTK of index 2 goes in beside index 1, receive-only, the port
+    // open throughout.
+    let (mut wifi, model) = associated();
+    let mut ap = authenticator();
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
+    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    ap.message_2(&model.0.borrow().eapol()[0]);
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3(&RSN)));
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.eapol().len() > 1 && progress(wifi).contains("acked 2")
+    }));
+    assert!(wifi.carrier());
+    let from = model.0.borrow().calls.len();
+    let group = protected_as(LOCAL, 2, 0, 1, [0x88, 0x8e], &ap.group_message_1());
+    model.0.borrow_mut().hear_as(group, true, false);
+    assert!(run(&mut wifi, &model, |_, air| air.eapol().len() > 2));
+    {
+        let air = model.0.borrow();
+        // MIC | SECURE, at the request's replay counter, under the KCK.
+        ap.signed_reply(&air.eapol()[2], 0x300);
+        let answer = air.calls[from..]
+            .iter()
+            .find_map(|c| match c {
+                Call::Data {
+                    bytes,
+                    eapol: true,
+                    key,
+                    ..
+                } if eapol(bytes).is_some() => Some(*key),
+                _ => None,
+            })
+            .unwrap();
+        // Under the PTK's CAM entry 0, key ID 0.
+        assert!(matches!(answer, Some((0, 0, _))), "{answer:?}");
+        assert!(air.calls[from..].iter().any(|c| matches!(
+            c,
+            Call::AddKey {
+                pairwise: false,
+                index: 2,
+                ..
+            }
+        )));
+        assert!(
+            !air.calls[from..]
+                .iter()
+                .any(|c| matches!(c, Call::RemoveKey(_)))
+        );
+    }
+    assert!(wifi.carrier());
+    // The authenticator hands every key RSC 7, so each GTK takes PN 8 on.
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(protected([0xff; 6], 3, 2, 8, &[0x5a; 46]));
+    hear(protected([0xff; 6], 4, 1, 8, &[0x5b; 46]));
+    hear(protected([0xff; 6], 5, 2, 7, &[0x5c; 46]));
+    wifi.carrier();
+    // The new GTK's frame is delivered and its replay refused. So is the
+    // old GTK's: the shared station layer authorizes the port on the GTK
+    // last installed alone, where mac80211 takes either index until the
+    // AP's switch. That is a known gap in the shared station layer, outside
+    // this radio, pinned here so a fix there shows up as this test failing.
+    assert_eq!(delivered(&mut wifi), [0x5a]);
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", keys 3, port open, rx data 1 sealed 0 nokey 0 refused 2, "),
+        "{line}"
+    );
 }
 
 /// Fragment `number` of frame `sequence` under the PTK at packet number

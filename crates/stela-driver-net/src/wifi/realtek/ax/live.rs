@@ -430,7 +430,7 @@ pub unsafe fn leave_ips<I: AxIo + ?Sized>(
 ///
 /// On a failure the chip is powered off as [`super::bringup::bring_up`]
 /// powers it off for that step (a failure from `"core start"` on as a
-/// calibration failure is, [`bringup::shut_down`]), and the window and the
+/// calibration failure is, `bringup::shut_down`), and the window and the
 /// rings come back in the error.
 ///
 /// # Safety
@@ -725,7 +725,7 @@ impl<I: AxIo> Live<I> {
     /// been ended ([`SCAN_NOT_ENDED`]: the firmware moves the radio), and for
     /// a channel [`Chan::new20`] would not build. Any later failure leaves
     /// the TX scheduler stopped, so the chip is powered off
-    /// ([`bringup::shut_down`]) and every later call fails with
+    /// (`bringup::shut_down`) and every later call fails with
     /// [`POWERED_OFF`]. The channel becomes the one a scan's restore
     /// returns to.
     ///
@@ -772,11 +772,11 @@ impl<I: AxIo> Live<I> {
     }
 
     /// Begin a firmware scan of `list` (M3 spec S8.1): `rtw89_hw_scan_start`'s
-    /// chip steps ([`scan::hw_scan_start`]), then the scan's receiver
+    /// chip steps (`scan::hw_scan_start`), then the scan's receiver
     /// ([`Mode::Scan`], see the module documentation), into which the frames
     /// still waiting for their PPDU status, received before the scan, are
     /// flushed for the next [`Live::drain`]; then `rtw89_hw_scan_offload(true)`
-    /// ([`scan::offload`]: ADD_SCANOFLD_CH with `list`, SCANOFLD start, each
+    /// (`scan::offload`: ADD_SCANOFLD_CH with `list`, SCANOFLD start, each
     /// with its 100 ms DONE_ACK wait). The scan's budget,
     /// [`scan::scan_budget_us`] of the list, runs from SCANOFLD start's
     /// DONE_ACK ([`Live::expire_scan`]). Frames drained meanwhile are held
@@ -787,7 +787,7 @@ impl<I: AxIo> Live<I> {
     /// ([`SCAN_NOT_ENDED`]), while a BSSID is set ([`CONNECTED`]), for a list
     /// [`scan::scan_list`] would refuse, and on a firmware without
     /// SCAN_OFFLOAD. A failure in the scan start's own steps powers the chip
-    /// off. A failed offload is aborted as Linux aborts it: [`scan::stop`],
+    /// off. A failed offload is aborted as Linux aborts it: `scan::stop`,
     /// its failure ignored, then the restore of [`Live::end_scan`]; its error
     /// is returned, and the chip stays on unless the restore failed.
     ///
@@ -851,13 +851,13 @@ impl<I: AxIo> Live<I> {
     /// One RXQ poll for `sink` (the RXQ step of the radio's poll): first the
     /// frames and beacon filter reports an operation held, oldest first
     /// (see [`Live::service`]), then every RXQ entry through the receiver,
-    /// the session's ledger and `rtw89_core_skb_pn_valid` ([`checked`]: a
+    /// the session's ledger and `rtw89_core_skb_pn_valid` (`checked`: a
     /// frame it drops is counted, not handed on), as `rtw89_pci_poll_rxq_dma`
     /// hands them to `rtw89_core_rx`; a held frame passed that check as it
     /// was drained. A running
     /// scan's first END_SCAN ends it: the same call then drains what
     /// followed END_SCAN and flushes the receiver into `sink`
-    /// ([`scan::tail`]), so every frame the scan heard is handed on before
+    /// (`scan::tail`), so every frame the scan heard is handed on before
     /// [`Live::scan_state`] says how it ended. A malformed buffer ends the
     /// drain with its error after the buffers before it were handed on, and
     /// a later call goes on. Refused with [`POWERED_OFF`] on a chip off.
@@ -899,8 +899,8 @@ impl<I: AxIo> Live<I> {
 
     /// The scan budget (the radio poll's last step, M3 spec S8.1): a scan
     /// without END_SCAN at its deadline is stopped as `rtw89_hw_scan_abort`
-    /// does ([`scan::stop`]: SCANOFLD stop, then up to `STOP_WAIT_US` for
-    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]) as
+    /// does (`scan::stop`: SCANOFLD stop, then up to `STOP_WAIT_US` for
+    /// END_SCAN), what followed drained into `sink` (`scan::tail`) as
     /// [`Live::drain`] drains it, after the frames held, and it ends
     /// [`ScanEnd::Stopped`], `ended` when
     /// END_SCAN came in the stop's wait or its tail. A stop or tail that
@@ -956,7 +956,7 @@ impl<I: AxIo> Live<I> {
     /// `rtw89_hw_scan_complete` for the ended scan (M3 spec S8.3; see the
     /// module documentation): the switch back to the operating channel through
     /// [`Live::tune`], with its TX power and the receiver's tag, then
-    /// [`scan::hw_scan_complete`] (the RX filter, the station receiver
+    /// `scan::hw_scan_complete` (the RX filter, the station receiver
     /// again, the address CAM, EDCCA, TSF sync, DIG), frames its CAM send
     /// drains held for the next [`Live::drain`]. The scan is over either way;
     /// a failure powers the chip off. Refused before any I/O on a chip off
@@ -1551,7 +1551,7 @@ impl<I: AxIo> Live<I> {
     /// drop counted); the scan budget ([`Live::expire_scan`]); then each
     /// beacon filter report
     /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
-    /// takes it ([`Live::beacon_filter`]); then, once,
+    /// takes it (`Live::beacon_filter`); then, once,
     /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
     /// frame it heard. Every step runs whatever an earlier one returned,
     /// and the first error is returned. Such an error is not fatal: no step
@@ -1785,7 +1785,7 @@ impl<I: AxIo> Live<I> {
         Ok(result)
     }
 
-    /// `rtw89_core_stop` (M3 spec S3.2, [`bringup::shut_down`]): the coex
+    /// `rtw89_core_stop` (M3 spec S3.2, `bringup::shut_down`): the coex
     /// half, `pci::deinit`, then the power-off, every result ignored as
     /// Linux ignores them; nothing on a chip a failure already powered
     /// off. The window, the rings and the pools come back and must be kept:
@@ -2045,7 +2045,8 @@ impl<I: AxIo> Live<I> {
         self.ba.tids()
     }
 
-    /// The PN check [`Live::service`] runs, on `frame`.
+    /// The PN check every drain runs on what it brings (`Live::passing`,
+    /// through `checked`), on `frame`.
     pub(crate) fn pn_valid(&mut self, frame: &Received) -> bool {
         self.rx_stats.valid(self.associated.is_some(), frame)
     }

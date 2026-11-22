@@ -1,6 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) AND GPL-2.0-only
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
+// The duplicate check is adapted from pinned Linux net/mac80211/rx.c
+// (ieee80211_rx_h_check_dup): Copyright 2002-2005, Instant802 Networks, Inc.;
+// 2005-2006, Devicescape Software, Inc.; 2006-2007 Jiri Benc; 2007-2010
+// Johannes Berg; 2013-2014 Intel Mobile Communications GmbH; 2015-2017 Intel
+// Deutschland GmbH; 2018-2026 Intel Corporation. See NOTICE.
 //! An RTL8852CE as the connection keeper's radio (M3 spec S14). rtw89
 //! leaves the MAC's soft half to mac80211, as rtw88 does, so the station's
 //! orchestration is Stela's, after rtw88's `realtek/station.rs` (its
@@ -760,7 +765,12 @@ impl<C: Chip> Rtl8852c<C> {
     /// `IEEE80211_TX_CTL_REQ_TX_STATUS`, rtw89 reporting TX status
     /// (`REPORTS_TX_ACK_STATUS`, `core.c:7495`), and the status times the
     /// exchange's next try (`ieee80211_mgd_conn_tx_status`). A protected
-    /// frame was sealed as it was queued.
+    /// frame was sealed as it was queued. A frame the chip refuses (a chip
+    /// off, or one the encoder or the submit refuses) stays at the head and
+    /// its error is returned, as rtw88's does, so the frames behind it wait
+    /// until a departure clears the outbox; rtw89 frees just that frame
+    /// (`ieee80211_free_txskb` after `rtw89_core_tx_write` fails,
+    /// `mac80211.c:39-43`).
     fn send_management(&mut self) -> Result<(), Error> {
         let basic_rates = self.basic_rates();
         while let Some((_, bytes)) = self.outbox.front() {
@@ -2084,7 +2094,9 @@ impl<C: Chip> Rtl8852c<C> {
         if first.is_ok() {
             first = left;
         }
-        if let Some(ticket) = self.departing.take() {
+        // rtw88's order: the ticket stays until the removal is completed,
+        // and `clear` drops it with the rest.
+        if let Some(ticket) = self.departing {
             self.station
                 .complete_removal(ticket, Completion::Accepted)
                 .map_err(Error::Station)?;

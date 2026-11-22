@@ -275,7 +275,7 @@ const RX_TABLE: [(u32, u32, u32); RX_CHANNELS] = [
 ];
 
 /// The 8-byte `struct rtw89_pci_tx_bd_32` of `rtw89_pci_fwcmd_submit`:
-/// le16 length, le16 opt = LS | dma[39:32] << 6, le32 dma[31:0].
+/// le16 length, le16 opt = LS | dma`[39:32]` << 6, le32 dma`[31:0]`.
 pub fn encode_txbd(len: u16, dma: u64) -> [u8; 8] {
     encode_bd(len, RTW89_PCI_TXBD_OPT_LS, dma)
 }
@@ -464,7 +464,7 @@ impl Rings {
     /// but CH12, which `__rtw89_pci_ops_flush_txchs` skips (`pci.c:1414-1430`;
     /// the 8852CE masks no other, `tx_dma_ch_mask` 0, `rtw8852ce.c:63`), in
     /// ring order, `__pci_flush_txch` (`pci.c:1388-1410`): up to 60 reads of
-    /// the ring's IDX, each not yet showing the hardware index ([27:16]) at
+    /// the ring's IDX, each not yet showing the hardware index (`[27:16]`) at
     /// the host's (`bd_ring->wp`: a data or management channel's, 0 for a
     /// ring nothing is queued on) followed by a 1 us delay. A ring still
     /// behind after them is passed over, as Linux only logs it. Nothing is
@@ -672,18 +672,26 @@ pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError>
 /// Linux's writes cannot fail and it ignores `ltr_set`'s `-EINVAL`, so every
 /// step runs whatever an earlier one returned; the first error is returned.
 /// The hardware indices restart, so CH12 and the data and management queues
-/// are marked stopped and the RXQ and RPQ host indices restart at 0: only
-/// another `pre_init` starts the rings again.
+/// are marked stopped, and once every index clear succeeded the RXQ and RPQ
+/// host indices restart at 0: only another `pre_init` starts the rings
+/// again. A clear that fails stops the ones after it, the RX clear last, so
+/// the RX host indices stay with the hardware's they still match. This
+/// relies on a failed clear never reaching the device: on the real MMIO
+/// window the range check runs before any access and every ring register is
+/// in range, so `clr_idx_all` fails only in a test model, never after a
+/// write has landed.
 pub fn deinit<I: AxIo + ?Sized>(io: &mut I, rings: &Rings, ltr: bool) -> Result<(), AxError> {
     rings.ch12_ready.set(false);
     rings.data_ready.set(false);
-    for host in &rings.rx_host {
-        host.set(0);
-    }
     let wake = clear32(io, R_AX_HCI_OPT_CTRL, BIT_WAKE_CTRL);
     let ltr = if ltr { ltr_set_v1(io, false) } else { Ok(()) };
     let dma = ctrl_dma_all(io, false);
     let indices = clr_idx_all(io);
+    if indices.is_ok() {
+        for host in &rings.rx_host {
+            host.set(0);
+        }
+    }
     wake.and(ltr).and(dma).and(indices)
 }
 
@@ -892,7 +900,7 @@ pub struct Ch12<'r> {
 impl Ch12<'_> {
     /// Send `packet` (its TX descriptor included) as `rtw89_pci_fwcmd_submit`
     /// and `__rtw89_pci_tx_kick_off` do, then wait until the hardware read
-    /// index (`IDX` [27:16]) has passed the entry (1 us samples, 400 ms).
+    /// index (`IDX` `[27:16]`) has passed the entry (1 us samples, 400 ms).
     ///
     /// Any failure after the length check (the slot or TXBD write, a sync,
     /// the kick or the reclaim wait) leaves the queue refusing further
@@ -1174,7 +1182,7 @@ impl Txq<'_> {
 
     /// Take back the TXBDs the DMA engine has read, as
     /// `rtw89_pci_reclaim_txbd` (`pci.c:501-520`) does: read the hardware
-    /// index (`IDX` [27:16], `rtw89_pci_txbd_recalc` `pci.c:87`), and for
+    /// index (`IDX` `[27:16]`, `rtw89_pci_txbd_recalc` `pci.c:87`), and for
     /// each entry from the last one read up to it, take the TXBD back for
     /// the CPU and mark its page's TXBD done; a page already reported
     /// returns to its pool. Nothing is written to the device.
@@ -1434,7 +1442,7 @@ pub struct Rxq<'r> {
 }
 
 impl Rxq<'_> {
-    /// The last in-range RXQ hardware index (`IDX` [27:16]) `poll` read; 0
+    /// The last in-range RXQ hardware index (`IDX` `[27:16]`) `poll` read; 0
     /// before the first.
     pub fn hardware_index(&self) -> u16 {
         self.hw
@@ -1442,7 +1450,7 @@ impl Rxq<'_> {
 
     /// Deliver every RXQ entry the device has filled, as
     /// `rtw89_pci_poll_rxq_dma` (`pci.c:436`) does with an unlimited budget:
-    /// read the hardware index (`IDX` [27:16], `rtw89_pci_rxbd_recalc`
+    /// read the hardware index (`IDX` `[27:16]`, `rtw89_pci_rxbd_recalc`
     /// `pci.c:146`), count the entries from the host index to it
     /// (`rtw89_pci_dma_recalc` `pci.c:61`, `rx_ring_eq_is_full` false), and
     /// for each one take its buffer for the CPU, copy the whole buffer

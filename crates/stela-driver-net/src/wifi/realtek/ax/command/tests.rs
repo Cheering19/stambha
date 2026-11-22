@@ -888,7 +888,7 @@ fn firmware_probe_response_goes_to_the_cam_mac_and_a_burst_fills_rxq() {
             fw.install(io);
         },
         &mut |s, io, sink| {
-            let cam = s.h2c.addr_cam(MAC, 0, 0);
+            let cam = s.h2c.addr_cam_unassociated(MAC, 0, 0);
             // SAFETY: as in `send_drains_rxq_after_the_submit`.
             let cammed = unsafe { s.send(io, cam, sink) };
             let list = scan_list(&[(HwBand::G2, 1), (HwBand::G5, 36)]);
@@ -1134,7 +1134,7 @@ fn the_firmware_model_answers_receipt_and_cam_waits() {
             let sec = rack_only(s, 0xA, 1);
             // SAFETY: as in `send_drains_rxq_after_the_submit`.
             let received = unsafe { s.send_and_wait_for(io, sec, Wait::Received, sink) };
-            let cam = s.h2c.addr_cam(MAC, 0, 0);
+            let cam = s.h2c.addr_cam_unassociated(MAC, 0, 0);
             let done = Wait::Done {
                 class: 6,
                 func: 0,

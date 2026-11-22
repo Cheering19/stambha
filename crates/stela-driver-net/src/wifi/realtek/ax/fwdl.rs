@@ -120,7 +120,7 @@ pub(super) fn descriptor(pkt_size: usize, rx_type: u32) -> [u8; TXDESC_BYTES] {
 /// The CH12 packet of `__rtw89_fw_download_hdr` for a v0 image: the FWCMD
 /// descriptor (type H2C), the FWCMD header of `rtw89_h2c_pkt_set_hdr_fwdl`
 /// (MAC / FWDL / FWHDR_DL, H2C sequence `seq`, total length = header +
-/// 8), then the image header without its dynamic part and with W7[15:0] =
+/// 8), then the image header without its dynamic part and with W7`[15:0]` =
 /// 2020 (`__rtw89_fw_download_tweak_hdr_v0`).
 pub fn header_packet(image: &AxImage<'_>, seq: u8) -> Vec<u8> {
     let header = image.header_packet();

@@ -146,7 +146,7 @@ impl KeyCam {
 
     /// The address CAM's and dctl's security fields
     /// (`rtw89_cam_fill_addr_cam_info`, `cam.c:906-927`): w9's key IDs, two
-    /// bits each from bit 18; w10 the valid map [7:0] and entries 0-2; w11
+    /// bits each from bit 18; w10 the valid map `[7:0]` and entries 0-2; w11
     /// entries 3-6.
     pub fn keys(&self) -> CamKeys {
         let keyids = self.keyids.iter().enumerate().fold(0u32, |w, (slot, &k)| {

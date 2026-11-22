@@ -29,7 +29,7 @@ const BCNFLTR_LEN: usize = 12;
 /// `RTW89_BCN_FLTR_BEACON_LOSS`, the first `enum rtw89_bcn_fltr_type`
 /// (`fw.h:273-277`); RSSI is 1 and NOTIFY 2.
 pub const BCNFLTR_BEACON_LOSS: u8 = 0;
-/// `enum rtw89_scan_ofld_notify_reason` and `rtw89_scanofld_status`
+/// `enum rtw89_scanofld_notify_reason` and `rtw89_scanofld_status`
 /// (`fw.h:228-245`).
 pub const SCAN_ENTER_CH: u8 = 3;
 pub const SCAN_LEAVE_CH: u8 = 4;
@@ -57,8 +57,8 @@ pub struct ScanOfld {
 }
 
 /// The w2 fields of `struct rtw89_c2h_mac_bcnfltr_rpt` (`fw.h:4011-4014`),
-/// raw: `macid` [7:0], `kind` (`TYPE`, [9:8]: [`BCNFLTR_BEACON_LOSS`],
-/// RSSI 1 or NOTIFY 2), `event` [11:10] and `ma` [23:16], the moving average
+/// raw: `macid` `[7:0]`, `kind` (`TYPE`, `[9:8]`: [`BCNFLTR_BEACON_LOSS`],
+/// RSSI 1 or NOTIFY 2), `event` `[11:10]` and `ma` `[23:16]`, the moving average
 /// whose signal Linux takes as `ma - MAX_RSSI` (`mac.c:5403`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BcnFltr {
