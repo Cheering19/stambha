@@ -26,3 +26,4 @@ mod harness;
 mod mac16;
 mod matfp;
 mod refusals;
+mod vecfp;

@@ -31,28 +31,6 @@ fn vector_operand(random: &mut Random) -> u64 {
     operand
 }
 
-/// Where the f16 `vecfp` path leaves an operand to the model: without
-/// F16C; bits 56:54, an indexed load, a mode past 1, a type that is not
-/// f16 (bf16 on M2 and later), the M2 multi-row form, a shuffle, and the
-/// lane-enable values 3 to 5 of mode 0 (`native::x86::vector_half`).
-fn vecfp_may_refuse(paths: &Paths, _: AmxOperation, generation: Generation, operand: u64) -> bool {
-    let m2 = generation != Generation::M1;
-    let operand = operand & !(1 << 37);
-    let mode = (operand >> 47) & 0x3f;
-    let kind = (operand >> 42) & 0xf;
-    let wider = matches!(kind, 3 | 4 | 7) || m2 && kind <= 1;
-    let field = (operand >> 38) & 7;
-    let value = (operand >> 32) & 0x3f;
-    !paths.f16c
-        || (operand >> 54) & 7 != 0
-        || operand & 1 << 53 != 0
-        || mode > 1
-        || wider
-        || m2 && operand & 1 << 31 != 0
-        || (operand >> 27) & 0xf != 0
-        || field == 0 && matches!(value, 3..=5)
-}
-
 /// The unit test's seed, operands and floor (more than 2000 of 20000 per
 /// generation), on M3 as well, and a floor for each lane form and for
 /// `z - x*y`: about half of what each ran.
@@ -65,7 +43,7 @@ const VECFP_HALF: Case = Case {
     fill: harness::fill,
     operand: vector_operand,
     runs_on: |paths| paths.f16c,
-    may_refuse: vecfp_may_refuse,
+    may_refuse: crate::vecfp::may_refuse,
     forms: &[
         Form {
             name: "f16 vecfp",
