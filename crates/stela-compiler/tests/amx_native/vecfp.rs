@@ -90,11 +90,17 @@ pub fn may_refuse(paths: &Paths, _: AmxOperation, generation: Generation, operan
     let mode = mode(operand);
     let arithmetic = matches!(mode, 0 | 1 | 10..=12);
     let wide_float = matches!(kind(operand), 4 | 7);
+    // The M2's multiple rows take bits 34:32 for their broadcast, 1 of
+    // which writes zeros.
+    let zeros = if m2 && operand & 1 << 31 != 0 {
+        (operand >> 32) & 7 == 1
+    } else {
+        zeros(operand)
+    };
     (operand >> 54) & 7 != 0
-        || m2 && operand & 1 << 31 != 0
         || !(matches!(mode, 0 | 1 | 4 | 5 | 7) || m2 && matches!(mode, 10..=12))
         || m2 && kind(operand) <= 1
-        || !zeros(operand)
+        || !zeros
             && arithmetic
             && if wide_float {
                 paths.tier() == Tier::Model
@@ -238,6 +244,87 @@ const VECFP_M2: Case = Case {
 #[test]
 fn vecfp_m2_modes_match_the_model_bit_for_bit() {
     differential(&VECFP_M2, &native);
+}
+
+/// The M2's multi-row operands: bit 31, each broadcast of bits 34:32, Z
+/// rows from both halves (bit 25: every 16th row, else every 32nd), every
+/// mode, some indexed and shuffled.
+fn rows_operand(random: &mut Random) -> u64 {
+    let modes = [0u64, 1, 4, 5, 7, 10, 11, 12];
+    let choice = random.next();
+    let mut operand = operand_of(random, &modes) & !(7 << 54);
+    operand &= !(0x1ff << 32);
+    operand | 1 << 31 | (choice & 7) << 32
+}
+
+/// The broadcast (bits 34:32) of a multi-row operand, as its own floor.
+const fn broadcast(value: u64) -> Form {
+    const NAMES: [&str; 8] = [
+        "rows",
+        "rows of zeros",
+        "one X row",
+        "one Y row",
+        "rows, zero X",
+        "rows, zero Y",
+        "X lane 0",
+        "Y lane 0",
+    ];
+    Form {
+        name: NAMES[value as usize],
+        of: match value {
+            0 => |_, operand| (operand >> 32) & 7 == 0,
+            1 => |_, operand| (operand >> 32) & 7 == 1,
+            2 => |_, operand| (operand >> 32) & 7 == 2,
+            3 => |_, operand| (operand >> 32) & 7 == 3,
+            4 => |_, operand| (operand >> 32) & 7 == 4,
+            5 => |_, operand| (operand >> 32) & 7 == 5,
+            6 => |_, operand| (operand >> 32) & 7 == 6,
+            _ => |_, operand| (operand >> 32) & 7 == 7,
+        },
+        floor: |_| 60,
+    }
+}
+
+const VECFP_ROWS: Case = Case {
+    name: "vecfp rows",
+    seed: 0x1f83_d9ab_fb41_bd6b,
+    operations: &[AmxOperation::VectorFloat],
+    generations: &[Generation::M2, Generation::M3, Generation::M4],
+    iterations: 4000,
+    fill: harness::fill,
+    operand: rows_operand,
+    runs_on: |_| true,
+    may_refuse,
+    forms: &[
+        broadcast(0),
+        broadcast(1),
+        broadcast(2),
+        broadcast(3),
+        broadcast(4),
+        broadcast(5),
+        broadcast(6),
+        broadcast(7),
+        Form {
+            name: "every 16th row",
+            of: |_, operand| operand & 1 << 25 != 0,
+            floor: |_| 300,
+        },
+        Form {
+            name: "every 32nd row",
+            of: |_, operand| operand & 1 << 25 == 0,
+            floor: |_| 300,
+        },
+        Form {
+            name: "indexed",
+            of: |_, operand| operand & INDEXED != 0,
+            floor: |_| 30,
+        },
+    ],
+};
+
+#[test]
+fn vecfp_multiple_rows_match_the_model_bit_for_bit() {
+    differential(&VECFP_ROWS, &native);
 }
 
 /// Special values in X, Y and Z lanes, rotated so that many triples meet,

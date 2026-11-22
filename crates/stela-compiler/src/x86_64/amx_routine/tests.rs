@@ -119,7 +119,8 @@ fn register_operations_complete_in_block_as_the_model_does() {
                     let number = operation.encoding().0 as usize;
                     let counts = cell.kernels[number];
                     assert_eq!(counts[0] + counts[1], 1, "{context}");
-                    if native == Native::MODEL && operation == AmxOperation::VectorFloat {
+                    // The model tier computes no matfp lane.
+                    if native == Native::MODEL && operation == AmxOperation::MatrixFloat {
                         assert_eq!(counts, [0, 1], "{context}: the model's");
                     }
                     // The first call of each operation is sampled.
