@@ -30,10 +30,12 @@
 //! Host frames queue until the guest's interrupt IN on endpoint 0x83, and
 //! are encoded only then, so a frame's touch states follow what the guest
 //! was sent: a frame dropped from the queue can delay a Start or a Stop but
-//! never lose one. The queue holds [`QUEUE`] frames; a frame arriving at a
-//! full queue replaces the newest one when both have the same contacts and
-//! buttons (their motion coalesces), and otherwise drops the oldest,
-//! counted. An unconfigured guest keeps the newest frame only. A bus reset
+//! never lose one. Once two frames are queued, a frame of the newest one's
+//! contacts and buttons replaces it (their motion coalesces, counted apart),
+//! so a guest reading slower than the pad lags two frames, not a queue's
+//! worth; frames of changing contacts queue up to [`QUEUE`], past which the
+//! oldest is dropped, counted. An unconfigured guest keeps the newest frame
+//! only. A bus reset
 //! or a new configuration forgets every contact, so a finger still down
 //! starts again. A report longer than the endpoint's 64-byte packets (six
 //! or more fingers) goes out over consecutive packets, the last one short.
@@ -59,6 +61,10 @@ use stela_drivers::input::multitouch::{Frame, Surface};
 
 /// Host frames waiting for the guest at most.
 pub const QUEUE: usize = 32;
+/// Queued frames from which a frame of the newest one's contacts and
+/// buttons replaces it: the guest's next report and the newest motion
+/// stay, so a guest reading slower than the pad lags two frames at most.
+const COALESCE_FROM: usize = 2;
 /// Trace entries kept between the owner's takes.
 const TRACE: usize = 64;
 /// Distinct unknown requests reported.
@@ -144,12 +150,15 @@ impl Trackpad {
             state.queue.push_back(frame);
             return;
         }
+        if state.queue.len() >= COALESCE_FROM
+            && let Some(back) = state.queue.back_mut()
+            && same_contacts(back, &frame)
+        {
+            *back = frame;
+            state.counters.coalesced += 1;
+            return;
+        }
         if state.queue.len() == QUEUE {
-            let back = state.queue.back_mut().expect("a full queue has a back");
-            if same_contacts(back, &frame) {
-                *back = frame;
-                return;
-            }
             state.queue.pop_front();
             state.counters.dropped += 1;
             state.dropped += 1;

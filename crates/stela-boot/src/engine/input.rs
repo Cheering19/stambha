@@ -301,9 +301,10 @@ impl HostInput {
             us => received.saturating_mul(1_000_000) / us,
         };
         output::arguments(format_args!(
-            "TRACKPAD frames received={received} sent={} dropped={} rate={rate} Hz over {} ms \
-             of touch\n",
+            "TRACKPAD frames received={received} sent={} coalesced={} dropped={} rate={rate} Hz \
+             over {} ms of touch\n",
             counters.sent.saturating_sub(seen.sent),
+            counters.coalesced.saturating_sub(seen.coalesced),
             counters.dropped.saturating_sub(seen.dropped),
             reporting_us / 1000,
         ));

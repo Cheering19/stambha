@@ -133,6 +133,9 @@ pub struct Counters {
     pub received: u64,
     pub sent: u64,
     pub dropped: u64,
+    /// Frames whose motion went into the newest queued frame of the same
+    /// contacts, behind a guest reading slower than the pad.
+    pub coalesced: u64,
     /// The sum of the gaps between consecutive received frames under
     /// 100 ms, by the frames' own times: the time the pad was reporting.
     pub reporting_us: u64,

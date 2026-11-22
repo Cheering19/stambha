@@ -419,12 +419,17 @@ fn an_unconfigured_guest_keeps_the_newest_frame() {
     assert_eq!(read(&mut t, 0x83), Ok(None), "one frame was kept");
 }
 
+/// A report's first finger's X.
+fn first_x(report: &[u8]) -> i16 {
+    i16::from_le_bytes([report[12], report[13] & 0x1f]) << 3 >> 3
+}
+
 #[test]
 fn queue_bound_keeps_lift() {
     let mut t = configured();
     t.take_trace();
-    // One finger moving for 100 frames without an IN: its motion coalesces
-    // at the full queue's back.
+    // One finger moving for 100 frames without an IN: past the second
+    // queued frame its motion coalesces into the newest, counted apart.
     for n in 0..100u64 {
         t.frame(Frame::new(
             n * 8_000,
@@ -432,32 +437,29 @@ fn queue_bound_keeps_lift() {
             &[elan(0, 500 + 10 * n, 1000, true, true)],
         ));
     }
-    // The lift differs from the back: the oldest frame goes, counted.
+    // The lift differs from the newest: it queues behind it.
     t.frame(Frame::new(800_000, 0, &[]));
-    assert_eq!(t.take_trace(), [TrackpadEvent::Dropped(1)]);
-    assert_eq!(t.counters().dropped, 1);
+    assert!(t.take_trace().is_empty(), "nothing dropped");
+    let counters = t.counters();
+    assert_eq!((counters.dropped, counters.coalesced), (0, 98));
     let mut reports = Vec::new();
     while let Some(r) = read(&mut t, 0x83).unwrap() {
         reports.push(r);
     }
-    assert_eq!(reports.len(), QUEUE + 1, "the queue, then the header alone");
-    assert_eq!(reports[0][15] >> 5, 3, "Start");
-    assert!(
-        reports[1..QUEUE - 1].iter().all(|r| r[15] >> 5 == 4),
-        "Active"
+    assert_eq!(
+        reports.len(),
+        4,
+        "the first and newest motion, the lift, the header"
     );
-    let stop = &reports[QUEUE - 1];
-    assert_eq!((stop.len(), stop[15] >> 5), (21, 7), "Stop");
-    assert_eq!(reports[QUEUE].len(), 12, "the header alone");
-    // The last Active report is the newest motion, coalesced.
-    let last = &reports[QUEUE - 2];
+    assert_eq!(reports[0][15] >> 5, 3, "Start");
+    assert_eq!(reports[1][15] >> 5, 4, "Active");
+    // The Active report is the newest motion.
     let moved = Mapping::mt2(ELAN)
         .to_mt2(elan(0, 500 + 990, 1000, true, true).x_um, 0)
         .0;
-    assert_eq!(
-        i16::from_le_bytes([last[12], last[13] & 0x1f]) << 3 >> 3,
-        moved
-    );
+    assert_eq!(first_x(&reports[1]), moved);
+    assert_eq!((reports[2].len(), reports[2][15] >> 5), (21, 7), "Stop");
+    assert_eq!(reports[3].len(), 12, "the header alone");
     // Contacts that keep changing drop one frame each past the bound.
     let mut t = configured();
     t.take_trace();
@@ -470,6 +472,40 @@ fn queue_bound_keeps_lift() {
         t.frame(Frame::new(n * 8_000, 0, &fingers[..count]));
     }
     assert_eq!(t.take_trace(), [TrackpadEvent::Dropped(100 - QUEUE as u64)]);
+    assert_eq!(t.counters().coalesced, 0);
+}
+
+#[test]
+fn a_slow_guest_lags_two_frames_at_most() {
+    // The pad reports twice per guest IN: the guest's next report is never
+    // more than two frames behind the pad, where a queue filling to its
+    // bound would hold it back by up to 31.
+    let mut t = configured();
+    let mut x = 500;
+    let mut frame = |t: &mut Trackpad| {
+        x += 10;
+        t.frame(Frame::new(x * 1_000, 0, &[elan(0, x, 1000, true, true)]));
+        Mapping::mt2(ELAN)
+            .to_mt2(elan(0, x, 1000, true, true).x_um, 0)
+            .0
+    };
+    let mut xs = Vec::new();
+    for _ in 0..60 {
+        xs.push(frame(&mut t));
+        xs.push(frame(&mut t));
+        let reported = first_x(&read(&mut t, 0x83).unwrap().unwrap());
+        // The newest frame or one of the two before it.
+        let recent = &xs[xs.len().saturating_sub(3)..];
+        assert!(recent.contains(&reported), "{reported} not in {recent:?}");
+    }
+    let mut queued = 0;
+    while read(&mut t, 0x83).unwrap().is_some() {
+        queued += 1;
+    }
+    assert!(queued <= 2, "{queued} frames queued");
+    let counters = t.counters();
+    assert_eq!(counters.dropped, 0);
+    assert!(counters.coalesced >= 55, "{counters:?}");
 }
 
 #[test]
