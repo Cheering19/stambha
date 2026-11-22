@@ -37,6 +37,7 @@ impl ParseState<'_> {
             "--serialized" => options.parallel = false,
             "--profile" => options.profile = true,
             "--lid-sleep" => options.lid_sleep = true,
+            "--brightness-keys" => options.brightness_keys = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

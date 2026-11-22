@@ -2688,6 +2688,7 @@ fn start_platform(
     // A freeze here was a screen that stopped after the step before with
     // nothing named (issue 36), so this is a step and names its parts.
     crate::status::begin("Taking over the PC's devices from the firmware");
+    super::aml::follow_brightness_keys(options.brightness_keys);
     // Before the lid's device is found, which reports what follows it.
     super::lid::configure(
         options.lid() == stela_boot_core::options::Lid::Method,

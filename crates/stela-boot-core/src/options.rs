@@ -339,6 +339,11 @@ pub struct System {
     /// with its power button when the panel lights again (`--lid-sleep`,
     /// with `--lid method`).
     pub lid_sleep: bool,
+    /// Step a display output with `_BCL` and `_BCM` in the firmware's
+    /// `_DOD` at its brightness notifications (`--brightness-keys`): Linux
+    /// does only where ACPI video owns the backlight, which Stela cannot
+    /// tell.
+    pub brightness_keys: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -447,6 +452,7 @@ impl Default for System {
             profile: false,
             lid: None,
             lid_sleep: false,
+            brightness_keys: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -910,6 +916,7 @@ impl fmt::Display for System {
         line.flag("--profile", self.profile)?;
         line.value("--lid", self.lid.map(Lid::name))?;
         line.flag("--lid-sleep", self.lid_sleep)?;
+        line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

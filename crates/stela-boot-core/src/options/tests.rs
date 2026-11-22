@@ -213,7 +213,8 @@ fn every_option_survives_a_round_trip() {
         "--system --storage {DISK} --nor {DISK} --bundle b --install p.json \
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
-         --native-artifacts --serialized --profile --lid method --lid-sleep --monitor-trace \
+         --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
+         --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
          --load 0x10000004000 --entry 0x10000008000 --x0 7 --budget 99 --break 0x10 \
@@ -227,6 +228,8 @@ fn every_option_survives_a_round_trip() {
     assert!(options.lid_sleep);
     assert!(!System::default().lid_sleep);
     assert_eq!(options.lid(), Lid::Method);
+    assert!(options.brightness_keys);
+    assert!(!System::default().brightness_keys);
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(

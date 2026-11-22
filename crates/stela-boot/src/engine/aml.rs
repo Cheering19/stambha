@@ -1171,6 +1171,13 @@ const BACKLIGHTS: usize = 8;
 static BRIGHTNESS: [AtomicU32; BACKLIGHTS] = [const { AtomicU32::new(0) }; BACKLIGHTS];
 /// The last brightness notification of any device since the poll took it.
 static BRIGHTNESS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// `--brightness-keys`: the brightness notifications are followed.
+static BRIGHTNESS_KEYS: AtomicBool = AtomicBool::new(false);
+
+/// Follow the brightness notifications (`--brightness-keys`).
+pub(super) fn follow_brightness_keys(on: bool) {
+    BRIGHTNESS_KEYS.store(on, Ordering::Release);
+}
 /// The ASUS WMI event notifications since the poll took them, each one
 /// event its firmware queued ([`HostAcpi::service_asus_wmi`]).
 static ASUS_EVENTS: AtomicU32 = AtomicU32::new(0);
@@ -1869,12 +1876,19 @@ impl HostAcpi {
         }
     }
 
-    /// Linux's ACPI video driver on each display output device with `_BCL`
-    /// and `_BCM`: its brightness notifications, which a laptop's
-    /// brightness keys send, step it ([`Self::service_brightness`]). One
-    /// line for each device, or one saying none was found.
+    /// With `--brightness-keys`, Linux's ACPI video driver on each display
+    /// output device with `_BCL` and `_BCM` its video bus's `_DOD` lists
+    /// ([`stela_drivers::probe::backlight::controls`]): its level set as at
+    /// registration, the level a press without `_BQC` starts from, and its
+    /// brightness notifications, which a laptop's brightness keys send,
+    /// stepping it ([`Self::service_brightness`]). Linux does this only
+    /// where ACPI video owns the backlight, which Stela cannot tell, so it
+    /// is asked for. One line for each device, or one saying none was found.
     fn attach_backlights(&'static self) {
         use stela_drivers::probe::backlight;
+        if !BRIGHTNESS_KEYS.load(Ordering::Acquire) {
+            return;
+        }
         let found = match backlight::controls(&self.session) {
             Ok(found) => found,
             Err(error) => {
@@ -1889,14 +1903,36 @@ impl HostAcpi {
                 "HOST ACPI backlight {path}: _BCL lists no levels, so the brightness keys leave it\n"
             ));
         }
+        for path in &found.undeclared {
+            output::arguments(format_args!(
+                "HOST ACPI backlight {path}: its video bus's _DOD does not list it (or it has no \
+                 _ADR), so the brightness keys leave it\n"
+            ));
+        }
         if found.controls.is_empty() {
             output::arguments(format_args!(
-                "HOST ACPI backlight: no display output has _BCL and _BCM, so the brightness keys \
-                 find no backlight control\n"
+                "HOST ACPI backlight: no display output in _DOD has _BCL and _BCM, so the \
+                 brightness keys find no backlight control\n"
             ));
         }
         let mut kept = self.backlights.borrow_mut();
-        for (index, control) in found.controls.into_iter().enumerate() {
+        for (index, mut control) in found.controls.into_iter().enumerate() {
+            if index >= BACKLIGHTS {
+                output::arguments(format_args!(
+                    "HOST ACPI backlight {}: past the first {BACKLIGHTS} outputs, its brightness \
+                     keys are not followed\n",
+                    control.path
+                ));
+                continue;
+            }
+            let set = match control.initialize() {
+                Ok(set) => alloc::format!("set to {} of {}", set.level, set.max),
+                Err(error) => alloc::format!(
+                    "_BCM refused its first level (status {:#x}), so a first press starts from \
+                     the middle",
+                    error.0
+                ),
+            };
             let path = &control.path;
             if index >= BACKLIGHTS {
                 output::arguments(format_args!(
@@ -1913,8 +1949,8 @@ impl HostAcpi {
             match notified {
                 Ok(notification) => {
                     output::arguments(format_args!(
-                        "HOST ACPI backlight {path}: _BCL lists {} levels up to {}, and the \
-                         brightness keys step it through _BCM\n",
+                        "HOST ACPI backlight {path}: _BCL lists {} levels up to {}, {set}, and \
+                         the brightness keys step it through _BCM\n",
                         control.levels.count(),
                         control.levels.max()
                     ));
@@ -1940,6 +1976,9 @@ impl HostAcpi {
             _ => "off",
         };
         let seen = BRIGHTNESS_SEEN.swap(0, Ordering::AcqRel);
+        if !BRIGHTNESS_KEYS.load(Ordering::Acquire) {
+            return;
+        }
         let mut taken = false;
         for (index, (control, _)) in self.backlights.borrow_mut().iter_mut().enumerate() {
             let event = BRIGHTNESS[index].swap(0, Ordering::AcqRel);

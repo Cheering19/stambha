@@ -93,6 +93,12 @@ impl Levels {
         self.steps().len()
     }
 
+    /// The level halfway through the panel's levels.
+    fn middle(&self) -> u64 {
+        let steps = self.steps();
+        steps.get(steps.len() / 2).copied().unwrap_or(self.max)
+    }
+
     /// The level `_BQC` names by index of the panel's levels, as listed.
     fn indexed(&self, index: u64) -> Option<u64> {
         let steps = self.steps().len() as u64;
@@ -215,10 +221,12 @@ pub struct Switch {
 /// Linux's `acpi_video_switch_brightness` for brightness `event`: the
 /// panel's level now, as `acpi_video_device_lcd_get_level_current` takes
 /// it (what `_BQC` reads where it is one of the panel's levels, else
-/// `last`, the level last set, else the highest), then the next level for
-/// `event` ([`next_level`]) set by `_BCM`. A `_BQC` that answers an index
-/// of `_BCL` (`acpi_video_bqc_quirk`) names no level here, so the level
-/// last set is taken.
+/// `last`, the level last set), then the next level for `event`
+/// ([`next_level`]) set by `_BCM`. With no level known, the middle of the
+/// levels stands for it, so a first press goes no further than half the
+/// range the wrong way. A `_BQC` that answers an index of `_BCL`
+/// (`acpi_video_bqc_quirk`) names no level here, so the level last set is
+/// taken.
 pub fn switch(
     levels: &Levels,
     panel: &mut impl Panel,
@@ -228,7 +236,7 @@ pub fn switch(
     let read = panel
         .current()
         .filter(|level| levels.steps().contains(level));
-    let from = read.or(last).unwrap_or(levels.max);
+    let from = read.or(last).unwrap_or_else(|| levels.middle());
     let to = next_level(levels, from, event);
     panel.set(to)?;
     Ok(Switch {
@@ -256,6 +264,15 @@ impl<'a> Control<'a> {
         self.device.handle
     }
 
+    /// [`initialize`], as Linux's ACPI video driver sets a backlight's
+    /// level when it registers it (`acpi_video_init_brightness`), the
+    /// level set kept as the one a press without `_BQC` starts from.
+    pub fn initialize(&mut self) -> Result<Brightness, Error> {
+        let set = initialize(&self.levels, &mut self.device)?;
+        self.last = Some(set.level);
+        Ok(set)
+    }
+
     /// [`switch`] for brightness `event`, from the level last set.
     pub fn switch(&mut self, event: u32) -> Result<Switch, Error> {
         let switched = switch(&self.levels, &mut self.device, self.last, event)?;
@@ -269,17 +286,37 @@ pub struct Controls<'a> {
     pub controls: Vec<Control<'a>>,
     /// The devices with `_BCL` and `_BCM` whose `_BCL` lists no levels.
     pub unlisted: Vec<String>,
+    /// Those without `_ADR`, or that their video bus's `_DOD` leaves out.
+    pub undeclared: Vec<String>,
 }
+
+/// The video buses' outputs past which Linux trusts no `_DOD`
+/// (`acpi_video_device_in_dod`).
+const DOD_OUTPUTS: usize = 8;
 
 /// Each present display output device with `_BCL` and `_BCM` in
 /// `session`'s namespace whose `_BCL` lists levels, for its brightness
-/// notifications.
+/// notifications: as Linux's ACPI video driver registers a backlight only
+/// for an output with `_ADR` (`acpi_video_bus_get_one_device`) that its
+/// video bus's `_DOD` lists, by the low twelve bits of `_ADR`, unless the
+/// bus has no `_DOD` or more than eight outputs (`acpi_video_device_in_dod`).
 pub fn controls(session: &Session) -> Result<Controls<'_>, Error> {
     let mut found = Controls {
         controls: Vec::new(),
         unlisted: Vec::new(),
+        undeclared: Vec::new(),
     };
+    let addressed: Vec<String> = session
+        .all_devices()?
+        .into_iter()
+        .filter(|device| device.child("_ADR").is_ok())
+        .filter_map(|device| device.path().ok())
+        .collect();
     for output in outputs(session)? {
+        if !in_dod(session, &output, &addressed) {
+            found.undeclared.push(output.path);
+            continue;
+        }
         match output.levels {
             Some(levels) => found.controls.push(Control {
                 path: output.path,
@@ -291,6 +328,42 @@ pub fn controls(session: &Session) -> Result<Controls<'_>, Error> {
         }
     }
     Ok(found)
+}
+
+/// Whether `output` has an `_ADR` its video bus's `_DOD` lists, or the bus
+/// has no `_DOD` to go by; `addressed` are the paths of the devices with
+/// `_ADR`.
+fn in_dod(session: &Session, output: &Output<'_>, addressed: &[String]) -> bool {
+    let address = match output.device.handle.evaluate(Some("_ADR"), &[]) {
+        Ok(Some(Value::Integer(address))) => address,
+        _ => return false,
+    };
+    let Some((bus, _)) = output.path.rsplit_once('.') else {
+        return true;
+    };
+    let listed: Vec<u64> = match session
+        .handle(bus)
+        .and_then(|bus| bus.evaluate(Some("_DOD"), &[]))
+    {
+        Ok(Some(Value::Package(values))) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::Integer(id) => Some(*id),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let outputs = addressed
+        .iter()
+        .filter(|path| {
+            path.rsplit_once('.')
+                .is_some_and(|(parent, _)| parent == bus)
+        })
+        .count();
+    listed.is_empty()
+        || outputs > DOD_OUTPUTS
+        || listed.iter().any(|id| id & 0xfff == address & 0xfff)
 }
 
 /// A present display output device with `_BCL` and `_BCM`.
