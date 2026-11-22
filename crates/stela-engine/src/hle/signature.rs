@@ -276,6 +276,20 @@ fn refusal(word: u32, offset: u32, length: u32) -> Result<(), Ineligible> {
     Ok(())
 }
 
+/// The signatures of `table` whose routines `enabled` holds and whose
+/// prefix hash, at each one's own length, is that of `head`, the first
+/// bytes at an entry: the candidates to verify, with their indexes.
+pub fn find<'a>(
+    table: &'a [Signature],
+    enabled: u32,
+    head: &'a [u8; PREFIX_BYTES],
+) -> impl Iterator<Item = (usize, &'a Signature)> + 'a {
+    table.iter().enumerate().filter(move |(_, signature)| {
+        enabled & signature.id.bit() != 0
+            && prefix_hash(head, u32::from(signature.length)) == signature.prefix
+    })
+}
+
 /// FNV-1a 64 over the 8 masked words of a function's first
 /// [`PREFIX_BYTES`], little-endian, for a function of `length` bytes.
 pub fn prefix_hash(head: &[u8; PREFIX_BYTES], length: u32) -> u64 {

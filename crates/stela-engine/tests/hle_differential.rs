@@ -9,7 +9,7 @@
 ))]
 use anyhow::Result;
 use stela_engine::{
-    hle::{self, Id, Signature},
+    hle::{self, Config, Id, Signature},
     machine::Stop,
 };
 #[path = "support/hle_harness.rs"]
@@ -70,7 +70,7 @@ fn named(case: &Case) -> String {
 fn stand_ins_match_the_reference_model() -> Result<()> {
     for id in STAND_INS {
         let stand_in = stand_in(id);
-        let mut session = Session::new(&stand_in)?;
+        let mut session = Session::new(&stand_in, None)?;
         let (mut returned, mut faulted) = (0, 0);
         for (index, case) in cases(id, 0x51ab_1e00 + id.bit() as u64, case_count(4000))
             .iter()
@@ -131,12 +131,17 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         .iter()
         .find(|case| reference(Id::Memmove, case).is_some() && case.x[2] > 8)
         .expect("a returning case");
-    let off = run(&stand_in, returning)?;
+    let off = run(&stand_in, returning, None)?.0;
     assert_eq!(
-        agree(&stand_in, returning, &off, &run(&stand_in, returning)?),
+        agree(
+            &stand_in,
+            returning,
+            &off,
+            &run(&stand_in, returning, None)?.0
+        ),
         Ok(())
     );
-    let mut on = run(&stand_in, returning)?;
+    let mut on = run(&stand_in, returning, None)?.0;
     on.state.x[9] ^= 1;
     on.state.nzcv ^= 0x4000_0000;
     on.state.v[16][0] ^= 1;
@@ -157,13 +162,16 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         ("btype", |on| on.pstate.btype = 0b10),
     ];
     for (name, change) in changes {
-        let mut on = run(&stand_in, returning)?;
+        let mut on = run(&stand_in, returning, None)?.0;
         change(&mut on);
         assert!(agree(&stand_in, returning, &off, &on).is_err(), "{name}");
     }
     // Both runs alike, X0 and memory against the model.
     for (name, change) in [changes[5], changes[6]] {
-        let (mut off, mut on) = (run(&stand_in, returning)?, run(&stand_in, returning)?);
+        let (mut off, mut on) = (
+            run(&stand_in, returning, None)?.0,
+            run(&stand_in, returning, None)?.0,
+        );
         change(&mut off);
         change(&mut on);
         assert!(
@@ -175,15 +183,15 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         .iter()
         .find(|case| reference(Id::Memmove, case).is_none())
         .expect("a faulting case");
-    let off = run(&stand_in, faulting)?;
-    let mut on = run(&stand_in, faulting)?;
+    let off = run(&stand_in, faulting, None)?.0;
+    let mut on = run(&stand_in, faulting, None)?.0;
     assert_eq!(agree(&stand_in, faulting, &off, &on), Ok(()));
     on.state.x[9] ^= 1;
     assert!(
         agree(&stand_in, faulting, &off, &on).is_err(),
         "a fault in full"
     );
-    let mut on = run(&stand_in, faulting)?;
+    let mut on = run(&stand_in, faulting, None)?.0;
     let spsr = &mut on.abort.as_mut().expect("an abort").3;
     *spsr ^= 0b10 << 10;
     assert!(
@@ -201,7 +209,7 @@ fn agree_refuses_a_changed_result() -> Result<()> {
 fn a_call_through_blr_on_a_guarded_page_lands_as_its_first_word_admits() -> Result<()> {
     for id in STAND_INS {
         let called = stand_in(id).through_blr();
-        let mut session = Session::new(&called)?;
+        let mut session = Session::new(&called, None)?;
         let (mut returned, mut refused) = (0, 0);
         for case in cases(id, 0x0b71 + id.bit() as u64, 64) {
             let outcome = session.run(&case)?;
@@ -241,7 +249,7 @@ fn a_call_through_blr_on_a_guarded_page_lands_as_its_first_word_admits() -> Resu
 fn a_wrong_stand_in_disagrees_with_the_reference_model() -> Result<()> {
     let mut forward = stand_in(Id::Memmove);
     forward.words[4] = a64::NOP; // b.lo back
-    let mut session = Session::new(&forward)?;
+    let mut session = Session::new(&forward, None)?;
     let mut wrong = 0;
     for case in cases(Id::Memmove, 11, 200) {
         let (dst, src, n) = (case.x[0], case.x[1], case.x[2]);
@@ -264,25 +272,38 @@ fn a_reused_session_runs_as_a_fresh_machine() -> Result<()> {
     let called = [Id::Memset, Id::Touch].map(|id| stand_in(id).through_blr());
     for stand_in in direct.iter().chain(&called) {
         let id = stand_in.id;
-        let mut session = Session::new(stand_in)?;
-        let (mut returned, mut aborted, mut after_abort) = (0, 0, false);
-        let count = if stand_in.caller.is_some() { 48 } else { 120 };
-        for case in cases(id, 23, count) {
-            let reused = session.run(&case)?;
-            // The first calls, every abort and every call after one.
-            if returned < 4 || after_abort || reused.abort.is_some() {
-                assert_eq!(reused, run(stand_in, &case)?, "{id:?}: {}", named(&case));
-            }
-            after_abort = reused.abort.is_some();
-            returned += usize::from(reused.abort.is_none());
-            aborted += usize::from(reused.abort.is_some());
+        // Off, and on with each test routine that suits the stand-in: Bail
+        // for all, Touch for touch's.
+        let mut routines = vec![None, Some(Id::Bail)];
+        if id == Id::Touch {
+            routines.push(Some(Id::Touch));
         }
-        // Touch through `blr` always takes its Branch Target exception.
-        let refused = stand_in.caller.is_some() && id == Id::Touch;
-        assert!(
-            aborted > 0 && (refused || returned > aborted),
-            "{id:?}: {aborted} aborted"
-        );
+        for routine in routines {
+            let hle = routine.map(|routine| {
+                Config::with_table(table(stand_in, routine), &[routine])
+                    .with_max_bytes(CASE_MAX_BYTES)
+            });
+            let mut session = Session::new(stand_in, hle.clone())?;
+            let (mut returned, mut aborted, mut after_abort) = (0, 0, false);
+            let count = if stand_in.caller.is_some() { 48 } else { 120 };
+            for case in cases(id, 23, count) {
+                let reused = session.run(&case)?;
+                // The first calls, every abort and every call after one.
+                if returned < 4 || after_abort || reused.abort.is_some() {
+                    let fresh = run(stand_in, &case, hle.clone())?.0;
+                    assert_eq!(reused, fresh, "{id:?} {routine:?}: {}", named(&case));
+                }
+                after_abort = reused.abort.is_some();
+                returned += usize::from(reused.abort.is_none());
+                aborted += usize::from(reused.abort.is_some());
+            }
+            // Touch through `blr` always takes its Branch Target exception.
+            let refused = stand_in.caller.is_some() && id == Id::Touch;
+            assert!(
+                aborted > 0 && (refused || returned > aborted),
+                "{id:?} {routine:?}: {aborted} aborted"
+            );
+        }
     }
     Ok(())
 }

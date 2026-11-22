@@ -18,7 +18,7 @@ use anyhow::{Result, ensure};
 use std::sync::Arc;
 use stela_compiler::{GuestState, TargetCpu};
 use stela_engine::{
-    hle::{Id, Signature},
+    hle::{Config, Id, Signature, Statistics},
     machine::{Machine, NoDevices, Stop, exception::Pstate, system::Register},
 };
 use store_host::{Mapping, NativeHost, machine};
@@ -483,7 +483,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(stand_in: &StandIn) -> Result<Self> {
+    /// A machine for `stand_in`, with HLE configured as `hle` says, or
+    /// never configured (`None`).
+    pub fn new(stand_in: &StandIn, hle: Option<Config>) -> Result<Self> {
         let machine = with_mappings(|code, data| {
             // The page holds this function alone.
             ensure!(code.write(code.0, &[0; BYTES]), "clear the code");
@@ -491,6 +493,9 @@ impl Session {
             machine.set_regions(false);
             if stand_in.caller.is_some() {
                 machine.host.guard(code.0, BYTES);
+            }
+            if let Some(config) = hle {
+                machine.set_hle(config);
             }
             Ok(machine)
         })?;
@@ -502,6 +507,11 @@ impl Session {
 
     pub fn machine(&mut self) -> &mut Machine<NativeHost, NoDevices> {
         &mut self.machine
+    }
+
+    /// What the machine's HLE did in all its calls so far.
+    pub fn hle(&self) -> Statistics {
+        self.machine.hle_statistics()
     }
 
     /// Call the stand-in once with `case`, from EL0. A call the last one
@@ -617,9 +627,13 @@ fn initial(stand_in: &StandIn, case: &Case) -> GuestState {
 }
 
 /// One call of `stand_in` with `case`, on a machine of its own (see
-/// [`Session`] for many).
-pub fn run(stand_in: &StandIn, case: &Case) -> Result<Outcome> {
-    Session::new(stand_in)?.run(case)
+/// [`Session`] for many), with HLE as `hle` configures it, bounded at the
+/// case's size bound, and what its HLE did.
+pub fn run(stand_in: &StandIn, case: &Case, hle: Option<Config>) -> Result<(Outcome, Statistics)> {
+    let hle = hle.map(|config| config.with_max_bytes(case.max_bytes));
+    let mut session = Session::new(stand_in, hle)?;
+    let outcome = session.run(case)?;
+    Ok((outcome, session.hle()))
 }
 
 /// The byte at data offset `at` is in the mapping and readable.

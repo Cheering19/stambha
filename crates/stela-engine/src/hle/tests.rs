@@ -397,6 +397,21 @@ fn max_bytes_above_its_bounds_panics() {
 }
 
 #[test]
+fn refusals_are_named_once_in_their_order() {
+    for (index, refusal) in Refusal::ALL.into_iter().enumerate() {
+        assert_eq!(refusal as usize, index, "{refusal:?}");
+        let named = Refusal::ALL
+            .iter()
+            .filter(|other| other.name() == refusal.name());
+        assert_eq!(named.count(), 1, "{refusal:?}");
+    }
+    let mut statistics = Statistics::default();
+    statistics.refuse(Refusal::Admitted);
+    assert_eq!(statistics.refusals(Refusal::Admitted), 1);
+    assert_eq!(statistics.refused.iter().sum::<u64>(), 1);
+}
+
+#[test]
 #[should_panic(expected = "at most 64 signatures")]
 fn a_table_of_more_than_64_signatures_panics() {
     let signature = Signature::of(Id::Memmove, &leaf(), EXIT).unwrap();
