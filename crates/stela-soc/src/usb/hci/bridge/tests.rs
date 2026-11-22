@@ -557,3 +557,56 @@ fn acl_from_the_guest_is_the_shadows_and_the_controllers_passes() {
     events(bridge.chip_failed(0));
     assert!(!bridge.chip_acl());
 }
+
+/// A fallback ends what the controller was running: the guest saw the
+/// procedure start, and the shadow's own end may already have passed while
+/// the bridge forwarded. Each ends exactly once.
+#[test]
+fn a_fallback_ends_the_procedures_the_controller_was_running() {
+    // An inquiry the controller runs past the shadow's end.
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 1, 0]), 0));
+    events(bridge.chip_event(&status(0x0401, 1, 0), 10));
+    let shadow_end = bridge.shadow.deadline().expect("the shadow's inquiry");
+    assert!(events(bridge.advance(shadow_end)).is_empty(), "discarded");
+    let ended = events(bridge.chip_failed(shadow_end + 1));
+    assert_eq!(ended, [vec![0x01, 1, 0]]);
+    assert!(events(bridge.advance(u64::MAX)).is_empty(), "once");
+    // A name request, ended with Page Timeout, and an inquiry the shadow
+    // still runs, ended once, now.
+    let mut bridge = Bridge::new(ADDRESS);
+    let mut name = CHIP_ADDRESS.to_vec();
+    name.extend_from_slice(&[1, 0, 0, 0]);
+    chip(bridge.command(&packet(0x0419, &name), 0));
+    events(bridge.chip_event(&status(0x0419, 1, 0), 0));
+    chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]), 0));
+    events(bridge.chip_event(&status(0x0401, 1, 0), 0));
+    let mut timeout = vec![0x07, 255, 0x04];
+    timeout.extend_from_slice(&CHIP_ADDRESS);
+    timeout.resize(257, 0);
+    let ended = events(bridge.chip_failed(0));
+    assert_eq!(ended, [timeout, vec![0x01, 1, 0]]);
+    assert!(events(bridge.advance(u64::MAX)).is_empty(), "once");
+    // Procedures the controller ended, cancelled or refused end nothing.
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]), 0));
+    events(bridge.chip_event(&status(0x0401, 1, 0), 0));
+    chip(bridge.command(&packet(0x0402, &[]), 0));
+    events(bridge.chip_event(&complete(0x0402, 1, 0, &[]), 0));
+    chip(bridge.command(&packet(0x0419, &name), 0));
+    events(bridge.chip_event(&status(0x0419, 1, 0x0c), 0));
+    assert!(events(bridge.chip_failed(0)).is_empty());
+    assert!(events(bridge.advance(u64::MAX)).is_empty());
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]), 0));
+    events(bridge.chip_event(&status(0x0401, 1, 0), 0));
+    events(bridge.chip_event(&[0x01, 1, 0], 0));
+    chip(bridge.command(&packet(0x0419, &name), 0));
+    events(bridge.chip_event(&status(0x0419, 1, 0), 0));
+    let mut named = vec![0x07, 255, 0];
+    named.extend_from_slice(&CHIP_ADDRESS);
+    named.resize(257, b'x');
+    events(bridge.chip_event(&named, 0));
+    assert!(events(bridge.chip_failed(0)).is_empty());
+    assert!(events(bridge.advance(u64::MAX)).is_empty());
+}

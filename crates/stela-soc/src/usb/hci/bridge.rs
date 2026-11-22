@@ -144,6 +144,8 @@ pub struct Bridge {
     written: Option<[u8; 6]>,
     /// Whether the controller reported another address than that.
     address_differs: bool,
+    /// The controller's procedures the guest saw start and not yet end.
+    running: Vec<Running>,
     counters: Counters,
 }
 
@@ -159,6 +161,16 @@ const READ_BD_ADDR: u16 = 0x1009;
 const WRITE_BD_ADDR: u16 = 0xfc01;
 const INQUIRY_COMPLETE: u8 = 0x01;
 const REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
+/// Page Timeout (Vol 1 Part F 1.3).
+const PAGE_TIMEOUT: u8 = 0x04;
+
+/// A procedure of the controller the guest saw start and not yet end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Running {
+    Inquiry,
+    /// A remote name request to this address.
+    Name([u8; 6]),
+}
 /// A vendor's own event (7.7.65 leaves code 0xFF to vendors).
 const VENDOR_EVENT: u8 = 0xff;
 
@@ -232,6 +244,7 @@ impl Bridge {
             resync: false,
             written: None,
             address_differs: false,
+            running: Vec::new(),
             counters: Counters::default(),
         }
     }
@@ -261,6 +274,7 @@ impl Bridge {
     pub fn resync(&mut self) {
         self.pending = None;
         self.backlog.clear();
+        self.running.clear();
         self.resync = true;
     }
 
@@ -351,7 +365,10 @@ impl Bridge {
     }
 
     /// Falls back for good; the guest gets the shadow's answer to the
-    /// command in flight, and the commands that waited are the shadow's.
+    /// command in flight, then the end of each procedure the controller was
+    /// running (an inquiry completes, a name request times out), which the
+    /// shadow then no longer runs, and the commands that waited are the
+    /// shadow's.
     fn fall(&mut self, cause: Cause, now: u64) -> Vec<Step> {
         let pending = self.pending.take();
         self.fallen.get_or_insert(Fallback {
@@ -359,6 +376,22 @@ impl Bridge {
             cause,
         });
         let mut steps = pending.map(|p| guest(p.shadow)).unwrap_or_default();
+        for running in core::mem::take(&mut self.running) {
+            let end = match running {
+                Running::Inquiry => {
+                    self.shadow_only(INQUIRY_CANCEL, &[], now);
+                    vec![INQUIRY_COMPLETE, 1, 0]
+                }
+                Running::Name(peer) => {
+                    self.shadow_only(REMOTE_NAME_REQUEST_CANCEL, &peer, now);
+                    let mut end = vec![REMOTE_NAME_REQUEST_COMPLETE, 255, PAGE_TIMEOUT];
+                    end.extend_from_slice(&peer);
+                    end.resize(2 + 255, 0);
+                    end
+                }
+            };
+            steps.push(Step::Guest(end));
+        }
         steps.extend(self.next(now));
         steps
     }
@@ -398,9 +431,13 @@ impl Bridge {
     /// fallback it gives the guest no second end of it.
     fn follow(&mut self, event: &[u8], now: u64) {
         match *event {
-            [INQUIRY_COMPLETE, ..] => self.shadow_only(INQUIRY_CANCEL, &[], now),
+            [INQUIRY_COMPLETE, ..] => {
+                self.running.retain(|r| *r != Running::Inquiry);
+                self.shadow_only(INQUIRY_CANCEL, &[], now);
+            }
             [REMOTE_NAME_REQUEST_COMPLETE, _, _, ref peer @ ..] if peer.len() >= 6 => {
-                let peer = peer[..6].to_vec();
+                let peer: [u8; 6] = peer[..6].try_into().expect("six bytes");
+                self.running.retain(|r| *r != Running::Name(peer));
                 self.shadow_only(REMOTE_NAME_REQUEST_CANCEL, &peer, now);
             }
             _ => {}
@@ -416,10 +453,25 @@ impl Bridge {
     }
 
     /// The shadow follows what the controller's answer to `pending` says:
-    /// the address it has, and a procedure it refused.
+    /// the address it has, and a procedure it refused; and the bridge, the
+    /// procedures it runs.
     fn follow_answer(&mut self, pending: &Pending, chip: &Completion<'_>, now: u64) {
         let shadow = pending.shadow.first().and_then(|e| Completion::of(e));
         let shadow_succeeded = shadow.is_some_and(|s| s.status == 0);
+        let peer: Option<[u8; 6]> = pending.parameters.get(..6).and_then(|p| p.try_into().ok());
+        match (pending.opcode, peer) {
+            (INQUIRY, _) if chip.status == 0 && !self.running.contains(&Running::Inquiry) => {
+                self.running.push(Running::Inquiry);
+            }
+            (REMOTE_NAME_REQUEST, Some(peer)) if chip.status == 0 => {
+                self.running.push(Running::Name(peer));
+            }
+            (INQUIRY_CANCEL, _) if chip.status == 0 => {
+                self.running.retain(|r| *r != Running::Inquiry);
+            }
+            (RESET, _) if chip.status == 0 => self.running.clear(),
+            _ => {}
+        }
         match pending.opcode {
             RESET if chip.status == 0 => self.resync = false,
             READ_BD_ADDR if chip.status == 0 && chip.returns.len() == 6 => {
