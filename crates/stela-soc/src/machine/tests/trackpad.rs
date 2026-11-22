@@ -172,6 +172,24 @@ fn touch_routes_to_trackpad() {
 }
 
 #[test]
+fn a_late_touchpad_s_surface_reaches_the_trackpad() {
+    let mut d = cabled(UsbCables {
+        trackpad: Some(config()),
+        ..UsbCables::default()
+    });
+    let late = Surface {
+        width_um: 100_000,
+        height_um: 60_000,
+    };
+    d.set_trackpad_surface(late);
+    assert_eq!(the_trackpad(&mut d).surface(), late);
+    // Without a trackpad there is nothing to tell.
+    let mut bare = cabled(UsbCables::default());
+    bare.set_trackpad_surface(late);
+    assert_eq!(bare.trackpad_counters(), None);
+}
+
+#[test]
 fn touch_without_a_trackpad_is_dropped_and_counted() {
     let mut d = cabled(UsbCables::default());
     d.input(Input::Touch(Frame::lifted(5))).unwrap();

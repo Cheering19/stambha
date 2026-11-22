@@ -135,6 +135,13 @@ impl Trackpad {
         self.state.map.surface()
     }
 
+    /// Map `surface` from now on: a touchpad that arrived after the
+    /// cabling, which was made with the MT2's own size. Feature 0xD9 and the
+    /// frames that follow take it.
+    pub fn set_surface(&mut self, surface: Surface) {
+        self.state.map = Mapping::mt2(surface);
+    }
+
     /// One host frame, for the guest's next interrupt IN.
     pub fn frame(&mut self, frame: Frame) {
         let state = &mut self.state;

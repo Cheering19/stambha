@@ -161,6 +161,12 @@ pub struct HostInput {
     next_id: u64,
     /// `--trackpad`: precision touchpads give whole frames.
     touch_frames: bool,
+    /// Whether the guest trackpad maps a host touchpad's surface, not the
+    /// MT2's own it was cabled with when none was there.
+    trackpad_surface: bool,
+    /// A touchpad's surface that arrived after the cabling, for the guest
+    /// trackpad at the next delivery.
+    new_surface: Option<Surface>,
     /// The guest trackpad's counters at the last `TRACKPAD frames` line,
     /// and the counter then.
     trackpad_seen: trackpad::Counters,
@@ -193,6 +199,8 @@ impl HostInput {
             reported_times: 0,
             held: HeldInputs::new(),
             touch_frames: false,
+            trackpad_surface: false,
+            new_surface: None,
             trackpad_seen: trackpad::Counters::default(),
             trackpad_reported: 0,
         }
@@ -200,45 +208,55 @@ impl HostInput {
 
     /// `--trackpad`: switch every precision touchpad to frames mode, now
     /// and as they arrive, and the guest trackpad they feed: the first
-    /// one's surface, else the Magic Trackpad 2's own.
+    /// one's surface, else the Magic Trackpad 2's own until one arrives.
     pub fn trackpad(&mut self, kind: GuestTrackpad) -> trackpad::Config {
         self.touch_frames = true;
         let mut surface = None;
         for device in &mut self.inputs.devices {
-            if device.set_touch_frames(true) {
-                output::arguments(format_args!("TRACKPAD frames from {}\n", device.name()));
-                surface = surface.or(device.touch_surface());
-            }
+            surface = surface.or(frames(device));
         }
-        if surface.is_none() {
-            output::arguments(format_args!(
-                "TRACKPAD no precision touchpad: the guest trackpad gets no frames\n"
-            ));
-        }
-        let surface = surface.unwrap_or(MT2_SURFACE);
+        self.trackpad_surface = surface.is_some();
         let identity = match kind {
             GuestTrackpad::Mt2 => Identity::MagicTrackpad2,
             GuestTrackpad::Builtin => Identity::Builtin,
         };
-        let mm = |um: u32| (um / 1000, um % 1000 / 10);
-        let (width, height) = (mm(surface.width_um), mm(surface.height_um));
-        output::arguments(format_args!(
-            "TRACKPAD surface {}.{:02} x {}.{:02} mm, as 05ac:{:04x} ({})\n",
-            width.0,
-            width.1,
-            height.0,
-            height.1,
-            identity.product(),
-            kind.name()
-        ));
-        trackpad::Config { identity, surface }
+        match surface {
+            Some(surface) => output::arguments(format_args!(
+                "TRACKPAD surface {}, as 05ac:{:04x} ({})\n",
+                Millimetres(surface),
+                identity.product(),
+                kind.name()
+            )),
+            None => output::arguments(format_args!(
+                "TRACKPAD no precision touchpad yet: the guest trackpad, as 05ac:{:04x} ({}), \
+                 spans the MT2's own {} until one arrives\n",
+                identity.product(),
+                kind.name(),
+                Millimetres(MT2_SURFACE)
+            )),
+        }
+        trackpad::Config {
+            identity,
+            surface: surface.unwrap_or(MT2_SURFACE),
+        }
     }
 
     /// Read `devices` too from now on: keyboards and pointers that arrived.
+    /// With `--trackpad` a precision touchpad among them gives frames, and
+    /// the first, when the guest trackpad spans the MT2's own size, gives
+    /// it its surface at the next delivery.
     pub fn add(&mut self, mut devices: Vec<InputDevice>) {
         if self.touch_frames {
             for device in &mut devices {
-                device.set_touch_frames(true);
+                if let Some(surface) = frames(device)
+                    && !core::mem::replace(&mut self.trackpad_surface, true)
+                {
+                    output::arguments(format_args!(
+                        "TRACKPAD surface {} from the touchpad that arrived\n",
+                        Millimetres(surface)
+                    ));
+                    self.new_surface = Some(surface);
+                }
             }
         }
         for device in devices {
@@ -266,6 +284,9 @@ impl HostInput {
     /// Deliver what [`Self::read`] read from the host's devices, and note
     /// the guest's lock-key LEDs for the next read to send.
     pub fn deliver_all(&mut self, devices: &mut AppleDevices, inputs: Vec<Input>) {
+        if let Some(surface) = self.new_surface.take() {
+            devices.set_trackpad_surface(surface);
+        }
         for input in inputs {
             self.deliver(devices, input);
         }
@@ -510,6 +531,27 @@ impl HostInput {
             drop(root);
             output::arguments(format_args!("INPUT {name} stopped and removed: {cause}\n"));
         }
+    }
+}
+
+/// Set `device` to give whole frames if it is a precision touchpad, logging
+/// it: its surface, else `None`.
+fn frames(device: &mut InputDevice) -> Option<Surface> {
+    if !device.set_touch_frames(true) {
+        return None;
+    }
+    output::arguments(format_args!("TRACKPAD frames from {}\n", device.name()));
+    device.touch_surface()
+}
+
+/// A surface as `W.WW x H.HH mm`.
+struct Millimetres(Surface);
+
+impl core::fmt::Display for Millimetres {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mm = |um: u32| (um / 1000, um % 1000 / 10);
+        let ((w, w_frac), (h, h_frac)) = (mm(self.0.width_um), mm(self.0.height_um));
+        write!(f, "{w}.{w_frac:02} x {h}.{h_frac:02} mm")
     }
 }
 

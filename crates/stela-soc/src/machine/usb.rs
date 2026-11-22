@@ -364,6 +364,16 @@ impl AppleDevices {
         Vec::new()
     }
 
+    /// The surface of a touchpad that arrived after the trackpad was cabled
+    /// for it to map; nothing without a trackpad.
+    pub fn set_trackpad_surface(&mut self, surface: stela_drivers::input::multitouch::Surface) {
+        #[cfg(any(feature = "trackpad", test))]
+        if let Some(trackpad) = self.usb_trackpad() {
+            trackpad.set_surface(surface);
+        }
+        let _ = surface;
+    }
+
     /// The trackpad's frame counters; `None` without one.
     pub fn trackpad_counters(&mut self) -> Option<trackpad::Counters> {
         #[cfg(any(feature = "trackpad", test))]

@@ -509,6 +509,31 @@ fn a_slow_guest_lags_two_frames_at_most() {
 }
 
 #[test]
+fn a_new_surface_maps_later_frames() {
+    // A touchpad that arrives after the cabling gives its own surface.
+    let mut t = configured();
+    let fixture = Surface {
+        width_um: 100_000,
+        height_um: 60_000,
+    };
+    t.set_surface(fixture);
+    assert_eq!(t.surface(), fixture);
+    let d9 = get_feature(&mut t, 0xd9, 64).unwrap();
+    assert_eq!(d9[..9], Mapping::mt2(fixture).d9()[..9]);
+    assert_eq!(&d9[1..5], &10_000u32.to_le_bytes());
+    // Its centre is the MT2's.
+    let centre = Finger {
+        id: 0,
+        x_um: 50_000,
+        y_um: 30_000,
+        tip: true,
+        confident: true,
+    };
+    t.frame(Frame::new(0, 0, &[centre]));
+    assert_eq!(first_x(&report(&mut t)), 128);
+}
+
+#[test]
 fn reset_frees_slots() {
     let mut t = configured();
     let finger = |time| Frame::new(time, 0, &[elan(3, 2000, 1000, true, true)]);
