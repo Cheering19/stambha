@@ -16,9 +16,12 @@ fn the_model_tier_and_other_operations_are_left_to_the_model() {
     assert!(!Native::MODEL.execute(Generation::M2, &mut registers, AmxOperation::Fma32, 0));
     for paths in tiers() {
         let native = paths.native;
-        for operation in [AmxOperation::Mac16, AmxOperation::LoadX] {
-            assert!(!native.execute(Generation::M2, &mut registers, operation, 0));
-        }
+        assert!(!native.execute(Generation::M2, &mut registers, AmxOperation::LoadX, 0));
+        // mac16 needs the AVX-512F tier.
+        assert_eq!(
+            native.execute(Generation::M2, &mut registers, AmxOperation::Mac16, 0),
+            paths.tier() == Tier::Avx512
+        );
         // fma16 arithmetic needs F16C.
         for mode in [0, 1, 2, 4] {
             assert_eq!(

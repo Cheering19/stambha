@@ -33,6 +33,11 @@
 //!   once-rounded f16 sum (the product alone is added to -0, `z ± x` and
 //!   `z ± y` multiply by 1.0), and in the widened shape one f32 addition of
 //!   the exact product.
+//! - `mac16` on the `Avx512` tier, every operand: vector, matrix and
+//!   bit-62 widened (i32 row pairs) shape, int8 inputs (bits 61/60), each
+//!   selection of bits 29:28, the shift of bits 59:55, with or without Z
+//!   (bit 27), every lane-enable mode. Integer lanes in i32 with Z's wrap,
+//!   so exact.
 //! - On every tier, the model's too, the fused operations' copies and
 //!   constants (bits 29:27 = 3, 5, 6, 7), which need no arithmetic, except
 //!   copies of f16-widened halves, whose NaN payloads the model rewrites.
@@ -160,6 +165,8 @@ impl Native {
             AmxOperation::VectorFloat => {
                 self.f16c && x86::vector_half(self.tier, generation, registers, operand)
             }
+            #[cfg(target_arch = "x86_64")]
+            AmxOperation::Mac16 => self.tier == Tier::Avx512 && x86::mac16(registers, operand),
             _ => false,
         }
     }
@@ -1679,6 +1686,204 @@ mod x86 {
                 subtract = in(reg) u32::from(subtract),
                 inout("ecx") lanes => _,
                 out("rax") _,
+                clobber_abi("sysv64"),
+                options(nostack),
+            );
+        }
+    }
+
+    /// `mac16` (bits 61/60: int8 X/Y from each lane's low byte; 29:28: the
+    /// product, X, Y or 0; 59:55: an arithmetic right shift; 27: no Z
+    /// input), in every shape: the vector's and the matrix's 16-bit Z lanes
+    /// and the bit-62 matrix's 32-bit ones. Integer lanes, so exact: each
+    /// lane's value in i32 (16-bit products fit), shifted, then added to Z
+    /// with the wrap of Z's width. AVX-512F alone: the selection becomes a
+    /// product with 1 or 0, lane enables opmasks.
+    pub(super) fn mac16(registers: &mut AmxRegisters, operand: u64) -> bool {
+        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
+        let mut y = registers.y_operand(operand & 0x1ff);
+        // X alone is X times 1, Y alone 1 times Y, nothing 0 times Y; 1 and
+        // 0 stay themselves as int8.
+        match (operand >> 28) & 3 {
+            1 => y = splat(1, 2),
+            2 => x = splat(1, 2),
+            3 => x = [0; ROW_BYTES],
+            _ => {}
+        }
+        let int8 = |bit: u64| if operand & bit != 0 { 24u64 } else { 16 };
+        let parameters = Mac16 {
+            x_extend: int8(MAC16_X_INT8),
+            y_extend: int8(MAC16_Y_INT8),
+            shift: (operand >> 55) & 0x1f,
+            z_input: if operand & (1 << 27) == 0 {
+                u32::MAX
+            } else {
+                0
+            },
+        };
+        let x_enable = write_mask(operand >> 41, 2, 7);
+        let y_enable = write_mask(operand >> 32, 2, 7);
+        let z_row = ((operand >> 20) & 63) as usize;
+        let lanes = HalfLanes::of(x_enable).lanes;
+        // SAFETY: the caller checked AVX-512F (with its OS-enabled state);
+        // every pointer is to a live 64-byte row. No floating point, so
+        // MXCSR is not touched.
+        unsafe {
+            if operand & VECTOR != 0 {
+                mac16_row(&x, &y, registers.z[z_row].as_mut_ptr(), lanes, &parameters);
+            } else if operand & super::WIDEN_16_32 == 0 {
+                for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
+                    let half = u64::from(u16::from_le_bytes([y[2 * j], y[2 * j + 1]]));
+                    let lane = splat(half, 2);
+                    let z = registers.z[j * 2 + (z_row & 1)].as_mut_ptr();
+                    mac16_row(&x, &lane, z, lanes, &parameters);
+                }
+            } else {
+                // Even and odd X lanes into rows 2j and 2j + 1, lane i/2.
+                let (mut even, mut odd) = (0u32, 0u32);
+                for lane in (0..32).filter(|&lane| on(x_enable, lane, 2)) {
+                    if lane & 1 == 0 {
+                        even |= 1 << (lane >> 1);
+                    } else {
+                        odd |= 1 << (lane >> 1);
+                    }
+                }
+                for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
+                    let half = i32::from(i16::from_le_bytes([y[2 * j], y[2 * j + 1]]));
+                    let y_lane = if parameters.y_extend == 24 {
+                        i32::from(half as i8)
+                    } else {
+                        half
+                    };
+                    let rows = registers.z[2 * j..2 * j + 2].as_mut_ptr().cast::<u8>();
+                    mac16_widened(&x, y_lane, rows, even | odd << 16, &parameters);
+                }
+            }
+        }
+        true
+    }
+
+    const MAC16_X_INT8: u64 = 1 << 61;
+    const MAC16_Y_INT8: u64 = 1 << 60;
+
+    /// A `mac16` operation's lane arithmetic, as its kernels take it: the
+    /// left-then-arithmetic-right shift that sign-extends X's and Y's lanes
+    /// in i32 from 16 bits (16) or their low byte (24), the result's shift,
+    /// and all ones to add Z (none for bit 27).
+    struct Mac16 {
+        x_extend: u64,
+        y_extend: u64,
+        shift: u64,
+        z_input: u32,
+    }
+
+    /// One row of 16-bit `mac16` lanes: `((x' * y') >> shift) + z` where
+    /// `lanes` (bit i: lane i) are on, sixteen lanes per step in i32, the
+    /// old lanes merged as dwords and the row narrowed back to 16 bits.
+    ///
+    /// # Safety
+    /// AVX-512F exists with OS-enabled opmask and ZMM state; `z` is a live
+    /// 64-byte row.
+    unsafe fn mac16_row(x: &Row, y: &Row, z: *mut u8, lanes: u32, parameters: &Mac16) {
+        // SAFETY: three live 64-byte rows; the caller's contract.
+        unsafe {
+            asm!(
+                "vmovq xmm15, {x_extend}",
+                "vmovq xmm14, {y_extend}",
+                "vmovq xmm13, {shift}",
+                "vpbroadcastd zmm12, {z_input:e}",
+                "xor eax, eax",
+                "2:",
+                "kmovw k1, ecx",
+                "shr ecx, 16",
+                "vpmovsxwd zmm0, ymmword ptr [{x} + rax]",
+                "vpslld zmm0, zmm0, xmm15",
+                "vpsrad zmm0, zmm0, xmm15",
+                "vpmovsxwd zmm1, ymmword ptr [{y} + rax]",
+                "vpslld zmm1, zmm1, xmm14",
+                "vpsrad zmm1, zmm1, xmm14",
+                "vpmulld zmm0, zmm0, zmm1",
+                "vpsrad zmm0, zmm0, xmm13",
+                "vpmovsxwd zmm2, ymmword ptr [{z} + rax]",
+                "vpandd zmm3, zmm2, zmm12",
+                "vpaddd zmm0, zmm0, zmm3",
+                "vmovdqa32 zmm2 {{k1}}, zmm0",
+                "vpmovdw ymmword ptr [{z} + rax], zmm2",
+                "add eax, 32",
+                "cmp eax, 64",
+                "jb 2b",
+                "vzeroupper",
+                x = in(reg) x.as_ptr(),
+                y = in(reg) y.as_ptr(),
+                z = in(reg) z,
+                x_extend = in(reg) parameters.x_extend,
+                y_extend = in(reg) parameters.y_extend,
+                shift = in(reg) parameters.shift,
+                z_input = in(reg) parameters.z_input,
+                inout("ecx") lanes => _,
+                out("rax") _,
+                clobber_abi("sysv64"),
+                options(nostack),
+            );
+        }
+    }
+
+    /// The bit-62 `mac16` matrix for one Y lane: X's even lanes into the
+    /// 32-bit lanes of the first of `rows` (two consecutive Z rows), its
+    /// odd lanes into the second's, each `((x' * y_lane) >> shift) + z`
+    /// where `lanes` (bits 15:0 the even rows', 31:16 the odd's) are on.
+    /// `y_lane` is already sign-extended from its width.
+    ///
+    /// # Safety
+    /// AVX-512F exists with OS-enabled opmask and ZMM state; `rows` is two
+    /// live 64-byte rows.
+    unsafe fn mac16_widened(x: &Row, y_lane: i32, rows: *mut u8, lanes: u32, parameters: &Mac16) {
+        // Even lanes are each dword's low half (or low byte), odd lanes its
+        // high half (or bits 23:16).
+        let (even_left, odd_left, right) = if parameters.x_extend == 24 {
+            (24u64, 8u64, 24u64)
+        } else {
+            (16, 0, 16)
+        };
+        // SAFETY: a live X row and two Z rows; the caller's contract.
+        unsafe {
+            asm!(
+                "vmovq xmm15, {even_left}",
+                "vmovq xmm14, {odd_left}",
+                "vmovq xmm11, {right}",
+                "vmovq xmm13, {shift}",
+                "vpbroadcastd zmm12, {z_input:e}",
+                "vpbroadcastd zmm3, {y:e}",
+                "kmovw k1, ecx",
+                "shr ecx, 16",
+                "kmovw k2, ecx",
+                "vmovdqu32 zmm0, zmmword ptr [{x}]",
+                "vpslld zmm1, zmm0, xmm15",
+                "vpsrad zmm1, zmm1, xmm11",
+                "vpslld zmm2, zmm0, xmm14",
+                "vpsrad zmm2, zmm2, xmm11",
+                "vpmulld zmm1, zmm1, zmm3",
+                "vpsrad zmm1, zmm1, xmm13",
+                "vpmulld zmm2, zmm2, zmm3",
+                "vpsrad zmm2, zmm2, xmm13",
+                "vmovdqu32 zmm4, zmmword ptr [{z}]",
+                "vpandd zmm4, zmm4, zmm12",
+                "vpaddd zmm1, zmm1, zmm4",
+                "vmovdqu32 zmmword ptr [{z}] {{k1}}, zmm1",
+                "vmovdqu32 zmm5, zmmword ptr [{z} + 64]",
+                "vpandd zmm5, zmm5, zmm12",
+                "vpaddd zmm2, zmm2, zmm5",
+                "vmovdqu32 zmmword ptr [{z} + 64] {{k2}}, zmm2",
+                "vzeroupper",
+                x = in(reg) x.as_ptr(),
+                z = in(reg) rows,
+                y = in(reg) y_lane,
+                even_left = in(reg) even_left,
+                odd_left = in(reg) odd_left,
+                right = in(reg) right,
+                shift = in(reg) parameters.shift,
+                z_input = in(reg) parameters.z_input,
+                inout("ecx") lanes => _,
                 clobber_abi("sysv64"),
                 options(nostack),
             );
