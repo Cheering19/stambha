@@ -743,6 +743,20 @@ fn detected_on<D: Drm>(drm: &mut D, id: u32) -> Result<bool, Error> {
     Ok(connector.connection == CONNECTED)
 }
 
+/// Whether connector `id` has a display as the driver last detected it, as
+/// [`detected_on`] reads it, and its kind (`DRM_MODE_CONNECTOR_*`).
+fn detected_kind<D: Drm>(drm: &mut D, id: u32) -> Result<(bool, u32), Error> {
+    let mut mode = ModeInfo::default();
+    let mut connector = Connector {
+        id,
+        modes: ptr::from_mut(&mut mode) as u64,
+        mode_count: 1,
+        ..Connector::default()
+    };
+    call(drm, GET_CONNECTOR, &mut connector)?;
+    Ok((connector.connection == CONNECTED, connector.kind))
+}
+
 /// Whether any connector of `drm` has a display as its driver last
 /// detected it, with no probe: cheap enough to ask often, and current where
 /// hot-plug interrupts arrive.
@@ -2116,6 +2130,24 @@ impl<D: Drm> Display<D> {
         }
         release_all(&mut self.drm, &self.buffers);
         self.drm
+    }
+
+    /// Whether a connector the picture is not shown on, and no built-in
+    /// panel, has a display as its driver last detected it, with no probe:
+    /// a monitor connected while the outputs are off, which a look joins
+    /// only once they are on again ([`Self::set_power`]). `false` where a
+    /// request must wait.
+    pub fn external_waiting(&mut self) -> bool {
+        if !self.drm.immediate() {
+            return false;
+        }
+        let others: Vec<u32> = self.others.iter().map(|&(id, _)| id).collect();
+        others.into_iter().any(|id| {
+            matches!(
+                detected_kind(&mut self.drm, id),
+                Ok((true, kind)) if !PANELS.contains(&kind)
+            )
+        })
     }
 
     /// How many outputs show the picture.

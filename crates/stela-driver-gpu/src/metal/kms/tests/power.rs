@@ -40,6 +40,29 @@ fn display_sleep_turns_the_output_off_and_a_wake_shows_the_newest_frame() {
     assert_eq!(card.mode_sets, 3);
 }
 
+/// A monitor connected while the outputs are off is told, where no look
+/// joins it, and a built-in panel connected then is not.
+#[test]
+fn a_monitor_connected_while_the_outputs_are_off_is_told() {
+    for (kind, external) in [(11, true), (14, false)] {
+        let mut card = super::outputs::two_monitors();
+        card.first_connected = false;
+        // The display shows on connector 51, an eDP panel; connector 50 is
+        // HDMI or another panel.
+        card.ports = [(kind, 1), (14, 1)];
+        let mut display = Display::take(&mut card, (6, 4)).unwrap();
+        display.set_power(false).unwrap();
+        assert!(!display.external_waiting());
+        display.drm.first_connected = true;
+        assert_eq!(display.external_waiting(), external, "{kind}");
+        assert_eq!(display.watch(), Watched::default());
+        // Lit again, a look joins it.
+        display.set_power(true).unwrap();
+        assert_eq!(display.watch().joined, 1);
+        assert!(!display.external_waiting());
+    }
+}
+
 #[test]
 fn an_output_that_cannot_be_lit_again_is_left_for_the_next_look() {
     let modes = vec![mode(2, 2, PREFERRED)];

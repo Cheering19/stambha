@@ -365,6 +365,28 @@ impl KmsScanout {
                     let ticks = age * u128::from(self.tsc_hz) / 1_000_000_000;
                     Some(tsc.saturating_sub(u64::try_from(ticks).ok()?))
                 });
+                // A monitor connected under a closed lid, as a dock's: the
+                // display lights, so this look shows the picture there.
+                if self.panel.lid_dark() && display.external_waiting() {
+                    use stela_boot_core::lid_panel::LidPower;
+                    match self.panel.external() {
+                        Some(LidPower::On) => match display.set_power(true) {
+                            Ok(()) => output::arguments(format_args!(
+                                "GPU {name}: lid: an external monitor connected, so the display \
+                                 lights to show on it\n"
+                            )),
+                            Err(error) => output::arguments(format_args!(
+                                "GPU {name}: lid: an external monitor connected, but the display \
+                                 refused to light: {error:?}\n"
+                            )),
+                        },
+                        Some(_) => output::arguments(format_args!(
+                            "GPU {name}: lid: an external monitor connected; the display lights \
+                             at the guest's wake\n"
+                        )),
+                        None => {}
+                    }
+                }
                 let watched = display.watch();
                 report_watched(name, display, watched);
                 report_listings(name, display);

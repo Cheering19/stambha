@@ -97,6 +97,29 @@ impl PanelPower {
         self.guest_on && !self.lid_dark
     }
 
+    /// Whether the display is dark for the lid alone, where a monitor
+    /// connected now would not be shown ([`Self::external`]).
+    pub fn lid_dark(&self) -> bool {
+        self.lid_dark
+    }
+
+    /// An external monitor connected while the display is dark for the
+    /// lid, as a laptop closed on a dock's: the lid no longer keeps the
+    /// display dark, so it lights to show there (or at the guest's wake),
+    /// as macOS shows a closed laptop's picture on an external display.
+    /// `None` where the lid keeps nothing dark.
+    pub fn external(&mut self) -> Option<LidPower> {
+        if !self.lid_dark {
+            return None;
+        }
+        self.lid_dark = false;
+        Some(if self.guest_on {
+            LidPower::On
+        } else {
+            LidPower::StaysOff
+        })
+    }
+
     /// The guest's display power `on`: whether the outputs are lit now.
     pub fn guest(&mut self, on: bool) -> bool {
         self.guest_on = on;
@@ -176,5 +199,25 @@ mod tests {
         assert!(panel.lit());
         assert_eq!(panel.lid(false, false), None);
         assert!(panel.lit());
+    }
+
+    #[test]
+    fn an_external_monitor_connected_under_a_closed_lid_lights_the_display() {
+        let mut panel = PanelPower::new();
+        // Lit, or not dark for the lid: nothing to do.
+        assert_eq!(panel.external(), None);
+        assert_eq!(panel.lid(true, true), Some(LidPower::Off));
+        assert!(panel.lid_dark());
+        // A dock's monitor: the display lights, so it can show there.
+        assert_eq!(panel.external(), Some(LidPower::On));
+        assert!(panel.lit() && !panel.lid_dark());
+        // The lid's request is unchanged: its end changes nothing more.
+        assert_eq!(panel.lid(true, true), None);
+        assert_eq!(panel.lid(false, true), None);
+        // While the guest's display sleeps, it lights at the guest's wake.
+        assert_eq!(panel.lid(true, true), Some(LidPower::Off));
+        assert!(!panel.guest(false));
+        assert_eq!(panel.external(), Some(LidPower::StaysOff));
+        assert!(panel.guest(true));
     }
 }
