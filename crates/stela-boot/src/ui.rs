@@ -1,4 +1,4 @@
-//! Stela's look on the firmware framebuffer, shared by the startup menu,
+//! Stambha's look on the firmware framebuffer, shared by the startup menu,
 //! the disk picker and the boot console: dark gray pages under the logo and
 //! name, centred at the top, with orange for what is chosen and blue for
 //! what is new or done.
@@ -22,7 +22,7 @@ pub const RED: u32 = 0xe4574d;
 /// Page units the header takes at the top.
 pub const HEADER: usize = 88;
 const LOGO: usize = 32;
-const NAME: &str = "Stela";
+const NAME: &str = "Stambha";
 pub use stela_boot_core::screen::scale;
 
 /// A page drawn in memory and shown at once.
@@ -155,10 +155,12 @@ impl Canvas {
                 let mut sum = [0u32; 3];
                 for sy in 0..SAMPLES {
                     for sx in 0..SAMPLES {
-                        let u = (px * SAMPLES + sx) as f32 / (side * SAMPLES) as f32;
-                        let v = (py * SAMPLES + sy) as f32 / (side * SAMPLES) as f32;
-                        let colour =
-                            stela_boot_core::screen::logo_pixel(u, v).unwrap_or(BACKGROUND);
+                        let colour = stela_boot_core::screen::logo_pixel(
+                            (px * SAMPLES + sx) as u32,
+                            (py * SAMPLES + sy) as u32,
+                            (side * SAMPLES) as u32,
+                        )
+                        .unwrap_or(BACKGROUND);
                         for (channel, total) in sum.iter_mut().enumerate() {
                             *total += (colour >> (16 - 8 * channel)) & 0xff;
                         }
