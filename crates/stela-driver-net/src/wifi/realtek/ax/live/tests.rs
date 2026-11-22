@@ -8,7 +8,7 @@ use crate::wifi::realtek::ax::bringup::tests::{
     efuse_with_country, efuse_with_mac, first_of, never, same_access, tables_file,
     tables_file_without, txpwr_alone, txpwr_window,
 };
-use crate::wifi::realtek::ax::chan::{HwBand, Subband};
+use crate::wifi::realtek::ax::chan::{Bw, HwBand, Subband};
 use crate::wifi::realtek::ax::command::H2cAck;
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::h2c::ScanChannel;
@@ -335,6 +335,10 @@ fn tune_refuses_an_unbuilt_channel_before_any_io() {
         band: HwBand::G2,
         freq: 2412,
         subband: Subband::G2,
+        primary: 6,
+        width: Bw::Mhz20,
+        pri_ch_idx: 0,
+        txsc: [0; 3],
     };
     // SAFETY: as in `start_on`.
     let refused = unsafe { live.tune(&bad) };

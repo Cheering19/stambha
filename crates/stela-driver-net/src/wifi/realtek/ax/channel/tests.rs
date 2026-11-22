@@ -2,7 +2,7 @@
 // Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
 use super::*;
-use crate::wifi::realtek::ax::chan::Subband;
+use crate::wifi::realtek::ax::chan::{Bw, Subband};
 use crate::wifi::realtek::ax::regd::Regd;
 use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -428,6 +428,10 @@ fn set_channel_rf_skips_the_channel_outside_ctrl_ch_ranges() {
         band: HwBand::G2,
         freq: 0,
         subband: Subband::G2,
+        primary: 20,
+        width: Bw::Mhz20,
+        pri_ch_idx: 0,
+        txsc: [0; 3],
     };
     set_channel_rf(&mut m, &chan, CBV).unwrap();
     let mut want = Vec::new();
@@ -448,6 +452,10 @@ fn set_channel_rf_refuses_6g_untouched() {
         band: HwBand::G6,
         freq: 5955,
         subband: Subband::G2,
+        primary: 1,
+        width: Bw::Mhz20,
+        pri_ch_idx: 0,
+        txsc: [0; 3],
     };
     assert!(matches!(
         set_channel_rf(&mut m, &chan, CBV),
@@ -1288,18 +1296,30 @@ fn set_channel_bb_refuses_a_channel_new20_would_not_build() {
             band: HwBand::G6,
             freq: 5955,
             subband: Subband::G2,
+            primary: 1,
+            width: Bw::Mhz20,
+            pri_ch_idx: 0,
+            txsc: [0; 3],
         },
         Chan {
             channel: 0,
             band: HwBand::G2,
             freq: 0,
             subband: Subband::G2,
+            primary: 0,
+            width: Bw::Mhz20,
+            pri_ch_idx: 0,
+            txsc: [0; 3],
         },
         Chan {
             channel: 6,
             band: HwBand::G2,
             freq: 2412,
             subband: Subband::G2,
+            primary: 6,
+            width: Bw::Mhz20,
+            pri_ch_idx: 0,
+            txsc: [0; 3],
         },
     ] {
         let mut m = model();
