@@ -4813,11 +4813,11 @@
   },
   {
     "package": "stela-compiler",
-    "test": "native_and_model_costs",
-    "source": "crates/stela-compiler/src/amx/native.rs",
+    "test": "costs",
+    "source": "crates/stela-compiler/tests/amx_native/costs.rs",
     "kind": "manual",
     "inputs": [],
-    "reason": "host timing report of the native AMX kernels against the reference model for fma32, fma64, vecfp, fma16 and fused constant modes; run on request"
+    "reason": "host timing report of every AMX form the plan targets, through the reference model and each native path with F16C, per Native::execute and per routine call; run on request in a release build"
   },
   {
     "package": "stela-driver-gpu",

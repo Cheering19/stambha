@@ -154,9 +154,10 @@ fn native_costs(
     (execute, routine, covered)
 }
 
-/// The cost table, printed as rows of the plan's results log.
+/// The cost table, printed as rows of the plan's results log; run it in a
+/// release build (the command above).
 #[test]
-#[ignore = "manual: opt-in, in a release build"]
+#[ignore = "manual: opt-in"]
 fn costs() {
     let initial = harness::fill(&mut Random(0x1234_5678_9abc_def1));
     let paths: Vec<Paths> = harness::tiers()
