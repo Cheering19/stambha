@@ -117,6 +117,7 @@ fn unpublished_profile(
         retry_resources: slot_resources::Cache::new(max_slots + 1),
         queued_resets: Vec::new(),
         after_boot: false,
+        mass_storage_unused: false,
         slot_ownership: vec![Ownership::Vacant; max_slots + 1],
         test_retired_numbers: vec![false; max_slots + 1],
         power: power::Ledger::new(max_slots + 1),

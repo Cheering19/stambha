@@ -211,3 +211,56 @@ fn bulk_only_disks_on_two_controllers_settle_in_one_second_together() {
     assert!(end - start >= SETTLE_US + SETTLE_US / 4);
     assert!(end - start < 2 * SETTLE_US, "{} us in all", end - start);
 }
+
+/// A controller started without mass storage
+/// ([`Started::without_mass_storage`]) enumerates its stick and reports
+/// the disk's interface unused: only enumeration's descriptor reads reach
+/// the stick, with no configuration, Bulk-Only or SCSI command and no
+/// settle wait. Started as usual, the same stick is configured to settle.
+#[test]
+fn a_controller_started_without_mass_storage_leaves_its_stick_unconfigured() {
+    let _clock = crate::test_clock::virtualize();
+    let mut dma = TestRegion::new(1024 * 1024 * 8);
+    let firmware = crate::firmware::HandoffProvider::new(None);
+    let (controller, bus) = bot_controller(&mut dma);
+    let start = Clock::ticks();
+    let mut found = Started {
+        controller,
+        controller_firmware: None,
+    }
+    .without_mass_storage()
+    .finish(&mut dma, &firmware);
+    let took = Clock::ticks() - start;
+    assert!(took < SETTLE_US, "{took} us");
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    assert_eq!(found.devices.len(), 1);
+    assert!(found.disks.is_empty() && found.storage.is_empty());
+    assert!(found.take_settling().is_empty());
+    assert_eq!(
+        found.unused,
+        [(
+            format!("{} interface 0", found.devices[0].location),
+            bind::NO_MASS_STORAGE
+        )]
+    );
+    let node = &bus.borrow().nodes[&0];
+    assert!(!node.configured && node.bot_commands().is_empty());
+    assert!(
+        bus.borrow()
+            .requests
+            .iter()
+            .all(|(_, _, request)| request[1] == GET_DESCRIPTOR),
+        "{:x?}",
+        bus.borrow().requests
+    );
+
+    let (controller, bus) = bot_controller(&mut dma);
+    let mut found = Started {
+        controller,
+        controller_firmware: None,
+    }
+    .finish_unsettled(&mut dma, &firmware);
+    assert!(found.unused.is_empty(), "{:?}", found.unused);
+    assert_eq!(found.take_settling().len(), 1);
+    assert!(bus.borrow().nodes[&0].configured);
+}

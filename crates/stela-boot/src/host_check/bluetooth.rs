@@ -21,8 +21,11 @@
 //!
 //! On this PC that xHCI (0000:05:00.4) also holds the boot stick, so its
 //! start resets the stick and enumerates it again. Nothing writes to it: the
-//! stick's disk is not even settled, and the lines go to the screen and,
-//! with `--keep-lines`, the firmware's variables.
+//! controller is started without mass storage
+//! (`xhci::Started::without_mass_storage`), so the stick's disk, Bulk-Only
+//! or UAS, is reported unused with no configuration or SCSI command, and
+//! the lines go to the screen and, with `--keep-lines`, the firmware's
+//! variables.
 use super::{Machine, Verdict};
 use alloc::{boxed::Box, format, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
@@ -321,10 +324,14 @@ fn bring_up(
     // host check, and no probe allocates from it in this mode.
     let mut dma = unsafe { RegionAllocator::new(handoff.dma.clone()) };
     // Its devices enumerated and their class drivers bound, the Bluetooth
-    // controller's among them; a Bulk-Only disk, the stick's, is left
-    // settling and never discovered, so it gets no SCSI command.
+    // controller's among them. Its mass storage, the stick's disk, is left
+    // unused, whether its binding would be Bulk-Only or UAS: the firmware's
+    // descriptors show only the setting it uses, so the census cannot tell
+    // which, and either way the disk gets no configuration, SCSI command or
+    // settle wait. Nothing is left settling either, so none is discovered.
     let found = xhci::begin_with_provider(&mut function, handoff, &mut dma, provider, minimum)
         .map_err(|error| format!("its xHCI driver failed: {error}"))?
+        .without_mass_storage()
         .finish_unsettled(&mut dma, provider);
     let mut devices = Devices::default();
     devices.absorb_usb(Some(address), found, provider);

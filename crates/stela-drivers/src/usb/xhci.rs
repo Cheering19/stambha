@@ -493,6 +493,10 @@ pub struct Controller {
     /// a device that arrives from then on gets only the classes the running
     /// system takes, and the rest are reported unused, never started.
     after_boot: bool,
+    /// Whether the controller was started without mass storage
+    /// ([`Started::without_mass_storage`]): its disks' interfaces are
+    /// reported unused, never configured or sent a command.
+    mass_storage_unused: bool,
     /// Transfer events that arrived while waiting for something else.
     pending: Vec<Event>,
     /// USBSTS once the controller reported a fatal error.
@@ -801,6 +805,7 @@ impl Controller {
             retry_resources: slot_resources::Cache::new(slots.len()),
             queued_resets: Vec::new(),
             after_boot: false,
+            mass_storage_unused: false,
             power: power::Ledger::new(slots.len()),
             slots,
             pending: Vec::new(),
@@ -1538,6 +1543,17 @@ pub struct Started {
 }
 
 impl Started {
+    /// Leave every mass-storage interface on this controller unused, for a
+    /// caller that takes no disk from it: the disk is enumerated, as every
+    /// device is, and reported unused ([`bind::NO_MASS_STORAGE`]), with no
+    /// configuration, Bulk-Only or UAS command and no settle wait, also
+    /// when it returns after a reset. Other classes bind as usual.
+    #[must_use]
+    pub fn without_mass_storage(mut self) -> Self {
+        self.controller.mass_storage_unused = true;
+        self
+    }
+
     /// Enumerate the controller's devices and bind the class drivers,
     /// waiting out the Bulk-Only settle time.
     pub fn finish(
