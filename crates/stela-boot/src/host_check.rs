@@ -44,9 +44,11 @@
 //! option they do not, and the check keeps nothing itself. One line says
 //! whether the firmware holds them. Then a key restarts the machine (back
 //! to the boot manager), the power button powers it off, and `--deadline`
-//! (counted from the start) stops it with `STELA STOPPED`. Every wait
-//! prints `BEAT` every 10 s and flushes the log; a fatal error, panic or
-//! x86 exception flushes it too (`output`).
+//! (counted from the start) stops it with `STELA STOPPED`, the lines so far
+//! kept first with `--keep-lines` when the deadline comes before the
+//! summary. Every wait prints `BEAT` every 10 s and flushes the log, the
+//! Bluetooth bring-up's and scan's waits in their drivers too; a fatal
+//! error, panic or x86 exception flushes it too (`output`).
 use crate::Result;
 use crate::{
     apic::{self, Apic, rdtsc},
@@ -66,6 +68,7 @@ use alloc::string::ToString;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     arch::asm,
+    cell::RefCell,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -152,12 +155,16 @@ impl fmt::Display for Check {
     }
 }
 
-/// The TSC rate, the beats and the deadline every wait shares.
+/// The TSC rate, the beats and the deadline every wait shares, and whether
+/// the lines are still to be kept in the firmware.
+#[derive(Clone, Copy)]
 struct Timing {
     tsc_hz: u64,
     started: u64,
     next_beat: u64,
     deadline: Option<u64>,
+    /// `--keep-lines`, until [`Timing::keep_lines`] has kept them.
+    keep_lines: bool,
 }
 
 impl Timing {
@@ -165,7 +172,9 @@ impl Timing {
         (rdtsc() - self.started) / self.tsc_hz
     }
 
-    /// Print a beat when one is due and stop at the deadline.
+    /// Print a beat when one is due and stop at the deadline, the lines so
+    /// far kept in the firmware first with `--keep-lines`, as [`finish`]
+    /// keeps them.
     fn tick(&mut self) {
         let now = rdtsc();
         if now >= self.next_beat {
@@ -180,8 +189,57 @@ impl Timing {
                 "HOST CHECK deadline reached after {}s\n",
                 self.elapsed_seconds()
             ));
+            output::flush_log();
+            self.keep_lines();
             output::terminate(DEADLINE_CODE)
         }
+    }
+
+    /// With `--keep-lines`, the lines so far kept in the firmware's
+    /// variables (`output::keep_lines_in_firmware`), once.
+    fn keep_lines(&mut self) {
+        if !core::mem::take(&mut self.keep_lines) {
+            return;
+        }
+        match output::keep_lines_in_firmware() {
+            Ok(()) => output::arguments(format_args!(
+                "HOST CHECK lines kept in the firmware (StelaStop variables): the next start of \
+                 Stela on this PC copies them into the USB's log and deletes them\n"
+            )),
+            Err(why) => output::arguments(format_args!(
+                "HOST CHECK lines not kept in the firmware: {why}\n"
+            )),
+        }
+        output::flush_log();
+    }
+}
+
+/// The check's [`Timing`] while drivers wait on their own
+/// ([`with_driver_waits`]), `None` otherwise.
+static DRIVER_WAITS: output::Global<Option<Timing>> = output::Global(RefCell::new(None));
+
+/// Run `work` with the beats and the deadline also checked in every driver
+/// wait (`stela_drivers::on_wait`): the Bluetooth bring-up and scan wait in
+/// their drivers, up to two minutes an initialization attempt, without
+/// returning to the check's own waits, so a hang there still ends at the
+/// deadline, the lines kept.
+fn with_driver_waits<T>(machine: &mut Machine, work: impl FnOnce(&mut Machine) -> T) -> T {
+    *DRIVER_WAITS.0.borrow_mut() = Some(machine.timing);
+    stela_drivers::on_wait(driver_waiting);
+    let result = work(machine);
+    if let Some(timing) = DRIVER_WAITS.0.borrow_mut().take() {
+        machine.timing = timing;
+    }
+    result
+}
+
+/// What a driver's wait runs: [`Timing::tick`] while [`with_driver_waits`]
+/// holds the timing, nothing otherwise or when a tick is already running.
+fn driver_waiting() {
+    if let Ok(mut timing) = DRIVER_WAITS.0.try_borrow_mut()
+        && let Some(timing) = timing.as_mut()
+    {
+        timing.tick();
     }
 }
 
@@ -266,6 +324,7 @@ fn prepare(
             started,
             next_beat: started,
             deadline: options.deadline.map(|seconds| started + seconds * tsc_hz),
+            keep_lines: options.keep_lines,
         },
         options,
         screen: Framebuffer::from_firmware(),
@@ -394,11 +453,13 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
     }
     let mut keyboards = match machine.storage.take() {
         // In place of the probe, which it would let start every driver.
-        Some(handoff) if machine.bluetooth.on() => bluetooth::start(machine, &handoff),
+        Some(handoff) if machine.bluetooth.on() => {
+            with_driver_waits(machine, |machine| bluetooth::start(machine, &handoff))
+        }
         Some(handoff) => disks(machine, &handoff),
         None => Vec::new(),
     };
-    bluetooth::check(machine);
+    with_driver_waits(machine, bluetooth::check);
     timer(machine);
     match (machine.screen, band) {
         (Some(screen), Some(top)) => bars(machine, &screen, top),
@@ -808,18 +869,8 @@ fn finish(machine: &mut Machine, keyboards: &mut [InputDevice]) -> ! {
         count(Verdict::Skip)
     ));
     output::flush_log();
-    if machine.options.keep_lines {
-        match output::keep_lines_in_firmware() {
-            Ok(()) => output::arguments(format_args!(
-                "HOST CHECK lines kept in the firmware (StelaStop variables): the next start of \
-                 Stela on this PC copies them into the USB's log and deletes them\n"
-            )),
-            Err(why) => output::arguments(format_args!(
-                "HOST CHECK lines not kept in the firmware: {why}\n"
-            )),
-        }
-        output::flush_log();
-    }
+    // Once: the deadline in the prompt below does not keep them again.
+    machine.timing.keep_lines();
     // The host check keeps the firmware's tables, which map no runtime
     // services for a firmware power-off.
     let mut power = HostPowerControl::new(
