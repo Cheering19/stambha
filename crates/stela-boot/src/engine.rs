@@ -1260,7 +1260,7 @@ fn run_machine<H: Host>(
         &machine.devices,
         options.battery,
         host_acpi,
-        restore.is_some(),
+        options.battery_withheld(restore.is_some()),
     );
     crate::status::begin(match restore {
         Some(_) => "Starting the macOS installer",

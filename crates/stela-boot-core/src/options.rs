@@ -650,6 +650,29 @@ impl System {
         metal_device || self.starts_metal_clients()
     }
 
+    /// The boot this is, by the name its `POWER` line gives, when the
+    /// guest's SMC takes no battery whatever `--battery` or `--test-battery`
+    /// asks, and answers as the Mac mini's; `restoring` when the engine
+    /// runs a restore. An install, a restore study and a staged update run
+    /// Apple's restore ramdisk (`-restore`), and a recoveryOS and the Metal
+    /// plugin repair mend the installed system: none needs a battery, and a
+    /// battery macOS read as empty or critical, which it shuts down at, or
+    /// whose `lpem` powers the laptop off, would cut that work short. The
+    /// installed macOS takes one, in single-user and safe mode too.
+    pub fn battery_withheld(&self, restoring: bool) -> Option<&'static str> {
+        if restoring || self.install.is_some() || self.restore {
+            Some("the macOS installer")
+        } else if self.upgrade {
+            Some("a staged macOS update")
+        } else if self.recovery.is_some() {
+            Some("recoveryOS")
+        } else if self.bundle_repair {
+            Some("the Metal plugin repair")
+        } else {
+            None
+        }
+    }
+
     /// Select the exact number of host processors the loader reserves.
     /// A disk-derived count is rechecked against the live source before SIPI.
     pub fn assigned_native_cores(

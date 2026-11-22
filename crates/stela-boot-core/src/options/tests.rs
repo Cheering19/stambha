@@ -132,6 +132,48 @@ fn no_boot_that_starts_metal_clients_sees_the_agx_model_and_restore_ramdisks_kee
 }
 
 #[test]
+fn an_install_a_restore_a_staged_update_a_recovery_os_and_a_repair_get_no_battery() {
+    use stela_loader::boot_selection::{
+        BUNDLE_REPAIR_OPTION, PAIRED_RECOVERY_OPTION, SAFE_BOOT_OPTION, SYSTEM_RECOVERY_OPTION,
+        UPGRADE_OPTION,
+    };
+    let withheld = |line: &str| round_trip(line).battery_withheld(false);
+    // The installed macOS takes the battery, in single-user and safe mode
+    // too.
+    for flag in ["", SINGLE_USER, SAFE_BOOT_OPTION] {
+        let line = format!("--system --battery --preboot {DISK} {flag}");
+        assert_eq!(withheld(&line), None, "{line}");
+    }
+    // A staged update runs the restore ramdisk; a recoveryOS and the repair
+    // mend the installed system.
+    for (flag, boot) in [
+        (UPGRADE_OPTION, "a staged macOS update"),
+        (PAIRED_RECOVERY_OPTION, "recoveryOS"),
+        (SYSTEM_RECOVERY_OPTION, "recoveryOS"),
+        (BUNDLE_REPAIR_OPTION, "the Metal plugin repair"),
+    ] {
+        let line = format!("--system --battery --preboot {DISK} {flag}");
+        assert_eq!(withheld(&line), Some(boot), "{line}");
+    }
+    // An install and a restore study, by their options or by the restore the
+    // engine runs.
+    let install = format!(
+        "--system --test-battery 80,charging --storage {DISK} --nor {DISK} --bundle b \
+         --install p.json"
+    );
+    let study = format!(
+        "--system --battery --bundle b --storage {DISK} --restore-study --restore-source {DISK} \
+         --restore-manifest m.plist --restore-identity 2"
+    );
+    for line in [install, study] {
+        assert_eq!(withheld(&line), Some("the macOS installer"), "{line}");
+    }
+    let plain = round_trip("--system --battery");
+    assert_eq!(plain.battery_withheld(false), None);
+    assert_eq!(plain.battery_withheld(true), Some("the macOS installer"));
+}
+
+#[test]
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);
