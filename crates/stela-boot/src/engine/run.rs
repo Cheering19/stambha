@@ -2136,7 +2136,8 @@ impl Heartbeat {
             // average and the longest.
             let hub = machine.devices.hub();
             let [taken, held, held_counts, longest] = hub.clock_timer_gates();
-            let micros = |counts: u64| u128::from(counts) * 1_000_000 / u128::from(host::COUNTER_HZ);
+            let micros =
+                |counts: u64| u128::from(counts) * 1_000_000 / u128::from(host::COUNTER_HZ);
             output::arguments(format_args!(
                 "CLOCK TIMERS taken={taken} held={held} held_us={}/{} delay_us={}\n",
                 micros(held_counts) / u128::from(held.max(1)),

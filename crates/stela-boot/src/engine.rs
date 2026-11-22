@@ -1208,9 +1208,9 @@ fn run_machine<H: Host>(
                 "CLOCK TIMER DELAY {micros}us (--timer-delay-us): a busy PE's timer interrupt \
                  comes at most this long after its last\n"
             )),
-            Err(reason) => output::arguments(format_args!(
-                "CLOCK TIMER DELAY unavailable: {reason}\n"
-            )),
+            Err(reason) => {
+                output::arguments(format_args!("CLOCK TIMER DELAY unavailable: {reason}\n"))
+            }
         }
     }
     machine.set_step_timing(options.profile);

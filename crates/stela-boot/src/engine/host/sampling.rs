@@ -51,9 +51,7 @@ use stela_boot_core::host_samples::{
     CLASSES, Counts, IDLE, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, native, shares,
 };
 use stela_compiler::x86_64::chain::ChainControl;
-use stela_engine::machine::engine::step_timing::{
-    self, BlockSample, CodeRegion, NO_BLOCK, Phase,
-};
+use stela_engine::machine::engine::step_timing::{self, BlockSample, CodeRegion, NO_BLOCK, Phase};
 
 /// Where a chain control holds the index of the block running.
 const BLOCK_OFFSET: usize = core::mem::offset_of!(ChainControl, block);
