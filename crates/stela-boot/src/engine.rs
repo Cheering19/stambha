@@ -1256,7 +1256,12 @@ fn run_machine<H: Host>(
         host_acpi,
         mut boot_progress,
     } = io;
-    battery::attach(&machine.devices, options.battery, host_acpi);
+    battery::attach(
+        &machine.devices,
+        options.battery,
+        host_acpi,
+        restore.is_some(),
+    );
     crate::status::begin(match restore {
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",

@@ -76,14 +76,19 @@ pub(super) fn polled(failure: Option<&str>, took_ms: u64) {
 /// without a percentage, a remaining or a full capacity would read as an
 /// empty battery, so the SMC keeps the Mac mini's keys, the line says why,
 /// and the service tries each new reading ([`serve`]) until macOS has read
-/// the SMC's key table or [`power_relay::WAIT_MILLIS`] pass.
+/// the SMC's key table or [`power_relay::WAIT_MILLIS`] pass. An install or
+/// restore (`installing`) runs Apple's restore ramdisk, which gets none.
 pub(super) fn attach(
     devices: &parallel::Board,
     choice: Option<Battery>,
     acpi: Option<&'static HostAcpi>,
+    installing: bool,
 ) {
     match choice {
         None => {}
+        Some(_) if installing => output::arguments(format_args!(
+            "POWER battery: not given to the macOS installer; its SMC answers as the Mac mini's\n"
+        )),
         Some(Battery::Test { percent, state }) => {
             let snapshot = PowerSnapshot::synthetic(percent, state);
             match devices.with(|devices| devices.add_battery(&snapshot)) {
