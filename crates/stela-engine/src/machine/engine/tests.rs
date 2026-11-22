@@ -140,9 +140,6 @@ pub(super) struct FakeHost {
     /// over and over, for the run loop's timings; and the turns so far.
     pub(super) cycle: Vec<NativeExit>,
     turn: usize,
-    /// The counter reads the host's time stamp counter, as a real host's
-    /// does, for the run loop's timings.
-    pub(super) stamped: bool,
     /// A translation store, for the tests that give the host one.
     pub(super) store: Option<stored::tests::MemoryStore>,
     /// Pages whose fetch the host refuses, and its answers.
@@ -538,11 +535,6 @@ impl Host for FakeHost {
         if self.real_counter {
             return super::board::timestamp();
         }
-        if self.stamped {
-            // SAFETY: RDTSC only reads the time stamp counter. Seven bits
-            // off bring a few-GHz count near the profile's 24 MHz.
-            return unsafe { core::arch::x86_64::_rdtsc() } >> 7;
-        }
         let now = self.now;
         self.now += self.counter_step;
         now
@@ -747,7 +739,6 @@ pub(super) fn board_on<D: Devices>(
         exits: Vec::new(),
         cycle: Vec::new(),
         turn: 0,
-        stamped: false,
         store: None,
         refused: Vec::new(),
         fetch_checks: 0,
