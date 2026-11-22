@@ -7,18 +7,31 @@ use crate::{
 };
 use stela_compiler::amx::{AmxOperation, AmxRegisters, Generation, native::Tier};
 
+/// The ALU mode: bits 52:47, or 0 under an indexed load (bit 53).
 fn mode(operand: u64) -> u64 {
-    (operand >> 47) & 0x3f
+    if operand & INDEXED != 0 {
+        0
+    } else {
+        (operand >> 47) & 0x3f
+    }
 }
 
 fn kind(operand: u64) -> u64 {
     (operand >> 42) & 0xf
 }
 
-/// No bits 56:54, indexed load (53), shuffle (30:27) or multiple rows
-/// (31, which M1 ignores): the one-row forms covered.
+const INDEXED: u64 = 1 << 53;
+/// Under an indexed load: the indices are Y's.
+const INDEXED_Y: u64 = 1 << 47;
+
+/// No bits 56:54 or multiple rows (31, which M1 ignores): the one-row
+/// forms covered.
 fn plain(operand: u64) -> bool {
-    (operand >> 54) & 7 == 0 && operand & (1 << 53 | 1 << 31) == 0 && (operand >> 27) & 0xf == 0
+    (operand >> 54) & 7 == 0 && operand & 1 << 31 == 0
+}
+
+fn shuffled(operand: u64) -> bool {
+    (operand >> 27) & 0xf != 0
 }
 
 /// The lane field (bits 40:38) and value (37:32, bit 37 ignored).
@@ -32,13 +45,20 @@ fn zeros(operand: u64) -> bool {
 }
 
 /// Operands over every field `vecfp` reads, mostly one-row forms of
-/// `modes` on the IEEE types, lane fields often all on, a broadcast Y
-/// lane, or the values 3 (zeros), 4 and 5 (a zero operand).
+/// `modes` on the IEEE types, a quarter with an indexed load and half
+/// shuffled, lane fields often all on, a broadcast Y lane, or the values 3
+/// (zeros), 4 and 5 (a zero operand).
 fn operand_of(random: &mut Random, modes: &[u64]) -> u64 {
     let mut operand = random.next();
     let choice = random.next();
     if choice & 7 != 0 {
-        operand &= !(7 << 54 | 1 << 53 | 0xf << 27);
+        operand &= !(7 << 54);
+    }
+    if (choice >> 32) & 3 != 0 {
+        operand &= !INDEXED;
+    }
+    if (choice >> 34) & 1 != 0 {
+        operand &= !(0xf << 27);
     }
     if choice & 0x8_0000 == 0 {
         operand &= !(1 << 31);
@@ -60,11 +80,10 @@ fn operand_of(random: &mut Random, modes: &[u64]) -> u64 {
     operand
 }
 
-/// Where `vecfp` is left to the model: bits 56:54, an indexed load, a
-/// shuffle, the M2's multiple rows, a mode the model leaves as a no-op,
-/// bf16 (types 0/1 from the M2), and arithmetic (modes 0, 1, 10-12 that
-/// write) on f32/f64 lanes on the model tier or on f16 lanes without F16C
-/// (`native::x86::vector_float`).
+/// Where `vecfp` is left to the model: bits 56:54, the M2's multiple
+/// rows, a mode the model leaves as a no-op, bf16 (types 0/1 from the M2),
+/// and arithmetic (modes 0, 1, 10-12 that write) on f32/f64 lanes on the
+/// model tier or on f16 lanes without F16C (`native::x86::vector_float`).
 pub fn may_refuse(paths: &Paths, _: AmxOperation, generation: Generation, operand: u64) -> bool {
     let operand = operand & !(1 << 37);
     let m2 = generation != Generation::M1;
@@ -72,8 +91,6 @@ pub fn may_refuse(paths: &Paths, _: AmxOperation, generation: Generation, operan
     let arithmetic = matches!(mode, 0 | 1 | 10..=12);
     let wide_float = matches!(kind(operand), 4 | 7);
     (operand >> 54) & 7 != 0
-        || operand & 1 << 53 != 0
-        || (operand >> 27) & 0xf != 0
         || m2 && operand & 1 << 31 != 0
         || !(matches!(mode, 0 | 1 | 4 | 5 | 7) || m2 && matches!(mode, 10..=12))
         || m2 && kind(operand) <= 1
@@ -154,6 +171,26 @@ const VECFP: Case = Case {
             name: "broadcast Y lane",
             of: |_, operand| plain(operand) && field(operand).0 == 1,
             floor: |_| 300,
+        },
+        Form {
+            name: "shuffled selections",
+            of: |_, operand| shuffled(operand) && covered(operand, &[4, 7, 3, 2, 5, 9], &[4, 5, 7]),
+            floor: |_| 200,
+        },
+        Form {
+            name: "indexed X, f32/f64",
+            of: |_, operand| {
+                operand & (INDEXED | INDEXED_Y) == INDEXED && covered(operand, &[4, 7], &[0])
+            },
+            floor: |paths| arithmetic(paths, true, 15),
+        },
+        Form {
+            name: "indexed Y, f16",
+            of: |_, operand| {
+                operand & (INDEXED | INDEXED_Y) == INDEXED | INDEXED_Y
+                    && covered(operand, &[2, 5, 9], &[0])
+            },
+            floor: |paths| arithmetic(paths, false, 30),
         },
     ],
 };

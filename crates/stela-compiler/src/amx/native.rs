@@ -19,8 +19,9 @@
 //!   halves per row, F16C for the widening, without which widening operands
 //!   use the model), and below FMA3 the model: a multiply-add rounded once
 //!   cannot be built exactly from SSE multiplies and adds.
-//! - `vecfp` on IEEE types, one Z row (no shuffle, indexed load or
-//!   multi-row form), a broadcast Y lane or any lane-enable mode, the
+//! - `vecfp` on IEEE types, one Z row (not the M2's multi-row form), its
+//!   operands staged by the model's own shuffles and indexed loads, a
+//!   broadcast Y lane or any lane-enable mode, the
 //!   zero-operand and zero-writing lane values: modes 0/1 (`z ± x*y`) and
 //!   from the M2 10-12 (`x*y`, `z + x`, `z + y`) on f16 lanes with F16C,
 //!   on f32 and f64 lanes with the FMA row kernels, on f16 into f32 (type
@@ -46,8 +47,9 @@
 //!   and 7) through the FMA kernels, f16 (and its widening into f32, type
 //!   3) through the f16 and widened rows with F16C, modes 0/1 (`z ± x*y`);
 //!   mode 4 (`x <= 0 ? 0 : y`, IEEE order on the bits) and the lane value
-//!   that writes zeros as bit selections; every lane mode. Not bf16, the
-//!   no-op modes, bits 56:54, indexed loads or shuffles.
+//!   that writes zeros as bit selections; every lane mode; operands staged
+//!   by the model's own shuffles and indexed loads. Not bf16, the no-op
+//!   modes or bits 56:54.
 //! - On every tier, the model's too, the fused operations' copies and
 //!   constants (bits 29:27 = 3, 5, 6, 7), which need no arithmetic, except
 //!   copies of f16-widened halves, whose NaN payloads the model rewrites,
@@ -203,7 +205,7 @@ mod x86 {
     //! blocks) and declares the SysV clobbers, which on the soft-float
     //! target name registers its own code never uses.
     use super::{Fused, Native, ROW_BYTES, Tier, VECTOR, X_HALF, Y_HALF, write_mask};
-    use crate::amx::{AmxOperation, AmxRegisters, Generation};
+    use crate::amx::{AmxOperation, AmxRegisters, Generation, model};
     use core::arch::asm;
 
     type Row = [u8; ROW_BYTES];
@@ -1236,8 +1238,47 @@ mod x86 {
         }
     }
 
-    const VECFP_INDEXED_LOAD: u64 = 1 << 53;
     const VECFP_MULTIPLE_ROWS: u64 = 1 << 31;
+    /// With an indexed load (bit 53): the indices index Y's row (47), four
+    /// bits each (48), else two.
+    const FLOAT_INDEXED_Y: u64 = 1 << 47;
+    const FLOAT_INDEXED_4BIT: u64 = 1 << 48;
+
+    /// The ALU mode of a `vecfp`/`matfp` operand: bits 52:47, or 0 under an
+    /// indexed load, which takes bits 48:47.
+    const fn float_mode(operand: u64) -> u64 {
+        if operand & FLOAT_INDEXED_LOAD != 0 {
+            0
+        } else {
+            (operand >> 47) & 0x3f
+        }
+    }
+
+    /// X and Y of a one-row `vecfp` or a `matfp` operand, staged as the
+    /// model stages them with its own byte movement: the pool rows, an
+    /// indexed load (bit 53: packed lane indices in the pool row expanded
+    /// from X or Y row bits 51:49), then the shuffles (bits 30:29 of X,
+    /// 28:27 of Y).
+    fn stage(registers: &AmxRegisters, operand: u64, xy_bits: usize) -> (Row, Row) {
+        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
+        let mut y = registers.y_operand(operand & 0x1ff);
+        if operand & FLOAT_INDEXED_LOAD != 0 {
+            let source = ((operand >> 49) & 7) as usize;
+            let index_bits = if operand & FLOAT_INDEXED_4BIT != 0 {
+                4
+            } else {
+                2
+            };
+            if operand & FLOAT_INDEXED_Y != 0 {
+                model::load_indexed(&mut y, &registers.y[source], index_bits, xy_bits as u32);
+            } else {
+                model::load_indexed(&mut x, &registers.x[source], index_bits, xy_bits as u32);
+            }
+        }
+        model::shuffle(&mut x, (operand >> 29) & 3, xy_bits / 8);
+        model::shuffle(&mut y, (operand >> 27) & 3, xy_bits / 8);
+        (x, y)
+    }
 
     /// `vecfp` (`vecfp.c`) on IEEE types, one Z row: f16 (types 2, 5, 6,
     /// 8-15, and 0/1 on M1) through the f16 rows with F16C, f32 and f64
@@ -1248,10 +1289,10 @@ mod x86 {
     /// to -0, each rounded once; modes 4 (`x <= 0 ? 0 : y`), 5 and 7 (Arm
     /// FMIN and FMAX with the default NaN) and the lane value that writes
     /// zeros as integer bit selections on every tier; a broadcast Y lane,
-    /// the zero-operand values and every lane mode. Refused, before any
-    /// write: bits 56:54, indexed loads, shuffles, the M2's multiple rows,
-    /// the modes the model leaves as no-ops, bf16, and arithmetic a tier
-    /// cannot do exactly.
+    /// the zero-operand values, every lane mode, shuffles and indexed loads
+    /// ([`stage`]). Refused, before any write: bits 56:54, the M2's
+    /// multiple rows, the modes the model leaves as no-ops, bf16, and
+    /// arithmetic a tier cannot do exactly.
     pub(super) fn vector_float(
         native: Native,
         generation: Generation,
@@ -1260,14 +1301,12 @@ mod x86 {
     ) -> bool {
         // The model ignores bit 37, which would otherwise join the lane field.
         let operand = operand & !(1 << 37);
-        let mode = (operand >> 47) & 0x3f;
+        let mode = float_mode(operand);
         let m2 = generation.m2_extensions();
         let (xy_bits, z_bits, bf16) = float_types(generation, operand);
         let widened = z_bits != xy_bits;
         let arithmetic = matches!(mode, 0 | 1 | 10..=12);
         if (operand >> 54) & 7 != 0
-            || operand & VECFP_INDEXED_LOAD != 0
-            || (operand >> 27) & 0xf != 0
             || m2 && operand & VECFP_MULTIPLE_ROWS != 0
             || !(matches!(mode, 0 | 1 | 4 | 5 | 7) || m2 && matches!(mode, 10..=12))
             || bf16
@@ -1288,8 +1327,7 @@ mod x86 {
                 return false;
             }
         }
-        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
-        let mut y = registers.y_operand(operand & 0x1ff);
+        let (mut x, mut y) = stage(registers, operand, xy_bits);
         let enable = if field == 1 {
             // Y lane (bits 36:32, within the lanes) in every lane, every
             // lane on.
@@ -2277,10 +2315,10 @@ mod x86 {
     /// f16 rows (F16C), f16 into f32 (type 3) through the widened rows
     /// (F16C), modes 0 (`z + x*y`) and 1 (`z - x*y`); mode 4 (`x <= 0 ? 0 :
     /// y`) and the lane-enable value 3 (zeros) as bit selections; the
-    /// values 4 and 5 (a zero X or Y) feeding a zero row. Every lane mode.
-    /// Refused, before anything is written: bits 56:54 (the model's no-op),
-    /// indexed loads (bit 53), shuffles (bits 30:27), other modes (no-ops),
-    /// bf16 (types 0/1 from the M2), and the model tier.
+    /// values 4 and 5 (a zero X or Y) feeding a zero row. Every lane mode,
+    /// shuffles and indexed loads ([`stage`]). Refused, before anything is
+    /// written: bits 56:54 (the model's no-op), other modes (no-ops), bf16
+    /// (types 0/1 from the M2), and the model tier.
     pub(super) fn matrix_float(
         native: Native,
         generation: Generation,
@@ -2289,12 +2327,10 @@ mod x86 {
     ) -> bool {
         // The model ignores bits 37 and 63.
         let operand = operand & !(1 << 37 | 1 << 63);
-        let mode = (operand >> 47) & 0x3f;
+        let mode = float_mode(operand);
         let (xy_bits, z_bits, bf16) = float_types(generation, operand);
         if native.tier == Tier::Model
             || (operand >> 54) & 7 != 0
-            || operand & FLOAT_INDEXED_LOAD != 0
-            || (operand >> 27) & 0xf != 0
             || !matches!(mode, 0 | 1 | 4)
             || bf16
         {
@@ -2304,8 +2340,7 @@ mod x86 {
         let widened = z_bits != xy_bits;
         let x_enable = write_mask(operand >> 32, bytes as u32, 9);
         let y_enable = write_mask(((operand >> 23) & 7) << 6 | operand >> 58, bytes as u32, 9);
-        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
-        let mut y = registers.y_operand(operand & 0x1ff);
+        let (mut x, mut y) = stage(registers, operand, xy_bits);
         let mut write = true;
         if (operand >> 38) & 7 == 0 {
             match (operand >> 32) & 0x3f {

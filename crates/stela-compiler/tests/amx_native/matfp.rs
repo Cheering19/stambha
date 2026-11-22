@@ -6,13 +6,26 @@ use crate::{
 };
 use stela_compiler::amx::{AmxOperation, AmxRegisters, Generation, native::Tier};
 
-/// No bits 56:54, indexed load (53) or shuffle (30:27): the forms covered.
+/// No bits 56:54: the forms covered.
 fn plain(operand: u64) -> bool {
-    (operand >> 54) & 7 == 0 && operand & 1 << 53 == 0 && (operand >> 27) & 0xf == 0
+    (operand >> 54) & 7 == 0
 }
 
+const INDEXED: u64 = 1 << 53;
+/// Under an indexed load: the indices are Y's.
+const INDEXED_Y: u64 = 1 << 47;
+
+/// The ALU mode: bits 52:47, or 0 under an indexed load (bit 53).
 fn mode(operand: u64) -> u64 {
-    (operand >> 47) & 0x3f
+    if operand & INDEXED != 0 {
+        0
+    } else {
+        (operand >> 47) & 0x3f
+    }
+}
+
+fn shuffled(operand: u64) -> bool {
+    (operand >> 27) & 0xf != 0
 }
 
 fn kind(operand: u64) -> u64 {
@@ -28,13 +41,20 @@ fn zeros(operand: u64) -> bool {
 }
 
 /// Operands over every field `matfp` reads, mostly in the covered forms:
-/// modes 0, 1 and 4, the IEEE types, lane fields often all on or one of
-/// the values 3 (zeros), 4 and 5 (a zero operand).
+/// modes 0, 1 and 4, the IEEE types, a quarter with an indexed load and
+/// half shuffled, lane fields often all on or one of the values 3 (zeros),
+/// 4 and 5 (a zero operand).
 fn operand(random: &mut Random) -> u64 {
     let mut operand = random.next();
     let choice = random.next();
     if choice & 7 != 0 {
-        operand &= !(7 << 54 | 1 << 53 | 0xf << 27);
+        operand &= !(7 << 54);
+    }
+    if (choice >> 32) & 3 != 0 {
+        operand &= !INDEXED;
+    }
+    if (choice >> 34) & 1 != 0 {
+        operand &= !(0xf << 27);
     }
     if choice & 0x38 != 0 {
         operand &= !(0x3f << 47);
@@ -58,10 +78,10 @@ fn operand(random: &mut Random) -> u64 {
     operand
 }
 
-/// Where `matfp` is left to the model: the model tier; bits 56:54, an
-/// indexed load, a shuffle; a mode other than 0, 1 and 4; bf16 (types 0/1
-/// from the M2); and without F16C the f16 arithmetic and anything of type
-/// 3 but zeros (`native::x86::matrix_float`).
+/// Where `matfp` is left to the model: the model tier; bits 56:54; a mode
+/// other than 0, 1 and 4; bf16 (types 0/1 from the M2); and without F16C
+/// the f16 arithmetic and anything of type 3 but zeros
+/// (`native::x86::matrix_float`).
 fn may_refuse(paths: &Paths, _: AmxOperation, generation: Generation, operand: u64) -> bool {
     let operand = operand & !(1 << 37 | 1 << 63);
     let m2 = generation != Generation::M1;
@@ -142,6 +162,26 @@ const MATFP: Case = Case {
             name: "zeros",
             of: |_, operand| plain(operand) && zeros(operand),
             floor: |paths| floor(paths, 100, false),
+        },
+        Form {
+            name: "shuffled f32/f64 z ± x*y",
+            of: |_, operand| shuffled(operand) && covered(operand, &[4, 7], &[0, 1]),
+            floor: |paths| floor(paths, 80, false),
+        },
+        Form {
+            name: "indexed X f32",
+            of: |_, operand| {
+                operand & (INDEXED | INDEXED_Y) == INDEXED && covered(operand, &[4], &[0])
+            },
+            floor: |paths| floor(paths, 15, false),
+        },
+        Form {
+            name: "indexed Y f16",
+            of: |_, operand| {
+                operand & (INDEXED | INDEXED_Y) == INDEXED | INDEXED_Y
+                    && covered(operand, &[2, 5, 9], &[0])
+            },
+            floor: |paths| floor(paths, 15, true),
         },
         Form {
             name: "a zero operand",
