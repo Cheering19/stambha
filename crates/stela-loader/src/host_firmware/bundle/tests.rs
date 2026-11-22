@@ -219,6 +219,16 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     assert!(found.iter().all(|member| expected.contains(member)));
     assert_eq!(found.len(), USB.len() + raphael.len() - 1);
     assert_eq!(ryzen.unknown, ["pci 1002:731f"]);
+    // Its log line names the device, not NVIDIA (#214, #208).
+    let lines: Vec<String> = ryzen.unknown_lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "HOST FIRMWARE BUNDLE NO RECIPE for the display device at pci 1002:731f: its \
+          firmware is not in Stela's catalog\n"
+        ]
+    );
+    assert!(!lines[0].contains("NVIDIA"));
     // An RX 9070 (Navi 48) and its audio function: amdgpu's files for Navi
     // 48 and nothing for the audio function.
     let navi48 = select_for(
@@ -247,6 +257,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);
+    assert_eq!(old.unknown_lines().count(), 1);
     assert_eq!(members(&old), USB);
 }
 

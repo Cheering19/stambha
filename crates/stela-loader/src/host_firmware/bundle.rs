@@ -515,6 +515,18 @@ impl Selection {
         }
     }
 
+    /// The boot log's line for each of [`Self::unknown`]: an AMD display
+    /// device is one as well as an NVIDIA one, so neither maker is named;
+    /// the PCI vendor in `why` says which.
+    pub fn unknown_lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.unknown.iter().map(|why| {
+            format!(
+                "HOST FIRMWARE BUNDLE NO RECIPE for the display device at {why}: its firmware \
+                 is not in Stela's catalog\n"
+            )
+        })
+    }
+
     /// The bytes of the wanted files.
     pub fn bytes(&self) -> usize {
         self.wanted
