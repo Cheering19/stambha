@@ -643,6 +643,9 @@ pub struct Counts {
     pub levels: step_timing::Levels,
     /// Its installs and evictions ([`super::InstallCauses`]).
     pub installs: super::InstallCauses,
+    /// Its AMX moves and register operations, these by form under step
+    /// timing ([`super::Machine::amx_counts`]).
+    pub amx: super::AmxCounts,
 }
 
 /// The cluster state its powered PEs share.
@@ -2817,6 +2820,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .as_ref()
                 .map_or_else(Default::default, |timing| timing.levels),
             installs: self.install_causes(),
+            amx: self.amx_counts(),
         }
     }
 

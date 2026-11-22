@@ -113,6 +113,8 @@ pub enum Error {
     WifiNetwork,
     DuplicateNativeShared,
     DuplicateNativeBootstrap,
+    AmxNative,
+    DuplicateAmxNative,
     Constraint(Constraint),
     Target {
         argument: TargetArgument,
@@ -258,6 +260,10 @@ impl Error {
             Self::WifiNetwork => "--wifi needs a 1 to 32 byte network name, with %XX escapes",
             Self::DuplicateNativeShared => "duplicate native shared check",
             Self::DuplicateNativeBootstrap => "duplicate native bootstrap check",
+            Self::AmxNative => {
+                "--amx-native takes on, off, or off: and AMX register operations such as fma32,vecfp"
+            }
+            Self::DuplicateAmxNative => "duplicate --amx-native",
             Self::Constraint(rule) => rule.message(),
             Self::Target { source, .. } | Self::Guid { source, .. } => source,
             Self::BootCommandOrigin { source, .. } => source,

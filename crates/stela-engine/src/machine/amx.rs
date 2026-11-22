@@ -106,8 +106,8 @@ pub struct Unit {
     state: u64,
     pub registers: Option<Box<AmxRegisters>>,
     /// What native moves find through `Anchor::Amx`, which the engine sets
-    /// as it enters native code.
-    pub native: stela_compiler::x86_64::amx_transfer::Cell,
+    /// as it enters native code, and the forms counted there.
+    pub native: super::engine::AmxCell,
 }
 
 /// Preserve the original M2 unit API. CPU construction must use `on(chip)`.

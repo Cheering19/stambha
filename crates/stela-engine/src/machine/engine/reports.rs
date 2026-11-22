@@ -715,6 +715,9 @@ pub struct Statistics {
     /// (`x86_64::amx_transfer::Cell`), added every 2^16 operations.
     pub amx_kernels: [[u64; 2]; stela_compiler::x86_64::amx_transfer::KINDS],
     pub amx_sampled: [[[u64; 2]; 2]; stela_compiler::x86_64::amx_transfer::KINDS],
+    /// Under step timing, every register operation by form and path, those
+    /// in blocks added with `amx_kernels` (`amx::forms`).
+    pub amx_forms: super::AmxForms,
     pub device_accesses: u64,
     /// Discards of every installed block, by [`Discard`] cause.
     pub code_discards: [u64; Discard::ALL.len()],
@@ -893,6 +896,7 @@ impl core::ops::AddAssign for Statistics {
             amx_operations,
             amx_kernels,
             amx_sampled,
+            amx_forms,
             device_accesses,
             code_discards,
             code_evictions,
@@ -956,6 +960,7 @@ impl core::ops::AddAssign for Statistics {
         {
             *total += count;
         }
+        self.amx_forms += amx_forms;
         for (total, count) in self.code_discards.iter_mut().zip(code_discards) {
             *total += count;
         }

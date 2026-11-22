@@ -1,7 +1,8 @@
 //! AMX block exits: one Apple AMX instruction against the PE's AMX unit and
 //! translated guest memory, with the reference model of
 //! `stela_compiler::amx::model`. The ABI and its evidence are in
-//! `machine::amx`.
+//! `machine::amx`. Under step timing the register operations blocks and the
+//! service complete are counted by form ([`forms`]).
 use super::{Devices, FETCH_PAGE, Host, Machine, RequirementKind, Step};
 use crate::machine::{
     amx,
@@ -15,11 +16,15 @@ use alloc::string::ToString;
 use stela_compiler::{
     GuestAddress,
     amx::{
-        AmxOperand, AmxOperation, decode,
+        AmxOperand, AmxOperation, Generation, decode,
         model::{self, AmxError, AmxMemory, MemoryFault},
         native::Native,
     },
 };
+
+mod forms;
+mod routines;
+pub use forms::{AmxCell, AmxCounts, AmxForms, FORMS};
 
 /// ISS of the exception for an AMX instruction while `AMX_CTL_EL1` bit 63 is
 /// clear: ESR 0xfe000003 (Asahi Linux, "Apple Instructions"). 26A434 XNU's
@@ -162,21 +167,69 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Each of these changes only at an instruction that leaves native code,
     /// and native code is entered with the anchor read again.
     /// Fill the PE's cell (`Anchor::Amx`) as native code is entered: the
-    /// register file it may use, the routine, generation and host paths.
+    /// register file it may use, the routine, generation, host paths and
+    /// the operations left to the model. The routine is the compiler's
+    /// (`x86_64::amx_routine::routine`) unless some operations are left to
+    /// the model, which [`routines::routine`] completes on it alone, and
+    /// under step timing the one that counts forms over that
+    /// ([`forms::routine`]); blocks call each through the cell, so their
+    /// code is the same.
     pub(super) fn enter_amx_cell(&mut self) {
         let registers = self.amx_registers();
         let generation = self.cpu.amx.generation();
-        let native = Native::select(self.target);
-        let cell = &mut self.cpu.amx.native;
+        let native = self.amx_paths();
+        let model = self.amx_model;
+        let routine = if self.step_timing.is_some() {
+            forms::routine as *const () as usize as u64
+        } else if model != 0 {
+            routines::routine as *const () as usize as u64
+        } else {
+            stela_compiler::x86_64::amx_routine::routine as *const () as usize as u64
+        };
+        let amx = &mut self.cpu.amx.native;
+        amx.model = model;
+        let cell = &mut amx.cell;
         cell.registers = registers;
-        cell.routine = stela_compiler::x86_64::amx_routine::routine as *const () as usize as u64;
+        cell.routine = routine;
         cell.generation = generation;
         cell.native = native;
     }
 
+    /// Let host kernels complete AMX register operations, as by default, or
+    /// leave every one to the reference model (`--amx-native off`), copies
+    /// and constants included, which every host path completes otherwise:
+    /// blocks from their next native entry, the service at once. The code
+    /// blocks hold is the same either way.
+    pub fn set_amx_native(&mut self, on: bool) {
+        self.set_amx_model(if on { 0 } else { u32::MAX });
+    }
+
+    /// Leave the register operations whose numbers (bits 9:5 of the word)
+    /// `operations` sets to the reference model alone, and let host kernels
+    /// complete the rest (`--amx-native off:fma16,vecfp`): blocks from their
+    /// next native entry, the service at once.
+    pub fn set_amx_model(&mut self, operations: u32) {
+        self.amx_model = operations;
+    }
+
+    /// Host kernels may complete the register operation `operation`.
+    fn amx_native(&self, operation: AmxOperation) -> bool {
+        self.amx_model & routines::bit(operation.encoding().0) == 0
+    }
+
+    /// The host paths register operations take in blocks: the target's, or
+    /// none where the model completes every operation.
+    fn amx_paths(&self) -> Native {
+        if self.amx_model == u32::MAX {
+            Native::MODEL
+        } else {
+            Native::select(self.target)
+        }
+    }
+
     /// Add what native code completed to the statistics as it returns.
     pub(super) fn leave_amx_cell(&mut self) {
-        let cell = &mut self.cpu.amx.native;
+        let cell = &mut self.cpu.amx.native.cell;
         self.statistics.amx_moves[0] += core::mem::take(&mut cell.moves);
         let before = self.statistics.amx_operations[0];
         self.statistics.amx_operations[0] += core::mem::take(&mut cell.calls);
@@ -185,10 +238,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Move the cell's per-operation counts into the statistics.
+    /// Move the cell's per-operation and per-form counts into the
+    /// statistics.
     pub(super) fn fold_amx_kernels(&mut self) {
-        let cell = &mut self.cpu.amx.native;
+        let amx = &mut self.cpu.amx.native;
         let statistics = &mut self.statistics;
+        statistics.amx_forms += core::mem::take(&mut amx.forms);
+        let cell = &mut amx.cell;
         for (total, count) in statistics
             .amx_kernels
             .as_flattened_mut()
@@ -205,6 +261,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .zip(cell.sampled.as_flattened_mut().as_flattened_mut())
         {
             *total += core::mem::take(count);
+        }
+    }
+
+    /// What this PE's AMX unit did: the statistics with what its cell holds
+    /// yet, which [`Self::fold_amx_kernels`] would add to them; the forms
+    /// only under step timing, which alone counts them (every PE publishes
+    /// these counts at each run slice).
+    pub fn amx_counts(&self) -> AmxCounts {
+        let statistics = &self.statistics;
+        let amx = &self.cpu.amx.native;
+        let mut counts = AmxCounts {
+            moves: statistics.amx_moves,
+            operations: statistics.amx_operations,
+            forms: AmxForms::ZERO,
+        };
+        counts.moves[0] += amx.cell.moves;
+        counts.operations[0] += amx.cell.calls;
+        if self.step_timing.is_some() {
+            counts.forms = statistics.amx_forms;
+            counts.forms += amx.forms;
+        }
+        counts
+    }
+
+    /// Under step timing, count a register operation the service completes
+    /// by form, on a host kernel (`path` 0) or the model (1).
+    fn count_amx_form(
+        &mut self,
+        generation: Generation,
+        operation: AmxOperation,
+        operand: u64,
+        path: usize,
+    ) {
+        if self.step_timing.is_some()
+            && let Some(form) = forms::key(operation, operand, generation)
+        {
+            self.statistics.amx_forms.counts[form][path] += 1;
         }
     }
 
@@ -317,17 +410,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
             AmxOperand::Register(_) | AmxOperand::None => 0,
         };
         // Arithmetic a host path covers completes without the model, which
-        // stays its definition and the fallback (`amx::native`).
+        // stays its definition and the fallback (`amx::native`), unless
+        // the operation is left to the model (`--amx-native off`).
         if !operation.accesses_memory()
+            && self.amx_native(operation)
             && let Some(registers) = self.cpu.amx.registers.as_deref_mut()
             && Native::select(self.target).execute(generation, registers, operation, operand)
         {
+            self.statistics.amx_operations[1] += 1;
+            self.count_amx_form(generation, operation, operand, 0);
             return self.next();
         }
         if stela_compiler::x86_64::amx_transfer::lowers(operation) {
             self.statistics.amx_moves[1] += 1;
         } else if stela_compiler::x86_64::amx_routine::calls(operation) {
             self.statistics.amx_operations[1] += 1;
+            self.count_amx_form(generation, operation, operand, 1);
         }
         let mut registers = self.cpu.amx.registers.take().expect("live above");
         let mut memory = Translate {

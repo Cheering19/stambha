@@ -1637,6 +1637,8 @@ pub(super) struct Heartbeat {
     /// [`HOT_TOTAL_BEATS`] stretch, for its `PES EXIT PATH` line
     /// (`exit_path_report`).
     pub(super) exit_paths: step_timing::ExitPaths,
+    /// Every PE's AMX counts at the last `PES AMX` line (`amx_profile`).
+    pub(super) amx: stela_engine::machine::engine::AmxCounts,
 }
 
 /// The heartbeat's reports after its first part ([`Heartbeat::beat`]), in
@@ -1710,6 +1712,7 @@ impl Heartbeat {
             pc_total: Default::default(),
             system_total: BTreeMap::new(),
             exit_paths: step_timing::ExitPaths::default(),
+            amx: Default::default(),
         }
     }
 
@@ -2052,6 +2055,12 @@ impl Heartbeat {
                 transfer_times_report(machine, tsc_hz);
                 aic_counts_report(machine);
                 write_times_report(machine, tsc_hz);
+                super::amx_profile::report(
+                    machine,
+                    &mut self.amx,
+                    self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    tsc_hz,
+                );
                 true
             }
             _ => {
