@@ -275,11 +275,16 @@ const LOADER_MARGIN: u64 = 16 << 20;
 /// the old file and still leaves room for another copy of the loader and
 /// [`LOADER_MARGIN`] once the new loader is in place, as the next update
 /// needs; else [`boot_log::LOG_BYTES`] for a new file or one shorter than
-/// any log (which no boot writes), and `None` to leave the file as it is.
+/// any log (which no boot writes). A file that as it is would leave the
+/// next update no room for its copy of a loader this long, as a 32 MiB log
+/// beside a loader of 84 MiB or more does, gets the longest of 16 MiB,
+/// 8 MiB and [`boot_log::LOG_BYTES`] shorter than it that does. `None`
+/// leaves the file as it is.
 pub(crate) fn boot_log_bytes(current: u64, free: u64, loader: u64, installed: u64) -> Option<u64> {
     let fits = |bytes: u64| {
         let left = free
-            .checked_sub(bytes - current)
+            .saturating_add(current)
+            .checked_sub(bytes)
             .and_then(|left| left.checked_sub(loader.saturating_sub(installed)));
         free >= bytes && left.is_some_and(|left| left >= loader.saturating_add(LOADER_MARGIN))
     };
@@ -289,6 +294,9 @@ pub(crate) fn boot_log_bytes(current: u64, free: u64, loader: u64, installed: u6
     match longest {
         Some(bytes) => Some(bytes),
         None if current < boot_log::LOG_BYTES => Some(boot_log::LOG_BYTES),
+        None if !fits(current) => [16 << 20, 8 << 20, boot_log::LOG_BYTES]
+            .into_iter()
+            .find(|&bytes| bytes < current && fits(bytes)),
         None => None,
     }
 }
@@ -317,6 +325,10 @@ pub(crate) enum LogFile {
     Made(u64),
     /// Made longer with every line and boot it held.
     Grown { from: u64, to: u64 },
+    /// Made shorter, its newest lines and its newest boots' records kept, so
+    /// that the EFI partition keeps room for the next update's copy of the
+    /// loader ([`boot_log_bytes`]).
+    Shrunk { from: u64, to: u64 },
     /// Left this long: the EFI partition lacks the room for a longer one.
     NoRoom(u64),
     /// Left this long: the EFI partition's free room could not be read.
@@ -350,6 +362,12 @@ impl LogFile {
                 size(*from),
                 short(*to)
             ),
+            Self::Shrunk { from, to } => format!(
+                "made shorter, {} from {}, with its newest lines and its last boots, so the EFI \
+                 partition keeps room for the next update",
+                size(*to),
+                size(*from)
+            ),
             Self::NoRoom(bytes) => format!(
                 "stays {}: the EFI partition has no room for a longer one",
                 size(*bytes)
@@ -366,7 +384,7 @@ impl LogFile {
                 format!("none: the stick refused the file ({error})")
             }
             Self::Failed { bytes, error } => format!(
-                "stays {} as it was: the stick refused the longer file ({error})",
+                "stays {} as it was: the stick refused the new file ({error})",
                 size(*bytes)
             ),
         })
@@ -374,7 +392,9 @@ impl LogFile {
 }
 
 /// Make the USB's log file, or make a shorter one longer with its lines
-/// ([`boot_log::relayout`]), as long as [`boot_log_bytes`] allows for a
+/// ([`boot_log::relayout`]), or one too long for the next update's copy of
+/// the loader shorter with its newest lines and boots, as long as
+/// [`boot_log_bytes`] allows for a
 /// `loader`-byte loader on the EFI partition `host` says is at `esp`. A
 /// file whose header does not decode keeps its bytes for `stela log` to
 /// read raw; a blank one, or one shorter than any log, is made anew. A
@@ -432,6 +452,10 @@ fn keep_boot_log_in(esp: &Path, loader: u64, free: Option<u64>) -> LogFile {
     };
     match write_atomic(&path, &new, current == 0) {
         Ok(()) if made => LogFile::Made(bytes),
+        Ok(()) if bytes < current => LogFile::Shrunk {
+            from: current,
+            to: bytes,
+        },
         Ok(()) => LogFile::Grown {
             from: current,
             to: bytes,
@@ -513,6 +537,163 @@ mod tests {
             boot_log_bytes(boot_log::FILE_BYTES, 1 << 40, 68_400_128, 68_400_128),
             None
         );
+    }
+
+    /// This tester build's loader, 87,715,840 bytes, and the NVIDIA one's.
+    const LARGE_LOADER: u64 = 87_715_840;
+    const NVIDIA_LOADER: u64 = 53_975_552;
+
+    /// A 32 MiB log beside a loader too long for two copies of it and the
+    /// log is made shorter, to the longest that keeps the next update's
+    /// copy; one that leaves room, or a loader that needs none, keeps it.
+    #[test]
+    fn a_log_too_long_for_the_next_updates_loader_is_made_shorter() {
+        let partition = 199 * MIB;
+        // An NVIDIA stick's 32 MiB log, updated to the larger loader: the
+        // update itself fits, the next would not.
+        let free = partition - NVIDIA_LOADER - boot_log::FILE_BYTES;
+        assert!(free >= LARGE_LOADER);
+        assert!(partition - LARGE_LOADER - boot_log::FILE_BYTES < LARGE_LOADER);
+        assert_eq!(
+            boot_log_bytes(boot_log::FILE_BYTES, free, LARGE_LOADER, NVIDIA_LOADER),
+            Some(8 * MIB)
+        );
+        // Then the next update of that loader keeps the 8 MiB log, and has
+        // room for its copy.
+        let free = partition - LARGE_LOADER - 8 * MIB;
+        assert!(free >= LARGE_LOADER + LOADER_MARGIN);
+        assert_eq!(
+            boot_log_bytes(8 * MIB, free, LARGE_LOADER, LARGE_LOADER),
+            None
+        );
+        // The NVIDIA loader beside the same log needs no change.
+        let free = partition - NVIDIA_LOADER - boot_log::FILE_BYTES;
+        assert_eq!(
+            boot_log_bytes(boot_log::FILE_BYTES, free, NVIDIA_LOADER, NVIDIA_LOADER),
+            None
+        );
+        // A little more room keeps a 16 MiB log; too little room
+        // for any shorter log leaves it.
+        assert_eq!(
+            boot_log_bytes(boot_log::FILE_BYTES, 90 * MIB, LARGE_LOADER, LARGE_LOADER),
+            Some(16 * MIB)
+        );
+        assert_eq!(
+            boot_log_bytes(boot_log::FILE_BYTES, 40 * MIB, LARGE_LOADER, LARGE_LOADER),
+            None
+        );
+    }
+
+    /// An update over a stick with a 32 MiB log of twenty boots, in a folder
+    /// for the EFI partition: the log is made 8 MiB with its newest lines
+    /// and its newest boots' records, the loader goes in, and the next
+    /// update keeps the log and has room for its copy of the loader.
+    #[test]
+    fn an_update_over_a_32_mib_log_keeps_its_newest_boots_and_room_for_the_next() {
+        use stela_runtime::pc::boot_log::read;
+        let temp = tempfile::tempdir().unwrap();
+        let esp = temp.path();
+        let path = esp.join(BOOT_LOG);
+        let partition = 199 * MIB;
+        // The NVIDIA stick: its loader (as long, never written out) and its
+        // 32 MiB log.
+        fs::create_dir_all(esp.join(LOADER_DIRECTORY)).unwrap();
+        fs::create_dir_all(esp.join(MOUNT)).unwrap();
+        fs::File::create(esp.join(LOADER))
+            .unwrap()
+            .set_len(NVIDIA_LOADER)
+            .unwrap();
+        let old = crate::boot_log::tests::written_in(
+            boot_log::FILE_BYTES,
+            &crate::boot_log::tests::boot_lines(1, 20, 12_000),
+        );
+        fs::write(&path, &old).unwrap();
+        let before = read(&old).unwrap();
+        assert_eq!(before.boots, 20);
+        let free = partition - NVIDIA_LOADER - boot_log::FILE_BYTES;
+        let log = keep_boot_log_in(esp, LARGE_LOADER, Some(free));
+        assert_eq!(
+            log,
+            LogFile::Shrunk {
+                from: boot_log::FILE_BYTES,
+                to: 8 * MIB
+            }
+        );
+        assert!(
+            log.said()
+                .unwrap()
+                .starts_with("made shorter, 8.4 MB from 33.6 MB")
+        );
+        let short = fs::read(&path).unwrap();
+        assert_eq!(short.len() as u64, 8 * MIB);
+        let after = read(&short).unwrap();
+        // The boots are counted on, the newest lines are kept as they were,
+        // and every boot the old log kept a record of that the new one has
+        // room for, the newest, keeps its record.
+        assert_eq!(after.boots, before.boots);
+        assert!(before.stream.ends_with(&after.stream));
+        assert!(after.stream.len() < before.stream.len());
+        assert!(after.stream.ends_with(b"boot 20 line 011999\n"));
+        assert_eq!((before.starts.len(), after.starts.len()), (16, 8));
+        let kept: Vec<u64> = after.starts.iter().map(|start| start.boot).collect();
+        let newest: Vec<u64> = before
+            .starts
+            .iter()
+            .map(|start| start.boot)
+            .rev()
+            .take(kept.len())
+            .rev()
+            .collect();
+        assert!(!kept.is_empty());
+        assert_eq!(kept, newest);
+        // The loader goes in over the old one.
+        let image = {
+            let mut image = b"MZ".to_vec();
+            image.extend_from_slice(&mount_interface::marker(mount_interface::CURRENT));
+            image
+        };
+        add_mount(esp, &image, None, None).unwrap();
+        assert_eq!(fs::read(esp.join(LOADER)).unwrap(), image);
+        // The next update of a loader as long: the log stays, and the
+        // partition holds that update's copy of the loader.
+        fs::File::create(esp.join(LOADER))
+            .unwrap()
+            .set_len(LARGE_LOADER)
+            .unwrap();
+        let free = partition - LARGE_LOADER - 8 * MIB;
+        assert!(free >= LARGE_LOADER);
+        assert_eq!(
+            keep_boot_log_in(esp, LARGE_LOADER, Some(free)),
+            LogFile::NoRoom(8 * MIB)
+        );
+        assert_eq!(fs::read(&path).unwrap(), short);
+    }
+
+    /// A stick that refuses the shorter file keeps the long log as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_shorter_log_file_the_stick_refuses_leaves_the_long_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join(MOUNT);
+        fs::create_dir_all(&folder).unwrap();
+        let path = temp.path().join(BOOT_LOG);
+        let four = crate::boot_log::tests::region(&["boot 1\n", "boot 2\n"]);
+        let old = boot_log::relayout(&four, boot_log::FILE_BYTES).unwrap();
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+        if tempfile::NamedTempFile::new_in(&folder).is_ok() {
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let free = 199 * MIB - NVIDIA_LOADER - boot_log::FILE_BYTES;
+        let log = keep_boot_log_in(temp.path(), LARGE_LOADER, Some(free));
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(log, LogFile::Failed { bytes, .. } if bytes == boot_log::FILE_BYTES),
+            "{log:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), old);
     }
 
     #[test]
@@ -609,7 +790,7 @@ mod tests {
         );
         let said = log.said().unwrap();
         assert!(
-            said.starts_with("stays 4.2 MB as it was: the stick refused the longer file ("),
+            said.starts_with("stays 4.2 MB as it was: the stick refused the new file ("),
             "{said}"
         );
         assert!(!said.contains("EFI/stela"), "{said}");
@@ -643,6 +824,15 @@ mod tests {
     fn what_happened_to_the_log_is_said_in_plain_words() {
         let said = |log: LogFile| log.said();
         assert_eq!(said(LogFile::Kept), None);
+        assert_eq!(
+            said(LogFile::Shrunk {
+                from: boot_log::FILE_BYTES,
+                to: 8 << 20
+            })
+            .unwrap(),
+            "made shorter, 8.4 MB from 33.6 MB, with its newest lines and its last boots, so \
+             the EFI partition keeps room for the next update"
+        );
         assert_eq!(
             said(LogFile::Made(boot_log::FILE_BYTES)).unwrap(),
             "made (33.6 MB)"
