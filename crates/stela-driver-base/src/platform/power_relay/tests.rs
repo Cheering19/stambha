@@ -72,6 +72,7 @@ fn a_turn_refreshes_every_30_s_passes_a_newer_reading_once_and_flushes_when_due(
             reading: None,
             flush: false,
             expired: false,
+            keys: false,
         }
     );
     assert!(!relay.turn(1_000 + REFRESH_MILLIS - 1).refresh);
@@ -170,6 +171,17 @@ fn a_failed_or_slow_reading_doubles_the_period_up_to_5_minutes_and_says_so_once(
         waiting.polled(true, 1).period_ms,
         2 * WAITING_REFRESH_MILLIS
     );
+}
+
+#[test]
+fn an_attached_relay_drains_the_smcs_requests_every_2_s() {
+    let relay = Relay::new();
+    relay.wait(0);
+    assert!(!relay.turn(0).keys);
+    relay.attached();
+    assert!(relay.turn(100).keys);
+    assert!(!relay.turn(100 + KEYS_MILLIS - 1).keys);
+    assert!(relay.turn(100 + KEYS_MILLIS).keys);
 }
 
 #[test]

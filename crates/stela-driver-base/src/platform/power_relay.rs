@@ -140,7 +140,12 @@ pub struct Turn {
     /// The guest waited [`WAIT_MILLIS`] for a complete reading in vain: no
     /// host battery goes to it now.
     pub expired: bool,
+    /// Take the keys the SMC says macOS asked for, every [`KEYS_MILLIS`]
+    /// once it has the battery.
+    pub keys: bool,
 }
+
+pub const KEYS_MILLIS: u64 = 2_000;
 
 /// Readings from the host's firmware to the guest's SMC.
 pub struct Relay {
@@ -164,6 +169,8 @@ pub struct Relay {
     failing: AtomicBool,
     /// A slow timed reading was said.
     slow_said: AtomicBool,
+    /// When the SMC's requests were last taken; [`NEVER`] before the first.
+    drained: AtomicU64,
 }
 
 const NEVER: u64 = u64::MAX;
@@ -184,6 +191,7 @@ impl Relay {
             period: AtomicU64::new(0),
             failing: AtomicBool::new(false),
             slow_said: AtomicBool::new(false),
+            drained: AtomicU64::new(NEVER),
         }
     }
 
@@ -234,6 +242,7 @@ impl Relay {
                 reading: None,
                 flush: false,
                 expired: true,
+                keys: false,
             };
         }
         let period = self.period.load(Ordering::Relaxed).max(self.base_period());
@@ -249,6 +258,14 @@ impl Relay {
             reading,
             flush: reading.is_none() && due != 0 && now_ms >= due,
             expired: false,
+            keys: self.mode() == Mode::Attached && {
+                let drained = self.drained.load(Ordering::Relaxed);
+                let due = drained == NEVER || now_ms.wrapping_sub(drained) >= KEYS_MILLIS;
+                if due {
+                    self.drained.store(now_ms, Ordering::Relaxed);
+                }
+                due
+            },
         }
     }
 

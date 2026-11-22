@@ -443,6 +443,12 @@ impl AppleDevices {
         Ok(self.smc()?.power(snapshot, now_ms))
     }
 
+    /// The next distinct missing key or write macOS asked of an SMC given
+    /// the host's battery, for the log.
+    pub fn take_smc_key_request(&mut self) -> Option<smc::KeyRequest> {
+        self.smc().ok()?.take_key_request()
+    }
+
     /// Send the battery notifications due at `now_ms`; when the next is.
     pub fn power_due(&mut self, now_ms: u64) -> Result<Option<u64>> {
         Ok(self.smc()?.power_due(now_ms))

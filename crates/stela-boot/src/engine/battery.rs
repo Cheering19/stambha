@@ -186,6 +186,18 @@ pub(super) fn serve(devices: &parallel::Board) {
         }
         return;
     }
+    if turn.keys {
+        // Without waiting for a PE that holds the devices: the next drain
+        // takes what this one could not.
+        let requests = devices
+            .try_with(|devices| {
+                core::iter::from_fn(|| devices.take_smc_key_request()).collect::<alloc::vec::Vec<_>>()
+            })
+            .unwrap_or_default();
+        for request in requests {
+            output::arguments(format_args!("POWER battery: macOS {request}\n"));
+        }
+    }
     if turn.reading.is_none() && !turn.flush {
         return;
     }

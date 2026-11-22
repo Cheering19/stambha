@@ -175,7 +175,7 @@ use stela_soc_data::smc::RtcKeyProfile;
 use super::asc::TransitionRequest;
 use super::rtkit::Endpoint;
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
     vec,
     vec::Vec,
@@ -279,6 +279,61 @@ pub struct WriteLog {
     pub reply: Result<u64>,
     /// Older observations lost to the bounded queue before this entry.
     pub dropped_before: usize,
+}
+
+/// What macOS asked of an SMC given a battery that the log says once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// A read of a key the SMC does not have.
+    Read,
+    /// GET_KEY_INFO of a key it does not have.
+    Information,
+    /// A write.
+    Write,
+    /// More than [`REQUEST_LIMIT`] were asked; the rest are not kept.
+    More,
+}
+
+/// One request [`Asked`] about: the key, the size asked, and the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRequest {
+    pub asked: Asked,
+    pub key: u32,
+    pub size: u8,
+    pub result: u8,
+}
+
+/// The distinct requests one SMC keeps.
+pub const REQUEST_LIMIT: usize = 256;
+
+impl core::fmt::Display for KeyRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = self.key.to_be_bytes().map(|byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte
+            } else {
+                b'?'
+            }
+        });
+        let name = core::str::from_utf8(&name).unwrap_or("????");
+        let bytes = if self.size == 1 { "byte" } else { "bytes" };
+        match self.asked {
+            Asked::Read => write!(f, "read SMC key {name} ({} {bytes}): ", self.size)?,
+            Asked::Information => write!(f, "asked for SMC key {name}'s information: ")?,
+            Asked::Write => write!(f, "wrote SMC key {name} ({} {bytes}): ", self.size)?,
+            Asked::More => return f.write_str("asked for more SMC keys than are said"),
+        }
+        let result = match self.result {
+            SUCCESS => return f.write_str("success"),
+            KEY_NOT_FOUND => "not found",
+            NOT_READABLE => "not readable",
+            NOT_WRITABLE => "not writable",
+            SIZE_MISMATCH => "size mismatch",
+            BAD_ARGUMENT => "bad argument",
+            _ => "error",
+        };
+        write!(f, "{result} ({:#04x})", self.result)
+    }
 }
 
 /// The 32-bit form of a four-character key or type code.
@@ -431,6 +486,11 @@ pub struct Smc {
     /// The AP read the key count or a key by its index: the table it
     /// caches (`_smcInitKeyTableCache`) is this one.
     table_read: bool,
+    /// With a battery: the requests the log was given ([`Self::ask`]),
+    /// those it has not taken yet, and whether the limit was reached.
+    asked: BTreeSet<(u8, u32, u8, u8)>,
+    requests: VecDeque<KeyRequest>,
+    asked_full: bool,
 }
 
 impl Smc {
@@ -473,6 +533,9 @@ impl Smc {
             dropped_writes: 0,
             battery: None,
             table_read: false,
+            asked: BTreeSet::new(),
+            requests: VecDeque::new(),
+            asked_full: false,
         })
     }
 
@@ -646,6 +709,41 @@ impl Smc {
     #[cfg(test)]
     pub fn notice(&self) -> Option<u32> {
         self.notice
+    }
+
+    /// The next distinct missing key or write macOS asked of an SMC given a
+    /// battery, for the log; none without a battery.
+    pub fn take_key_request(&mut self) -> Option<KeyRequest> {
+        self.requests.pop_front()
+    }
+
+    /// Keep `request` for the log, once each: a missing key once per kind,
+    /// a write once per key, size and result, and no more than
+    /// [`REQUEST_LIMIT`] of them, the last one saying so.
+    fn ask(&mut self, request: KeyRequest) {
+        if self.battery.is_none() || self.asked_full {
+            return;
+        }
+        let distinct = match request.asked {
+            Asked::Read => (0, request.key, 0, 0),
+            Asked::Information => (1, request.key, 0, 0),
+            Asked::Write | Asked::More => (2, request.key, request.size, request.result),
+        };
+        if self.asked.contains(&distinct) {
+            return;
+        }
+        if self.asked.len() == REQUEST_LIMIT {
+            self.asked_full = true;
+            self.requests.push_back(KeyRequest {
+                asked: Asked::More,
+                key: 0,
+                size: 0,
+                result: 0,
+            });
+            return;
+        }
+        self.asked.insert(distinct);
+        self.requests.push_back(request);
     }
 
     /// Drains one bounded protocol observation without altering its reply.
@@ -875,6 +973,24 @@ impl Endpoint for Smc {
             };
             Ok(reply)
         })();
+        if let Ok(&reply) = result.as_ref() {
+            let code = reply as u8;
+            let asked = match kind {
+                READ if code == KEY_NOT_FOUND => Some((Asked::Read, size)),
+                KEY_INFO if code == KEY_NOT_FOUND => Some((Asked::Information, 0)),
+                WRITE => Some((Asked::Write, size)),
+                READ_WRITE => Some((Asked::Write, write_size)),
+                _ => None,
+            };
+            if let Some((asked, size)) = asked {
+                self.ask(KeyRequest {
+                    asked,
+                    key: name,
+                    size: size as u8,
+                    result: code,
+                });
+            }
+        }
         if matches!(kind, WRITE | READ_WRITE) {
             if self.write_log.len() == WRITE_LOG_LIMIT {
                 self.write_log.pop_front();

@@ -189,6 +189,8 @@ fn an_smc_given_no_battery_answers_as_the_mac_minis_whatever_the_host_reads() {
             );
         }
     }
+    // Nor is any request kept for the log.
+    assert_eq!(smc.take_key_request(), None);
     // Host readings reach an SMC with no battery as nothing at all.
     enable_notifications(&mut smc, &sram);
     enable_notifications(&mut fresh, &fresh_sram);
@@ -492,6 +494,87 @@ fn the_first_reading_after_attach_that_lost_every_value_keeps_the_attached_ones(
         (b"CHCE", vec![0]),
     ] {
         assert_eq!(read(&mut smc, &sram, name), value);
+    }
+}
+
+#[test]
+fn with_a_battery_each_distinct_missing_key_and_write_macos_makes_is_kept_once() {
+    let (mut smc, sram) = with_battery();
+    let asked = |asked, name: &[u8; 4], size, result| KeyRequest {
+        asked,
+        key: code(name),
+        size,
+        result,
+    };
+    // Missing keys read or asked about, once per key and kind.
+    assert_eq!(result(&mut smc, READ, 8, b"BFS0"), KEY_NOT_FOUND);
+    assert_eq!(result(&mut smc, READ, 2, b"BFS0"), KEY_NOT_FOUND);
+    assert_eq!(result(&mut smc, KEY_INFO, 0, b"BFS0"), KEY_NOT_FOUND);
+    // A key there is no question.
+    read(&mut smc, &sram, b"B0UC");
+    // Writes, once per key, size and result.
+    sram.put(&[1]);
+    assert_eq!(result(&mut smc, WRITE, 1, b"CH0C"), SUCCESS);
+    assert_eq!(result(&mut smc, WRITE, 1, b"CH0C"), SUCCESS);
+    assert_eq!(result(&mut smc, WRITE, 1, b"CHTE"), SIZE_MISMATCH);
+    assert_eq!(result(&mut smc, WRITE, 1, b"B0UC"), NOT_WRITABLE);
+    let requests: Vec<_> = core::iter::from_fn(|| smc.take_key_request()).collect();
+    assert_eq!(
+        requests,
+        [
+            asked(Asked::Read, b"BFS0", 8, KEY_NOT_FOUND),
+            asked(Asked::Information, b"BFS0", 0, KEY_NOT_FOUND),
+            asked(Asked::Write, b"CH0C", 1, SUCCESS),
+            asked(Asked::Write, b"CHTE", 1, SIZE_MISMATCH),
+            asked(Asked::Write, b"B0UC", 1, NOT_WRITABLE),
+        ]
+    );
+    assert_eq!(
+        requests.map_to_strings(),
+        [
+            "read SMC key BFS0 (8 bytes): not found (0x84)",
+            "asked for SMC key BFS0's information: not found (0x84)",
+            "wrote SMC key CH0C (1 byte): success",
+            "wrote SMC key CHTE (1 byte): size mismatch (0x87)",
+            "wrote SMC key B0UC (1 byte): not writable (0x86)",
+        ]
+    );
+    // A key's bytes outside printable ASCII are shown as '?'.
+    assert_eq!(
+        result(&mut smc, READ, 1, &[b'k', 0, 0xff, b'Z']),
+        KEY_NOT_FOUND
+    );
+    assert_eq!(
+        smc.take_key_request().unwrap().to_string(),
+        "read SMC key k??Z (1 byte): not found (0x84)"
+    );
+}
+
+#[test]
+fn the_requests_kept_are_bounded_and_the_bound_is_said() {
+    let (mut smc, _) = with_battery();
+    for number in 0..(REQUEST_LIMIT as u32 + 40) {
+        let name = (0x5a00_0000 | number).to_be_bytes();
+        assert_eq!(result(&mut smc, READ, 1, &name), KEY_NOT_FOUND);
+    }
+    let requests: Vec<_> = core::iter::from_fn(|| smc.take_key_request()).collect();
+    assert_eq!(requests.len(), REQUEST_LIMIT + 1);
+    assert_eq!(requests[REQUEST_LIMIT].asked, Asked::More);
+    assert_eq!(
+        requests[REQUEST_LIMIT].to_string(),
+        "asked for more SMC keys than are said"
+    );
+    assert_eq!(smc.take_key_request(), None);
+}
+
+trait Strings {
+    fn map_to_strings(&self) -> Vec<alloc::string::String>;
+}
+
+impl Strings for Vec<KeyRequest> {
+    fn map_to_strings(&self) -> Vec<alloc::string::String> {
+        use alloc::string::ToString;
+        self.iter().map(ToString::to_string).collect()
     }
 }
 
