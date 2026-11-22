@@ -683,7 +683,7 @@ impl Missing {
             lacks.push_str(name);
         }
         refuse!(
-            "this PC's CPU lacks {lacks}; Stela needs an x86-64-v2 CPU (Intel Nehalem, AMD \
+            "this PC's CPU lacks {lacks}; Stambha needs an x86-64-v2 CPU (Intel Nehalem, AMD \
              Bulldozer or newer)",
             lacks = %lacks
         )

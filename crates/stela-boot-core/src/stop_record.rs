@@ -326,7 +326,7 @@ pub fn stop_reason(text: &str) -> Option<&str> {
 /// log took them. A stop that left no screen, as one after the GPU's
 /// reset, is then told at the next start.
 pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
-    let mut notice = String::from("The last start of Stela on this PC stopped");
+    let mut notice = String::from("The last start of Stambha on this PC stopped");
     if let Some(reason) = reason {
         notice.push_str(": ");
         match reason.char_indices().nth(REASON_CHARACTERS) {
@@ -338,8 +338,8 @@ pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
         }
     }
     notice.push_str(if in_log {
-        ". This PC kept its last lines, now in the log on this USB: on any computer with stela, \
-         plug in this USB and run `stela log`, which saves it to log.txt; include that file in a \
+        ". This PC kept its last lines, now in the log on this USB: on any computer with stambha, \
+         plug in this USB and run `stambha log`, which saves it to log.txt; include that file in a \
          report."
     } else {
         ". This PC keeps its last lines, but the log on this USB did not take them; they stay \
@@ -386,15 +386,15 @@ impl FirmwareCall {
             Self::Record => (
                 "to keep this stop's last lines",
                 "this PC keeps no record of the stop; the failure before this line is why \
-                 Stela stopped",
+                 Stambha stopped",
             ),
             Self::BootNext => (
-                "to start Stela again after the restart macOS asked for",
+                "to start Stambha again after the restart macOS asked for",
                 "the PC does not restart by itself",
             ),
         };
         Some(alloc::format!(
-            "{FAULT_WORDS}, which Stela called {purpose} ({exception}): {outcome}"
+            "{FAULT_WORDS}, which Stambha called {purpose} ({exception}): {outcome}"
         ))
     }
 }
@@ -449,11 +449,11 @@ mod tests {
     fn the_carried_notice_says_why_and_where_the_lines_are() {
         let logged = carried_notice(Some("GPU startup exceeded its deadline"), true);
         assert!(logged.starts_with(
-            "The last start of Stela on this PC stopped: GPU startup exceeded its deadline. "
+            "The last start of Stambha on this PC stopped: GPU startup exceeded its deadline. "
         ));
-        assert!(logged.contains("`stela log`"));
+        assert!(logged.contains("`stambha log`"));
         let kept = carried_notice(None, false);
-        assert!(kept.starts_with("The last start of Stela on this PC stopped. "));
+        assert!(kept.starts_with("The last start of Stambha on this PC stopped. "));
         assert!(kept.contains("did not take them"));
         // A long reason is cut on a character, not a byte.
         let long = "é".repeat(REASON_CHARACTERS + 5);

@@ -857,8 +857,8 @@ fn the_stop_names_the_repairs_result_and_advice_the_cli_can_follow() {
             reason.contains(&format!("its boot reported: {reported}")),
             "{reason}"
         );
-        assert!(reason.contains("run stela repair"), "{reason}");
-        assert!(reason.contains("stela log"), "{reason}");
+        assert!(reason.contains("run stambha repair"), "{reason}");
+        assert!(reason.contains("stambha log"), "{reason}");
         // No console takes the manual remedy on a PC without COM1, and no
         // command asks for that boot.
         assert!(!reason.contains("--single-user"), "{reason}");
@@ -867,7 +867,7 @@ fn the_stop_names_the_repairs_result_and_advice_the_cli_can_follow() {
     assert!(silent.contains("left no result"), "{silent}");
     let unread = stop_reason(false, Record::None, false, None);
     assert!(unread.contains("NVRAM was not read"), "{unread}");
-    assert!(!unread.contains("stela repair"), "{unread}");
+    assert!(!unread.contains("stambha repair"), "{unread}");
     let untaken = stop_reason(false, Record::Pending, true, None);
     assert!(untaken.contains("(pending)"), "{untaken}");
     for reason in [silent, unread, untaken] {

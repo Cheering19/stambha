@@ -923,8 +923,8 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
     output::flush_log();
     if output::usb_log_kept() {
         crate::status::info(
-            "Its full log is on this USB: on any computer with stela, plug in this USB and run \
-             `stela log`, which saves it to log.txt.",
+            "Its full log is on this USB: on any computer with stambha, plug in this USB and run \
+             `stambha log`, which saves it to log.txt.",
         );
     }
     crate::status::countdown(action, hold);
@@ -1208,9 +1208,9 @@ fn run_machine<H: Host>(
                 "CLOCK TIMER DELAY {micros}us (--timer-delay-us): a busy PE's timer interrupt \
                  comes at most this long after its last\n"
             )),
-            Err(reason) => output::arguments(format_args!(
-                "CLOCK TIMER DELAY unavailable: {reason}\n"
-            )),
+            Err(reason) => {
+                output::arguments(format_args!("CLOCK TIMER DELAY unavailable: {reason}\n"))
+            }
         }
     }
     machine.set_step_timing(options.profile);
@@ -1479,7 +1479,7 @@ fn finish<H: Host>(
                 // asked for; a panic macOS printed still names it first.
                 Transition::Halt => stop_here(
                     &guest_down(if stela_soc::machine::model_refused(&reset.reason) {
-                        format!("Stela stopped the Mac: {}", reset.reason)
+                        format!("Stambha stopped the Mac: {}", reset.reason)
                     } else {
                         format!("macOS halted the Mac: {}", reset.reason)
                     }),
@@ -1494,14 +1494,14 @@ fn finish<H: Host>(
         Stop::NativeFailure(failure) => {
             output::arguments(format_args!("STOP NATIVE_FAILURE {failure:?}\n"));
             stop_here(
-                "Stela's own code failed while running macOS. This is a Stela bug",
+                "Stambha's own code failed while running macOS. This is a Stambha bug",
                 0x13,
             )
         }
         Stop::Unsupported(requirement) => {
             output::arguments(format_args!("STOP UNSUPPORTED {requirement}\n"));
             stop_here(
-                &format!("macOS needs {requirement}, which Stela does not support yet"),
+                &format!("macOS needs {requirement}, which Stambha does not support yet"),
                 0x13,
             )
         }
@@ -1510,7 +1510,7 @@ fn finish<H: Host>(
                 "STOP canonical read requires its live continuation: {request:?}\n"
             ));
             stop_here(
-                "a device read was left unanswered. This is a Stela bug",
+                "a device read was left unanswered. This is a Stambha bug",
                 0x13,
             )
         }
@@ -1519,13 +1519,13 @@ fn finish<H: Host>(
                 "STOP canonical write requires its live continuation: {request:?}\n"
             ));
             stop_here(
-                "a device write was left unanswered. This is a Stela bug",
+                "a device write was left unanswered. This is a Stambha bug",
                 0x13,
             )
         }
         Stop::Breakpoint(pc) => {
             output::arguments(format_args!("STOP breakpoint pc={pc:#x}\n"));
-            stop_here(&format!("Stela's breakpoint at {pc:#x}"), 0x16)
+            stop_here(&format!("Stambha's breakpoint at {pc:#x}"), 0x16)
         }
     }
 }

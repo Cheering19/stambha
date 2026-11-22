@@ -22,7 +22,7 @@ impl fmt::Display for InsufficientMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "this PC has {} MB of RAM free in firmware; Stela needs at least {} MB to start",
+            "this PC has {} MB of RAM free in firmware; Stambha needs at least {} MB to start",
             self.free / 1_000_000,
             MINIMUM_FREE.div_ceil(1_000_000)
         )
@@ -53,7 +53,7 @@ mod tests {
         );
         assert_eq!(
             InsufficientMemory { free: 200 * MIB }.to_string(),
-            "this PC has 209 MB of RAM free in firmware; Stela needs at least 269 MB to start"
+            "this PC has 209 MB of RAM free in firmware; Stambha needs at least 269 MB to start"
         );
         assert_eq!(bootstrap_heap(256 * MIB), Ok(16 * MIB));
         assert_eq!(bootstrap_heap(1024 * MIB), Ok(64 * MIB));

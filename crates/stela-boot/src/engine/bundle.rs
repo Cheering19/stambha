@@ -171,7 +171,7 @@ fn read_sized(mut file: RegularFile, path: &str, bytes: u64) -> Result<ReadPages
     let count = length.div_ceil(PAGE).max(1);
     let pages = ReadPages {
         start: crate::firmware::any_pages(count)
-            .map_err(|_| refuse!("firmware has no memory for Stela"))?,
+            .map_err(|_| refuse!("firmware has no memory for Stambha"))?,
         count,
         length,
     };

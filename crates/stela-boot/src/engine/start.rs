@@ -753,7 +753,7 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
                 stela_soc::machine::sep_state::owner(&opened.3, ecid)
         {
             output::fatal(
-                "this macOS was installed by a Stela USB with another machine identity (ECID) \
+                "this macOS was installed by a Stambha USB with another machine identity (ECID) \
                  than this USB's, and neither its machine state nor its boot ticket names the \
                  one it was installed as. Start it with the USB that installed it, or run \
                  Install macOS, which replaces it.",
@@ -1635,7 +1635,7 @@ fn open_gpus(
         }
         Err(error) => {
             crate::status::warn(&format!(
-                "the GPU could not be claimed: {error}. This is a Stela bug; the boot log on \
+                "the GPU could not be claimed: {error}. This is a Stambha bug; the boot log on \
                  this USB holds the details"
             ));
             return false;
@@ -2395,7 +2395,7 @@ fn prepare_restore(
         let ecid = boot_ecid.unwrap_or_else(|| {
             output::fatal(
                 "install: the bundle names no machine ECID; on another computer, plug in this \
-                 USB and run `stela repair`",
+                 USB and run `stambha repair`",
             )
         });
         stela_runtime::restore::tss::Signer {
@@ -3141,7 +3141,7 @@ fn disk_writes(handoff: &Handoff) -> stela_runtime::pc::disk_writes::Pending {
     };
     stela_runtime::pc::disk_writes::Pending::decode(encoded).unwrap_or_else(|| {
         output::fatal(
-            "what this start was to write to the PC's disks did not reach Stela's drivers \
+            "what this start was to write to the PC's disks did not reach Stambha's drivers \
              whole; nothing was written. Start again",
         )
     })

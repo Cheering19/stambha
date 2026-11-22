@@ -108,12 +108,12 @@ impl Adapter {
     pub fn unavailable_reason(&self) -> &'static str {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
-            Vendor::Amd => "AMDGPU is not ported to Stela",
+            Vendor::Amd => "AMDGPU is not ported to Stambha",
             Vendor::Intel => {
-                "it needs Linux's i915 driver, which Stela does not have: its xe driver runs \
+                "it needs Linux's i915 driver, which Stambha does not have: its xe driver runs \
                  Tiger Lake and later"
             }
-            Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
+            Vendor::Other(_) => "no Stambha GPU backend for this PCI vendor",
         }
     }
 }

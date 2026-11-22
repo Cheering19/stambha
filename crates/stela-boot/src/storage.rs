@@ -352,15 +352,15 @@ pub const NO_NVIDIA_GPU_NOTICE: &str = "No NVIDIA graphics card found: macOS can
 
 /// Said in the same place on a PC whose NVIDIA cards are all of chips Stela
 /// has no driver for, older or newer than the series it names.
-pub const NO_DRIVEN_NVIDIA_GPU_NOTICE: &str = "The NVIDIA graphics card here is not one Stela \
+pub const NO_DRIVEN_NVIDIA_GPU_NOTICE: &str = "The NVIDIA graphics card here is not one Stambha \
     drives: macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 \
     or 50 series card.";
 
 /// Said in the same place when no NVIDIA card Stela drives answers yet but
 /// a PCI port shows nothing below it: a card the firmware left powered off
 /// there, as on some laptops, answers only after Stela powers the port on.
-pub const NO_NVIDIA_GPU_YET_NOTICE: &str = "No NVIDIA graphics card Stela drives found yet: \
-    a card the PC keeps powered off, as some laptops do, is found only after Stela has started. \
+pub const NO_NVIDIA_GPU_YET_NOTICE: &str = "No NVIDIA graphics card Stambha drives found yet: \
+    a card the PC keeps powered off, as some laptops do, is found only after Stambha has started. \
     macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 \
     series card.";
 

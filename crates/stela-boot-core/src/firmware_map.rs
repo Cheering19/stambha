@@ -129,7 +129,7 @@ impl core::fmt::Display for SealError {
             Self::Capacity { entries, capacity } => write!(
                 f,
                 "the firmware's final memory map has {entries} entries, more than the \
-                 {capacity} Stela keeps"
+                 {capacity} Stambha keeps"
             ),
             Self::Unaligned { index, start } => write!(
                 f,
@@ -276,7 +276,7 @@ mod tests {
         );
         assert_eq!(
             alloc::format!("{error}"),
-            "the firmware's final memory map has 700 entries, more than the 512 Stela keeps"
+            "the firmware's final memory map has 700 entries, more than the 512 Stambha keeps"
         );
     }
 

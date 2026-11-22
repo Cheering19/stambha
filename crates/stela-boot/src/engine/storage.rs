@@ -1115,7 +1115,7 @@ struct Observer {
 }
 
 /// Why a skipped function is not driven, in the boot's account.
-const SKIPPED: &str = "skipped: it did not finish starting on an earlier boot. Run stela repair \
+const SKIPPED: &str = "skipped: it did not finish starting on an earlier boot. Run stambha repair \
                        to try it again";
 
 impl Observer {
@@ -2261,7 +2261,7 @@ pub unsafe fn open(
                 if matches!(which, Optional::Log) {
                     output::log_lost(
                         output::Log::Usb,
-                        format_args!("Stela's drivers did not find its partition: {why}"),
+                        format_args!("Stambha's drivers did not find its partition: {why}"),
                     );
                 }
             }
@@ -2646,7 +2646,7 @@ fn account(
         us => format!("Not usable after {} s: {role}.", us.div_ceil(1_000_000)),
     });
     match boot_disk {
-        Some(at) => lines.push(format!("The firmware started Stela from {at}.")),
+        Some(at) => lines.push(format!("The firmware started Stambha from {at}.")),
         None => lines.push(String::from(
             "Where the firmware found the stick is unknown.",
         )),
