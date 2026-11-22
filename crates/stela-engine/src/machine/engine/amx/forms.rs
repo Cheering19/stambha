@@ -14,16 +14,16 @@
 //! key below [`FORMS`] is one some operand takes.
 //!
 //! The counting is outside generated code: under step timing the engine
-//! gives blocks [`routine`] instead of the compiler's own, which it wraps,
-//! so the code blocks hold is the same either way.
+//! gives blocks [`routine`] instead of the compiler's own, which it wraps
+//! (through `routines::complete`, which leaves the operations
+//! `--amx-native off` names to the model), so the code blocks hold is the
+//! same either way.
+use super::routines::{self, OPERATIONS, ticks};
 use alloc::{format, string::String, vec::Vec};
 use core::{fmt, ops::AddAssign};
 use stela_compiler::{
     amx::{AmxOperation, Generation},
-    x86_64::{
-        amx_routine,
-        amx_transfer::{Cell, KINDS, SAMPLE},
-    },
+    x86_64::amx_transfer::{Cell, SAMPLE},
 };
 
 /// The forms; each key below is one some operand takes.
@@ -246,46 +246,22 @@ impl serde::Serialize for AmxForms {
 
 /// What native code finds through `Anchor::Amx`: the compiler's cell,
 /// which the anchor's address names, then the forms [`routine`] counts
-/// there until the engine folds them into its statistics.
+/// there until the engine folds them into its statistics, and the
+/// register operations the engine's routines leave to the model.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AmxCell {
     pub cell: Cell,
     pub forms: AmxForms,
+    /// Bit n: the register operation numbered n (bits 9:5 of its word)
+    /// runs on the model alone in blocks (`routines::complete`), as the
+    /// engine set it at native entry (`Machine::set_amx_native`).
+    pub model: u32,
 }
 
 const _: () = assert!(core::mem::offset_of!(AmxCell, cell) == 0);
 
-/// The register operation each number (bits 9:5 of a word) names, where
-/// blocks call the routine for it.
-const OPERATIONS: [Option<AmxOperation>; KINDS] = {
-    let mut table = [None; KINDS];
-    let mut index = 0;
-    while index < AmxOperation::ALL.len() {
-        let operation = AmxOperation::ALL[index];
-        let number = operation.encoding().0 as usize;
-        if number < KINDS && amx_routine::calls(operation) {
-            table[number] = Some(operation);
-        }
-        index += 1;
-    }
-    table
-};
-
-/// The time stamp counter, or 0 where there is none.
-fn ticks() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: RDTSC is unprivileged on every host Stela runs on.
-        unsafe { core::arch::x86_64::_rdtsc() }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        0
-    }
-}
-
-/// `amx_routine::routine`, with what it completes counted by form.
+/// `routines::complete`, with what it completes counted by form.
 ///
 /// # Safety
 /// As [`routine`].
@@ -302,14 +278,14 @@ unsafe fn counted(cell: *mut Cell, operation: u32, operand: u64) -> u64 {
         .and_then(|(operation, generation)| key(operation, operand, generation));
     let (Some(key), Some(before)) = (form, before) else {
         // SAFETY: the caller's contract.
-        return unsafe { amx_routine::routine(cell, operation, operand) };
+        return unsafe { routines::complete(cell, operation, operand) };
     };
     let amx_cell = cell.cast::<AmxCell>();
     // SAFETY: the caller's contract: `cell` is an `AmxCell`'s first field.
     let calls = unsafe { (*amx_cell).forms.counts[key] };
     let started = (calls[0] + calls[1]).is_multiple_of(SAMPLE).then(ticks);
     // SAFETY: the caller's contract.
-    let done = unsafe { amx_routine::routine(cell, operation, operand) };
+    let done = unsafe { routines::complete(cell, operation, operand) };
     if done != 0 {
         let ended = started.map(|started| ticks().wrapping_sub(started));
         // The routine counts each operation it completes once, by path: a
@@ -329,7 +305,8 @@ unsafe fn counted(cell: *mut Cell, operation: u32, operand: u64) -> u64 {
 }
 
 /// The routine blocks call under step timing (`Machine::enter_amx_cell`):
-/// `amx_routine::routine`, with each register operation it completes
+/// `amx_routine::routine`, or the model for the operations the cell leaves
+/// to it (`routines::complete`), with each register operation completed
 /// counted by form and path and every [`SAMPLE`]th call of a form timed.
 ///
 /// # Safety

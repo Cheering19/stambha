@@ -160,7 +160,9 @@ fn vecfp_half_rounds_once_at_ties_and_extremes() {
         0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x1400, 0x1001, 0x5bff, 0x2400, 0x0200, 0x6800,
         0xe800, 0x0c00,
     ];
+    let mut ran = 0;
     for paths in harness::tiers().iter().filter(|paths| paths.f16c) {
+        ran += 1;
         for generation in GENERATIONS {
             let mut registers = AmxRegisters::zeroed();
             for (index, &x) in HALVES.iter().enumerate() {
@@ -188,4 +190,5 @@ fn vecfp_half_rounds_once_at_ties_and_extremes() {
             }
         }
     }
+    assert!(ran > 0, "no F16C path ran");
 }

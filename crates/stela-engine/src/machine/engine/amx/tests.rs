@@ -548,32 +548,182 @@ fn profiled_register_operations_count_by_form_and_path() {
     assert_eq!(machine.cpu.amx.native.cell.routine, compiler);
 }
 
-/// With native AMX off (`--amx-native off`) blocks find the model's paths
-/// in their cell and the service runs every register operation on the
-/// model, whatever tier the host has; on again, the host's paths.
+/// Register operations reach no memory.
+struct NoMemory;
+
+impl stela_compiler::amx::model::AmxMemory for NoMemory {
+    fn read(
+        &mut self,
+        _: u64,
+        _: &mut [u8],
+    ) -> Result<(), stela_compiler::amx::model::MemoryFault> {
+        panic!("arithmetic must not read guest memory")
+    }
+    fn write(&mut self, _: u64, _: &[u8]) -> Result<(), stela_compiler::amx::model::MemoryFault> {
+        panic!("arithmetic must not write guest memory")
+    }
+}
+
+/// With native AMX off (`--amx-native off`) blocks find a routine in their
+/// cell that completes every register operation on the model alone, and
+/// the service runs each on the model too, with and without step timing:
+/// copies and constants (bits 29:27 of 3, 5, 6 and 7) of fma32, fma64 and
+/// fma16 included, which every host path, the model tier's too, otherwise
+/// completes itself. On again, the compiler's routine and the host's
+/// paths, which complete those copies natively.
 #[test]
 fn native_amx_off_leaves_every_register_operation_to_the_model() {
+    use super::forms::{self, AmxForms};
+    use stela_compiler::amx::{AmxOperation, AmxRegisters, Generation, model};
+    const FMA64: u32 = 0x0020_1140;
+    const FMA16: u32 = 0x0020_11e0;
+    const VECTOR: u64 = 1 << 63;
     let host = TargetCpu::detect();
     let native = Native::select(host);
+    let compiler = stela_compiler::x86_64::amx_routine::routine as *const () as usize as u64;
+    let modelled = super::routines::routine as *const () as usize as u64;
+    let counting = forms::routine as *const () as usize as u64;
     let mut machine = machine(&[]);
     machine.target = host;
     machine.cpu.state.x[1] = 1 << 63;
     machine.system_instruction(msr(AMX_CTL_EL1, 1)).unwrap();
     machine.amx(SET).unwrap();
+    let mut seed = 0x6a09_e667_f3bc_c908_u64;
+    for byte in machine.cpu.amx.registers.as_mut().unwrap().as_bytes_mut() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *byte = seed as u8;
+    }
     machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.routine, compiler);
     assert_eq!(machine.cpu.amx.native.cell.native, native);
     machine.set_amx_native(false);
-    machine.enter_amx_cell();
-    assert_eq!(machine.cpu.amx.native.cell.native, Native::MODEL);
-    // A matrix fma32 with every lane on, which each host tier covers: the
-    // service counts the operations the model completes.
-    machine.cpu.state.x[3] = 0;
-    machine.amx(FMA32 | 3).unwrap();
-    assert_eq!(machine.statistics.amx_operations, [0, 1]);
+    // Modes 3, 5, 6 and 7, vector and matrix, with lane enables and
+    // offsets, none widening.
+    let operands: Vec<u64> = [3u64, 5, 6, 7]
+        .into_iter()
+        .flat_map(|mode| {
+            [
+                mode << 27 | 5 << 20 | 0x48 << 10 | 0x31,
+                VECTOR | mode << 27 | 9 << 20 | 2 << 46 | 3 << 41 | 0x1c0 << 10 | 0x7,
+                mode << 27 | 4 << 37 | 5 << 32 | 1 << 20,
+            ]
+        })
+        .collect();
+    let operations = [
+        (FMA32, AmxOperation::Fma32),
+        (FMA64, AmxOperation::Fma64),
+        (FMA16, AmxOperation::Fma16),
+    ];
+    for timing in [false, true] {
+        machine.set_step_timing(timing);
+        machine.enter_amx_cell();
+        let amx = machine.cpu.amx.native;
+        assert_eq!(amx.cell.routine, if timing { counting } else { modelled });
+        assert_eq!(amx.cell.native, Native::MODEL);
+        assert_eq!(amx.model, u32::MAX);
+        let service = machine.statistics.amx_operations[1];
+        for (word, operation) in operations {
+            let number = operation.encoding().0;
+            for &operand in &operands {
+                // In a block, through the routine the cell names.
+                let mut expected: AmxRegisters =
+                    (**machine.cpu.amx.registers.as_ref().unwrap()).clone();
+                model::execute_for(
+                    Generation::M2,
+                    &mut expected,
+                    operation,
+                    operand,
+                    &mut NoMemory,
+                )
+                .unwrap();
+                let cell = &raw mut machine.cpu.amx.native.cell;
+                // SAFETY: the cell names the PE's live register file, which
+                // nothing else touches during the call, and is an AmxCell's.
+                let done = unsafe {
+                    if timing {
+                        forms::routine(cell, number, operand)
+                    } else {
+                        super::routines::routine(cell, number, operand)
+                    }
+                };
+                assert_eq!(done, 1);
+                assert!(
+                    **machine.cpu.amx.registers.as_ref().unwrap() == expected,
+                    "{operation:?} operand {operand:#x} in a block"
+                );
+                // Through the service.
+                model::execute_for(
+                    Generation::M2,
+                    &mut expected,
+                    operation,
+                    operand,
+                    &mut NoMemory,
+                )
+                .unwrap();
+                machine.cpu.state.x[3] = operand;
+                machine.amx(word | 3).unwrap();
+                assert!(
+                    **machine.cpu.amx.registers.as_ref().unwrap() == expected,
+                    "{operation:?} operand {operand:#x} in the service"
+                );
+            }
+            let kernels = machine.cpu.amx.native.cell.kernels[number as usize];
+            assert_eq!(kernels, [0, operands.len() as u64], "{operation:?}");
+            if timing {
+                for &operand in &operands {
+                    let form = forms::key(operation, operand, Generation::M2).unwrap();
+                    assert_eq!(machine.cpu.amx.native.forms.counts[form][0], 0);
+                    assert_eq!(machine.statistics.amx_forms.counts[form][0], 0);
+                    assert_ne!(machine.statistics.amx_forms.counts[form][1], 0);
+                }
+            }
+            machine.fold_amx_kernels();
+        }
+        assert_eq!(
+            machine.statistics.amx_operations[1] - service,
+            (operations.len() * operands.len()) as u64,
+            "the service counts what it completes"
+        );
+    }
+    assert_eq!(machine.statistics.amx_kernels[12][0], 0);
+    // On again: the compiler's routine, and a copy completes natively in a
+    // block and in the service, on every host.
+    machine.set_step_timing(false);
     machine.set_amx_native(true);
-    machine.amx(FMA32 | 3).unwrap();
-    let model = u64::from(native == Native::MODEL);
-    assert_eq!(machine.statistics.amx_operations, [0, 1 + model]);
     machine.enter_amx_cell();
-    assert_eq!(machine.cpu.amx.native.cell.native, native);
+    let amx = machine.cpu.amx.native;
+    assert_eq!(
+        (amx.cell.routine, amx.cell.native, amx.model),
+        (compiler, native, 0)
+    );
+    let cell = &raw mut machine.cpu.amx.native.cell;
+    // SAFETY: as above.
+    let done = unsafe { stela_compiler::x86_64::amx_routine::routine(cell, 12, operands[0]) };
+    assert_eq!(done, 1);
+    assert_eq!(machine.cpu.amx.native.cell.kernels[12], [1, 0]);
+    machine.set_step_timing(true);
+    machine.statistics.amx_forms = AmxForms::ZERO;
+    let service = machine.statistics.amx_operations[1];
+    machine.cpu.state.x[3] = operands[0];
+    machine.amx(FMA32 | 3).unwrap();
+    let form = forms::key(AmxOperation::Fma32, operands[0], Generation::M2).unwrap();
+    assert_eq!(machine.statistics.amx_forms.counts[form], [1, 0]);
+    assert_eq!(machine.statistics.amx_operations[1], service + 1);
+}
+
+/// Every PE publishes its AMX counts at each run slice: the forms only
+/// under step timing, which alone counts them.
+#[test]
+fn published_amx_counts_hold_forms_only_under_step_timing() {
+    let mut machine = machine(&[]);
+    machine.statistics.amx_forms.counts[3] = [4, 5];
+    machine.cpu.amx.native.forms.counts[3] = [1, 0];
+    machine.statistics.amx_operations = [7, 2];
+    let counts = machine.amx_counts();
+    assert_eq!(counts.operations, [7, 2]);
+    assert_eq!(counts.forms, super::forms::AmxForms::ZERO);
+    machine.set_step_timing(true);
+    assert_eq!(machine.amx_counts().forms.counts[3], [5, 5]);
 }

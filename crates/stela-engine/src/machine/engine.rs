@@ -1124,9 +1124,11 @@ pub struct Machine<H: Host, D: Devices> {
     clock: alloc::boxed::Box<clock::Clock>,
     /// End waits of every PE by leaping the counter (`clock::Clock::skip_to`).
     idle_skip: bool,
-    /// Whether host kernels complete AMX register operations
-    /// ([`Self::set_amx_native`]); without, the model completes every one.
-    amx_native: bool,
+    /// The AMX register operations the model completes alone, which no
+    /// host kernel then touches, by number (bit n: bits 9:5 of the word
+    /// equal to n): none by default, every one under `--amx-native off`
+    /// ([`Self::set_amx_native`]).
+    amx_model: u32,
     /// The longest the waits of every PE in one `run` last in all, in
     /// host counter ticks, before it returns [`Stop::Waiting`]
     /// (`set_wait_limit`).
@@ -1519,7 +1521,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             idle_poll: 0,
             clock: alloc::boxed::Box::default(),
             idle_skip: false,
-            amx_native: true,
+            amx_model: 0,
             wait_limit: None,
             waited: 0,
             pacm_written: false,

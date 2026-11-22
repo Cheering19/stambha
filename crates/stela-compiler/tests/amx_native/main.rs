@@ -8,7 +8,10 @@
 //! A host that lacks a tier these tests cover fails them, unless
 //! `STELA_AMX_OPTIONAL` names that tier's feature (`fma`, `avx512f` or
 //! `f16c`, comma separated), which leaves its paths out with a note
-//! ([`harness::tiers`]).
+//! ([`harness::tiers`]). So on a host without AVX-512, such as most Intel
+//! client CPUs, run them, or `cargo xtask check`, with
+//! `STELA_AMX_OPTIONAL=avx512f`; the cases that need F16C fail with no F16C
+//! path at all.
 //!
 //! Run: `cargo test -p stela-compiler --test amx_native`; what each form
 //! costs on this host ([`costs`]): `cargo test -p stela-compiler --release

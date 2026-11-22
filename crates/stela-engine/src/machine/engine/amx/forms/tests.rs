@@ -1,6 +1,6 @@
 use super::*;
 use alloc::{collections::BTreeSet, string::ToString};
-use stela_compiler::amx::AmxOperation::*;
+use stela_compiler::{amx::AmxOperation::*, x86_64::amx_routine};
 
 const GENERATIONS: [Generation; 4] = [
     Generation::M1,

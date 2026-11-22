@@ -5,7 +5,10 @@
 //! target directory: the UEFI target's Clippy in [`BOOT_TARGET_DIR`], then
 //! the other shipped hosts' ([`CROSS`]) and a compile for
 //! [`RELEASE_HOST`] in [`CROSS_TARGET_DIR`], and the host's Clippy and test
-//! build in `target`. The tests then run alone.
+//! build in `target`. The tests then run alone. The AMX native tests fail
+//! on a host that lacks a host tier they cover; on one without AVX-512, run
+//! the gate with `STELA_AMX_OPTIONAL=avx512f`
+//! (`crates/stela-compiler/tests/amx_native`).
 //! A lane stops at its first failure; the gate fails if any part did, once
 //! every part has finished.
 //! Low-memory mode runs the same checks in sequence, with one job per build
