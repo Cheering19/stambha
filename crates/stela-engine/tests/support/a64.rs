@@ -5,6 +5,7 @@
 pub const NOP: u32 = 0xd503_201f;
 pub const RET: u32 = 0xd65f_03c0;
 pub const BTI_C: u32 = 0xd503_245f;
+pub const BLR_X16: u32 = 0xd63f_0200;
 pub const ZR: u32 = 31;
 
 /// Condition codes.

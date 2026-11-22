@@ -19,7 +19,7 @@ use std::sync::Arc;
 use stela_compiler::{GuestState, TargetCpu};
 use stela_engine::{
     hle::{Id, Signature},
-    machine::{Machine, NoDevices, Stop, system::Register},
+    machine::{Machine, NoDevices, Stop, exception::Pstate, system::Register},
 };
 use store_host::{Mapping, NativeHost, machine};
 
@@ -57,7 +57,8 @@ pub fn data_base() -> u64 {
 
 /// A guest function a native routine replaces: its words from the start of
 /// the code page, the word it starts at, its exit `ret` (bytes from its
-/// start) and whether X0 holds a result.
+/// start), whether X0 holds a result, and the word of the `blr x16` that
+/// calls it when a call enters it through one, on a guarded page.
 #[derive(Debug, Clone)]
 pub struct StandIn {
     pub id: Id,
@@ -65,12 +66,14 @@ pub struct StandIn {
     pub entry: usize,
     pub exit: u16,
     pub returns: bool,
+    pub caller: Option<usize>,
 }
 
 impl StandIn {
-    /// The function's own bytes, from its entry.
+    /// The function's own bytes, from its entry (its caller's `blr` is not
+    /// one of them).
     pub fn function(&self) -> Vec<u8> {
-        self.words[self.entry..]
+        self.words[self.entry..self.caller.unwrap_or(self.words.len())]
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect()
@@ -83,13 +86,30 @@ impl StandIn {
         StandIn {
             words: placed,
             entry: words,
+            caller: self.caller.map(|caller| caller - self.entry + words),
             ..self.clone()
         }
+    }
+
+    /// The same function called by a `blr x16` after its last word, with
+    /// its code page guarded (FEAT_BTI): the call enters with BTYPE 0b10,
+    /// which only a first word such as `bti c` admits.
+    pub fn through_blr(&self) -> StandIn {
+        assert!(self.caller.is_none(), "one caller");
+        let mut called = self.clone();
+        called.caller = Some(called.words.len());
+        called.words.push(BLR_X16);
+        called
     }
 
     /// Its entry's guest address.
     pub fn pc(&self) -> u64 {
         code_base() + 4 * self.entry as u64
+    }
+
+    /// Where a call of it starts: its caller's `blr`, or its entry.
+    pub fn start(&self) -> u64 {
+        code_base() + 4 * self.caller.unwrap_or(self.entry) as u64
     }
 
     /// The address its caller returns to: the word after its last, where
@@ -207,6 +227,7 @@ pub fn stand_in(id: Id) -> StandIn {
         entry: 0,
         exit,
         returns,
+        caller: None,
     }
 }
 
@@ -421,17 +442,37 @@ fn faulting(rng: &mut Rng, buffers: &[(u64, u64)]) -> (Option<usize>, Option<usi
 /// for each machine, so its address names the machine, not the call).
 pub const VECTOR: u64 = 0x400;
 
-/// What a run ends in: its stop, PC and registers, the instructions it
-/// retired, the data mapping and, for a data abort, ESR, FAR and ELR.
+/// What a run ends in: its stop, PC, registers and PSTATE (BTYPE among
+/// it), the instructions it retired, the data mapping and, for an abort,
+/// ESR, FAR, ELR and SPSR.
 #[derive(Debug, PartialEq)]
 pub struct Outcome {
     pub stop: Stop,
     pub pc: u64,
     pub state: GuestState,
+    pub pstate: Pstate,
     pub retired: u64,
     pub memory: Vec<u8>,
-    pub abort: Option<(u64, u64, u64)>,
+    pub abort: Option<(u64, u64, u64, u64)>,
 }
+
+/// The exception class of an abort's ESR.
+pub fn exception_class(esr: u64) -> u64 {
+    esr >> 26 & 0x3f
+}
+
+/// ESR's class of a Branch Target exception.
+pub const BRANCH_TARGET: u64 = 0x0d;
+
+/// The syndrome registers an abort writes, which each call clears first
+/// so it ends as on a fresh machine: a Branch Target exception, for one,
+/// leaves FAR as it was.
+const ABORT_REGISTERS: [Register; 4] = [
+    Register::ESR_EL1,
+    Register::FAR_EL1,
+    Register::ELR_EL1,
+    Register::SPSR_EL1,
+];
 
 /// A machine with a stand-in in its code page, for one or more calls. A
 /// suite runs its cases on one: a debug build takes about 0.1 s to make a
@@ -448,6 +489,9 @@ impl Session {
             ensure!(code.write(code.0, &[0; BYTES]), "clear the code");
             let mut machine = machine(code, data, &stand_in.words, TargetCpu::detect())?;
             machine.set_regions(false);
+            if stand_in.caller.is_some() {
+                machine.host.guard(code.0, BYTES);
+            }
             Ok(machine)
         })?;
         Ok(Self {
@@ -474,6 +518,11 @@ impl Session {
                 .map_err(|status| anyhow::anyhow!("return from an abort: {status:?}"))?;
         }
         ensure!(self.machine.cpu.pstate.el == 0, "a call starts at EL0");
+        // A new call: the ERET took the aborted call's BTYPE back from SPSR.
+        self.machine.cpu.pstate.btype = 0;
+        for register in ABORT_REGISTERS {
+            self.machine.cpu.registers.set_raw(register, 0, 0);
+        }
         let state = initial(&self.stand_in, case);
         with_mappings(|_, data| -> Result<Outcome> {
             ensure!(data.write(data.0, &case.contents), "write data");
@@ -485,7 +534,7 @@ impl Session {
             }
             let machine = &mut self.machine;
             machine.cpu.state = state;
-            machine.cpu.pc = self.stand_in.pc();
+            machine.cpu.pc = self.stand_in.start();
             let retired = machine.cpu.retired;
             let stop = machine.run(machine.statistics.blocks + RUN_BLOCKS);
             for page in [case.unreadable, case.read_only].into_iter().flatten() {
@@ -493,11 +542,9 @@ impl Session {
             }
             let aborted = stop == Stop::Breakpoint(machine.host.lower_synchronous());
             let abort = aborted.then(|| {
-                (
-                    machine.cpu.registers.get(Register::ESR_EL1, 0),
-                    machine.cpu.registers.get(Register::FAR_EL1, 0),
-                    machine.cpu.registers.get(Register::ELR_EL1, 0),
-                )
+                let [esr, far, elr, spsr] =
+                    ABORT_REGISTERS.map(|register| machine.cpu.registers.get(register, 0));
+                (esr, far, elr, spsr)
             });
             // Each machine maps its test kernel anew: an abort's stop names
             // the vector it took, not where this machine mapped it.
@@ -509,6 +556,7 @@ impl Session {
                 stop,
                 pc,
                 state: machine.cpu.state.clone(),
+                pstate: machine.cpu.pstate,
                 retired: machine.cpu.retired - retired,
                 memory: data.read(data.0, BYTES).expect("readable data"),
                 abort,
@@ -538,8 +586,9 @@ fn read_only(data: &Mapping, page: usize) -> Result<()> {
 }
 
 /// The registers a call starts with: the case's arguments, the return to
-/// the stand-in's end, and the rest drawn from the arguments so both runs
-/// of a case start alike.
+/// the stand-in's end (and X16 at its entry, for a call through `blr x16`,
+/// which sets X30 itself), and the rest drawn from the arguments so both
+/// runs of a case start alike.
 fn initial(stand_in: &StandIn, case: &Case) -> GuestState {
     let mut rng = Rng(
         (case.x[0] ^ case.x[1].rotate_left(21) ^ case.x[2].rotate_left(42))
@@ -561,6 +610,9 @@ fn initial(stand_in: &StandIn, case: &Case) -> GuestState {
         };
     }
     state.x[30] = stand_in.end();
+    if stand_in.caller.is_some() {
+        state.x[16] = stand_in.pc();
+    }
     state
 }
 
@@ -658,15 +710,15 @@ pub fn reference(id: Id, case: &Case) -> Option<(Option<u64>, Vec<u8>)> {
 /// Unless both returned to the caller, they must be equal in full: the
 /// original takes any fault in both. When both returned, they must agree on
 /// what the ABI keeps: the PC, all memory, X19-X29, SP, X30, the low halves
-/// of V8-V15, FPCR and FPSR, X0 where it is a result, and memory as the
-/// reference model leaves it.
+/// of V8-V15, FPCR and FPSR, X0 where it is a result, and PSTATE; and `on`
+/// must leave memory and X0 as the reference model does.
 pub fn agree(stand_in: &StandIn, case: &Case, off: &Outcome, on: &Outcome) -> Result<(), String> {
     let end = Stop::Breakpoint(stand_in.end());
     if off.stop != end || on.stop != end {
         return match off == on {
             true => Ok(()),
             false => Err(format!(
-                "outcomes differ: off {:?} pc {:#x} abort {:?}, on {:?} pc {:#x} abort {:?}",
+                "outcomes differ: off {:?} pc {:#x} abort {:x?}, on {:?} pc {:#x} abort {:x?}",
                 off.stop, off.pc, off.abort, on.stop, on.pc, on.abort
             )),
         };
@@ -685,13 +737,19 @@ pub fn agree(stand_in: &StandIn, case: &Case, off: &Outcome, on: &Outcome) -> Re
         ("fpcr", a.fpcr == b.fpcr),
         ("fpsr", a.fpsr == b.fpsr),
         ("x0", !stand_in.returns || a.x[0] == b.x[0]),
+        ("pstate", off.pstate == on.pstate),
     ];
     if let Some((name, _)) = kept.iter().find(|(_, equal)| !equal) {
         return Err(format!("{name} differs"));
     }
     match reference(stand_in.id, case) {
-        Some((_, memory)) if memory == on.memory => Ok(()),
-        Some(_) => Err("memory differs from the reference model".into()),
         None => Err("returned where the reference model faults".into()),
+        Some((_, memory)) if memory != on.memory => {
+            Err("memory differs from the reference model".into())
+        }
+        Some((x0, _)) if stand_in.returns && x0 != Some(b.x[0]) => {
+            Err("x0 differs from the reference model".into())
+        }
+        Some(_) => Ok(()),
     }
 }

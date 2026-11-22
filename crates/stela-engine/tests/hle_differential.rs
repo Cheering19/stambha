@@ -146,7 +146,7 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         "caller-saved"
     );
     type Change = fn(&mut Outcome);
-    let changes: [(&str, Change); 7] = [
+    let changes: [(&str, Change); 8] = [
         ("x19", |on| on.state.x[19] ^= 1),
         ("x29", |on| on.state.x[29] ^= 1),
         ("sp", |on| on.state.sp ^= 16),
@@ -154,11 +154,22 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         ("v8", |on| on.state.v[8][0] ^= 1),
         ("x0", |on| on.state.x[0] ^= 1),
         ("memory", |on| on.memory[0] ^= 1),
+        ("btype", |on| on.pstate.btype = 0b10),
     ];
     for (name, change) in changes {
         let mut on = run(&stand_in, returning)?;
         change(&mut on);
         assert!(agree(&stand_in, returning, &off, &on).is_err(), "{name}");
+    }
+    // Both runs alike, X0 and memory against the model.
+    for (name, change) in [changes[5], changes[6]] {
+        let (mut off, mut on) = (run(&stand_in, returning)?, run(&stand_in, returning)?);
+        change(&mut off);
+        change(&mut on);
+        assert!(
+            agree(&stand_in, returning, &off, &on).is_err(),
+            "{name} against the model"
+        );
     }
     let faulting = all
         .iter()
@@ -172,6 +183,55 @@ fn agree_refuses_a_changed_result() -> Result<()> {
         agree(&stand_in, faulting, &off, &on).is_err(),
         "a fault in full"
     );
+    let mut on = run(&stand_in, faulting)?;
+    let spsr = &mut on.abort.as_mut().expect("an abort").3;
+    *spsr ^= 0b10 << 10;
+    assert!(
+        agree(&stand_in, faulting, &off, &on).is_err(),
+        "an abort's SPSR (BTYPE)"
+    );
+    Ok(())
+}
+
+/// A call through `blr x16` into a guarded page enters with BTYPE 0b10:
+/// memset's `bti c` admits it and the call runs as the model says; every
+/// other stand-in's first word takes a Branch Target exception at its entry,
+/// with BTYPE saved in SPSR and memory untouched.
+#[test]
+fn a_call_through_blr_on_a_guarded_page_lands_as_its_first_word_admits() -> Result<()> {
+    for id in STAND_INS {
+        let called = stand_in(id).through_blr();
+        let mut session = Session::new(&called)?;
+        let (mut returned, mut refused) = (0, 0);
+        for case in cases(id, 0x0b71 + id.bit() as u64, 64) {
+            let outcome = session.run(&case)?;
+            if id == Id::Memset {
+                match reference(id, &case) {
+                    Some((x0, memory)) => {
+                        assert_eq!(
+                            outcome.stop,
+                            Stop::Breakpoint(called.end()),
+                            "{}",
+                            named(&case)
+                        );
+                        assert_eq!(Some(outcome.state.x[0]), x0, "{}", named(&case));
+                        assert!(outcome.memory == memory, "{}", named(&case));
+                        assert_eq!(outcome.pstate.btype, 0);
+                        returned += 1;
+                    }
+                    None => assert!(outcome.abort.is_some(), "{}", named(&case)),
+                }
+                continue;
+            }
+            let (esr, _, elr, spsr) = outcome.abort.expect("a Branch Target exception");
+            assert_eq!(exception_class(esr), BRANCH_TARGET, "{id:?} {esr:#x}");
+            assert_eq!(esr & 3, 0b10, "{id:?}: ESR's BTYPE");
+            assert_eq!((elr, spsr >> 10 & 3), (called.pc(), 0b10), "{id:?}");
+            assert!(outcome.memory == case.contents, "{id:?}");
+            refused += 1;
+        }
+        assert!(returned + refused > 32, "{id:?}");
+    }
     Ok(())
 }
 
@@ -195,25 +255,32 @@ fn a_wrong_stand_in_disagrees_with_the_reference_model() -> Result<()> {
 }
 
 /// The harness's own check: a session's calls, after returns and aborts
-/// alike, end as each would on a machine of its own.
+/// alike, end as each would on a machine of its own, entered directly or
+/// through `blr x16` on a guarded page (where a Branch Target exception
+/// leaves FAR as it was, and its ERET brings BTYPE back).
 #[test]
 fn a_reused_session_runs_as_a_fresh_machine() -> Result<()> {
-    for id in [Id::Memmove, Id::Strlen, Id::Touch] {
-        let stand_in = stand_in(id);
-        let mut session = Session::new(&stand_in)?;
+    let direct = [Id::Memmove, Id::Strlen, Id::Touch].map(stand_in);
+    let called = [Id::Memset, Id::Touch].map(|id| stand_in(id).through_blr());
+    for stand_in in direct.iter().chain(&called) {
+        let id = stand_in.id;
+        let mut session = Session::new(stand_in)?;
         let (mut returned, mut aborted, mut after_abort) = (0, 0, false);
-        for case in cases(id, 23, 120) {
+        let count = if stand_in.caller.is_some() { 48 } else { 120 };
+        for case in cases(id, 23, count) {
             let reused = session.run(&case)?;
             // The first calls, every abort and every call after one.
             if returned < 4 || after_abort || reused.abort.is_some() {
-                assert_eq!(reused, run(&stand_in, &case)?, "{id:?}: {}", named(&case));
+                assert_eq!(reused, run(stand_in, &case)?, "{id:?}: {}", named(&case));
             }
             after_abort = reused.abort.is_some();
             returned += usize::from(reused.abort.is_none());
             aborted += usize::from(reused.abort.is_some());
         }
+        // Touch through `blr` always takes its Branch Target exception.
+        let refused = stand_in.caller.is_some() && id == Id::Touch;
         assert!(
-            aborted > 0 && returned > aborted,
+            aborted > 0 && (refused || returned > aborted),
             "{id:?}: {aborted} aborted"
         );
     }
