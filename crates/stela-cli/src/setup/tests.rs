@@ -6485,7 +6485,7 @@ fn a_stick_records_its_stela_version_and_an_update_brings_an_older_one_to_this_o
     let f = made_by(None);
     let status = rerun(&f, |c| c.action = Action::Status).unwrap();
     assert!(
-        status.contains("Stambha        0.3 or older; this stambha is"),
+        status.contains("Stambha        Stela 0.3 or older; this stambha is"),
         "{status}"
     );
     rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
@@ -7118,7 +7118,7 @@ fn journey_c_an_older_stick_offers_the_update_and_quit_changes_nothing() {
     assert!(done, "{shown}");
     assert!(shown.contains(&question), "{shown}");
     assert!(
-        shown.contains("● Stambha 0.3 or older · Offline"),
+        shown.contains("● Stela 0.3 or older · Offline"),
         "{shown}"
     );
     assert!(shown.contains("● Updates Stambha on the stick"), "{shown}");
@@ -7309,7 +7309,7 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
     assert!(error.is::<home::Due>());
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
     assert!(due);
-    assert!(text.contains("Stambha 0.3 or older · Offline"), "{text}");
+    assert!(text.contains("Stela 0.3 or older · Offline"), "{text}");
     assert!(text.contains("Next: stambha update\n"), "{text}");
     assert_eq!(stick_files(&f), before);
     // A healthy stick: nothing is due.

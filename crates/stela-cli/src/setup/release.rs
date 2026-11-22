@@ -88,7 +88,7 @@ pub(super) fn describe(record: &Record) -> String {
             Ordering::Less => format!("{version}; this stambha is {CURRENT}"),
             Ordering::Greater => format!("{version}, newer than this stambha ({CURRENT})"),
         },
-        None => format!("0.3 or older; this stambha is {CURRENT}"),
+        None => format!("Stela 0.3 or older; this stambha is {CURRENT}"),
     }
 }
 

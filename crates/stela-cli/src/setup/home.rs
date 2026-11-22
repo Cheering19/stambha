@@ -105,7 +105,7 @@ impl Stick {
             "{} · {} · macOS {}",
             match &record.release {
                 Some(version) => format!("Stambha {version}"),
-                None => "Stambha 0.3 or older".into(),
+                None => "Stela 0.3 or older".into(),
             },
             record.install_kind().name(),
             macos_name(&record.build)
