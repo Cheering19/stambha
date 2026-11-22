@@ -138,7 +138,7 @@ fn check_model(models: &[(&str, &str)], model: &str) -> Result<()> {
         .map(|(model, name)| format!("{model} ({name})"))
         .collect();
     bail!(
-        "Mac model {model} is not supported yet; Stela supports {}",
+        "Mac model {model} is not supported yet; Stambha supports {}",
         supported.join(", ")
     )
 }
@@ -230,15 +230,15 @@ fn fix(usb: &Path, words: &str) -> String {
             let stick = NAMED
                 .with_borrow(Clone::clone)
                 .unwrap_or_else(|| usb.display().to_string());
-            format!("`stela {words} {}`", quoted(&stick))
+            format!("`stambha {words} {}`", quoted(&stick))
         }
-        false => format!("`stela {words}`"),
+        false => format!("`stambha {words}`"),
     }
 }
 
 /// How a message says to start over: the hidden `uninstall` is never
 /// suggested.
-const START_OVER: &str = "start over with `stela create` on the stick's whole disk, which \
+const START_OVER: &str = "start over with `stambha create` on the stick's whole disk, which \
     erases it";
 
 /// `word` as a shell takes it as one argument.
@@ -254,7 +254,7 @@ fn quoted(word: &str) -> String {
 fn interrupted_text(usb: &Path) -> String {
     format!(
         "the create on this stick stopped part way: {} finishes it. To start over, make a new \
-         installer on the stick with `stela create`",
+         installer on the stick with `stambha create`",
         fix(usb, "repair")
     )
 }
@@ -725,8 +725,8 @@ fn read_efi(environment: &Environment<'_>, path: &Path) -> Result<Vec<u8>> {
         mount_interface::mismatch(environment.interface, mount_interface::find(&image))
     {
         bail!(
-            "{} is not the stela.efi this stela installs: {reason}. Omit --efi to install the \
-             stela.efi built into this stela.",
+            "{} is not the stela.efi this stambha installs: {reason}. Omit --efi to install the \
+             stela.efi built into this stambha.",
             path.display()
         );
     }
@@ -758,8 +758,8 @@ fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result
     let image = fs::read(&tool).with_context(|| format!("cannot read {}", tool.display()))?;
     if mount_interface::mismatch(environment.interface, mount_interface::find(&image)).is_some() {
         bail!(
-            "Stela on this stick does not match this stela: update it first with {}, or use the \
-             stela that made it",
+            "Stambha on this stick does not match this stambha: update it first with {}, or use the \
+             stambha that made it",
             fix(&record.esp, "update")
         );
     }
@@ -785,11 +785,11 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
     }
     Some(if theirs < ours {
         format!(
-            "this stick's boot files were prepared by an older stela: prepare them again with {}",
+            "this stick's boot files were prepared by an older stambha: prepare them again with {}",
             fix(&record.esp, "update")
         )
     } else {
-        "this stick's boot files were prepared by a newer stela: use that stela".into()
+        "this stick's boot files were prepared by a newer stambha: use that stambha".into()
     })
 }
 
@@ -863,8 +863,8 @@ fn stick_volume(host: &dyn Host, stick: &Path) -> Result<PathBuf> {
         .with_context(|| format!("this computer lists no disk {identifier}"))?;
     setup_volume(&disk).with_context(|| {
         format!(
-            "no mounted volume of {} ({}) holds Stela: mount its {} volume, or make an \
-             installer on it with `stela create {}`",
+            "no mounted volume of {} ({}) holds Stambha: mount its {} volume, or make an \
+             installer on it with `stambha create {}`",
             disk.identifier,
             disk.name,
             create::USB_VOLUME,
@@ -892,8 +892,8 @@ fn choose_setup(host: &dyn Host, words: &str) -> Result<(PathBuf, String)> {
     match found.as_slice() {
         [one] => Ok(one.clone()),
         [] => bail!(
-            "no mounted volume on this computer holds Stela: plug in the stick and mount its \
-             STELA volume, or make an installer with `stela create`"
+            "no mounted volume on this computer holds Stambha: plug in the stick and mount its \
+             STELA volume, or make an installer with `stambha create`"
         ),
         several => {
             let list: String = several
@@ -902,8 +902,8 @@ fn choose_setup(host: &dyn Host, words: &str) -> Result<(PathBuf, String)> {
                 .collect();
             let first = several[0].1.split(" (").next().unwrap_or_default();
             bail!(
-                "{} sticks hold Stela:\n{list}Name the one to use after the command, such as \
-                 `stela {words} {}`",
+                "{} sticks hold Stambha:\n{list}Name the one to use after the command, such as \
+                 `stambha {words} {}`",
                 several.len(),
                 quoted(first)
             )
@@ -1006,7 +1006,7 @@ impl Request {
         }
         // Said once, by the run that has the rights.
         if let Some(disk) = found {
-            eprintln!("Using the Stela stick {disk}");
+            eprintln!("Using the Stambha stick {disk}");
         }
         // Under sudo, what this run downloads into the invoking user's
         // cache stays theirs, also when it stops with an error.
@@ -1112,7 +1112,7 @@ impl Request {
             Action::Create if wizard => {
                 ensure!(
                     asks,
-                    "name the stick to erase without a terminal: stela create {} --confirm-disk \
+                    "name the stick to erase without a terminal: stambha create {} --confirm-disk \
                      SIZE",
                     host::DISK_EXAMPLE
                 );
@@ -1266,7 +1266,7 @@ impl Request {
                 environment,
                 &record,
                 self.yes,
-                "change it with this older stela",
+                "change it with this older stambha",
             )?;
         }
         match action {
@@ -1288,7 +1288,7 @@ impl Request {
                         text = self.update_stela(environment, record, (true, false))?;
                         if self.dry_run {
                             text.push_str(&format!(
-                                "  then          the switch to macOS {} goes on once Stela is \
+                                "  then          the switch to macOS {} goes on once Stambha is \
                                  updated\n",
                                 home::macos_name(&build)
                             ));
@@ -1309,7 +1309,7 @@ impl Request {
                 let mut text = self.update_stela(environment, record, (false, self.dry_run))?;
                 match self.dry_run {
                     true => text.push_str(
-                        "  then          the repair checks the rest once Stela is updated\n",
+                        "  then          the repair checks the rest once Stambha is updated\n",
                     ),
                     false => text.push_str(&doctor::repair(environment, &self)?),
                 }
@@ -1333,7 +1333,7 @@ impl Request {
                     text.push_str(&next.dispatch(environment)?);
                 }
                 if !dry_run {
-                    doctor::end_device_skips(&esp, "stela update")?;
+                    doctor::end_device_skips(&esp, "stambha update")?;
                 }
                 Ok(text)
             }
@@ -1591,7 +1591,7 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
             })?,
         },
         None => bail!(
-            "{} is on a disk without an EFI partition. `stela create` erases a stick into one \
+            "{} is on a disk without an EFI partition. `stambha create` erases a stick into one \
              when given its whole disk (such as {}), which deletes everything on it.",
             usb.display(),
             host::DISK_EXAMPLE
@@ -1608,7 +1608,7 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
     {
         ensure!(
             disk.erasable(),
-            "{} is on {} ({}), an internal disk{}. Stela changes only a removable stick: \
+            "{} is on {} ({}), an internal disk{}. Stambha changes only a removable stick: \
              plug one in and name it.",
             esp.display(),
             disk.identifier,

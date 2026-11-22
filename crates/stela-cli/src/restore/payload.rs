@@ -140,7 +140,7 @@ fn select_scope<R: Read + Seek>(
                 variant: identity.variant.clone(),
                 purpose: components::purpose(identity).with_context(|| {
                     format!(
-                        "macOS {} identity {} ({}) has no RestoreBehavior Stela knows",
+                        "macOS {} identity {} ({}) has no RestoreBehavior Stambha knows",
                         restore.product_build, identity.index, identity.variant
                     )
                 })?,

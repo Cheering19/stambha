@@ -374,7 +374,7 @@ fn find(path: &Path) -> Result<Found> {
     }
     ensure!(
         !logs.is_empty(),
-        "{} holds no Stela boot log: no {} on a FAT32 volume, and nothing at the start or in \
+        "{} holds no Stambha boot log: no {} on a FAT32 volume, and nothing at the start or in \
          the last 16 MiB of any partition{listed}",
         path.display(),
         crate::efi::BOOT_LOG
@@ -461,7 +461,7 @@ fn partition_logs(read: &mut Reader<'_>, bytes: u64, place: &str) -> Logs {
         }
         // A volume that is no Stela stick has no log to miss.
         Err(error) if stick(read, bytes) => logs.stick_notes.push(format!(
-            "{place} is a Stela stick whose {} could not be read: {error:#}",
+            "{place} is a Stambha stick whose {} could not be read: {error:#}",
             crate::efi::BOOT_LOG
         )),
         Err(_) => {}
@@ -630,9 +630,9 @@ pub(crate) fn disk_logs(host: &dyn Host, disk: &Disk) -> Result<Logs> {
 }
 
 /// What [`scan_noted`] says when the logs it found lack the stick's own.
-pub(crate) const NO_STICK_LOG: &str = "no log from a Stela stick was found. \
+pub(crate) const NO_STICK_LOG: &str = "no log from a Stambha stick was found. \
     These logs come only from the disk macOS is on, which an install writes and later boots do \
-    not: they do not show a boot that failed after the install. Plug in the stick Stela booted \
+    not: they do not show a boot that failed after the install. Plug in the stick Stambha booted \
     from and run this again.";
 
 /// Every boot log on `host`'s disks ([`scan_noted`]), without its notes.
@@ -704,7 +704,7 @@ pub(crate) fn scan_noted(host: &dyn Host) -> Result<Found> {
         format!("Could not read:\n{unread}")
     };
     bail!(
-        "no Stela boot log on this computer's disks.\n{looked}{unread}Plug in the stick Stela \
+        "no Stambha boot log on this computer's disks.\n{looked}{unread}Plug in the stick Stambha \
          booted from and run this again {rights}."
     )
 }
@@ -1133,21 +1133,21 @@ pub(crate) mod tests {
             device_starts::read(&log.stream)
         };
         assert_eq!(skips(&path).iter().count(), 1);
-        let named = clear_device_skips(&path, "stela repair", true).unwrap();
+        let named = clear_device_skips(&path, "stambha repair", true).unwrap();
         assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
         assert_eq!(skips(&path).iter().count(), 1);
-        let named = clear_device_skips(&path, "stela repair", false).unwrap();
+        let named = clear_device_skips(&path, "stambha repair", false).unwrap();
         assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
         assert!(skips(&path).is_empty());
         let log = boot_log::read(&std::fs::read(&path).unwrap()).unwrap();
         let text = String::from_utf8(log.stream).unwrap();
         assert!(
-            text.ends_with("HOST DEVICE SKIPS CLEARED by stela repair\n"),
+            text.ends_with("HOST DEVICE SKIPS CLEARED by stambha repair\n"),
             "{text}"
         );
         // Nothing left to clear, and no log at all, write nothing.
         assert!(
-            clear_device_skips(&path, "stela update", false)
+            clear_device_skips(&path, "stambha update", false)
                 .unwrap()
                 .is_empty()
         );
@@ -1248,7 +1248,7 @@ pub(crate) mod tests {
         assert!(error.contains("boots it without one"), "{error}");
         // Without a place, no log anywhere is named with the GPT's partitions.
         let error = format!("{:#}", find(&path).unwrap_err());
-        assert!(error.contains("holds no Stela boot log"), "{error}");
+        assert!(error.contains("holds no Stambha boot log"), "{error}");
         assert!(error.contains(GUID), "{error}");
     }
 
@@ -1536,7 +1536,7 @@ pub(crate) mod tests {
         assert_eq!(logs.stick_notes.len(), 1, "{:?}", logs.stick_notes);
         assert!(
             logs.stick_notes[0].starts_with(
-                "partition sdb1 is a Stela stick whose EFI/stela/boot.log could not be read: "
+                "partition sdb1 is a Stambha stick whose EFI/stela/boot.log could not be read: "
             ) && logs.stick_notes[0].ends_with("the log region is blank"),
             "{:?}",
             logs.stick_notes

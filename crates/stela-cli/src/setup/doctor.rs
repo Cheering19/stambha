@@ -185,19 +185,19 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
             let fix = report.fix("update");
             if record.stela_version.as_deref() != Some(id.as_str()) {
                 report.problem(format!(
-                    "Stela's boot loader on the stick is not the one it was made with: {fix} \
+                    "Stambha's boot loader on the stick is not the one it was made with: {fix} \
                      puts it back"
                 ));
             } else if mount_interface::mismatch(environment.interface, interface).is_some() {
                 report.problem(format!(
-                    "Stela on the stick does not match this stela: {fix}"
+                    "Stambha on the stick does not match this stambha: {fix}"
                 ));
             }
         }
         Err(_) => {
             let fix = report.fix("update");
             report.problem(format!(
-                "Stela's boot loader is missing from the stick: {fix} puts it back"
+                "Stambha's boot loader is missing from the stick: {fix} puts it back"
             ))
         }
     }
@@ -255,7 +255,7 @@ fn firmware_status(record: &Record, report: &mut Report) {
         report.line(
             "firmware",
             format!(
-                "the last boot asked for {}, which Stela has no pinned source for",
+                "the last boot asked for {}, which Stambha has no pinned source for",
                 super::firmware::describe(request)
             ),
         );
@@ -499,7 +499,7 @@ fn metal_plugin_status(report: &mut Report, variables: &stela_soc_data::nor::nvr
         ),
         Record::Outdated => report.line(
             "Metal plugin",
-            "another Stela version's automatic repair did not install it; this version's runs \
+            "another Stambha version's automatic repair did not install it; this version's runs \
              at the next start",
         ),
         Record::None => {}
@@ -569,7 +569,7 @@ fn install_status(
     if install.ecid.is_none() {
         let fix = report.fix("repair");
         report.problem(format!(
-            "install \"{}\" was made by an older stela and needs new boot files: {fix}",
+            "install \"{}\" was made by an older stambha and needs new boot files: {fix}",
             install.name
         ))
     }
@@ -699,7 +699,7 @@ fn install_status(
 fn foreign_problem(install: &str, region: &str) -> String {
     format!(
         "install \"{install}\"'s SSD partition {region} holds another file system. The PC's own \
-         OS mounts it and can overwrite Stela's machine state in it"
+         OS mounts it and can overwrite Stambha's machine state in it"
     )
 }
 
@@ -711,12 +711,12 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> R
         problems: Vec::new(),
         usb: usb.to_path_buf(),
     };
-    let _ = writeln!(report.text, "Stela stick {}:", usb.display());
+    let _ = writeln!(report.text, "Stambha stick {}:", usb.display());
     if !record.complete {
         report.problem(interrupted_text(usb));
     }
     report.line("model", &record.model);
-    report.line("Stela", super::release::describe(&record));
+    report.line("Stambha", super::release::describe(&record));
     report.line("macOS", super::home::macos_name(&record.build));
     report.line(
         "Wi-Fi",
@@ -815,7 +815,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     let text = repair_steps(environment, command)?;
     if !command.dry_run {
         let record = read_record(environment, &command.usb)?;
-        end_device_skips(&record.esp, "stela repair")?;
+        end_device_skips(&record.esp, "stambha repair")?;
     }
     Ok(text)
 }
@@ -829,24 +829,24 @@ fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<Stri
             environment,
             &record,
             command.yes,
-            "repair it with this older stela",
+            "repair it with this older stambha",
         )?;
     }
     // A macOS switch that stopped part way never comes here: `repair`
     // finishes it as an update (`Request::dispatch`).
     debug_assert!(record.replacing.is_none());
     let esp = record.esp.clone();
-    let mut text = String::from("Stela repair:\n");
+    let mut text = String::from("Stambha repair:\n");
     text.push_str(&device_skips(&esp, command.dry_run)?);
     let Ok(tool) = fs::read(esp.join(LOADER_PATH)) else {
         bail!(
-            "Stela's boot loader is missing from the stick: {} puts it back",
+            "Stambha's boot loader is missing from the stick: {} puts it back",
             fix(usb, "update")
         );
     };
     if mount_interface::mismatch(environment.interface, mount_interface::find(&tool)).is_some() {
         bail!(
-            "Stela on the stick does not match this stela: run {} first",
+            "Stambha on the stick does not match this stambha: run {} first",
             fix(usb, "update")
         );
     }
