@@ -682,12 +682,21 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
             let hashes = restore::inventory_file(handoff, crate::system::INSTALL_PIECES_FILE)
                 .ok_or(refuse!("the install medium's piece hashes were not loaded"))?;
             crate::status::begin("Finding the macOS install files on the USB");
-            let opened = install::open(partition, &manifest, directory, hashes)?;
+            let read_ahead = options
+                .medium_read_ahead
+                .unwrap_or(restore::READ_AHEAD_DEPTH);
+            let opened = install::open(partition, &manifest, directory, hashes, read_ahead)?;
             crate::status::done("");
-            let bound = opened.read_bound();
-            Ok(restore::Source::bounded(opened, bound))
+            let (bound, ahead) = (opened.read_bound(), opened.read_ahead());
+            Ok(restore::Source::partition(opened, bound, ahead))
         })),
         (None, None) if remote_image => Some(restore::inventory(handoff).and_then(|manifest| {
+            if let Some(depth) = options.medium_read_ahead {
+                output::arguments(format_args!(
+                    "INSTALL MEDIUM read-ahead {depth} ignored (--medium-read-ahead): the image \
+                     comes over the network, whose ranges are read ahead as before\n"
+                ));
+            }
             let network = match &host_network {
                 Some(Ok(network)) => network.clone(),
                 Some(Err(reason)) => return Err(reason.clone()),

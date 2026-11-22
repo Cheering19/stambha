@@ -1277,6 +1277,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
                     cursor: (0, 0),
                     latency: 0,
                     longest: 0,
+                    waited: 0,
                     failed: 0,
                     next: 0,
                     launched: 0,
@@ -1765,8 +1766,8 @@ struct Flight {
 /// their records lie in there, the pack file's extents, the records in
 /// flight, those laid out after a record a lookup asked for (to read
 /// next), how far reading ahead in layout order went, the mean and longest
-/// time a record took to read in counter ticks, the part asked next, and
-/// the records it gave up.
+/// time a record took to read in counter ticks and the time all took, the
+/// part asked next, and the records it gave up.
 struct Reader {
     segments: Vec<Pack<'static>>,
     offsets: Vec<Option<u64>>,
@@ -1777,6 +1778,11 @@ struct Reader {
     cursor: (usize, usize),
     latency: u64,
     longest: u64,
+    /// The ticks every record took to read, from its read's start to its
+    /// end, queued behind other reads of the disk included, summed: the
+    /// reader's own reads ahead count, and reads in flight together each
+    /// count whole, so it is not wall time.
+    waited: u64,
     next: usize,
     failed: u64,
     launched: u64,
@@ -1828,6 +1834,7 @@ impl Reader {
                 let took = super::host::fresh_counter().wrapping_sub(flight.started);
                 self.latency = (self.latency * 7 + took) / 8;
                 self.longest = self.longest.max(took);
+                self.waited = self.waited.saturating_add(took);
                 done.push(flight);
             } else {
                 at += 1;
@@ -2060,13 +2067,19 @@ impl WriterReads {
 }
 
 /// Report the reader: the records left in the file it read, the time a
-/// record took (mean and longest), whether lookups stopped asking a slow
-/// disk, and the reads it gave up.
+/// record took (mean and longest) and all took (`waited_ms`, behind the
+/// install medium's read-ahead on the same USB among them: the sum of each
+/// record read's time, the reader's reads ahead included and reads in
+/// flight together each counted whole, so not wall time; `waited_ms` over
+/// `read` is a record's mean), whether lookups stopped asking a slow disk,
+/// and the reads it gave up (`dropped`, those a lookup asked for that would
+/// have waited past its bound).
 fn report_reader(counters: &pack::Counters) {
-    let Some((latency, longest, slow, failed, launched, dropped)) = READER.with(|reader| {
+    let Some((latency, longest, waited, slow, failed, launched, dropped)) = READER.with(|reader| {
         (
             reader.latency,
             reader.longest,
+            reader.waited,
             reader.slow(),
             reader.failed,
             reader.launched,
@@ -2078,7 +2091,7 @@ fn report_reader(counters: &pack::Counters) {
     let micros = |ticks: u64| ticks * 1_000_000 / super::host::COUNTER_HZ;
     output::arguments(format_args!(
         "TRANSLATIONS reader awaited={} read={} read_mb={} ahead={} launched={launched} \
-         dropped={dropped} mean_us={} longest_us={} slow={slow} failed={failed} \
+         dropped={dropped} mean_us={} longest_us={} waited_ms={} slow={slow} failed={failed} \
          awaited_pages={} awaited_lookups={} awaited_found={}\n",
         counters.awaited,
         counters.read,
@@ -2086,6 +2099,7 @@ fn report_reader(counters: &pack::Counters) {
         counters.read_ahead,
         micros(latency),
         micros(longest),
+        waited / (super::host::COUNTER_HZ / 1000),
         COSTS.awaited_pages.load(Ordering::Relaxed),
         COSTS.awaited_lookups.load(Ordering::Relaxed),
         COSTS.awaited_found.load(Ordering::Relaxed),

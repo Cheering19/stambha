@@ -175,6 +175,48 @@ fn chosen_disk_round_trips_and_the_mount_refuses_it_unreplaced() {
     assert!(System::parse_resolved(&resolved).is_ok());
 }
 
+/// `--medium-read-ahead` takes the install medium's read-ahead in 1 MiB
+/// chunks, 0 (read only when asked) to [`MAX_MEDIUM_READ_AHEAD`], once, for
+/// an `--install`; without it the engine takes its own default.
+#[test]
+fn the_medium_read_ahead_is_a_chunk_count_for_an_install() {
+    let install = format!("--system --storage {DISK} --nor {DISK} --bundle b --install p.json");
+    assert_eq!(System::parse(&install).unwrap().medium_read_ahead, None);
+    for chunks in [0, 4, MAX_MEDIUM_READ_AHEAD] {
+        let options = round_trip(&format!("{install} {MEDIUM_READ_AHEAD} {chunks}"));
+        assert_eq!(options.medium_read_ahead, Some(chunks));
+    }
+    let past = MAX_MEDIUM_READ_AHEAD + 1;
+    for (text, error) in [
+        (
+            format!("{install} {MEDIUM_READ_AHEAD} {past}"),
+            Error::MediumReadAhead,
+        ),
+        (
+            format!("{install} {MEDIUM_READ_AHEAD}"),
+            Error::MediumReadAhead,
+        ),
+        (
+            format!("{install} {MEDIUM_READ_AHEAD} -1"),
+            Error::MediumReadAhead,
+        ),
+        (
+            format!("{install} {MEDIUM_READ_AHEAD} abc"),
+            Error::MediumReadAhead,
+        ),
+        (
+            format!("{install} {MEDIUM_READ_AHEAD} 1 {MEDIUM_READ_AHEAD} 2"),
+            Error::DuplicateMediumReadAhead,
+        ),
+        (
+            format!("--system {MEDIUM_READ_AHEAD} 2"),
+            Error::Constraint(Constraint::MediumReadAheadDependency),
+        ),
+    ] {
+        assert_eq!(System::parse(&text).unwrap_err(), error, "{text}");
+    }
+}
+
 #[test]
 fn every_option_survives_a_round_trip() {
     let options = round_trip(&format!(

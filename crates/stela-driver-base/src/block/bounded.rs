@@ -35,6 +35,24 @@ impl ReadBound {
     pub fn blocked(&self) -> bool {
         self.0.blocked.replace(false)
     }
+
+    /// Whether a bound was set: until then reads wait for their device.
+    pub(super) fn is_set(&self) -> bool {
+        self.0.ticks.get().is_some()
+    }
+
+    /// Whether the bound set last has passed; never before one is set.
+    pub(super) fn passed(&self) -> bool {
+        self.0
+            .ticks
+            .get()
+            .is_some_and(|ticks| crate::Clock::ticks().wrapping_sub(self.0.since.get()) >= ticks)
+    }
+
+    /// Mark the read that ran out of the bound as blocked ([`Self::blocked`]).
+    pub(super) fn block(&self) {
+        self.0.blocked.set(true);
+    }
 }
 
 /// Reads started and results kept at most, each for one read a caller asks

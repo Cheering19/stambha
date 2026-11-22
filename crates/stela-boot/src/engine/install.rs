@@ -15,7 +15,8 @@ use crate::Result;
 use crate::output;
 use alloc::{boxed::Box, format, vec::Vec};
 use stela_contracts::refuse;
-use stela_drivers::block::{BlockDevice, Bounded, ReadBound};
+use stela_drivers::block::{Ahead, BlockDevice, Bounded, ReadBound};
+use stela_runtime::restore::asr::CHUNK_BYTES;
 use uefi::proto::media::file::Directory;
 use {
     stela_formats::payload::Layout, stela_formats::payload::PayloadError,
@@ -32,6 +33,9 @@ pub(super) struct Medium {
     reported: bool,
     /// The bound of the partition's reads ([`Bounded`]).
     bound: ReadBound,
+    /// The partition's read-ahead, which the restore host pumps each turn;
+    /// none with `--medium-read-ahead 0`.
+    ahead: Option<Ahead>,
 }
 
 impl Medium {
@@ -39,6 +43,12 @@ impl Medium {
     /// serves on a PE whose guest waits meanwhile.
     pub(super) fn read_bound(&self) -> ReadBound {
         self.bound.clone()
+    }
+
+    /// The read-ahead the pieces are read through, if any: pumped, it keeps
+    /// the USB's next reads in flight while the service is away.
+    pub(super) fn read_ahead(&self) -> Option<Ahead> {
+        self.ahead.clone()
     }
 }
 
@@ -118,12 +128,16 @@ pub fn check_pieces(
 
 /// The install medium on `partition`: each piece of `manifest` found
 /// through FAT32 in `directory` (the manifest's own, as `stela.cfg` names
-/// it) and joined, checked against `hashes`, the piece hash file.
+/// it) and joined, checked against `hashes`, the piece hash file. The
+/// partition is read `read_ahead` chunks ahead (`--medium-read-ahead`);
+/// with none it is read only when asked, through the bound alone, as it
+/// was before the read-ahead.
 pub(super) fn open(
     partition: Box<dyn BlockDevice>,
     manifest: &PayloadManifest,
     directory: &str,
     hashes: &'static [u8],
+    read_ahead: usize,
 ) -> Result<Medium> {
     let Layout::Pieces { pieces, .. } = &manifest.layout else {
         return Err(refuse!(
@@ -139,9 +153,32 @@ pub(super) fn open(
     // The restore host reads the pieces in service turns, and the USB may
     // hold a read behind its own slow writes (the logs, the translation
     // store) for seconds: once bounded, a read waits for it only briefly.
-    let partition = Bounded::new(partition);
-    let bound = partition.bound();
-    let partition: Box<dyn BlockDevice> = Box::new(partition);
+    // Read ahead, as the study's raw source is, the USB goes on reading the
+    // pieces between the turns instead of only within each one's bound.
+    let (bound, ahead, partition) = match read_ahead {
+        0 => {
+            let partition = Bounded::new(partition);
+            let bound = partition.bound();
+            (bound, None, Box::new(partition) as Box<dyn BlockDevice>)
+        }
+        depth => {
+            let (bound, ahead) = super::restore::read_ahead(partition, depth);
+            let partition = Box::new(ahead.clone()) as Box<dyn BlockDevice>;
+            (bound, Some(ahead), partition)
+        }
+    };
+    let prefetch = (super::restore::prefetch_chunks(ahead.is_some()) * CHUNK_BYTES) >> 10;
+    match read_ahead {
+        0 => output::arguments(format_args!(
+            "INSTALL MEDIUM read-ahead off (--medium-read-ahead 0): each read waits for the \
+             USB within its service, {prefetch} KiB a service, as before the read-ahead\n"
+        )),
+        depth => output::arguments(format_args!(
+            "INSTALL MEDIUM read-ahead {depth} chunks of {} KiB (--medium-read-ahead), \
+             {prefetch} KiB a service\n",
+            super::restore::READ_AHEAD_BYTES >> 10
+        )),
+    }
     let mut volume = Fat32::open(Bytes::new(partition))
         .map_err(|error| refuse!("install medium: {error}", %error))?;
     let directory = directory.replace('\\', "/");
@@ -157,6 +194,7 @@ pub(super) fn open(
             joined: joined.with_two_block_reads(read_limit, sector_bytes),
             reported: false,
             bound,
+            ahead,
         })
         .map_err(|error| refuse!("install medium: {error}", %error))
 }

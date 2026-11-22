@@ -62,6 +62,9 @@ fn install(options: &System) -> Result<(), Error> {
     if options.install_source.is_some() && options.install.is_none() {
         return Err(Error::Constraint(Constraint::InstallSourceDependency));
     }
+    if options.medium_read_ahead.is_some() && options.install.is_none() {
+        return Err(Error::Constraint(Constraint::MediumReadAheadDependency));
+    }
     if options.install.is_some()
         && (!options.bundle
             || options.preboot.is_some()

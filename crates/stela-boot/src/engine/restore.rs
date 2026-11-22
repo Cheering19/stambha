@@ -72,12 +72,13 @@ impl Mode {
     }
 }
 
-/// Any IPSW source, its errors described; a remote image's reader also
-/// reads ahead between the restore's requests ([`Source::pump`]).
+/// Any IPSW source, its errors described; a remote image's reader, and a
+/// partition's, also read ahead between the restore's requests
+/// ([`Source::pump`]).
 pub struct Source {
     reader: Box<dyn ReadAt<Error = Refusal>>,
     remote: Option<Rc<RefCell<Remote>>>,
-    /// The partition's read-ahead ([`Source::extent`]).
+    /// The partition's read-ahead ([`Source::read_ahead`]).
     ahead: Option<Ahead>,
     /// The bound of a partition's reads ([`Source::bound`]).
     local: Option<ReadBound>,
@@ -121,12 +122,26 @@ impl Source {
     }
 
     /// A source read from a partition whose reads `bound` bounds
-    /// ([`Bounded`]), as the install medium's are.
-    pub fn bounded<R: ReadAt + 'static>(reader: R, bound: ReadBound) -> Self {
+    /// ([`Bounded`]), as the install medium's and the study's are, through
+    /// `ahead`, its read-ahead ([`read_ahead`]), when it has one:
+    /// [`Self::pump`] keeps the partition's next reads in flight between the
+    /// service's turns.
+    pub fn partition<R: ReadAt + 'static>(
+        reader: R,
+        bound: ReadBound,
+        ahead: Option<Ahead>,
+    ) -> Self {
         Self {
             local: Some(bound),
+            ahead,
             ..Self::new(reader)
         }
+    }
+
+    /// Whether the source reads ahead of the restore, a partition's
+    /// read-ahead or a remote image's ranges.
+    fn reads_ahead(&self) -> bool {
+        self.ahead.is_some() || self.remote.is_some()
     }
 
     pub fn remote(remote: Remote) -> Self {
@@ -152,18 +167,31 @@ impl Source {
     /// The study's raw source: the IPSW from the partition's first byte,
     /// read ahead in the host storage's largest commands.
     pub fn extent(partition: Box<dyn BlockDevice>, bytes: u64) -> Result<Self> {
-        let partition = Bounded::new(partition);
-        let bound = partition.bound();
-        let ahead = Ahead::new(ReadAhead::new(
-            Box::new(partition),
-            READ_AHEAD_BYTES,
-            READ_AHEAD_DEPTH,
-        ));
+        let (bound, ahead) = read_ahead(partition, READ_AHEAD_DEPTH);
         let extent = Extent::new(Bytes::new(ahead.clone()), bytes)
             .map_err(|error| refuse!("restore source extent: {error}", %error))?;
-        let mut source = Self::bounded(extent, bound);
-        source.ahead = Some(ahead);
-        Ok(source)
+        Ok(Self::partition(extent, bound, Some(ahead)))
+    }
+}
+
+/// `partition` bounded ([`Bounded`]) and read ahead `depth` chunks of
+/// [`READ_AHEAD_BYTES`]: the bound its reads wait within once the service
+/// reads it ([`Source::bound`]), and the read-ahead the service pumps each
+/// turn ([`Source::pump`]), through which it is read.
+pub(super) fn read_ahead(partition: Box<dyn BlockDevice>, depth: usize) -> (ReadBound, Ahead) {
+    let partition = Bounded::new(partition);
+    let bound = partition.bound();
+    let ahead = ReadAhead::bounded(partition, READ_AHEAD_BYTES, depth);
+    (bound, Ahead::new(ahead))
+}
+
+/// The chunks of the image a service reads ahead: [`PREFETCH_CHUNKS`] from a
+/// source that reads ahead itself, which usually holds them in memory, and
+/// [`ASKED_PREFETCH_CHUNKS`] from one read only when asked.
+pub(super) fn prefetch_chunks(reads_ahead: bool) -> usize {
+    match reads_ahead {
+        true => PREFETCH_CHUNKS,
+        false => ASKED_PREFETCH_CHUNKS,
     }
 }
 
@@ -336,6 +364,8 @@ pub struct Experiment {
     /// serial, the counter when it began waiting, and when the log names
     /// it next, in milliseconds after that.
     waiting: Option<(u64, u64, u64)>,
+    /// The chunks of the image a service reads ahead ([`prefetch_chunks`]).
+    prefetch_chunks: usize,
 }
 
 /// How long the guest runs on after its restore fails. A failure is often
@@ -343,23 +373,41 @@ pub struct Experiment {
 /// reaches the console after that.
 const FAILURE_GRACE_MS: u64 = 10_000;
 
-/// The install medium's read-ahead: requests of 1 MiB, the most a USB
-/// disk's command moves, four kept ahead.
-const READ_AHEAD_BYTES: usize = 1 << 20;
-const READ_AHEAD_DEPTH: usize = 4;
+/// The read-ahead of a partition the source is on, the install medium's
+/// or the study's ([`read_ahead`]): requests of 1 MiB, the most a USB
+/// disk's command moves, four kept ahead unless `--medium-read-ahead`
+/// says otherwise. Its memory is the chunks kept ahead, in memory or in
+/// flight, and those of the last read, kept for a read asked again (2 at
+/// most): about 6 MiB at four, and up to about 10 MiB for a while after a
+/// jump, while chunks it left are still in flight and its direct reads'
+/// results wait in the bound ([`Bounded`]). Beside it the ASR sender keeps
+/// 4 MiB read ahead from such a source, where it kept 2 MiB.
+///
+/// A one-command-at-a-time USB disk runs those four in turn before a read
+/// queued after them, such as the translation store's: about 130 ms on
+/// USB 2, against the store reader's 3 ms mark of a seeking disk and its
+/// 1 s bound on a lookup's read (`translations`).
+pub(super) const READ_AHEAD_BYTES: usize = 1 << 20;
+pub(super) const READ_AHEAD_DEPTH: usize = 4;
 
 /// How long a bounded read of a partition waits for the disk, as a remote
 /// read waits for the network (`ranges::BUDGET_MS`).
 const READ_WAIT_MICROS: u64 = 20_000;
 
-/// Chunks of the image each service reads ahead, in one read the size of
-/// the store's largest, which the host's storage moves in its largest
-/// commands.
-const PREFETCH_CHUNKS: usize = 8;
+/// Chunks of the image each service reads ahead from a source that reads
+/// ahead itself, a partition or a remote image ([`prefetch_chunks`]): 2 MiB
+/// in two reads the size of the store's largest, which the host's storage
+/// moves in its largest commands. The source usually holds both in memory
+/// already, so a service moves on as much as two did.
+const PREFETCH_CHUNKS: usize = 16;
+
+/// From a source read only when asked (`--medium-read-ahead 0`): one read
+/// of 1 MiB, as before the read-ahead.
+const ASKED_PREFETCH_CHUNKS: usize = 8;
 
 /// The time a service's read ahead goes on to the next job for, as a remote
 /// read waits for the network (`ranges::BUDGET_MS`): its PE's guest waits
-/// meanwhile, and one job's read moves 1 MiB at most.
+/// meanwhile, and one job's read ahead moves 2 MiB at most.
 const PREFETCH_MICROS: u64 = 20_000;
 
 /// How long an answer waits for its reads before the log names it, and
@@ -769,6 +817,7 @@ impl Experiment {
         } = services;
         let manifest = inventory(handoff)?;
         let remote = source.remote.is_some();
+        let prefetch_chunks = prefetch_chunks(source.reads_ahead());
         let purpose = match mode {
             Mode::Update => Purpose::Update,
             Mode::Install | Mode::DevelopmentInstall | Mode::Study => Purpose::Erase,
@@ -932,6 +981,7 @@ impl Experiment {
             backpressure: MuxBackpressure::default(),
             tsc_hz: handoff.tsc_hz,
             waiting: None,
+            prefetch_chunks,
         })
     }
     /// Read ahead from the host's storage, without the guest's devices.
@@ -958,7 +1008,7 @@ impl Experiment {
             self.driver.answers.store.reader_mut().bound(self.tsc_hz);
             let started = super::host::rdtsc();
             let budget = self.tsc_hz / 1_000_000 * PREFETCH_MICROS;
-            self.driver.prefetch(PREFETCH_CHUNKS, || {
+            self.driver.prefetch(self.prefetch_chunks, || {
                 super::host::rdtsc().wrapping_sub(started) >= budget
             });
         }
