@@ -20,11 +20,17 @@ fn the_model_tier_and_other_operations_are_left_to_the_model() {
             assert!(!native.execute(Generation::M2, &mut registers, operation, 0));
         }
         // fma16 arithmetic needs F16C.
-        assert_eq!(
-            native.execute(Generation::M2, &mut registers, AmxOperation::Fma16, 0),
-            paths.f16c
-        );
-        assert!(!native.execute(Generation::M2, &mut registers, AmxOperation::Fma16, 1 << 27));
+        for mode in [0, 1, 2, 4] {
+            assert_eq!(
+                native.execute(
+                    Generation::M2,
+                    &mut registers,
+                    AmxOperation::Fma16,
+                    mode << 27
+                ),
+                paths.f16c
+            );
+        }
         // fma16 bit 62 with bits 29:27 = 7: the Z clear Espresso runs,
         // native on every tier.
         assert!(native.execute(

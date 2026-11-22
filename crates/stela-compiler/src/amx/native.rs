@@ -25,6 +25,12 @@
 //!   values is exact in f32, the f32 sum is rounded to odd from its exact
 //!   TwoSum error, and the conversion to f16 then rounds once correctly
 //!   (24 >= 11 + 2 bits). Without F16C the model.
+//! - `fma16` and `fms16` with F16C, in vector, f16 matrix and bit-62
+//!   widened (f32 row pairs) matrix shape, accumulating, product-only or
+//!   add-only (bits 29:27 = 0, 1, 2 or 4), every lane-enable mode: the same
+//!   once-rounded f16 sum (the product alone is added to -0, `z ± x` and
+//!   `z ± y` multiply by 1.0), and in the widened shape one f32 addition of
+//!   the exact product.
 //! - On every tier, the model's too, the fused operations' copies and
 //!   constants (bits 29:27 = 3, 5, 6, 7), which need no arithmetic, except
 //!   copies of f16-widened halves, whose NaN payloads the model rewrites.
@@ -1264,16 +1270,24 @@ mod x86 {
         // pointer is to a live 64-byte row; MXCSR is restored after.
         unsafe {
             let saved = enter();
-            fused_half_row(&x, &y, row, &mask, mode == 1);
+            fused_half_row(&x, &y, None, row, &mask, mode == 1);
             leave(saved);
         }
         true
     }
 
-    /// `fma16`/`fms16` (`fma.c`) in the fused form (bits 29:27 clear): the
-    /// vector shape and the f16 matrix row by row through [`fused_half_row`],
-    /// the bit-62 matrix into interleaved f32 row pairs through
-    /// [`widened_rows`]. Every lane's f16 product is exact in f32.
+    /// 1.0 and -0 in every f16 lane.
+    const HALF_ONES: Row = splat(0x3c00, 2);
+    const HALF_NEGATIVE_ZEROS: Row = splat(0x8000, 2);
+
+    /// `fma16`/`fms16` (`fma.c`) in the arithmetic forms (bits 29:27 of 0,
+    /// 1, 2 and 4): the vector shape and the f16 matrix row by row through
+    /// [`fused_half_row`], the bit-62 matrix into interleaved f32 row pairs
+    /// through [`widened_rows`]. Every lane's f16 product is exact in f32.
+    /// `z ± x` (2) and `z ± y` (4) multiply by 1.0, whose product is exact,
+    /// so the sum rounds once to the model's add or subtract; the product
+    /// alone (1) adds it to -0, which leaves every product unchanged (and
+    /// `-0 - p` is `-p`, both zeros included), so it too rounds once.
     pub(super) fn fused_half(
         registers: &mut AmxRegisters,
         operation: AmxOperation,
@@ -1289,11 +1303,14 @@ mod x86 {
             };
             return skip(registers, operand, 2, mode, subtract, shape);
         }
-        if mode != 0 {
-            return false;
+        let mut x = registers.x_operand((operand >> 10) & 0x1ff);
+        let mut y = registers.y_operand(operand & 0x1ff);
+        match mode {
+            2 => y = HALF_ONES,
+            4 => x = HALF_ONES,
+            _ => {}
         }
-        let x = registers.x_operand((operand >> 10) & 0x1ff);
-        let y = registers.y_operand(operand & 0x1ff);
+        let product = mode == 1;
         let x_enable = write_mask(operand >> 41, 2, 7);
         let y_enable = write_mask(operand >> 32, 2, 7);
         let z_row = ((operand >> 20) & 63) as usize;
@@ -1302,7 +1319,7 @@ mod x86 {
         unsafe {
             let saved = enter();
             if operand & VECTOR != 0 {
-                half_row(&mut registers.z[z_row], &x, &y, x_enable, subtract);
+                half_row(&mut registers.z[z_row], &x, &y, x_enable, subtract, product);
             } else if operand & super::WIDEN_16_32 == 0 {
                 for j in (0..32).filter(|&j| on(y_enable, j, 2)) {
                     let mut lane = [0u8; ROW_BYTES];
@@ -1310,34 +1327,44 @@ mod x86 {
                         pair.copy_from_slice(&y[2 * j..2 * j + 2]);
                     }
                     let row = j * 2 + (z_row & 1);
-                    half_row(&mut registers.z[row], &x, &lane, x_enable, subtract);
+                    half_row(
+                        &mut registers.z[row],
+                        &x,
+                        &lane,
+                        x_enable,
+                        subtract,
+                        product,
+                    );
                 }
             } else {
-                widened_rows(registers, &x, &y, x_enable, y_enable, subtract);
+                widened_rows(registers, &x, &y, x_enable, y_enable, subtract, product);
             }
             leave(saved);
         }
         true
     }
 
-    /// One f16 row: `z ± x*y` lane by lane where `enable` (per byte) is on.
+    /// One f16 row: `z ± x*y`, or `-0 ± x*y` for the `product` alone, lane
+    /// by lane where `enable` (per byte) is on.
     ///
     /// # Safety
     /// F16C and AVX exist; MXCSR holds the AMX environment.
-    unsafe fn half_row(z: &mut Row, x: &Row, y: &Row, enable: u64, subtract: bool) {
+    unsafe fn half_row(z: &mut Row, x: &Row, y: &Row, enable: u64, subtract: bool, product: bool) {
         let mut mask = ALL_LANES;
         if enable != u64::MAX {
             for lane in (0..32).filter(|&lane| !on(enable, lane, 2)) {
                 mask[2 * lane..2 * lane + 2].fill(0);
             }
         }
+        let addend = product.then_some(&HALF_NEGATIVE_ZEROS);
         // SAFETY: the caller's contract.
-        unsafe { fused_half_row(x, y, z, &mask, subtract) };
+        unsafe { fused_half_row(x, y, addend, z, &mask, subtract) };
     }
 
     /// The bit-62 matrix: X lane i times Y lane j, widened to f32, into f32
     /// lane i/2 of Z row 2j + i%2. The product is exact in f32, so the
-    /// fused result is one rounded f32 addition (or subtraction).
+    /// fused result is one rounded f32 addition (or subtraction) to Z, or
+    /// for the `product` alone to -0.
     ///
     /// # Safety
     /// F16C and AVX exist; MXCSR holds the AMX environment.
@@ -1348,6 +1375,7 @@ mod x86 {
         x_enable: u64,
         y_enable: u64,
         subtract: bool,
+        product: bool,
     ) {
         // The even and the odd X lanes, each sixteen f16 in order.
         let mut halves = [[0u8; 32]; 2];
@@ -1402,16 +1430,23 @@ mod x86 {
                     asm!(
                         "vbroadcastss xmm1, dword ptr [{y}]",
                         "vbroadcastss xmm7, dword ptr [{nan}]",
+                        "vbroadcastss xmm6, dword ptr [{zero}]",
                         "xor eax, eax",
                         "2:",
                         "vmulps xmm0, xmm1, xmmword ptr [{x} + rax]",
                         "vmovups xmm2, xmmword ptr [{z} + rax]",
+                        // The addend: Z, or -0 for the product alone.
+                        "vmovaps xmm8, xmm2",
+                        "test {product:e}, {product:e}",
+                        "jz 5f",
+                        "vmovaps xmm8, xmm6",
+                        "5:",
                         "test {subtract:e}, {subtract:e}",
                         "jz 3f",
-                        "vsubps xmm3, xmm2, xmm0",
+                        "vsubps xmm3, xmm8, xmm0",
                         "jmp 4f",
                         "3:",
-                        "vaddps xmm3, xmm2, xmm0",
+                        "vaddps xmm3, xmm8, xmm0",
                         "4:",
                         // NaN sums become the default NaN.
                         "vcmpps xmm4, xmm3, xmm3, 3",
@@ -1428,7 +1463,9 @@ mod x86 {
                         z = in(reg) z,
                         m = in(reg) masks[parity].as_ptr(),
                         nan = in(reg) &raw const NAN_32,
+                        zero = in(reg) &raw const NEGATIVE_ZERO_32,
                         subtract = in(reg) u32::from(subtract),
+                        product = in(reg) u32::from(product),
                         out("rax") _,
                         clobber_abi("sysv64"),
                         options(nostack),
@@ -1441,15 +1478,25 @@ mod x86 {
     /// Every byte set: all 32 f16 lanes written.
     const ALL_LANES: Row = [0xff; ROW_BYTES];
 
-    /// One f16 row in one kernel, four lanes per step: `z ± x*y` in f16
+    /// One f16 row in one kernel, four lanes per step: `a ± x*y` in f16
     /// lanes, rounded once (f32 product exact, f32 sum rounded to odd,
-    /// then to f16 to nearest even), default NaN, written where `mask`
-    /// (per byte) is set.
+    /// then to f16 to nearest even), default NaN, written to `z` where
+    /// `mask` (per byte) is set. The addend `a` is `addend`, or `z` itself.
     ///
     /// # Safety
     /// F16C and AVX exist; MXCSR holds the AMX environment.
-    unsafe fn fused_half_row(x: &Row, y: &Row, z: &mut Row, mask: &Row, subtract: bool) {
-        // SAFETY: four live 64-byte rows; the caller's contract.
+    unsafe fn fused_half_row(
+        x: &Row,
+        y: &Row,
+        addend: Option<&Row>,
+        z: &mut Row,
+        mask: &Row,
+        subtract: bool,
+    ) {
+        let z = z.as_mut_ptr();
+        let addend = addend.map_or(z.cast_const(), |row| row.as_ptr());
+        // SAFETY: five live 64-byte rows (the addend may be Z, which each
+        // step reads before it writes); the caller's contract.
         unsafe {
             asm!(
                 "vpcmpeqd xmm10, xmm10, xmm10",
@@ -1465,7 +1512,7 @@ mod x86 {
                 "3:",
                 "vcvtph2ps xmm0, qword ptr [{x} + rax]",
                 "vcvtph2ps xmm1, qword ptr [{y} + rax]",
-                "vcvtph2ps xmm2, qword ptr [{z} + rax]",
+                "vcvtph2ps xmm2, qword ptr [{a} + rax]",
                 // p = x*y, exact; negated for z - x*y.
                 "vmulps xmm3, xmm0, xmm1",
                 "vxorps xmm3, xmm3, xmm13",
@@ -1502,7 +1549,8 @@ mod x86 {
                 "jb 3b",
                 x = in(reg) x.as_ptr(),
                 y = in(reg) y.as_ptr(),
-                z = in(reg) z.as_mut_ptr(),
+                a = in(reg) addend,
+                z = in(reg) z,
                 m = in(reg) mask.as_ptr(),
                 nan = in(reg) &raw const NAN_32,
                 subtract = in(reg) u32::from(subtract),
