@@ -312,6 +312,10 @@ struct Menu<'a> {
     /// The saved network the Wi-Fi page chose to join first this boot, when
     /// not `--wifi`'s ([`with_prefer`]).
     wifi_prefer: Option<String>,
+    /// The PC may have a Wi-Fi chip the driver starts
+    /// ([`crate::wifi_menu::offered`]); without one the Wi-Fi line is not
+    /// shown and `W` opens nothing.
+    wifi_offered: bool,
 }
 
 /// What the menu was left with.
@@ -455,6 +459,7 @@ impl<'a> Menu<'a> {
                 .find_map(|entry| System::parse(&entry.options).ok()?.ssid),
             wifi_saved: false,
             wifi_prefer: None,
+            wifi_offered: true,
         }
     }
 
@@ -495,11 +500,13 @@ impl<'a> Menu<'a> {
         }
         // The network this boot joins first and the Wi-Fi page's key, on
         // the bottom line.
-        if let Some(line) = wifi_page::status_line(
-            self.wifi.as_deref(),
-            self.wifi_prefer.as_deref(),
-            self.wifi_saved,
-        ) {
+        if self.wifi_offered
+            && let Some(line) = wifi_page::status_line(
+                self.wifi.as_deref(),
+                self.wifi_prefer.as_deref(),
+                self.wifi_saved,
+            )
+        {
             canvas.text_centred(width / 2, height.saturating_sub(24), &line, 1, ui::DIM);
         }
         let (status, colour) = match (self.notice, self.countdown, self.held) {
@@ -542,7 +549,10 @@ impl<'a> Menu<'a> {
                     if let Some(chosen) = chosen {
                         return Some(Pick::Item(chosen));
                     }
-                    if matches!(key, 'w' | 'W') && (self.wifi.is_some() || self.wifi_saved) {
+                    if matches!(key, 'w' | 'W')
+                        && self.wifi_offered
+                        && (self.wifi.is_some() || self.wifi_saved)
+                    {
                         return Some(Pick::Wifi);
                     }
                 }
@@ -627,6 +637,7 @@ fn asked() -> bool {
 /// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
     menu.wifi_saved = crate::wifi_menu::saved(volume);
+    menu.wifi_offered = crate::wifi_menu::offered();
     loop {
         let index = match menu.run()? {
             Pick::Item(index) => index,
