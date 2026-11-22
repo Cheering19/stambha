@@ -116,6 +116,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                         // What the GPU addresses near a fault held: the
                         // host kernel names the address and its neighbours.
                         book = self.device.memory_book_report();
+                        // What it was running, shader by shader, for a
+                        // fault that names no shader (Xid 13), the boot's
+                        // first few losses only.
+                        if let Some(fault) = self.faults.take() {
+                            book.extend(self.device.fault_dump(fault));
+                        }
                         format!(
                             "{fault} in operation {} running {}",
                             call.operation,

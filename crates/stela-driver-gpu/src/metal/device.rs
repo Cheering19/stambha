@@ -38,6 +38,7 @@ const MARKER_MEMORY: MemoryRequest = MemoryRequest {
 
 pub mod display;
 mod execution_sets;
+mod fault_dump;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub mod gpu_times;

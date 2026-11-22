@@ -1756,6 +1756,27 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         work
     }
 
+    /// The command buffers the GPU was given and had not finished, by
+    /// serial, oldest first, and the pipelines they bound, each once in the
+    /// order first bound: what a lost device was running. Held work never
+    /// reached the GPU and is left out.
+    pub(super) fn unfinished_pipelines(&self) -> (Vec<u64>, Vec<BoundPipeline>) {
+        let mut serials = Vec::new();
+        let mut pipelines = Vec::new();
+        for flight in &self.queue.in_flight {
+            if matches!(flight.track, Track::Held | Track::Done) {
+                continue;
+            }
+            serials.push(flight.serial);
+            for &pipeline in &flight.pipelines {
+                if !pipelines.contains(&pipeline) {
+                    pipelines.push(pipeline);
+                }
+            }
+        }
+        (serials, pipelines)
+    }
+
     /// Submits ready held work, retires completed command buffers and
     /// returns the completed serial.
     pub fn poll(&mut self) -> Result<u64> {
