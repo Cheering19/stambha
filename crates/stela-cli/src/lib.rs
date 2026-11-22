@@ -69,7 +69,7 @@ const ABOUT: &str = "Make and maintain the USB stick that installs macOS on a PC
 #[derive(Parser)]
 #[command(
     name = "stela",
-    version,
+    version = env!("STELA_SHOWN_VERSION"),
     about = ABOUT,
     override_usage = "stela [COMMAND [STICK]] [OPTIONS]",
     help_template = help_template(),
