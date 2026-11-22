@@ -7,12 +7,39 @@
 //! not notify each change of charge. Every value is an atomic or behind
 //! [`Latest`]'s flag, so a relay can be a `static` that both processors
 //! reach.
+//!
+//! A reading is of one of the host's batteries ([`pick`]): the first with
+//! a reading until the guest's SMC takes one, then the one it took
+//! ([`Relay::pinned`]) for the rest of the boot, as the SMC shows one pack.
+//! A failed `_BST` on that battery then gives a reading with none, which
+//! the SMC keeps its last values through, not another pack's charge.
 use super::power_snapshot::PowerSnapshot;
 use core::{
     cell::UnsafeCell,
     fmt,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+
+/// The battery a reading is of, by its index among the host's in their
+/// order, and its reading: the one the guest's SMC took (`pinned`,
+/// [`Relay::pinned`]) once it has one, else the first with a reading.
+/// `readings` are the batteries' latest, `None` for one with none, such as
+/// after a failed `_BST`: a pinned battery with none gives none.
+pub fn pick<T>(
+    pinned: Option<usize>,
+    readings: impl IntoIterator<Item = Option<T>>,
+) -> Option<(usize, T)> {
+    let mut readings = readings.into_iter();
+    match pinned {
+        Some(index) => readings
+            .nth(index)
+            .flatten()
+            .map(|reading| (index, reading)),
+        None => readings
+            .enumerate()
+            .find_map(|(index, reading)| reading.map(|reading| (index, reading))),
+    }
+}
 
 /// How often the host's battery is read again with no notification.
 pub const REFRESH_MILLIS: u64 = 30_000;
@@ -150,7 +177,13 @@ pub const KEYS_MILLIS: u64 = 2_000;
 
 /// Readings from the host's firmware to the guest's SMC.
 pub struct Relay {
-    latest: Latest<PowerSnapshot>,
+    /// The newest reading and its battery's index ([`pick`]).
+    latest: Latest<(PowerSnapshot, Option<usize>)>,
+    /// The battery of the last reading given the guest before its SMC took
+    /// one, which [`Self::attached`] pins; [`NO_BATTERY`] for none.
+    offered: AtomicUsize,
+    /// The battery the guest's SMC took; [`NO_BATTERY`] before it takes one.
+    pinned: AtomicUsize,
     /// The write of the reading the SMC has.
     seen: AtomicU32,
     /// When a notification the SMC holds is due, in milliseconds; 0 none.
@@ -175,6 +208,7 @@ pub struct Relay {
 }
 
 const NEVER: u64 = u64::MAX;
+const NO_BATTERY: usize = usize::MAX;
 const OFF: u8 = 0;
 const WAITING: u8 = 1;
 const ATTACHED: u8 = 2;
@@ -183,6 +217,8 @@ impl Relay {
     pub const fn new() -> Self {
         Self {
             latest: Latest::new(),
+            offered: AtomicUsize::new(NO_BATTERY),
+            pinned: AtomicUsize::new(NO_BATTERY),
             seen: AtomicU32::new(0),
             due: AtomicU64::new(0),
             refreshed: AtomicU64::new(NEVER),
@@ -212,8 +248,11 @@ impl Relay {
         self.mode.store(WAITING, Ordering::Release);
     }
 
-    /// The guest's SMC took the battery.
+    /// The guest's SMC took the battery of the last reading it was given,
+    /// which every later reading is then of ([`Self::pinned`]).
     pub fn attached(&self) {
+        self.pinned
+            .store(self.offered.load(Ordering::Relaxed), Ordering::Release);
         self.mode.store(ATTACHED, Ordering::Release);
     }
 
@@ -222,15 +261,38 @@ impl Relay {
         self.mode.store(OFF, Ordering::Release);
     }
 
-    /// The firmware's newest reading.
-    pub fn publish(&self, reading: PowerSnapshot) {
-        self.latest.store(reading);
+    /// The battery the guest's SMC took, by its index among the host's
+    /// ([`pick`]), once it has one.
+    pub fn pinned(&self) -> Option<usize> {
+        let index = self.pinned.load(Ordering::Acquire);
+        (index != NO_BATTERY).then_some(index)
+    }
+
+    /// The firmware's newest reading, of the host's battery at `battery`
+    /// ([`pick`]), `None` for a reading with no battery.
+    pub fn publish(&self, reading: PowerSnapshot, battery: Option<usize>) {
+        self.latest.store((reading, battery));
     }
 
     /// The newest reading, which the SMC then counts as having.
     pub fn take(&self) -> Option<PowerSnapshot> {
         let (reading, generation) = self.latest.load();
         self.seen.store(generation, Ordering::Relaxed);
+        reading.map(|(reading, battery)| self.offer(reading, battery))
+    }
+
+    /// `reading`, of the host's battery at `battery`, as the guest is given
+    /// it: before its SMC has a battery, one [`Self::attached`] would pin;
+    /// after, one of another battery, published before the pin reached the
+    /// firmware's processor, carries the AC adapter alone.
+    fn offer(&self, mut reading: PowerSnapshot, battery: Option<usize>) -> PowerSnapshot {
+        match self.pinned() {
+            None => self
+                .offered
+                .store(battery.unwrap_or(NO_BATTERY), Ordering::Relaxed),
+            Some(pinned) if battery != Some(pinned) => reading.battery = None,
+            Some(_) => {}
+        }
         reading
     }
 
@@ -252,7 +314,10 @@ impl Relay {
         if refresh {
             self.refreshed.store(now_ms, Ordering::Relaxed);
         }
-        let reading = self.latest.take_newer(&self.seen);
+        let reading = self
+            .latest
+            .take_newer(&self.seen)
+            .map(|(reading, battery)| self.offer(reading, battery));
         let due = self.due.load(Ordering::Relaxed);
         Turn {
             refresh,

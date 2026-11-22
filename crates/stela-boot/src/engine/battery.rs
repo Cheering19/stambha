@@ -4,7 +4,8 @@
 //!
 //! The AML host reads the batteries and the AC adapter as they attach and
 //! after every notification ([`super::aml`]) and publishes each reading
-//! ([`publish`]): the first battery with a reading and the adapter, in the
+//! ([`publish`]): the first battery with a reading, or once the SMC has one
+//! the battery it took (`power_relay::pick`), and the adapter, in the
 //! SMC's units (`power_snapshot`). Before the guest starts, [`attach`] gives
 //! the SMC that reading; each service turn ([`serve`]) then does what the
 //! relay (`power_relay`) says: ask the AML host for a new reading, pass a
@@ -33,16 +34,21 @@ fn now_ms() -> u64 {
 }
 
 /// The AML host read the batteries and AC adapter `power` holds: its first
-/// battery with a reading, and the adapter, become the latest reading. On
-/// the boot processor, while it holds them.
+/// battery with a reading, or the one the guest's SMC took once it has one,
+/// even with no reading (`power_relay::pick`), and the adapter, become the
+/// latest reading. On the boot processor, while it holds them.
 pub(super) fn publish(power: &stela_drivers::probe::Power) {
     let ac_online = power.ac.as_ref().and_then(|ac| ac.online());
-    let battery = power
-        .batteries
-        .iter()
-        .find_map(|battery| battery.snapshot())
-        .map(|snapshot| BatteryState::from_readings(&Readings::acpi(snapshot), ac_online));
-    RELAY.publish(PowerSnapshot { ac_online, battery });
+    let picked = power_relay::pick(
+        RELAY.pinned(),
+        power.batteries.iter().map(|battery| battery.snapshot()),
+    );
+    let battery = picked
+        .map(|(_, snapshot)| BatteryState::from_readings(&Readings::acpi(snapshot), ac_online));
+    RELAY.publish(
+        PowerSnapshot { ac_online, battery },
+        picked.map(|(index, _)| index),
+    );
 }
 
 /// The AML host's timed reading, which a turn asked for, ended: `failure`

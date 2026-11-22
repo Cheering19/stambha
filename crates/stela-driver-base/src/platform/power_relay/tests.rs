@@ -78,7 +78,7 @@ fn a_turn_refreshes_every_30_s_passes_a_newer_reading_once_and_flushes_when_due(
     assert!(!relay.turn(1_000 + REFRESH_MILLIS - 1).refresh);
     assert!(relay.turn(1_000 + REFRESH_MILLIS).refresh);
     // A published reading goes on once.
-    relay.publish(reading(70));
+    relay.publish(reading(70), Some(0));
     assert_eq!(relay.turn(40_000).reading, Some(reading(70)));
     assert_eq!(relay.turn(40_001).reading, None);
     // A notification the SMC holds is flushed once due, and not again.
@@ -89,7 +89,7 @@ fn a_turn_refreshes_every_30_s_passes_a_newer_reading_once_and_flushes_when_due(
     assert!(!relay.turn(90_000).flush);
     // With a newer reading a turn passes it on rather than flush.
     relay.delivered(Some(50_000));
-    relay.publish(reading(69));
+    relay.publish(reading(69), Some(0));
     let turn = relay.turn(60_000);
     assert_eq!((turn.reading, turn.flush), (Some(reading(69)), false));
 }
@@ -244,9 +244,61 @@ fn a_held_reading_says_the_smc_shows_it_only_once_the_next_confirms_it() {
 fn the_reading_at_attach_counts_as_the_guests() {
     let relay = Relay::new();
     assert_eq!(relay.take(), None);
-    relay.publish(reading(70));
+    relay.publish(reading(70), Some(0));
     assert_eq!(relay.take(), Some(reading(70)));
     assert_eq!(relay.turn(1).reading, None);
+}
+
+#[test]
+fn a_reading_is_of_the_first_battery_with_one_until_the_guest_takes_one_then_of_that_one_alone() {
+    // Before the guest's SMC has a battery: the first with a reading.
+    assert_eq!(pick(None, [None, Some('b'), Some('c')]), Some((1, 'b')));
+    assert_eq!(pick(None, [Some('a'), Some('b')]), Some((0, 'a')));
+    assert_eq!(pick::<char>(None, [None, None]), None);
+    // After, the battery it took alone: one whose `_BST` failed gives no
+    // reading, not another pack's, which the SMC would show as its one.
+    assert_eq!(pick(Some(1), [Some('a'), Some('b')]), Some((1, 'b')));
+    assert_eq!(pick(Some(0), [None, Some('b')]), None);
+    assert_eq!(pick(Some(2), [Some('a'), Some('b')]), None);
+}
+
+#[test]
+fn the_guest_keeps_the_battery_its_smc_took_and_another_packs_reading_brings_only_the_ac_adapter() {
+    // Taken before the guest starts: the battery of the reading at attach.
+    let relay = Relay::new();
+    relay.publish(reading(70), Some(1));
+    assert_eq!(relay.pinned(), None);
+    assert_eq!(relay.take(), Some(reading(70)));
+    relay.attached();
+    assert_eq!(relay.pinned(), Some(1));
+    // A reading of another pack, published before the firmware's processor
+    // saw the pin, carries the AC adapter alone.
+    relay.publish(reading(40), Some(0));
+    assert_eq!(
+        relay.turn(1_000).reading,
+        Some(PowerSnapshot {
+            battery: None,
+            ..reading(40)
+        })
+    );
+    relay.publish(reading(69), Some(1));
+    assert_eq!(relay.turn(2_000).reading, Some(reading(69)));
+    // Taken while the guest waited: the battery of the last reading a turn
+    // gave, whichever pack the ones before were of.
+    let waiting = Relay::new();
+    waiting.wait(0);
+    waiting.publish(reading(70), Some(0));
+    assert_eq!(waiting.turn(0).reading, Some(reading(70)));
+    waiting.publish(reading(71), Some(2));
+    assert_eq!(waiting.turn(1).reading, Some(reading(71)));
+    waiting.attached();
+    assert_eq!(waiting.pinned(), Some(2));
+    // A battery the SMC refused pins nothing.
+    let refused = Relay::new();
+    refused.publish(reading(70), Some(0));
+    refused.take();
+    refused.give_up();
+    assert_eq!(refused.pinned(), None);
 }
 
 #[test]
