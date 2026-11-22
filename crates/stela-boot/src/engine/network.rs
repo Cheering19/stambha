@@ -908,22 +908,22 @@ pub(super) fn set_receive_core(apic: u64) {
 const RECEIVE_BURST: usize = 256;
 
 impl GuestNetwork {
-    /// The first adapter left in `links` with carrier now, else the first
-    /// one left. The mount's own client, when it runs, has taken its adapter
-    /// first ([`HostNetwork::open`]), so the guest never takes the only
-    /// adapter with a cable from an install. `ssid` is the configured
-    /// Wi-Fi network's name, hidden in what a Wi-Fi adapter's link says.
+    /// The first adapter left in `links` with carrier now; else, with a
+    /// Wi-Fi network configured, the first Wi-Fi adapter; else the first one
+    /// left (`network_link::guest_adapter`). The mount's own client, when it
+    /// runs, has taken its adapter first ([`HostNetwork::open`]), so the
+    /// guest never takes the only adapter with a cable from an install.
+    /// `ssid` is the configured Wi-Fi network's name, hidden in what a Wi-Fi
+    /// adapter's link says.
     pub fn open(links: &mut Links, ssid: Option<&str>) -> Result<Self> {
         if links.devices.is_empty() {
             return Err(refuse!(
                 "the guest network needs a host network adapter of its own; none is left"
             ));
         }
-        let index = links
-            .carriers()
-            .iter()
-            .position(|&carrier| carrier)
-            .unwrap_or(0);
+        let carriers = links.carriers();
+        let wireless: Vec<bool> = links.devices.iter().map(|device| device.wireless()).collect();
+        let index = network_link::guest_adapter(&carriers, &wireless, ssid.is_some());
         let device = links.devices.remove(index);
         output::arguments(format_args!(
             "GUEST NETWORK adapter {} mac={}\n",

@@ -235,3 +235,22 @@ fn a_keeper_failure_reaches_the_boot_with_the_name_hidden() {
     );
     assert!(!error.to_string().contains("test"));
 }
+
+/// macOS's network takes an adapter with carrier first; with none, the
+/// configured Wi-Fi adapter, not an empty Ethernet port probed before it;
+/// without a configured network, the first adapter as before.
+#[test]
+fn the_guest_takes_the_configured_wifi_over_an_empty_ethernet_port() {
+    // Ethernet (no cable) then Wi-Fi, a network configured: Wi-Fi.
+    assert_eq!(guest_adapter(&[false, false], &[false, true], true), 1);
+    // No network configured: the first adapter, as before.
+    assert_eq!(guest_adapter(&[false, false], &[false, true], false), 0);
+    // A cable in the Ethernet port: carrier wins over Wi-Fi.
+    assert_eq!(guest_adapter(&[true, false], &[false, true], true), 0);
+    // Carrier on a later adapter wins over the configured Wi-Fi.
+    assert_eq!(guest_adapter(&[false, false, true], &[false, true, false], true), 2);
+    // No Wi-Fi adapter at all: the first adapter.
+    assert_eq!(guest_adapter(&[false, false], &[false, false], true), 0);
+    // Wi-Fi alone: itself.
+    assert_eq!(guest_adapter(&[false], &[true], true), 0);
+}

@@ -24,6 +24,26 @@ use stela_runtime::net::{NetError, stack::DHCP_WAIT_US};
 /// What a hidden network name reads as.
 const HIDDEN: &str = "<ssid>";
 
+/// Which of the host's adapters macOS's network takes, given each one's
+/// `carriers` now and whether it is `wireless`, in probe order: the first
+/// with carrier; else, when a Wi-Fi network is configured (`--wifi`), the
+/// first Wi-Fi adapter, whose keeper joins that network once the guest
+/// owns it; else the first. A Wi-Fi adapter has no carrier before its
+/// keeper runs, so on a laptop whose Ethernet port precedes its Wi-Fi and
+/// has no cable, the first adapter was always the empty port and macOS
+/// had no network although Wi-Fi was configured.
+pub fn guest_adapter(carriers: &[bool], wireless: &[bool], wifi_configured: bool) -> usize {
+    carriers
+        .iter()
+        .position(|&carrier| carrier)
+        .or_else(|| {
+            wifi_configured
+                .then(|| wireless.iter().position(|&wireless| wireless))
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
 /// `text` with the network's name `ssid` written `<ssid>` wherever it
 /// occurs, byte for byte, as `String::from_utf8_lossy` writes it (the
 /// connection keeper's failures name the network so): occurrences that
