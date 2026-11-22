@@ -400,6 +400,9 @@ pub struct Service<B: Backend, C: Compiler> {
     served: (u32, Status),
     /// Whether a refusal named the work the device was lost running.
     loss_described: bool,
+    /// The boot's faults left to dump when a loss is described
+    /// ([`crate::metal::fault_dump`]).
+    faults: &'static crate::metal::fault_dump::Limiter,
     /// Whether a close reported what held work keeps.
     pins_reported: bool,
     /// The bytes of the call served now's library, read before its turn
@@ -448,6 +451,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             dropped: Dropped::default(),
             served: (0, Status::Ok),
             loss_described: false,
+            faults: crate::metal::fault_dump::Limiter::boot(),
             pins_reported: false,
             staged_library: None,
             library_wanted: None,

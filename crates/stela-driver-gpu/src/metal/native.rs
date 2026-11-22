@@ -34,6 +34,7 @@ use super::{
     binding::{HEAP_SET, HeapLayout, NULL_DESCRIPTOR, PushConstants},
     command_buffer::Segment,
     error::{Error, Result, ensure},
+    fault_dump::{self, ShaderImage},
     vulkan::{
         SampleCounts,
         backend::{
@@ -55,6 +56,7 @@ use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
     format,
+    string::String,
     sync::Arc,
     vec::Vec,
 };
@@ -546,6 +548,131 @@ struct ExtensionFns {
 struct Executables {
     fns: khr::pipeline_executable_properties::Device,
     log: fn(&str),
+}
+
+/// A statistic's value as an unsigned count; 0 for a format that is none.
+fn statistic_value(statistic: &vk::PipelineExecutableStatisticKHR) -> u64 {
+    match statistic.format {
+        vk::PipelineExecutableStatisticFormatKHR::UINT64 => {
+            // SAFETY: the format names the union's member.
+            unsafe { statistic.value.u64 }
+        }
+        vk::PipelineExecutableStatisticFormatKHR::INT64 => {
+            // SAFETY: as above.
+            unsafe { statistic.value.i64 }.max(0) as u64
+        }
+        _ => 0,
+    }
+}
+
+/// A name the driver wrote into a fixed array of C characters.
+fn described(name: core::result::Result<&CStr, core::ffi::FromBytesUntilNulError>) -> String {
+    name.ok()
+        .and_then(|name| name.to_str().ok())
+        .unwrap_or("?")
+        .into()
+}
+
+impl Executables {
+    /// Each of `pipeline`'s stages as the driver compiled it, for a lost
+    /// device's fault dump: NVK's statistics, and the program header and
+    /// machine code its internal representations give (Mesa patch 0043).
+    fn images(&self, pipeline: vk::Pipeline) -> Vec<ShaderImage> {
+        let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
+        // SAFETY: the pipeline is alive: the device holds the object that
+        // made it. The driver reads only its CPU copy of each shader.
+        let Ok(executables) = (unsafe { self.fns.get_pipeline_executable_properties(&info) })
+        else {
+            return Vec::new();
+        };
+        executables
+            .iter()
+            .enumerate()
+            .map(|(index, executable)| {
+                let info = vk::PipelineExecutableInfoKHR::default()
+                    .pipeline(pipeline)
+                    .executable_index(index as u32);
+                // SAFETY: the executable is one the pipeline listed.
+                let statistics = unsafe { self.fns.get_pipeline_executable_statistics(&info) }
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|statistic| {
+                        (
+                            described(statistic.name_as_c_str()),
+                            statistic_value(statistic),
+                        )
+                    })
+                    .collect();
+                let mut image = ShaderImage {
+                    stage: described(executable.name_as_c_str()),
+                    statistics,
+                    ..ShaderImage::default()
+                };
+                for (name, bytes) in self.representations(&info) {
+                    match name.as_str() {
+                        "NAK program header" => image.header = fault_dump::words(&bytes),
+                        "NAK geometry program header" => {
+                            image.geometry_header = fault_dump::words(&bytes)
+                        }
+                        "NAK binary" => image.code = bytes,
+                        _ => {}
+                    }
+                }
+                image
+            })
+            .collect()
+    }
+
+    /// The executable's internal representations, by name, with their
+    /// bytes: the driver says each one's size, then fills buffers of them.
+    fn representations(&self, info: &vk::PipelineExecutableInfoKHR<'_>) -> Vec<(String, Vec<u8>)> {
+        // SAFETY: the executable is one the pipeline listed; with no data
+        // pointers the driver writes each representation's size alone.
+        let Ok(sized) = (unsafe {
+            self.fns
+                .get_pipeline_executable_internal_representations(info)
+        }) else {
+            return Vec::new();
+        };
+        let mut buffers: Vec<Vec<u8>> = sized
+            .iter()
+            .map(|representation| alloc::vec![0; representation.data_size])
+            .collect();
+        let mut filled: Vec<vk::PipelineExecutableInternalRepresentationKHR<'_>> = buffers
+            .iter_mut()
+            .map(|buffer| vk::PipelineExecutableInternalRepresentationKHR {
+                data_size: buffer.len(),
+                p_data: buffer.as_mut_ptr().cast(),
+                ..Default::default()
+            })
+            .collect();
+        let mut count = filled.len() as u32;
+        // SAFETY: each structure points at a buffer of the size it names,
+        // alive and not otherwise reached until the call returns.
+        let result = unsafe {
+            (self
+                .fns
+                .fp()
+                .get_pipeline_executable_internal_representations_khr)(
+                self.fns.device(),
+                info,
+                &mut count,
+                filled.as_mut_ptr(),
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            return Vec::new();
+        }
+        filled
+            .iter()
+            .zip(buffers)
+            .take(count as usize)
+            .map(|(representation, mut bytes)| {
+                bytes.truncate(representation.data_size);
+                (described(representation.name_as_c_str()), bytes)
+            })
+            .collect()
+    }
 }
 
 pub struct NativeBackend {
@@ -1862,17 +1989,7 @@ impl NativeBackend {
             let Ok(statistics) = (unsafe { fns.get_pipeline_executable_statistics(&info) }) else {
                 continue;
             };
-            let value = |statistic: &vk::PipelineExecutableStatisticKHR| match statistic.format {
-                vk::PipelineExecutableStatisticFormatKHR::UINT64 => {
-                    // SAFETY: the format names the union's member.
-                    unsafe { statistic.value.u64 }
-                }
-                vk::PipelineExecutableStatisticFormatKHR::INT64 => {
-                    // SAFETY: as above.
-                    unsafe { statistic.value.i64 }.max(0) as u64
-                }
-                _ => 0,
-            };
+            let value = statistic_value;
             let named = |name: &str| {
                 statistics
                     .iter()
@@ -3642,6 +3759,15 @@ impl Backend for NativeBackend {
 
     fn take_unbound(&mut self) -> Vec<u64> {
         core::mem::take(&mut self.unbound)
+    }
+
+    fn shader_images(&mut self, pipeline: Pipeline) -> Vec<ShaderImage> {
+        self.fns
+            .executables
+            .as_ref()
+            .map_or_else(Vec::new, |executables| {
+                executables.images(handle(pipeline.0))
+            })
     }
 }
 
