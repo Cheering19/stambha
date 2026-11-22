@@ -542,6 +542,7 @@ mod tests {
             installer: 0,
             part: super::super::board::NO_PART,
             device_stub: false,
+            hle: None,
         }
     }
 

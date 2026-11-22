@@ -478,6 +478,10 @@ struct Block {
     /// exit is the site's access, on whichever PE runs it, whether or not
     /// that PE learnt the site.
     device_stub: bool,
+    /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
+    /// ends, which a fault inside it is taken back from.
+    #[expect(dead_code, reason = "the fault bypass reads it next")]
+    hle: Option<hle::Mark>,
 }
 
 // The board keeps one per block, millions in all.

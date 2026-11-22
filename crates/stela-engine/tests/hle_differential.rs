@@ -273,9 +273,10 @@ fn a_reused_session_runs_as_a_fresh_machine() -> Result<()> {
     for stand_in in direct.iter().chain(&called) {
         let id = stand_in.id;
         // Off, and on with each test routine that suits the stand-in: Bail
-        // for all, Touch for touch's.
+        // for all, Touch for touch's where a Branch Target exception comes
+        // before its fast path could fault.
         let mut routines = vec![None, Some(Id::Bail)];
-        if id == Id::Touch {
+        if id == Id::Touch && stand_in.caller.is_some() {
             routines.push(Some(Id::Touch));
         }
         for routine in routines {

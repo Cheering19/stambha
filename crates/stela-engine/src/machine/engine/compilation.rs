@@ -1366,6 +1366,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installer: self.current as u8,
             part: shared_part(&self.code, code),
             device_stub: self.installing_stub,
+            hle: self.hle.installing,
         };
         let shared = Arc::clone(&self.code);
         shared.blocks.fill(slot, block);

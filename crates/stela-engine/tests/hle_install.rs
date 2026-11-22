@@ -1,6 +1,8 @@
 //! HLE in the engine: with HLE off the engine compiles exactly the blocks
 //! it did without it; with a table, the compile of a signed function's
-//! entry matches it, counts what it refuses, and still translates it.
+//! entry matches it, counts what it refuses, and installs a composite block
+//! in its place, a native fast path in front of its first instruction
+//! compiled alone, or translates it as before when it refuses.
 #![cfg(all(
     feature = "test-support",
     feature = "std",
@@ -63,19 +65,21 @@ fn hle_off_compiles_the_same_blocks_as_without_it() -> Result<()> {
 }
 
 #[test]
-fn a_matching_function_is_matched_and_still_translated() -> Result<()> {
+fn a_match_whose_routine_has_no_native_is_refused_and_translated() -> Result<()> {
+    // memmove's fast path is not built yet: its composite is refused.
     let stand_in = stand_in(Id::Memmove);
+    let memmove = || Config::with_table(table(&stand_in, Id::Memmove), &[Id::Memmove]);
     let case = returning(Id::Memmove, 5);
-    let (on, statistics) = run(&stand_in, &case, Some(bail(&stand_in)))?;
+    let (on, statistics) = run(&stand_in, &case, Some(memmove()))?;
     let (off, _) = run(&stand_in, &case, None)?;
     assert_eq!(agree(&stand_in, &case, &off, &on), Ok(()));
     assert_eq!(on, off);
     assert!(statistics.matched >= 1, "{statistics:?}");
     assert_eq!(statistics.matched_signatures, 1);
     assert_eq!(statistics.installed, 0);
-    assert_eq!(statistics.refused, [0; Refusal::COUNT]);
+    assert_eq!(statistics.refusals(Refusal::Compose), statistics.matched);
     // Over many calls: the same outcomes and the same blocks as off.
-    let mut on = Session::new(&stand_in, Some(bail(&stand_in)))?;
+    let mut on = Session::new(&stand_in, Some(memmove()))?;
     let mut off = Session::new(&stand_in, None)?;
     for case in cases(Id::Memmove, 6, 40) {
         assert_eq!(on.run(&case)?, off.run(&case)?);
@@ -83,6 +87,90 @@ fn a_matching_function_is_matched_and_still_translated() -> Result<()> {
     assert_eq!(compiled(&mut on), compiled(&mut off));
     assert!(on.hle().matched >= 1);
     assert_eq!(on.hle().installed, 0);
+    Ok(())
+}
+
+/// Whether every page of `case`'s data mapping is readable and writable.
+fn mapped(case: &Case) -> bool {
+    case.unreadable.is_none() && case.read_only.is_none()
+}
+
+#[test]
+fn a_bail_only_native_agrees_with_the_original_for_every_stand_in() -> Result<()> {
+    // Direct calls, and calls through `blr x16` on a guarded page, where
+    // memset's `bti c` admits the call and the rest take a Branch Target
+    // exception at the composite's entry.
+    let direct = STAND_INS.map(stand_in);
+    let called = STAND_INS.map(|id| stand_in(id).through_blr());
+    for stand_in in direct.iter().chain(&called) {
+        let id = stand_in.id;
+        let count = match stand_in.caller {
+            Some(_) => case_count(4000) / 16,
+            None => case_count(4000),
+        };
+        let mut on = Session::new(stand_in, Some(bail(stand_in)))?;
+        let mut off = Session::new(stand_in, None)?;
+        let (mut returned, mut aborted) = (0, 0);
+        for case in cases(id, 0xba11 + id.bit() as u64, count) {
+            let (expected, got) = (off.run(&case)?, on.run(&case)?);
+            assert_eq!(agree(stand_in, &case, &expected, &got), Ok(()), "{id:?}");
+            // The original runs in both: they end alike in full.
+            assert_eq!(got, expected, "{id:?} {:x?}", case.x);
+            returned += usize::from(got.abort.is_none());
+            aborted += usize::from(got.abort.is_some());
+            assert!(!mapped(&case) || on.hle().bypassed == 0);
+        }
+        let statistics = on.hle();
+        assert!(statistics.installed >= 1, "{id:?}: {statistics:?}");
+        assert_eq!(statistics.bypassed, 0, "{id:?}");
+        assert_eq!(statistics.refused, [0; Refusal::COUNT], "{id:?}");
+        let refused = stand_in.caller.is_some() && id != Id::Memset;
+        assert!(
+            aborted > 0 && (refused || returned > aborted),
+            "{id:?}: {returned} returned, {aborted} aborted"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_composite_is_installed_once_and_reused() -> Result<()> {
+    let stand_in = stand_in(Id::Memmove);
+    let case = returning(Id::Memmove, 19);
+    let mut session = Session::new(&stand_in, Some(bail(&stand_in)))?;
+    let first = session.run(&case)?;
+    assert_eq!(first.stop, Stop::Breakpoint(stand_in.end()));
+    for _ in 0..2 {
+        assert_eq!(session.run(&case)?, first);
+    }
+    let statistics = session.hle();
+    assert_eq!((statistics.matched, statistics.installed), (1, 1));
+    Ok(())
+}
+
+#[test]
+fn a_fault_in_the_bail_path_is_the_originals_own() -> Result<()> {
+    // Touch's fast path loads X0's byte, which is readable, and bails; the
+    // original's first instruction, its bail, loads X1's, which is not: the
+    // fault is taken through the bail's recovery row, moved past the fast
+    // path.
+    let stand_in = stand_in(Id::Touch);
+    let base = cases(Id::Touch, 21, 1).remove(0);
+    let case = Case {
+        x: [100, 2 * PAGE as u64 + 5, 0],
+        unreadable: Some(2),
+        read_only: None,
+        ..base
+    };
+    let touch = Config::with_table(table(&stand_in, Id::Touch), &[Id::Touch]);
+    let (on, statistics) = run(&stand_in, &case, Some(touch))?;
+    let (off, _) = run(&stand_in, &case, None)?;
+    assert_eq!(on, off);
+    let (_, far, elr, _) = on.abort.expect("the original's data abort");
+    assert_eq!((far, elr), (data_base() + case.x[1], stand_in.pc()));
+    assert_eq!(on.retired, 0);
+    assert!(statistics.installed >= 1, "{statistics:?}");
+    assert_eq!(statistics.bypassed, 0);
     Ok(())
 }
 
@@ -148,7 +236,8 @@ fn a_function_crossing_its_fetch_page_is_refused() -> Result<()> {
             crosses,
             "at word {words}: {statistics:?}"
         );
-        assert_eq!(statistics.installed, 0);
+        // A function that fits takes its composite.
+        assert_eq!(statistics.installed >= 1, matched, "at word {words}");
     }
     Ok(())
 }
