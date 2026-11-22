@@ -1421,7 +1421,32 @@ impl HostAcpi {
             output::arguments(format_args!(
                 "UNSUPPORTED ACPI hardware activation: continuation unavailable: {error}\n"
             ));
+            return;
         }
+        if self.hardware_active() {
+            self.attach_laptop_controls();
+        }
+    }
+
+    /// Once the ACPI events are on, the brightness keys' outputs and the
+    /// ASUS WMI device, each in its own bounded firmware call ([`bounded`])
+    /// after the activation's, whose bound ends what was left of it: their
+    /// methods (`_BCL`, `_BCM`, INIT and the keyboard backlight's) are the
+    /// firmware's to make slow, and so can cost only what they attach, not
+    /// the notifications and GPEs every device's events need.
+    fn attach_laptop_controls(&'static self) {
+        self.firmware(
+            "brightness key attachment",
+            "the outputs it reached are followed",
+            false,
+            move |_| self.attach_backlights(),
+        );
+        self.firmware(
+            "ASUS WMI attachment",
+            "its hotkeys are followed as far as it got",
+            false,
+            move |_| self.attach_asus_wmi(),
+        );
     }
     fn activate_entered(&'static self, prepared_sci: Option<sci::Prepared>) {
         // SAFETY: this permanent provider is held by the leaked Session.
@@ -1461,8 +1486,6 @@ impl HostAcpi {
                     output::arguments(format_args!("HOST ACPI power button refused: {error:?}\n"));
                 }
                 self.attach_power_buttons();
-                self.attach_backlights();
-                self.attach_asus_wmi();
                 match self.session.notify_all(|_, value| {
                     POWER_CHANGED.store(true, Ordering::Release);
                     if stela_drivers::probe::backlight::switches(value) {
