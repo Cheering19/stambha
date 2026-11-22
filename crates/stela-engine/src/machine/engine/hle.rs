@@ -18,14 +18,22 @@
 //! instruction at the entry's PC and fetch page, so an IC IVAU of any byte
 //! of the function retires it, and it is never stored, offered or rebased.
 //! Its block holds a [`Mark`]: where its fast path ends.
+//!
+//! A guest access's fault inside the fast path ([`Machine::hle_fault`])
+//! puts the PC back at the entry with the guest state the fast path found,
+//! which it has not changed, and the next step runs the entry's first
+//! instruction alone ([`Machine::take_hle_bypass`]): the original takes the
+//! fault itself, with the ESR, FAR, ELR and state it would have without
+//! HLE.
 use super::*;
 use crate::hle::{Config, Id, PREFIX_BYTES, Refusal, Signature, Statistics};
 use core::num::NonZeroU8;
 use stela_compiler::x86_64::hle::{self as composite, Request};
 
 /// A machine's HLE: its configuration, what it did, the bytes of a
-/// candidate function longer than the compile's window, and the mark of
-/// the composite it is installing, for its block ([`Self::installing`]).
+/// candidate function longer than the compile's window, the mark of the
+/// composite it is installing, for its block ([`Self::installing`]), and
+/// the entry whose original the next step runs ([`Self::bypass`]).
 #[derive(Default)]
 pub(super) struct State {
     config: Config,
@@ -34,6 +42,9 @@ pub(super) struct State {
     /// While a composite installs: the mark its block takes, as
     /// `installing_stub` marks a device stub's.
     pub(super) installing: Option<Mark>,
+    /// The entry of the composite whose fast path faulted: a step there
+    /// next runs its first instruction alone.
+    bypass: Option<u64>,
 }
 
 /// What a composite block holds of its composite: the length of its fast
@@ -62,7 +73,6 @@ impl Mark {
 
     /// Where the fast path ends and the original's first instruction
     /// starts, in the block's code.
-    #[expect(dead_code, reason = "the fault bypass reads it next")]
     pub(super) fn prefix_end(self) -> usize {
         usize::from(self.prefix_units.get()) * composite::PREFIX_ALIGN as usize
     }
@@ -256,5 +266,65 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let fetched = installed?;
         self.hle.statistics.installed += 1;
         Ok(Some(fetched))
+    }
+
+    /// `fault`, in block `index`'s code after `chained_retired` instructions
+    /// of the run's earlier blocks, entered with `chained_btype` by a link:
+    /// when the block is a composite and the fault one of a guest access in
+    /// its fast path, settle the run as `native_fault` does at the block's
+    /// first instruction with none of it retired, which is the guest state
+    /// the fast path found (it writes no guest register or frame field
+    /// before it can no longer fault), put the PC at the entry and have the
+    /// next step there run the original's first instruction alone. `None`
+    /// for any other fault: one in the bail's code is the original's own,
+    /// settled by its rows, and any other trap in a fast path stops the PE
+    /// as `native_fault` stops for a fault no row covers.
+    ///
+    /// A guest access's fault is one `native_fault` takes at a guest access
+    /// site: a #PF of a plain read or write (no fetch, reserved-bit or key
+    /// error code), or a #GP or #SS of a non-canonical address, as a fast
+    /// path's address that passed its range check can be on a host whose
+    /// placement's limit lies past its canonical range.
+    pub(super) fn hle_fault(
+        &mut self,
+        index: usize,
+        fault: &NativeFault,
+        chained_retired: u64,
+        chained_btype: Option<u8>,
+    ) -> Option<Step> {
+        let block = self.code.blocks.get(index)?;
+        let (entry, mark) = (block.pc, block.hle?);
+        let access = match fault.trap {
+            14 => {
+                fault.error_code & !0b111 == 0 && !matches!(fault.cause, FaultCause::InvalidOpcode)
+            }
+            12 | 13 => fault.error_code == 0 && matches!(fault.cause, FaultCause::NonCanonical),
+            _ => false,
+        };
+        if fault.offset >= mark.prefix_end()
+            || fault.origin != NativeFaultOrigin::Exception
+            || !access
+        {
+            return None;
+        }
+        let mut staged = self.cpu.state.clone();
+        stela_compiler::x86_64::pinned::settle(&fault.registers, &mut staged);
+        self.cpu.state = staged;
+        self.cpu.retired = self.cpu.retired.wrapping_add(chained_retired);
+        self.cpu.pc = entry;
+        if let Some(btype) = chained_btype {
+            self.cpu.pstate.btype = btype;
+        }
+        self.hle.bypass = Some(entry);
+        self.hle.statistics.bypassed += 1;
+        Some(Ok(()))
+    }
+
+    /// Whether the step at `pc` runs the original's first instruction alone
+    /// after its composite's fast path faulted there. Every step that
+    /// fetches takes the bypass, so one left when an interrupt moved the PC
+    /// elsewhere does not outlive that step.
+    pub(super) fn take_hle_bypass(&mut self, pc: u64) -> bool {
+        self.hle.bypass.take() == Some(pc)
     }
 }

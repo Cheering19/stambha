@@ -270,6 +270,182 @@ fn a_disabled_id_never_matches() -> Result<()> {
     Ok(())
 }
 
+/// The Touch routine over touch's stand-in, enabled.
+fn touch() -> Config {
+    Config::with_table(table(&stand_in(Id::Touch), Id::Touch), &[Id::Touch])
+}
+
+/// A call of touch's stand-in with X0 and X1 at data offsets `x0` and `x1`
+/// (offsets wrap: any address is one) and page `unreadable` unreadable.
+fn touching(x0: u64, x1: u64, unreadable: Option<usize>) -> Case {
+    Case {
+        x: [x0, x1, 0],
+        unreadable,
+        read_only: None,
+        ..cases(Id::Touch, 21, 1).remove(0)
+    }
+}
+
+/// Touch's X1, readable on the data mapping's third page.
+const X1: u64 = 2 * PAGE as u64 + 5;
+
+#[test]
+fn a_fault_in_the_native_prefix_is_taken_by_the_original() -> Result<()> {
+    // X0's page is unreadable: the fast path's load of it faults, and the
+    // original then loads X1 and faults at its second instruction.
+    let stand_in = stand_in(Id::Touch);
+    let case = touching(100, X1, Some(0));
+    let (on, statistics) = run(&stand_in, &case, Some(touch()))?;
+    let (off, _) = run(&stand_in, &case, None)?;
+    assert_eq!(on, off);
+    let (_, far, elr, _) = on.abort.expect("the original's data abort");
+    assert_eq!((far, elr), (data_base() + 100, stand_in.pc() + 4));
+    assert_eq!(on.retired, 1);
+    assert_eq!((statistics.installed, statistics.bypassed), (1, 1));
+    Ok(())
+}
+
+#[test]
+fn a_call_that_always_faults_bypasses_every_time_and_stays_exact() -> Result<()> {
+    let stand_in = stand_in(Id::Touch);
+    let case = touching(100, X1, Some(0));
+    let off = run(&stand_in, &case, None)?.0;
+    let mut session = Session::new(&stand_in, Some(touch()))?;
+    for call in 1..=3 {
+        assert_eq!(session.run(&case)?, off, "call {call}");
+        assert_eq!(session.hle().bypassed, call);
+    }
+    assert_eq!(session.hle().installed, 1);
+    Ok(())
+}
+
+#[test]
+fn every_touch_combination_agrees() -> Result<()> {
+    let stand_in = stand_in(Id::Touch);
+    // X0 and X1 apart with neither, X0's or X1's page unreadable; both on
+    // one unreadable page; and X0 on a read-only page, which reads.
+    let read_only = Case {
+        read_only: Some(0),
+        ..touching(100, X1, None)
+    };
+    for (case, bypassed) in [
+        (touching(100, X1, None), 0),
+        (touching(100, X1, Some(0)), 1),
+        (touching(100, X1, Some(2)), 0),
+        (touching(100, 107, Some(0)), 1),
+        (read_only, 0),
+    ] {
+        let (on, statistics) = run(&stand_in, &case, Some(touch()))?;
+        let (off, _) = run(&stand_in, &case, None)?;
+        assert_eq!(agree(&stand_in, &case, &off, &on), Ok(()), "{case:?}");
+        assert_eq!(statistics.bypassed, bypassed, "{:x?}", case.x);
+        assert_eq!(statistics.installed, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_touch_native_agrees_with_the_original_on_random_cases() -> Result<()> {
+    // Unreadable and read-only pages anywhere: a call bypasses exactly when
+    // X0's page is unreadable, the only fault its fast path can take.
+    let stand_in = stand_in(Id::Touch);
+    let mut on = Session::new(&stand_in, Some(touch()))?;
+    let mut off = Session::new(&stand_in, None)?;
+    let (mut bypassed, mut aborted) = (0, 0);
+    for case in cases(Id::Touch, 0x70c4, case_count(4000)) {
+        let before = on.hle().bypassed;
+        let (expected, got) = (off.run(&case)?, on.run(&case)?);
+        assert_eq!(
+            agree(&stand_in, &case, &expected, &got),
+            Ok(()),
+            "{case:x?}"
+        );
+        let faults = case.unreadable == Some(case.x[0] as usize / PAGE);
+        assert_eq!(
+            on.hle().bypassed - before,
+            u64::from(faults),
+            "{:x?}",
+            case.x
+        );
+        assert!(!mapped(&case) || !faults);
+        bypassed += usize::from(faults);
+        aborted += usize::from(got.abort.is_some());
+    }
+    assert!(bypassed > 0 && aborted > bypassed, "{bypassed} bypassed");
+    assert_eq!(on.hle().installed, 1);
+    Ok(())
+}
+
+#[test]
+fn an_out_of_range_pointer_bails_before_the_fast_path_loads() -> Result<()> {
+    use stela_engine::machine::Host as _;
+    let stand_in = stand_in(Id::Touch);
+    let limit = Session::new(&stand_in, None)?
+        .machine()
+        .host
+        .placement()
+        .check()
+        .lower_limit();
+    let at = |address: u64| address.wrapping_sub(data_base());
+    for (address, faults) in [
+        // At and past the limit, in the upper half and top-byte tagged: the
+        // range check bails and the original's access takes the fault.
+        (limit, false),
+        (limit + PAGE as u64, false),
+        (u64::MAX - 7, false),
+        ((data_base() + 100) | 0x5a << 56, false),
+        // In range and not mapped: the fast path's load faults and the
+        // original takes it.
+        (0x10, true),
+        // In the test host's five-level range but past 2^47: on a
+        // four-level host the fast path's load takes a #GP, which bypasses
+        // as a #PF does, and the original's access stops the engine as an
+        // unsupported address check, alike with HLE.
+        (limit - 64, true),
+    ] {
+        let case = touching(at(address), X1, None);
+        let (on, statistics) = run(&stand_in, &case, Some(touch()))?;
+        let (off, _) = run(&stand_in, &case, None)?;
+        assert_eq!(on, off, "{address:#x}");
+        let canonical = !(1 << 47..0xffff_8000_0000_0000).contains(&address);
+        assert!(
+            on.abort.is_some() || !canonical,
+            "{address:#x}: {:?}",
+            on.stop
+        );
+        assert_eq!(statistics.bypassed, u64::from(faults), "{address:#x}");
+    }
+    Ok(())
+}
+
+#[test]
+fn software_step_never_enters_the_native() -> Result<()> {
+    // MDSCR_EL1.SS with the OS lock clear, and PSTATE.SS: each instruction
+    // is a block of its own, which HLE never matches.
+    let stand_in = stand_in(Id::Touch);
+    let case = touching(100, X1, None);
+    let mut outcomes = Vec::new();
+    for hle in [None, Some(touch())] {
+        let mut session = Session::new(&stand_in, hle)?;
+        let machine = session.machine();
+        machine
+            .cpu
+            .registers
+            .set_raw(Register::OSLSR_EL1, 0, 0b1000);
+        machine.cpu.registers.set_raw(Register::MDSCR_EL1, 0, 1);
+        machine.cpu.pstate.ss = true;
+        let outcome = session.run(&case)?;
+        outcomes.push((outcome, session.hle()));
+    }
+    let ((off, _), (on, statistics)) = (&outcomes[0], &outcomes[1]);
+    assert_eq!(on, off);
+    let (esr, ..) = on.abort.expect("a software step exception");
+    assert_eq!(exception_class(esr), 0x32, "{esr:#x}");
+    assert_eq!(on.retired, 1);
+    assert_eq!(*statistics, Statistics::default());
+    Ok(())
+}
+
 #[test]
 fn a_function_longer_than_the_first_window_is_matched_once_per_compile() -> Result<()> {
     // 39 NOPs and a `ret`: 160 bytes, past the 128 a compile reads first,

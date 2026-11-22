@@ -273,10 +273,10 @@ fn a_reused_session_runs_as_a_fresh_machine() -> Result<()> {
     for stand_in in direct.iter().chain(&called) {
         let id = stand_in.id;
         // Off, and on with each test routine that suits the stand-in: Bail
-        // for all, Touch for touch's where a Branch Target exception comes
-        // before its fast path could fault.
+        // for all, Touch for touch's, whose fast path faults and bypasses
+        // where X0's page is unreadable.
         let mut routines = vec![None, Some(Id::Bail)];
-        if id == Id::Touch && stand_in.caller.is_some() {
+        if id == Id::Touch {
             routines.push(Some(Id::Touch));
         }
         for routine in routines {
@@ -288,7 +288,11 @@ fn a_reused_session_runs_as_a_fresh_machine() -> Result<()> {
             let (mut returned, mut aborted, mut after_abort) = (0, 0, false);
             let count = if stand_in.caller.is_some() { 48 } else { 120 };
             for case in cases(id, 23, count) {
+                let bypassed = session.hle().bypassed;
                 let reused = session.run(&case)?;
+                // A fast path faults only on a page that is not mapped.
+                let mapped = case.unreadable.is_none() && case.read_only.is_none();
+                assert!(!mapped || session.hle().bypassed == bypassed);
                 // The first calls, every abort and every call after one.
                 if returned < 4 || after_abort || reused.abort.is_some() {
                     let fresh = run(stand_in, &case, hle.clone())?.0;

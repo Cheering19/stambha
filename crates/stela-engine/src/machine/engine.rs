@@ -480,7 +480,6 @@ struct Block {
     device_stub: bool,
     /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
     /// ends, which a fault inside it is taken back from.
-    #[expect(dead_code, reason = "the fault bypass reads it next")]
     hle: Option<hle::Mark>,
 }
 
