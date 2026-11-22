@@ -501,6 +501,12 @@ pub(super) const OFFLINE_SIGNING_NOTE: &str =
 /// An Online installer.
 pub(super) const ONLINE_NOTE: &str = "Online: the install downloads macOS, so the PC needs \
     internet (Ethernet, or the Wi-Fi set here).";
+/// Said before the PC boots the stick: its firmware starts Stela only with
+/// Secure Boot off (the README's requirements), and turning it off can make
+/// Windows ask for its BitLocker recovery key at its next start.
+pub(super) const SECURE_BOOT_STEP: &str = "Turn Secure Boot off in the PC's firmware setup \
+    first, or the PC will not start the stick. If Windows uses BitLocker, have its recovery key \
+    ready: Windows may ask for it after the change.";
 /// What is not known yet about the installed system without a network.
 pub(super) const FIRST_START_NOTE: &str =
     "macOS may ask for internet the first time it starts; this is not tested yet.";
@@ -806,6 +812,10 @@ pub(super) fn plan(
         )
         .collect();
     notes.extend(network_notes(remote, offline(remote, &restore_bundles)));
+    // The network set here is joined only by a card the boot drives.
+    if record.wifi.is_some() {
+        notes.push(wifi::CHIP_NOTE.into());
+    }
     notes.extend(installed.notes.iter().cloned());
     // The USB holds every supported device's firmware, whatever this
     // computer has; its own devices only earn a note.
@@ -1130,7 +1140,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     writeln!(
         report,
         "Done. Eject the stick before you unplug it. Boot the PC from it (the PC's boot menu \
-         lists it as a UEFI USB device) and {start}.\nCheck it with {}",
+         lists it as a UEFI USB device) and {start}.\n{SECURE_BOOT_STEP}\nCheck it with {}",
         super::fix(&command.usb, "status")
     )?;
     Ok(report)

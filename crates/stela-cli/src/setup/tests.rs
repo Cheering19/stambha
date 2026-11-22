@@ -5267,6 +5267,20 @@ fn usb4_approvals_apply_to_all_boot_choices_until_withdrawn() {
 }
 
 #[test]
+fn a_finished_create_says_secure_boot_must_be_off_first() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    // A dry run writes nothing, so it has no last word.
+    let mut dry = command(&f, &f.esp);
+    dry.dry_run = true;
+    let plan = setup(&environment(&f.host), dry).unwrap();
+    assert!(!plan.contains(create::SECURE_BOOT_STEP), "{plan}");
+    let report = setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    assert!(report.contains("Done."), "{report}");
+    assert!(report.contains(create::SECURE_BOOT_STEP), "{report}");
+}
+
+#[test]
 fn wifi_configuration_applies_to_all_boot_choices() {
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
@@ -5279,6 +5293,8 @@ fn wifi_configuration_applies_to_all_boot_choices() {
         report.contains("Wi-Fi          \"Home Net\", DE rules; the passphrase is stored"),
         "{report}"
     );
+    // The plan says which PCs the network works on, and what else does.
+    assert!(report.contains(wifi::CHIP_NOTE), "{report}");
     let key = f.esp.join(wifi::KEY_PATH);
     let options = || fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap();
     assert_eq!(fs::read_to_string(&key).unwrap(), "correct horse");
@@ -6965,6 +6981,8 @@ fn review_and_status_show_the_wifi_country() {
     home::run(&environment, request).unwrap();
     let shown = person.transcript();
     assert!(shown.contains("Network    Wi-Fi Home, DE rules"), "{shown}");
+    // Choosing a network says which PCs it works on.
+    assert!(shown.contains(&format!("▲ {}", wifi::CHIP_NOTE)), "{shown}");
     // Status names the network and its country.
     let f = made_by(Some(release::CURRENT));
     let status = rerun(&f, |c| c.action = Action::Status).unwrap();

@@ -932,7 +932,8 @@ fn create_installer(environment: &Environment<'_>, request: Request) -> Result<(
     ui.note(
         "Next steps",
         &format!(
-            "Boot the target PC from this stick and choose Install macOS.\n{}{profile}",
+            "{}\nBoot the target PC from this stick and choose Install macOS.\n{}{profile}",
+            create::SECURE_BOOT_STEP,
             create::network_next_step(&report)
         ),
     )?;
