@@ -100,6 +100,7 @@ mod conditional_select;
 mod crc;
 pub(crate) mod exclusive;
 pub mod flag_word;
+pub mod hle;
 mod flags;
 mod fp_register;
 mod guest_range;

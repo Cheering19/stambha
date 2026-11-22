@@ -314,23 +314,12 @@ fn bytes_shorter_than_the_length_never_match() {
 }
 
 #[test]
-fn names_round_trip() {
-    for routine in Id::PRODUCTION {
-        assert_eq!(Id::from_name(routine.name()), Some(routine));
-    }
-    assert_eq!(Id::from_name("bail"), None);
-    assert_eq!(Id::from_name("touch"), None);
-    assert_eq!(Id::from_name("Memmove"), None);
-    assert_eq!(Id::Bail.name(), "bail");
-    assert_eq!(Id::Touch.name(), "touch");
-    let bits = Id::PRODUCTION
-        .iter()
-        .chain(&[Id::Bail, Id::Touch])
-        .fold(0, |bits, routine| {
-            assert_eq!(bits & routine.bit(), 0, "{routine:?}");
-            bits | routine.bit()
-        });
-    assert_eq!(bits, 0x7f);
+fn ids_are_the_compiler_s_routines() {
+    // The routines' own tests are the compiler's (`x86_64::hle`); an id
+    // here is one of them, test routines included.
+    let routine: stela_compiler::x86_64::hle::Routine = Id::Touch;
+    assert_eq!(routine.name(), "touch");
+    assert_eq!(Id::from_name("memmove"), Some(Id::Memmove));
 }
 
 /// A table of two functions: the leaf as memmove and another as bzero.

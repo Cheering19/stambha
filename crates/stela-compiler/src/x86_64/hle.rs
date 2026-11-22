@@ -1,4 +1,8 @@
-//! The native routines a matched function can be replaced with.
+//! High-level emulation (HLE): native x86-64 routines that replace guest
+//! library functions the engine finds by their bytes (`stela_engine::hle`).
+//! The routines are named here, where the composite blocks they are emitted
+//! into are laid out, so the engine's signatures and the compiler's
+//! emitters share one id.
 
 /// A native routine, by the C function whose contract it keeps. Its bit in a
 /// configuration's enabled set is [`Self::bit`]; its name is the one
@@ -54,3 +58,6 @@ impl Routine {
         1 << self as u32
     }
 }
+
+#[cfg(test)]
+mod tests;
