@@ -419,7 +419,8 @@ pub(super) fn check(machine: &mut Machine) {
         Plan::Refused(why) => bluetooth_check::refused(why),
         Plan::Failed(why) => bluetooth_check::not_started(why),
         Plan::Chosen { .. } => bluetooth_check::refused(
-            "no PCI access (see the cpu lines), so its xHCI was not started; nothing is started",
+            "no PCI access (the CHECK storage FAIL no PCI access line says why), so its xHCI was \
+             not started; nothing is started",
         ),
         Plan::Started => {
             let transports = &mut machine.bluetooth.transports;
