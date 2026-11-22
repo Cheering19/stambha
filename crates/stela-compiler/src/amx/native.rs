@@ -219,11 +219,25 @@ mod x86 {
 
     /// A row of `bytes`-byte lanes each holding `value`.
     const fn splat(value: u64, bytes: usize) -> Row {
+        // One eight-byte word of the lanes, stored eight times.
+        let word = match bytes {
+            2 => (value & 0xffff) * 0x0001_0001_0001_0001,
+            4 => (value & 0xffff_ffff) * 0x0000_0001_0000_0001,
+            _ => value,
+        }
+        .to_le_bytes();
         let mut row = [0u8; ROW_BYTES];
-        let mut byte = 0;
-        while byte < ROW_BYTES {
-            row[byte] = (value >> (8 * (byte % bytes))) as u8;
-            byte += 1;
+        let mut at = 0;
+        while at < ROW_BYTES {
+            row[at] = word[0];
+            row[at + 1] = word[1];
+            row[at + 2] = word[2];
+            row[at + 3] = word[3];
+            row[at + 4] = word[4];
+            row[at + 5] = word[5];
+            row[at + 6] = word[6];
+            row[at + 7] = word[7];
+            at += 8;
         }
         row
     }
@@ -293,15 +307,9 @@ mod x86 {
         let mut y = registers.y_operand(operand & 0x1ff);
         let bytes = bytes as usize;
         let lanes = 64 / bytes;
-        // Per-lane all-ones masks (VEX) or the opmask (EVEX) of X's lanes.
-        let mut mask = [0u8; ROW_BYTES];
-        let mut opmask = 0u32;
-        for lane in 0..lanes {
-            if on(fused.x_enable, lane, bytes) {
-                mask[lane * bytes..lane * bytes + bytes].fill(0xff);
-                opmask |= 1 << lane;
-            }
-        }
+        // Per-lane all-ones masks (VEX) or the opmask (EVEX) of X's lanes;
+        // with every lane on, as most operands have, no loop.
+        let (mask, opmask) = lane_masks(fused.x_enable, bytes);
         // SAFETY: `select` chose the tier from a target whose features the
         // host admits, and F16C is checked above for VEX widening. Every
         // pointer is to a live 64-byte row; MXCSR is restored after.
@@ -335,9 +343,7 @@ mod x86 {
                 // Y lane j into Z row j*g + z_row%g, g = 64/lanes, in one
                 // kernel loop over the enabled Y lanes.
                 let g = 64 / lanes;
-                let rows = (0..lanes).fold(0u32, |rows, j| {
-                    rows | u32::from(on(fused.y_enable, j, bytes)) << j
-                });
+                let rows = lane_bits(fused.y_enable, bytes);
                 let matrix = Matrix {
                     z: registers.z[fused.z_row & (g - 1)].as_mut_ptr(),
                     stride: g * ROW_BYTES,
@@ -394,51 +400,41 @@ mod x86 {
             _ => (8, 1 << 63),
         };
         // Rows of `out_bytes` lanes: each lane's value, and all-ones where
-        // it is written, merged into Z eight bytes at a time.
-        let splat = |value: u64| -> Row {
-            let mut row = [0u8; ROW_BYTES];
-            for lane in row.chunks_exact_mut(out_bytes) {
-                lane.copy_from_slice(&value.to_le_bytes()[..out_bytes]);
-            }
-            row
-        };
+        // it is written, merged into Z eight bytes at a time (stored whole
+        // when every lane is on, as most operands have).
         let negated = |row: &Row| -> Row {
             let mut row = *row;
             if subtract {
-                for (byte, flip) in row.iter_mut().zip(splat(sign)) {
+                for (byte, flip) in row.iter_mut().zip(splat(sign, out_bytes)) {
                     *byte ^= flip;
                 }
             }
             row
         };
-        let merge = |z: &mut Row, values: &Row, mask: &Row| {
-            let z = z.as_chunks_mut::<8>().0;
-            let values = values.as_chunks::<8>().0;
-            let mask = mask.as_chunks::<8>().0;
-            for ((z, value), mask) in z.iter_mut().zip(values).zip(mask) {
-                let (old, value, mask) = (
-                    u64::from_le_bytes(*z),
-                    u64::from_le_bytes(*value),
-                    u64::from_le_bytes(*mask),
-                );
-                *z = (old & !mask | value & mask).to_le_bytes();
+        let every_lane = x_enable == u64::MAX;
+        let store = |z: &mut Row, values: &Row, mask: &Row| {
+            if every_lane {
+                *z = *values;
+                return;
             }
+            merge(z, values, mask);
         };
-        let mut x_mask = [0u8; ROW_BYTES];
-        let mut parity_masks = [[0u8; ROW_BYTES]; 2];
-        for i in (0..lanes).filter(|&i| on(x_enable, i, bytes)) {
-            x_mask[i * bytes..i * bytes + bytes].fill(0xff);
-            parity_masks[i & 1][(i >> 1) * 4..(i >> 1) * 4 + 4].fill(0xff);
-        }
-        let constant = splat(if subtract { sign } else { 0 });
+        let (x_mask, parity_masks) = if every_lane {
+            ([0xff; ROW_BYTES], [[0xff; ROW_BYTES]; 2])
+        } else {
+            let mut x_mask = [0u8; ROW_BYTES];
+            let mut parity_masks = [[0u8; ROW_BYTES]; 2];
+            for i in (0..lanes).filter(|&i| on(x_enable, i, bytes)) {
+                x_mask[i * bytes..i * bytes + bytes].fill(0xff);
+                parity_masks[i & 1][(i >> 1) * 4..(i >> 1) * 4 + 4].fill(0xff);
+            }
+            (x_mask, parity_masks)
+        };
+        let constant = splat(if subtract { sign } else { 0 }, out_bytes);
         let lane_values = |j: usize| -> Row {
             match mode {
                 3 => negated(&x),
-                5 => {
-                    let mut value = [0u8; 8];
-                    value[..bytes].copy_from_slice(&y[j * bytes..j * bytes + bytes]);
-                    negated(&splat(u64::from_le_bytes(value)))
-                }
+                5 => negated(&splat(lane(&y, bytes, j), bytes)),
                 _ => constant,
             }
         };
@@ -448,20 +444,20 @@ mod x86 {
                 5 => negated(&y),
                 _ => constant,
             };
-            merge(&mut registers.z[z_row], &values, &x_mask);
+            store(&mut registers.z[z_row], &values, &x_mask);
             return true;
         }
         for j in (0..lanes).filter(|&j| on(y_enable, j, bytes)) {
             match shape {
                 Shape::Widened => {
                     for (parity, mask) in parity_masks.iter().enumerate() {
-                        merge(&mut registers.z[2 * j + parity], &constant, mask);
+                        store(&mut registers.z[2 * j + parity], &constant, mask);
                     }
                 }
                 Shape::Plain => {
                     let g = 64 / lanes;
                     let values = lane_values(j);
-                    merge(
+                    store(
                         &mut registers.z[j * g + (z_row & (g - 1))],
                         &values,
                         &x_mask,
@@ -508,6 +504,33 @@ mod x86 {
     /// Lane `lane` of `bytes`-byte lanes is on in a per-byte enable.
     fn on(enable: u64, lane: usize, bytes: usize) -> bool {
         (enable >> (lane * bytes)) & 1 != 0
+    }
+
+    /// Bit i for each lane i of `bytes`-byte lanes a per-byte enable turns
+    /// on; every bit, with no loop, when all are on (most operands).
+    fn lane_bits(enable: u64, bytes: usize) -> u32 {
+        if enable == u64::MAX {
+            return u32::MAX;
+        }
+        (0..64 / bytes).fold(0, |bits, lane| {
+            bits | u32::from(on(enable, lane, bytes)) << lane
+        })
+    }
+
+    /// The fused kernels' lane masks of a per-byte enable: all ones in each
+    /// enabled lane's bytes (VEX) and [`lane_bits`] (EVEX); no loop when
+    /// every lane is on.
+    fn lane_masks(enable: u64, bytes: usize) -> (Row, u32) {
+        if enable == u64::MAX {
+            return ([0xff; ROW_BYTES], u32::MAX);
+        }
+        let mut mask = [0u8; ROW_BYTES];
+        let mut opmask = 0u32;
+        for lane in (0..64 / bytes).filter(|&lane| on(enable, lane, bytes)) {
+            mask[lane * bytes..lane * bytes + bytes].fill(0xff);
+            opmask |= 1 << lane;
+        }
+        (mask, opmask)
     }
 
     /// The even f16 lanes of a row widened to f32, exactly; NaNs stay NaN
@@ -1269,6 +1292,9 @@ mod x86 {
     ) -> (Row, Row) {
         let mut x = registers.x_operand(x_offset & 0x1ff);
         let mut y = registers.y_operand(y_offset & 0x1ff);
+        if operand & (FLOAT_INDEXED_LOAD | 0xf << 27) == 0 {
+            return (x, y);
+        }
         if operand & FLOAT_INDEXED_LOAD != 0 {
             let source = ((operand >> 49) & 7) as usize;
             let index_bits = if operand & FLOAT_INDEXED_4BIT != 0 {
@@ -1504,12 +1530,7 @@ mod x86 {
                         (_, true) => Form::Product,
                         _ => Form::Add,
                     };
-                    let mut mask = [0u8; ROW_BYTES];
-                    let mut opmask = 0u32;
-                    for i in (0..lanes).filter(|&i| on(enable, i, bytes)) {
-                        mask[i * bytes..i * bytes + bytes].fill(0xff);
-                        opmask |= 1 << i;
-                    }
+                    let (mask, opmask) = lane_masks(enable, bytes);
                     let z = registers.z[z_row].as_mut_ptr();
                     match native.tier {
                         Tier::Avx512 => row_avx512(double, form, z, &x, &y, opmask),
@@ -2518,15 +2539,8 @@ mod x86 {
             (32 | 64, _) => {
                 let double = xy_bits == 64;
                 let form = if subtract { Form::Subtract } else { Form::Add };
-                let mut mask = [0u8; ROW_BYTES];
-                let mut opmask = 0u32;
-                for i in (0..lanes).filter(|&i| on(x_enable, i, bytes)) {
-                    mask[i * bytes..i * bytes + bytes].fill(0xff);
-                    opmask |= 1 << i;
-                }
-                let rows = (0..lanes).fold(0u32, |rows, j| {
-                    rows | u32::from(on(y_enable, j, bytes)) << j
-                });
+                let (mask, opmask) = lane_masks(x_enable, bytes);
+                let rows = lane_bits(y_enable, bytes);
                 // Y lane j into Z row j*g + z_row%g, g = 64/lanes.
                 let g = 64 / lanes;
                 let matrix = Matrix {
