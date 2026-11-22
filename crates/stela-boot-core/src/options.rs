@@ -49,6 +49,9 @@ pub const WIFI_COUNTRY: &str = "--wifi-country";
 pub const USB4_APPROVE: &str = "--usb4-approve";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
+/// The saved networks a boot with `--wifi` also joins when its network is
+/// not in range (`wifi_saved`); none when the file is absent.
+pub const WIFI_SAVED: &str = "\\EFI\\stela\\wifi.saved";
 /// IEEE 802.11 SSIDs are 1 to 32 octets.
 const SSID_BYTES: core::ops::RangeInclusive<usize> = 1..=32;
 pub const IPV4: &str = "--ipv4";

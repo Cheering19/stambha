@@ -746,6 +746,7 @@ fn raise_as<'n>(
             ),
         ]),
         network: Network {
+            alternates: Default::default(),
             ssid: b"test".to_vec(),
             secret,
             country,

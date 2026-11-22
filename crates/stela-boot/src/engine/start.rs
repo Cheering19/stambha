@@ -3046,7 +3046,36 @@ fn wifi_network(
         ssid: ssid.as_bytes().to_vec(),
         secret,
         country,
+        alternates: saved_networks(handoff),
     })
+}
+
+/// The other saved networks (`options::WIFI_SAVED`) the loader read, whose
+/// bytes are wiped here. Lines it cannot use are counted, never shown.
+fn saved_networks(handoff: &Handoff) -> Vec<stela_drivers::net::wifi::network::Alternate> {
+    let bytes = handoff.wifi_saved.bytes as usize;
+    if bytes == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the loader left the file's bytes allocated, and only this
+    // reads them.
+    let file = unsafe {
+        core::slice::from_raw_parts_mut(
+            layout::physical(handoff.wifi_saved.physical) as *mut u8,
+            bytes,
+        )
+    };
+    let saved = stela_boot_core::wifi_saved::parse(file);
+    for byte in file.iter_mut() {
+        // SAFETY: a byte of the file, which nothing else reads.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    output::arguments(format_args!(
+        "HOST Wi-Fi saved networks: {} usable, {} unusable lines\n",
+        saved.networks.len(),
+        saved.unusable
+    ));
+    saved.networks
 }
 
 /// The disk work the loader decided before the firmware exited

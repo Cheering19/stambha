@@ -248,7 +248,10 @@ fn the_guest_takes_the_configured_wifi_over_an_empty_ethernet_port() {
     // A cable in the Ethernet port: carrier wins over Wi-Fi.
     assert_eq!(guest_adapter(&[true, false], &[false, true], true), 0);
     // Carrier on a later adapter wins over the configured Wi-Fi.
-    assert_eq!(guest_adapter(&[false, false, true], &[false, true, false], true), 2);
+    assert_eq!(
+        guest_adapter(&[false, false, true], &[false, true, false], true),
+        2
+    );
     // No Wi-Fi adapter at all: the first adapter.
     assert_eq!(guest_adapter(&[false, false], &[false, false], true), 0);
     // Wi-Fi alone: itself.

@@ -4204,6 +4204,7 @@ mod tests {
         };
         let firmware = handoff_provider(&handoff);
         let network = Network {
+            alternates: Default::default(),
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
             country: None,
@@ -4405,6 +4406,7 @@ mod tests {
         assert_eq!(ecam[1], 0);
 
         let network = Network {
+            alternates: Default::default(),
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
             country: None,
@@ -4440,6 +4442,7 @@ mod tests {
             function: 0,
         };
         let network = |country| Network {
+            alternates: Default::default(),
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(&[b'0'; 64]).unwrap(),
             country,

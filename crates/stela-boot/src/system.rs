@@ -21,7 +21,7 @@ use alloc::{format, string::String, vec::Vec};
 use core::{arch::asm, ops::Range, ptr::NonNull};
 use stela_boot_core::firmware_map::{self, RuntimeMapping};
 use stela_boot_core::firmware_runtime;
-use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
+use stela_boot_core::options::{DEFAULT_WIFI_KEY, System, WIFI_SAVED};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_runtime::pc;
@@ -323,6 +323,15 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
             volume.read(uefi::fs::PathBuf::from(path)).ok()
         })
         .unwrap_or_default();
+    // The other saved networks, beside the key: none when the file is absent.
+    let wifi_saved = system
+        .ssid
+        .as_ref()
+        .and_then(|_| {
+            let path = uefi::CString16::try_from(WIFI_SAVED).ok()?;
+            volume.read(uefi::fs::PathBuf::from(path)).ok()
+        })
+        .unwrap_or_default();
     let host_devices = system.storage.is_some()
         || system.preboot.is_some()
         || system.restore_source.is_some()
@@ -426,6 +435,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         bundle_pes,
         storage,
         wifi_key,
+        wifi_saved,
     })
 }
 
@@ -436,6 +446,7 @@ struct Inputs {
     bundle_pes: Option<usize>,
     storage: Option<stela_drivers::Handoff>,
     wifi_key: Vec<u8>,
+    wifi_saved: Vec<u8>,
 }
 
 /// The firmware's runtime regions, and its `ResetSystem` service: zero when
@@ -795,6 +806,7 @@ fn load(
         bundle_pes,
         storage,
         wifi_key,
+        wifi_saved,
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
@@ -1178,6 +1190,10 @@ fn load(
             inactive_firmware_units,
             amd_tables,
             low_dma,
+            wifi_saved: Region {
+                physical: wifi_saved.as_ptr() as u64,
+                bytes: wifi_saved.len() as u64,
+            },
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

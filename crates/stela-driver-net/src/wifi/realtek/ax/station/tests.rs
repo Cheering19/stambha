@@ -720,6 +720,7 @@ fn wifi_with(set: impl FnOnce(&mut Air)) -> (Wifi<Model>, Model) {
     let model = Model(Rc::new(RefCell::new(air)));
     let country = database.select(*b"US").unwrap();
     let network = Network {
+        alternates: Default::default(),
         ssid: SSID.to_vec(),
         secret,
         country: None,

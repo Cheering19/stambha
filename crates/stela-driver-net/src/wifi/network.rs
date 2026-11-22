@@ -17,6 +17,10 @@ pub struct Network {
     /// An ISO 3166 alpha-2 country code in uppercase ASCII; none leaves the
     /// adapter firmware's default regulatory domain.
     pub country: Option<[u8; 2]>,
+    /// The other saved networks (`wifi.saved`), joined when this one, the
+    /// preferred network, is not in range: the strongest of them a scan
+    /// finds. Their names never appear in a failure the keeper reports.
+    pub alternates: Vec<Alternate>,
 }
 
 impl fmt::Debug for Network {
@@ -28,6 +32,24 @@ impl fmt::Debug for Network {
                 "country",
                 &self.country.map(|code| [code[0] as char, code[1] as char]),
             )
+            .field("alternates", &self.alternates.len())
+            .finish()
+    }
+}
+
+/// A saved network other than the preferred one.
+#[derive(Clone)]
+pub struct Alternate {
+    /// One to [`SSID_BYTES`] bytes.
+    pub ssid: Vec<u8>,
+    pub secret: Secret,
+}
+
+impl fmt::Debug for Alternate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Alternate")
+            .field("ssid", &"..")
+            .field("secret", &self.secret)
             .finish()
     }
 }
@@ -178,6 +200,7 @@ mod tests {
     #[test]
     fn debug_output_hides_the_secret() {
         let config = Network {
+            alternates: Default::default(),
             ssid: b"Home".to_vec(),
             secret: Secret::parse(b"hunter22").unwrap(),
             country: Some(*b"US"),

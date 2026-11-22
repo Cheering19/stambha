@@ -354,6 +354,7 @@ fn wifi(rules: &[(u32, u32, u8, u16)], channel: u16) -> (Wifi<Model>, Model) {
     })));
     let country = database.select(*b"US").unwrap();
     let network = Network {
+        alternates: Default::default(),
         ssid: SSID.to_vec(),
         secret: Secret::Psk(Zeroizing::new([0; 32])),
         country: None,
