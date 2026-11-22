@@ -1,7 +1,8 @@
 # Shared NIR, the AMD, Intel and NVIDIA shader compilers with their command,
 # surface and sampler support, and the DRM shims the host tests run ANV and
-# RADV on. Other vendors' drivers, window systems and CI are left out;
-# directories Mesa's Meson build names unconditionally stay.
+# RADV on, i915's among Intel's tools. Other vendors' drivers, window
+# systems and CI are left out; directories Mesa's Meson build names
+# unconditionally stay.
 /*
 !/.gitlab-ci/
 !/.github/
@@ -59,5 +60,6 @@
 !/src/nouveau/ci/
 !/src/nouveau/drm-shim/
 !/src/intel/tools/
+/src/intel/tools/intel_noop_drm_shim.c
 !/src/intel/executor/
 !/src/intel/nullhw-layer/

@@ -6,11 +6,16 @@
 //! admits a device and supplies the facts Vulkan does not report, as the AMD
 //! stack's part of [`open`](super::open). Features, limits and formats are
 //! what RADV reports, as for every stack.
+#[cfg(feature = "amdgpu-port")]
+use super::open::{self, Admission};
 use super::{
     abi::DeviceLocation,
     capabilities::Platform,
-    open::{self, Admission, Attachment},
-    vulkan::{DriverId, PhysicalDeviceType, physical::Identity},
+    open::Attachment,
+    vulkan::{
+        DriverId, PhysicalDeviceType,
+        physical::{HeapLayout, Identity},
+    },
 };
 use alloc::string::String;
 
@@ -50,10 +55,29 @@ const LINEAR_OFFSET_ALIGNMENT: u64 = 256;
 const SPARSE_PAGE_BYTES: u64 = 64 << 10;
 
 /// Admits the Vulkan device `identity` whose kernel driver reports the
-/// family `family` (`drm_amdgpu_info_device::family`).
+/// family `family` (`drm_amdgpu_info_device::family`), named as amdgpu's
+/// interface names it.
+#[cfg(feature = "amdgpu-port")]
 pub fn admit_family(
     identity: &Identity,
     family: u32,
+    attachment: Attachment,
+) -> Result<Platform, Refusal> {
+    admit_named(
+        identity,
+        family,
+        crate::amdgpu::family_name(family),
+        attachment,
+    )
+}
+
+/// Admits the Vulkan device `identity` of the family `family`, which
+/// amdgpu's interface (`AMDGPU_FAMILY_*` in `amdgpu_drm.h`) names `name`;
+/// `None` when it names no such family.
+pub fn admit_named(
+    identity: &Identity,
+    family: u32,
+    name: Option<&str>,
     attachment: Attachment,
 ) -> Result<Platform, Refusal> {
     if identity.vendor_id != VENDOR_ID {
@@ -64,7 +88,7 @@ pub fn admit_family(
     if identity.driver_id != DriverId::MesaRadv {
         return Err(Refusal::NotRadv(identity.driver_id));
     }
-    let name = crate::amdgpu::family_name(family).ok_or(Refusal::UnknownFamily { family })?;
+    let name = name.ok_or(Refusal::UnknownFamily { family })?;
     let (location, max_transfer_rate) = match identity.device_type {
         // Part of the processor, on its fabric rather than a link.
         PhysicalDeviceType::IntegratedGpu => (DeviceLocation::BuiltIn, 0),
@@ -89,13 +113,16 @@ pub fn admit_family(
         linear_row_alignment: LINEAR_ROW_ALIGNMENT,
         linear_offset_alignment: LINEAR_OFFSET_ALIGNMENT,
         sparse_page_bytes: SPARSE_PAGE_BYTES,
+        heaps: HeapLayout::Disjoint,
     })
 }
 
 /// The AMD stack's admission: the Vulkan device must be RADV's, for a
 /// family amdgpu's interface names.
+#[cfg(feature = "amdgpu-port")]
 pub const ADMISSION: Admission = Admission { admit };
 
+#[cfg(feature = "amdgpu-port")]
 fn admit(
     identity: &Identity,
     chip: u32,
@@ -113,7 +140,12 @@ fn admit(
 /// loses the device, which the service reopens. An image whose build host
 /// lacked the tools RADV's build runs holds no RADV, and then no driver
 /// here.
-#[cfg(all(feature = "metal-linked", not(test), stela_vulkan_amd))]
+#[cfg(all(
+    feature = "metal-linked",
+    not(test),
+    target_os = "uefi",
+    stela_vulkan_amd
+))]
 pub const DRIVER: super::native::Driver = {
     use super::native::{Driver, Refusals, vk};
     use core::ffi::{c_char, c_void};
@@ -148,6 +180,7 @@ pub const DRIVER: super::native::Driver = {
         // amdgpu's recovery from a hung GPU holds back the VM work closing
         // RADV's file waits for.
         keep_lost: true,
+        check_first_submission: true,
     }
 };
 

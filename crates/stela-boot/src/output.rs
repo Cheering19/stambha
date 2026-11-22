@@ -1395,6 +1395,7 @@ fn halt(code: u32) -> ! {
 /// exists.
 fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
     crate::native_mmio::shootdown::before_stop_screen();
+    crate::engine::firmware_picture_at_stop();
     console::reclaim();
     if console::active() && !RAW_SCREEN.load(Ordering::Relaxed) {
         crate::status::fail(message);
@@ -1463,14 +1464,56 @@ fn stop_advice(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// The stack the boot's first stop does its work on, once the engine kept
+/// one ([`keep_stop_stack`]).
+static STOP_STACK: stela_boot_core::stack_guards::StopStack =
+    stela_boot_core::stack_guards::StopStack::new();
+
+/// Whether the stop's stack is kept.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(crate) fn stop_stack_kept() -> bool {
+    STOP_STACK.kept()
+}
+
+/// Keep the mapped stack whose usable bytes are `usable` for the boot's
+/// first stop; the first one kept stays.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(crate) fn keep_stop_stack(usable: core::ops::Range<u64>) -> bool {
+    STOP_STACK.keep(usable)
+}
+
 pub fn fatal(message: impl core::fmt::Display) -> ! {
     heap_stops();
     if let Claim::Later { first_here } = FIRST_STOP.claim(stopping_processor()) {
         later_stop(&message, first_here)
     }
+    // Only this processor gets here. Its stop stores the logs through the
+    // USB's drivers and stops the GPUs, deeper than the stack it may have
+    // been raised on: a Linux task's 16 KiB, where a driver's failed probe
+    // raises it. A stop within this one, already on the stop's stack, stays
+    // there; one raised elsewhere within it (an exception's own stack)
+    // takes the stack from its top, as the frames there never resume.
+    if let Some(top) = STOP_STACK.top_for(crate::stack_switch::pointer()) {
+        let mut rest = || {
+            fatal_here(&message);
+        };
+        // SAFETY: the stop's stack is used by this processor's stop alone,
+        // and a stop never returns to the frames it leaves.
+        unsafe { crate::stack_switch::on_stack(top, &mut rest) };
+    }
+    fatal_here(&message)
+}
+
+/// [`fatal`] once its processor made the boot's first stop.
+fn fatal_here(message: &dyn core::fmt::Display) -> ! {
     // The guest's last lines, which often explain the stop, before it.
     crate::engine::write_guest_output_at_stop();
-    let message = alloc::string::ToString::to_string(&message);
+    let mut message = alloc::string::ToString::to_string(&message);
+    // A stop inside a GPU driver's probe names the GPU, and another that
+    // could have drawn in its place: such a stop is not contained.
+    if let Some(probe) = crate::engine::gpu_probe_stop() {
+        message = alloc::format!("{message}; {probe}");
+    }
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();

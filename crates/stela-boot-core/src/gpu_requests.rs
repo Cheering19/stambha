@@ -74,10 +74,53 @@ impl core::fmt::Display for Request {
     }
 }
 
+/// `DRM_IOCTL_AMDGPU_INFO`: `DRM_IOW(DRM_COMMAND_BASE + 0x05, struct
+/// drm_amdgpu_info)`, 32 bytes, whose code no other driver's ioctl has.
+pub const AMDGPU_INFO: u32 = 0x4020_6445;
+/// `AMDGPU_INFO_HW_IP_COUNT`: how many engines of a hardware type the GPU
+/// has.
+pub const AMDGPU_INFO_HW_IP_COUNT: u32 = 0x03;
+const EINVAL: i64 = -22;
+
+/// Whether a DRM call's error `result` is its driver's answer to a probe,
+/// which is no refusal: amdgpu answers `AMDGPU_INFO_HW_IP_COUNT` for a
+/// hardware engine type the GPU lacks with EINVAL (`amdgpu_info_ioctl`),
+/// and RADV asks about every type on every GPU. `query` is an
+/// `AMDGPU_INFO` call's query, where it was kept.
+pub fn probe_answer(request: u32, query: Option<u32>, result: i64) -> bool {
+    request == AMDGPU_INFO && query == Some(AMDGPU_INFO_HW_IP_COUNT) && result == EINVAL
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HostCall, Request};
+    use super::{AMDGPU_INFO, AMDGPU_INFO_HW_IP_COUNT, HostCall, Request, probe_answer};
     use alloc::format;
+
+    #[test]
+    fn an_engine_count_for_an_engine_the_gpu_lacks_is_an_answer() {
+        // igpu2's four lines: RADV's counts of UVD, VCE, UVD_ENC and VPE
+        // engines, which a Raphael iGPU has none of.
+        assert!(probe_answer(
+            AMDGPU_INFO,
+            Some(AMDGPU_INFO_HW_IP_COUNT),
+            -22
+        ));
+        // Any other query, error or call stays a refusal, as does one whose
+        // query was not kept.
+        assert!(!probe_answer(
+            AMDGPU_INFO,
+            Some(AMDGPU_INFO_HW_IP_COUNT),
+            -14
+        ));
+        assert!(!probe_answer(AMDGPU_INFO, Some(0x02), -22));
+        assert!(!probe_answer(AMDGPU_INFO, None, -22));
+        // DRM_IOCTL_NOUVEAU_GEM_NEW.
+        assert!(!probe_answer(
+            0xc030_6480,
+            Some(AMDGPU_INFO_HW_IP_COUNT),
+            -22
+        ));
+    }
 
     #[test]
     fn host_calls_print_by_name_and_ioctls_in_hex() {

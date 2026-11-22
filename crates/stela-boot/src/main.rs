@@ -57,6 +57,7 @@ mod pci_io;
 mod random;
 mod selection;
 mod serial;
+mod stack_switch;
 mod status;
 mod stop;
 mod stop_record;

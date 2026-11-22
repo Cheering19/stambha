@@ -51,17 +51,14 @@ static void check_scope(const struct stela_linux_lease *scope)
 		__builtin_trap();
 }
 static int copy_snapshot(const struct firmware **out, const char *name,
-                         const void *authority, const struct stela_linux_lease *scope,
-                         bool *provider_refused)
+                         const void *authority, const struct stela_linux_lease *scope)
 {
 	const u8 *data = NULL;
 	size_t size = 0;
 	int status = stela_linux_firmware_image(authority, name, &data, &size);
 	check_scope(scope);
-	if (status) {
-		*provider_refused = true;
+	if (status)
 		return status;
-	}
 	if (!size)
 		return -ENOENT;
 	if (!data)
@@ -85,6 +82,51 @@ static int copy_snapshot(const struct firmware **out, const char *name,
 	*out = &snapshot->firmware;
 	return 0;
 }
+/* The requests a boot log names: each file a driver asked for, with its bytes
+ * or why it was not given, so a failed probe's log says which file its driver
+ * did not get. A boot's drivers ask for some tens; past the bound one line says
+ * the rest are not listed. */
+#define REPORTED_REQUESTS 64U
+static unsigned int reported_requests;
+
+/* Why the device's firmware source did not give a file, in plain words. The
+ * source answers -EACCES for a file outside the device's selection and -ENOENT
+ * for one the USB lacks (firmware.rs). */
+static const char *refusal(int status)
+{
+	switch (status) {
+	case -ENOENT:
+		return "it is not on the USB";
+	case -EACCES:
+		return "it is not among the files Stela chose for this device";
+	case -EBADMSG:
+	case -EOVERFLOW:
+		return "its copy on the USB is damaged";
+	case -ENOMEM:
+		return "no memory for its copy";
+	default:
+		return "its firmware source refused it";
+	}
+}
+
+static void report(struct device *device, const char *name, int status, size_t bytes, bool warn)
+{
+	if (reported_requests > REPORTED_REQUESTS)
+		return;
+	if (reported_requests++ == REPORTED_REQUESTS) {
+		dev_info(device, "firmware: later requests are not listed\n");
+		return;
+	}
+	if (!status)
+		dev_info(device, "firmware %s: %zu bytes\n", name, bytes);
+	else if (warn)
+		dev_warn(device, "Direct firmware load for %s failed with error %d: %s\n", name,
+			 status, refusal(status));
+	else
+		dev_info(device, "firmware %s not given (error %d: %s); asked for as optional\n",
+			 name, status, refusal(status));
+}
+
 static int load(const struct firmware **out, const char *name, struct device *device, bool warn)
 {
 	(void)stela_linux_owner();
@@ -101,12 +143,14 @@ static int load(const struct firmware **out, const char *name, struct device *de
 	stela_linux_lease_snapshot(&scope);
 	struct stela_linux_device_lease source;
 	int status = stela_linux_device_acquire(device, &source);
-	bool acquired = !status, provider_refused = false;
+	bool acquired = !status;
 	const struct firmware *result = NULL;
 	if (acquired)
-		status = copy_snapshot(&result, name, source.authority, &scope, &provider_refused);
+		status = copy_snapshot(&result, name, source.authority, &scope);
 	check_scope(&scope);
-	if (status && warn && (!acquired || provider_refused))
+	if (acquired)
+		report(device, name, status, result ? result->size : 0, warn);
+	else if (status && warn)
 		dev_warn(device, "Direct firmware load for %s failed with error %d\n", name, status);
 	check_scope(&scope);
 	/* No catalogue mutable borrow survives provider/copy/diagnostic/release.

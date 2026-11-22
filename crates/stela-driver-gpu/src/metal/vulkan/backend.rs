@@ -524,6 +524,18 @@ pub trait Backend {
     }
 }
 
+/// Every requirement `device` lacks, in [`requirements`]' order, then
+/// importing guest memory as dma-bufs (`VK_EXT_external_memory_dma_buf`):
+/// the device is refused for the first. Empty when it meets them all.
+pub fn unmet(device: &PhysicalDevice) -> Vec<&'static str> {
+    requirements(&device.features)
+        .iter()
+        .filter(|requirement| !requirement.present)
+        .map(|requirement| requirement.name)
+        .chain((!device.limits.dma_buf_import).then_some("VK_EXT_external_memory_dma_buf"))
+        .collect()
+}
+
 /// A Vulkan feature or extension the Metal layer needs from every device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Requirement {
@@ -541,7 +553,14 @@ pub struct Requirement {
 /// promises that `GENERAL` costs nothing beside the optimal layouts, and
 /// lets `GENERAL` stand for the attachment feedback loop and video layouts,
 /// which the layer never uses. The device enables it when offered.
-pub fn requirements(features: &Features) -> [Requirement; 19] {
+///
+/// Nor is `dynamicPrimitiveTopologyUnrestricted`: a device without it draws
+/// points and lines of a pipeline without an input primitive topology with
+/// a variant built for their class
+/// ([`RenderPipelinePlan::topology_variants`]).
+///
+/// [`RenderPipelinePlan::topology_variants`]: crate::metal::pipeline::RenderPipelinePlan::topology_variants
+pub fn requirements(features: &Features) -> [Requirement; 18] {
     let requirement = |name, present| Requirement { name, present };
     [
         requirement("bufferDeviceAddress", features.buffer_device_address),
@@ -590,10 +609,6 @@ pub fn requirements(features: &Features) -> [Requirement; 19] {
         requirement(
             "dynamicRenderingUnusedAttachments",
             features.dynamic_rendering_unused_attachments,
-        ),
-        requirement(
-            "dynamicPrimitiveTopologyUnrestricted",
-            features.dynamic_primitive_topology_unrestricted,
         ),
         requirement("hostQueryReset", features.host_query_reset),
     ]

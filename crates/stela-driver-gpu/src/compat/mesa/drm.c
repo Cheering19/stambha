@@ -237,11 +237,22 @@ int drmGetNodeTypeFromFd(int fd)
 	return DRM_NODE_RENDER;
 }
 
-/* The host offers render nodes only, so no device has a primary node. */
+/* The name of the primary node Linux gives the device behind `fd`,
+ * /dev/dri/card<minor>, which nothing here opens: the host offers render
+ * nodes only. libdrm_amdgpu compares these names to find one device behind
+ * two descriptors, and takes any two descriptors without a name for one
+ * device, which would hand a second GPU the first one's. */
 char *drmGetPrimaryDeviceNameFromFd(int fd)
 {
-	(void)fd;
-	return NULL;
+	struct stat status;
+	if (fstat(fd, &status) || major(status.st_rdev) != DRM_MAJOR ||
+	    minor(status.st_rdev) < RENDER_MINOR)
+		return NULL;
+	char *name = malloc(sizeof(DRM_DIR_NAME "/card") + 10);
+	if (name)
+		snprintf(name, sizeof(DRM_DIR_NAME "/card") + 10, DRM_DIR_NAME "/card%u",
+			 minor(status.st_rdev) - RENDER_MINOR);
+	return name;
 }
 
 /* A format modifier's name, for debug prints only. libdrm spells out each
@@ -413,4 +424,37 @@ int drmSyncobjTransfer(int fd, uint32_t destination, uint64_t destination_point,
 		.flags = flags,
 	};
 	return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &transfer);
+}
+
+/* What libdrm_amdgpu prints, which its units send here in place of fprintf
+ * (`xtask/src/gpu/nvk.rs`): each line named for the boot log. The two files
+ * it reads, its marketing-name table and /proc/cpuinfo, are not in the
+ * image; their reports, a path and the error or the error alone, repeat for
+ * every device it opens and become one line, once per boot. */
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...);
+
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...)
+{
+	char text[256];
+	va_list arguments;
+	va_start(arguments, format);
+	int size = vsnprintf(text, sizeof(text), format, arguments);
+	va_end(arguments);
+	if (size < 0)
+		return size;
+	size_t length = strnlen(text, sizeof(text));
+	while (length && text[length - 1] == '\n')
+		text[--length] = 0;
+	const char *missing = strerror(ENOENT);
+	size_t missing_length = strlen(missing);
+	if (length >= missing_length && !strcmp(text + length - missing_length, missing)) {
+		static int said;
+		if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+			fprintf(stream, "GPU libdrm_amdgpu: no marketing-name table or /proc/cpuinfo "
+					"in the image, so it gives no AMD GPU a marketing name (first: %s)\n",
+				text);
+		return size;
+	}
+	fprintf(stream, "GPU libdrm_amdgpu: %s\n", text);
+	return size;
 }

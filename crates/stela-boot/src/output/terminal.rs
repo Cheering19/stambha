@@ -192,9 +192,26 @@ struct Failed(Option<stela_boot_core::heap::Failure>);
 
 impl core::fmt::Display for Failed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.0 {
-            Some(failure) => write!(f, "{failure}"),
-            None => Ok(()),
+        let Some(failure) = self.0 else {
+            return Ok(());
+        };
+        write!(f, "{failure}")?;
+        // Linux's pages are held apart from the heap's own needs, to an
+        // integrated GPU's share or to the plan's bound beside a discrete
+        // GPU: what Linux held says whether the GPU's work was near its own
+        // limit too. Plain reads, no allocation.
+        let page = stela_boot_core::native_memory::PAGE as u64;
+        match stela_linux::pages::held_and_limit() {
+            (held, limit) if limit != 0 => write!(
+                f,
+                "{}",
+                stela_boot_core::gpu_triage::PagesAtStop {
+                    held: held as u64 * page,
+                    limit: limit as u64 * page,
+                    share: crate::native_memory::gpu_share() != 0,
+                }
+            ),
+            _ => Ok(()),
         }
     }
 }

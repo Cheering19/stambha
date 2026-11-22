@@ -26,10 +26,22 @@ pub(super) struct EngineImage {
 
 /// Firmware-owned allocations kept by the engine and its native workers.
 pub(super) struct EngineMemory {
+    /// The engine heap, with an integrated GPU's share at its end.
     pub heap: Region,
     /// The heap bytes for compiled code beside the window
     /// (`host_memory::Sizes::kept`).
     pub kept_code: u64,
+    /// The integrated GPU's share of `heap` (`host_memory::Sizes::gpu`) when
+    /// it bounds Linux's pages, the most they hold at once; zero otherwise,
+    /// as for a display's pages beside a discrete GPU, which only grow the
+    /// heap.
+    pub gpu: u64,
+    /// The most bytes of pages Linux may hold at once
+    /// (`host_memory::page_bound`): the share, or what the heap holds past
+    /// its own needs.
+    pub pages: u64,
+    /// The plan holds Linux to `pages` (`host_memory::held_bound`).
+    pub pages_held: bool,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -139,10 +151,12 @@ pub(super) fn reserve(
         },
     };
     let free = free_ram()?;
+    let plan = crate::storage::gpu_plan();
+    let gpu = plan.memory;
     // A pack read on demand left part of its budget free: the window and
     // the guest share it.
     let room = crate::engine::translations::PACK_ROOM.load(core::sync::atomic::Ordering::Acquire);
-    let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, room)?;
+    let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, room, plan)?;
     let sizes = match window {
         Some(mib) => {
             let chosen = stela_boot_core::host_memory::with_window(sizes, mib << 20);
@@ -162,8 +176,13 @@ pub(super) fn reserve(
         }
         None => sizes,
     };
+    // Linux's page bound follows the heap the boot runs with, after any
+    // `--code-window`.
+    let pages = stela_boot_core::host_memory::page_bound(&sizes, gpu);
+    let held = stela_boot_core::host_memory::held_bound(&sizes, plan);
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M\n",
+        "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M gpu={}M \
+         aperture={}M pages={}{}\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
@@ -171,7 +190,34 @@ pub(super) fn reserve(
         sizes.kept >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
+        sizes.gpu >> 20,
+        sizes.aperture >> 20,
+        match held {
+            Some(bytes) => format!("{}M", bytes >> 20),
+            None => String::from("unbounded"),
+        },
+        match plan.fallback {
+            true => format!(" fallback={}M", sizes.fallback >> 20),
+            false => String::new(),
+        },
     ));
+    output::arguments(format_args!("HOST MEMORY gpu: {}\n", plan.describe(&sizes)));
+    if gpu.limits_pages() && sizes.gpu < stela_boot_core::host_memory::GPU_FLOOR {
+        output::arguments(format_args!(
+            "HOST MEMORY the integrated GPU gets {}M of this PC's RAM, under the {}M a macOS \
+             desktop needs beside the guest's floor: its allocations past it fail as a full \
+             GPU's do\n",
+            sizes.gpu >> 20,
+            stela_boot_core::host_memory::GPU_FLOOR >> 20,
+        ));
+        let tenths = sizes.gpu / 100_000_000;
+        crate::status::warning(&format!(
+            "this PC's RAM leaves the graphics built into its processor {}.{} GB; some windows \
+             may not draw",
+            tenths / 10,
+            tenths % 10
+        ));
+    }
     // Each claimed core owns a full native part. Check both ends before allocation.
     for slot in [0, cores - 1] {
         let part = crate::native_smp::resources::partition(
@@ -183,7 +229,12 @@ pub(super) fn reserve(
         )?;
         crate::native_smp::resources::code_part_bytes(part.code_bytes, sizes.code.parts)?;
     }
-    let heap = allocate(sizes.heap)?;
+    // The GPU's pages come from the heap's allocator, held to their share
+    // by Linux's page limit, so the share lies in the same region, as do
+    // the page tables of the apertures drivers map whole.
+    // So is the room an integrated GPU that may draw in a discrete one's
+    // place keeps for Linux's pages, which the heap uses while none does.
+    let heap = allocate(sizes.heap + sizes.gpu + sizes.aperture + sizes.fallback)?;
     // The engine allocator uses this existing physmap directly. Prove the
     // complete firmware reservation is covered before publishing the handoff.
     if !ram.iter().any(|&(start, end)| {
@@ -235,6 +286,9 @@ pub(super) fn reserve(
     Ok(EngineMemory {
         heap,
         kept_code: sizes.kept,
+        gpu: if gpu.limits_pages() { sizes.gpu } else { 0 },
+        pages,
+        pages_held: held.is_some(),
         native_resources,
         native_task_allocations,
         stack,

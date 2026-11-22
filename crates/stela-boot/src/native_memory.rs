@@ -178,6 +178,118 @@ pub unsafe fn initialize(cpu: usize, physical: u64, bytes: usize, table_offset: 
     unsafe { SOURCE.initialize(cpu, physical, bytes, table_offset) }
 }
 
+/// The bytes of the heap kept for an integrated GPU's pages, zero for a GPU
+/// with memory of its own (`Handoff::gpu_share`).
+static GPU_SHARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The most bytes of pages Linux may hold at once (`Handoff::gpu_pages`).
+static GPU_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The plan holds Linux to [`GPU_PAGES`] (`Handoff::gpu_pages_held`).
+static GPU_PAGES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The heap region's bytes, the share's among them.
+static HEAP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records the integrated GPU's share of the heap the loader planned, the
+/// bound on Linux's pages and whether the plan holds Linux to it, and the
+/// heap region's bytes. The Metal device of an integrated GPU budgets its
+/// allocations by what Linux holds of that bound ([`share_state`]); a
+/// discrete GPU's never is (`share::budget`).
+pub(crate) fn set_gpu_share(share: u64, pages: u64, held: bool, heap: u64) {
+    GPU_SHARE.store(share, core::sync::atomic::Ordering::Relaxed);
+    GPU_PAGES.store(pages, core::sync::atomic::Ordering::Relaxed);
+    GPU_PAGES_HELD.store(held, core::sync::atomic::Ordering::Relaxed);
+    HEAP_BYTES.store(heap, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "nvk")]
+    stela_drivers::gpu::metal::device::share::set_probe(share_state);
+}
+
+/// The bytes of the integrated GPU's share of RAM the loader planned, zero
+/// for a GPU with memory of its own.
+pub(crate) fn gpu_share() -> u64 {
+    GPU_SHARE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// What Linux holds now of the memory an integrated GPU that draws works
+/// in, and that memory's size: the page catalog's limit, the share. A plan
+/// without one gave the Metal device to a discrete GPU, which did not
+/// start, so the integrated GPU draws after all: it then works in the bound
+/// the plan figured for Linux's pages, what the heap holds past its own
+/// needs, said once, whether or not the plan holds Linux to it. None
+/// before the catalog has its limit, or with no bound at all.
+#[cfg(feature = "nvk")]
+fn share_state() -> Option<stela_drivers::gpu::metal::device::share::ShareState> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let (held, limit) = stela_linux::pages::held_and_limit();
+    let limit = match (limit, GPU_PAGES_HELD.load(Ordering::Relaxed)) {
+        (0, true) => return None,
+        (0, false) => GPU_PAGES.load(Ordering::Relaxed),
+        (limit, _) => limit as u64 * PAGE as u64,
+    };
+    if limit == 0 {
+        return None;
+    }
+    let state = stela_drivers::gpu::metal::device::share::ShareState {
+        held: held as u64 * PAGE as u64,
+        limit,
+    };
+    if GPU_SHARE.load(Ordering::Relaxed) == 0 && !SAID.swap(true, Ordering::Relaxed) {
+        crate::output::arguments(format_args!(
+            "GPU MEMORY an integrated GPU draws without a share of its own, as the plan gave the \
+             Metal device to a discrete GPU that did not start: its allocations are held to the \
+             {}M of pages the {}M heap holds past its own needs{}\n",
+            state.limit >> 20,
+            HEAP_BYTES.load(Ordering::Relaxed) >> 20,
+            match GPU_PAGES_HELD.load(Ordering::Relaxed) {
+                true => "",
+                false => ", by its Metal device alone, as the plan holds Linux to no bound",
+            },
+        ));
+    }
+    Some(state)
+}
+
+/// Linux's pages once an integrated GPU is to draw in place of a GPU that
+/// could not (`host_memory::fallback_pages`), from the bound the plan
+/// figured and what Linux holds and is held to now.
+pub(crate) fn fallback_pages() -> stela_boot_core::host_memory::FallbackPages {
+    let (held, limit) = stela_linux::pages::held_and_limit();
+    stela_boot_core::host_memory::fallback_pages(
+        fallback_bound(),
+        held as u64 * PAGE as u64,
+        limit as u64 * PAGE as u64,
+    )
+}
+
+/// The bytes the plan figured Linux's pages may hold (`Handoff::gpu_pages`),
+/// which a fallback holds them to where the plan did not.
+pub(crate) fn fallback_bound() -> u64 {
+    GPU_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Linux's pages are held to [`GPU_PAGES`] from now on: a fallback held
+/// them where the plan did not.
+#[cfg(feature = "nvk")]
+pub(crate) fn pages_held() {
+    GPU_PAGES_HELD.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ordinary pages Linux may hold at once (`Handoff::gpu_pages`): an
+/// integrated GPU's share of the heap, or what the heap holds past its own
+/// needs, in pages, so that no driver's pages take the heap's own; `None`
+/// where the plan holds Linux to no bound (`Handoff::gpu_pages_held`).
+pub(crate) fn gpu_page_limit() -> Option<usize> {
+    if !GPU_PAGES_HELD.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let bytes = GPU_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    usize::try_from(bytes / PAGE as u64)
+        .ok()
+        .filter(|&pages| pages != 0)
+}
+
 /// Keeps the same boot heap generation registered through every consumer.
 pub(crate) struct HeapPin {
     registration: Registration,

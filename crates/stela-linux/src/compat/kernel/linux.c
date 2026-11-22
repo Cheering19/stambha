@@ -178,6 +178,28 @@ bool stela_linux_quiescent(void)
 	       !preempt_count() && irq_flags == ARCH_IRQ_ENABLED;
 }
 
+/* Linux forbids sleeping in a kernel FPU section: x86's kernel_fpu_begin
+ * disables bottom halves (preemption, as here, on RT), so the FPU registers
+ * cannot be saved by a task switch. amdgpu's display core still allocates
+ * with GFP_KERNEL there: dcn30_resource_construct builds Navi 21's and
+ * Navi 22's whole resource pool between DC_FP_START and DC_FP_END. Linux's
+ * slab serves such a request from its free lists without sleeping, and only
+ * a debug kernel's might_sleep check reports it. The platform heap never
+ * sleeps, reclaims or enters Linux's scheduler and touches no FPU or vector
+ * register, so it serves the request as that slab does. Only plain
+ * preemption counts may be held (DC adds one per nesting level): no bottom
+ * half, interrupt or callback context, and interrupts on, as for any
+ * blocking allocation. */
+bool stela_linux_blocking_allocation_allowed(void)
+{
+	if (stela_linux_quiescent())
+		return true;
+	return stela_linux_kernel_fpu_open() && !stela_linux_atomic_callback_active() &&
+	       !stela_linux_rcu_callback_active() &&
+	       !((unsigned int)preempt_count() & ~PREEMPT_MASK) &&
+	       irq_flags == ARCH_IRQ_ENABLED;
+}
+
 #ifdef STELA_LINUX_ENTRY_GENERATION_TEST
 #include <stela/test.h>
 static void exhaust_generation(void)

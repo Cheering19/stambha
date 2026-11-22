@@ -6,8 +6,15 @@
 #include <asm-generic/thread_info_tif.h>
 #include <asm/page.h>
 
-/* Exact admitted Linux usable stack size; Runtime retains the real backing. */
-#define THREAD_SIZE_ORDER 2
+/* Exact admitted Linux usable stack size; Runtime retains the real backing.
+ * 32 KiB, twice x86-64 Linux's: Stela builds Linux code for UEFI's
+ * Microsoft x64 convention, where a function saves the XMM registers it
+ * uses (Linux's SysV convention saves none), so floating-point code's
+ * frames grow. amdgpu's display core takes about 14 KiB in a commit that
+ * validates bandwidth on DCN 3.x (dml31_recalculate alone 9.5 KiB, frames
+ * of up to 4.9 KiB where Linux keeps them under 2 or 3 KiB), and its
+ * assertions print from the deepest of them. */
+#define THREAD_SIZE_ORDER 3
 #define THREAD_SIZE (PAGE_SIZE << THREAD_SIZE_ORDER)
 
 struct task_struct;

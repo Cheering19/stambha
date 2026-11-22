@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:19:06 +0000
+Subject: [PATCH] fix(amdgpu): decide PCIe speed switching by the host's
+ processor, as Linux does on x86
+
+amdgpu turns PCIe speed switching off on Intel hosts and on Pinnacle
+Ridge, under CONFIG_X86, which Stela's build does not set: those hosts
+kept the switching Linux turns off there. Stela gives cpu_data the boot
+processor's identity from CPUID, so the same code runs.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index eaa8340ffbb288833147b4f040a4763cd1036cf7..4c9f8e153c3eb91fa2928b8ee9f814633c55c304 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1389,7 +1389,10 @@ bool amdgpu_device_seamless_boot_supported(struct amdgpu_device *adev)
+  */
+ static bool amdgpu_device_pcie_dynamic_switching_supported(struct amdgpu_device *adev)
+ {
+-#if IS_ENABLED(CONFIG_X86)
++	/* Stela: its build sets no CONFIG_X86, but it runs on an x86 host and
++	 * gives cpu_data the boot processor's identity from CPUID, so the host
++	 * gets the answer Linux gives it. */
++#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_STELA)
+ 	struct cpuinfo_x86 *c = &cpu_data(0);
+ 
+ 	/* eGPU change speeds based on USB4 fabric conditions */

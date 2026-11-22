@@ -1616,9 +1616,22 @@ pub(crate) unsafe fn in_loader_root_at_stop<T>(root: u64, call: impl FnOnce() ->
     unsafe { storage::at_stop_in_loader_root(root, call) }
 }
 
+/// What a stop raised inside a GPU driver's probe adds to its reason: the
+/// GPU, the turn, and another GPU that could have drawn in its place
+/// ([`gpu::probe_stop`]). None outside a probe.
+pub(crate) fn gpu_probe_stop() -> Option<alloc::string::String> {
+    gpu::probe_stop()
+}
+
 /// Unload the GPUs' firmware before a fatal stop, where one can
 /// (`gpu::gate::stop_for_fatal`).
 pub(crate) fn stop_gpus_for_fatal() {
     #[cfg(feature = "nvk")]
     gpu::gate::stop_for_fatal();
+}
+
+/// Before a stop draws its reason: the firmware's screen back when a GPU
+/// claim holds it and nothing ended its picture ([`gpu::picture_at_stop`]).
+pub(crate) fn firmware_picture_at_stop() {
+    gpu::picture_at_stop();
 }

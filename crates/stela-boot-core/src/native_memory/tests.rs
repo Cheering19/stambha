@@ -4,7 +4,7 @@ use core::alloc::Layout;
 // Only the hosted test executable uses this allocator. Each armed window
 // is thread-local and contains no harness/assertion work. The production
 // provider has no fault hook or alternate allocation path.
-pub(super) mod allocation_failure {
+pub(crate) mod allocation_failure {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,

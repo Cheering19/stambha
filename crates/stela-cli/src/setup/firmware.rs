@@ -412,6 +412,17 @@ pub(super) fn bundle_summary() -> String {
     )
 }
 
+/// The complete bundle of this build's GPU ports, for the tests: its files
+/// and its size in MiB.
+#[cfg(test)]
+pub(super) const BUILT_BUNDLE: (usize, &str) =
+    match (cfg!(feature = "amdgpu-port"), cfg!(feature = "intel-port")) {
+        (true, true) => (468, "245.8"),
+        (true, false) => (441, "240.3"),
+        (false, true) => (119, "185.2"),
+        (false, false) => (92, "179.7"),
+    };
+
 /// Download every file of the complete bundle that neither the cache nor
 /// the stick's data volume `volume` (when it exists yet) holds, before
 /// setup, `repair` or `update` changes anything on the stick: a failed
@@ -1037,14 +1048,14 @@ mod tests {
         let manifest = bundle::manifest(&files).unwrap();
         let parsed = bundle::Bundle::parse(&manifest).unwrap();
         assert!(parsed.missing().is_empty());
-        // A stick for an image with the AMD port also holds its firmware.
-        let (objects, summary) = if cfg!(feature = "amdgpu-port") {
-            (125, "for every supported device (187.6 MiB)")
-        } else {
-            (92, "for every supported device (179.7 MiB)")
-        };
+        // A stick for an image with the AMD and Intel ports also holds
+        // their firmware.
+        let (objects, size) = BUILT_BUNDLE;
         assert_eq!(parsed.objects.len(), objects);
-        assert_eq!(bundle_summary(), summary);
+        assert_eq!(
+            bundle_summary(),
+            format!("for every supported device ({size} MiB)")
+        );
         // A volume short of room keeps the small files and leaves the large
         // GPU images out, by name.
         let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
@@ -1068,7 +1079,7 @@ mod tests {
         );
         assert!(!left.contains(&"regulatory.db"));
         // Files the volume already holds count as room.
-        let (_, left) = bundle_plan(Some(MARGIN), 260 * MIB);
+        let (_, left) = bundle_plan(Some(MARGIN), 280 * MIB);
         assert!(left.is_empty());
     }
 
@@ -1329,11 +1340,10 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            if cfg!(feature = "amdgpu-port") {
-                "the firmware on the stick is incomplete: 3 of 125 files are there"
-            } else {
-                "the firmware on the stick is incomplete: 3 of 92 files are there"
-            }
+            format!(
+                "the firmware on the stick is incomplete: 3 of {} files are there",
+                BUILT_BUNDLE.0
+            )
         );
     }
 
@@ -1355,12 +1365,9 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        let lacks = if cfg!(feature = "amdgpu-port") {
-            "lacks 124 of 125 files"
-        } else {
-            "lacks 91 of 92 files"
-        };
-        assert!(status.contains(lacks), "{status}");
+        let files = BUILT_BUNDLE.0;
+        let lacks = format!("lacks {} of {files} files", files - 1);
+        assert!(status.contains(&lacks), "{status}");
         assert!(!status.contains("nvidia/"), "{status}");
         assert!(status.contains("1 of its files are damaged"), "{status}");
     }

@@ -350,6 +350,11 @@ pub trait IrqRegistration {
     fn mask(&mut self) -> Result<(), IrqError>;
     fn unmask(&mut self) -> Result<(), IrqError>;
     fn retire(&mut self) -> Result<RetiredSource<dyn Source>, IrqError>;
+    /// The step of the last retirement that failed, in words, for the log
+    /// line that says the action was retained.
+    fn retire_step(&self) -> &'static str {
+        ""
+    }
 }
 /// Physical-parent mask capability for a hard-IRQ failure.
 /// This endpoint grants no route, callback, device or DMA ownership.
@@ -1128,6 +1133,7 @@ impl<P: Platform + 'static> Registry<P> {
             slot,
             vector,
             active: true,
+            retire_step: "",
             owner_cpu: PhantomData,
         };
         // SAFETY: unique checked process owner as above.
@@ -1303,6 +1309,8 @@ pub struct Registration<'a, P: Platform> {
     slot: NonNull<Slot>,
     vector: u8,
     active: bool,
+    /// The step retirement was at when it last returned, in words.
+    retire_step: &'static str,
     owner_cpu: PhantomData<*mut ()>,
 }
 impl<P: Platform> Registration<'_, P> {
@@ -1385,6 +1393,7 @@ impl<P: Platform> Registration<'_, P> {
             completed: false,
         };
         let result = (|| {
+            self.retire_step = "the process and controller checks before it";
             self.registry.platform.check_process()?;
             self.registry.check_controller()?;
             let guard = self.registry.lock();
@@ -1396,10 +1405,12 @@ impl<P: Platform> Registration<'_, P> {
             let source = unsafe { &mut *slot.source.get() };
             // SAFETY: same exclusive process access to the independent route.
             let routing = unsafe { &mut *slot.routing.get() };
+            self.retire_step = "its notification domain";
             let domain = slot
                 .domain
                 .as_ref()
                 .ok_or(IrqError::Delivery(posted_msi::Error::RootUnavailable))?;
+            self.retire_step = "masking and quiescing its source";
             match routing {
                 RouteRequest::Msi(route) if route.fabric_fenced() => {
                     // The exact source and route stay closed through CPU/work retries.
@@ -1413,7 +1424,9 @@ impl<P: Platform> Registration<'_, P> {
                     source.quiesce()?;
                 }
             }
+            self.retire_step = "its notification domain's check";
             domain.check().map_err(IrqError::Delivery)?;
+            self.retire_step = "the fabric fence before the processor's retirement";
             if let RouteRequest::Msi(route) = routing
                 && route.needs_fabric_fence()
             {
@@ -1425,6 +1438,7 @@ impl<P: Platform> Registration<'_, P> {
                     return Err(error);
                 }
             }
+            self.retire_step = "draining its vector's pending and in-flight interrupts";
             let saved = SavedInterrupts::new(&self.registry.platform);
             let start = self.registry.platform.ticks();
             let drained = loop {
@@ -1446,9 +1460,11 @@ impl<P: Platform> Registration<'_, P> {
             };
             drop(saved);
             drained?;
+            self.retire_step = "joining the driver's work for the line";
             // SAFETY: CLOSING excludes old callbacks after CPU/EOI drain. Keep
             // all source memory through actual captured work/controller joins.
             unsafe { source.synchronize() }?;
+            self.retire_step = "the checks after the drain";
             self.registry.platform.check_process()?;
             self.registry.check_controller()?;
             slot.domain
@@ -1459,6 +1475,7 @@ impl<P: Platform> Registration<'_, P> {
             if let RouteRequest::Msi(route) = routing {
                 route.cpu_retired().map_err(IrqError::Delivery)?;
             }
+            self.retire_step = "the final locked check";
             let guard = self.registry.lock();
             self.registry.check_controller()?;
             if slot.state.load(Ordering::Acquire) != CLOSING {
@@ -1572,6 +1589,9 @@ impl<P: Platform> IrqRegistration for Registration<'_, P> {
     }
     fn retire(&mut self) -> Result<RetiredSource<dyn Source>, IrqError> {
         self.retire()
+    }
+    fn retire_step(&self) -> &'static str {
+        self.retire_step
     }
 }
 #[cfg(test)]

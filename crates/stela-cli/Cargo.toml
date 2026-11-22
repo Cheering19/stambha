@@ -16,10 +16,13 @@ name = "stela"
 path = "src/main.rs"
 
 [features]
-# The AMD GPU port's firmware on the sticks `stela` makes, for a boot image
-# built with amdgpu (`cargo xtask boot build --amdgpu` or `--radv`); a
-# release leaves both out.
+# The AMD and Intel GPU ports' firmware on the sticks `stela` makes, as the
+# boot image `cargo xtask boot build` makes holds amdgpu, xe and i915 outside
+# a release. The release workflow builds `stela` without default features and
+# its image without the ports (`.github/workflows/release.yml`).
+default = ["amdgpu-port", "intel-port"]
 amdgpu-port = ["stela-loader/amdgpu-port"]
+intel-port = ["stela-loader/xe-port", "stela-loader/i915-port"]
 # Set only by `--all-features` gates (`cargo xtask check`), whose feature
 # unification gives stela-soc its `trackpad` here; it lifts the build's
 # refusal of a stela-soc with the GPL-2.0-only trackpad (src/lib.rs). A

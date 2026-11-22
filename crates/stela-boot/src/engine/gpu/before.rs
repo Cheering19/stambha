@@ -5,22 +5,20 @@
 //! reset and the private domain, MSI) are the same for every stack.
 use super::{PAGE, output};
 use alloc::{format, string::String, sync::Arc, vec::Vec};
-use stela_boot_core::opregion;
-use stela_crypto::{Sha256, digest::Digest};
 use stela_drivers::{
     bus::{
         mmio::owned::{self, CacheAttribute, Mapping, Protection},
-        pci::{ConfigSpace, Function, owned::OwnedConfig},
+        pci::{Function, owned::OwnedConfig},
     },
-    firmware::{
-        self, Catalog, ErrorKind as FirmwareError, Image, Provenance, Provider, Requirement,
-        Resource,
-    },
-    gpu::{self, Vendor, stack::GpuStack},
+    firmware::{self, Catalog, ErrorKind as FirmwareError, Image, Provider, Requirement},
+    gpu::{self, stack::GpuStack},
     probe::{NativeServices, ServiceError},
 };
 use stela_linux::catalogue::{FirmwareTarget, PciFirmware};
 use stela_loader::host_firmware::requirements::Inventory;
+
+#[cfg(feature = "intel")]
+mod intel;
 
 /// What a stack's part found on the function before its reset.
 pub(super) struct Identified {
@@ -36,19 +34,42 @@ pub(super) struct Identified {
     pub(super) parameters: Option<String>,
     /// Other functions the driver's probe searches for and reads the
     /// identity of. Linux is shown them for searches only.
-    pub(super) searched: Vec<stela_linux::function::Identity>,
+    pub(super) searched: Vec<Searched>,
+    /// The graphics memory the firmware reserved for the GPU, as Linux's
+    /// x86 early quirks find it, by base and size.
+    pub(super) stolen: Option<(u64, u64)>,
+}
+
+/// A function shown to Linux for a probe's searches, with the
+/// configuration the scan read for it, if the probe reads any.
+#[derive(Clone)]
+pub(super) struct Searched {
+    pub(super) identity: stela_linux::function::Identity,
+    pub(super) configuration: Option<[u8; 256]>,
 }
 
 /// The function as a stack's part may read it before its reset.
 pub(super) struct Observed<'a> {
+    /// The platform's services; the AMD and Intel parts read through them.
+    #[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
     pub(super) services: &'a dyn NativeServices,
+    /// The adapter; the AMD and Intel parts name it.
+    #[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
     pub(super) adapter: &'a gpu::Adapter,
-    /// The PCI-to-ISA bridges the probe read.
-    pub(super) isa_bridges: &'a [stela_drivers::probe::IsaBridge],
-    /// Its configuration, for reads only.
+    /// The PCI-to-ISA bridges and host bridge functions the probe read,
+    /// which the Intel parts show their drivers.
+    #[cfg_attr(not(feature = "intel"), allow(dead_code))]
+    pub(super) chipset: &'a [stela_drivers::probe::ChipsetFunction],
+    /// Its configuration, for reads only; the Intel parts read it.
+    #[cfg_attr(not(feature = "intel"), allow(dead_code))]
     pub(super) function: &'a mut Function<OwnedConfig>,
-    /// The first page of the stack's register BAR, mapped read-only.
+    /// The first page of the stack's register BAR, mapped as the stack's
+    /// part asks ([`Before::register_page`]).
     pub(super) registers: &'a Mapping,
+    /// The stack's register BAR, for the reads a stack's part maps itself:
+    /// amdgpu's IP discovery table.
+    #[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
+    pub(super) register_bar: &'a owned::Resource,
 }
 
 /// One stack's part of the claim.
@@ -62,18 +83,30 @@ pub(super) struct Before {
     /// the stack's register BAR mapped read-only before the reset, and
     /// selects it.
     pub(super) identify: fn(Observed<'_>, Arc<Catalog>) -> Result<Identified, ServiceError>,
+    /// How the first page of the register BAR is mapped for `identify`:
+    /// read-write for a part that writes there (amdgpu's index registers),
+    /// as a page already mapped is not mapped a second time.
+    pub(super) register_page: Protection,
     /// Waits, after the reset, for what the driver's probe expects to find
     /// done. The register BAR is the resource.
     pub(super) settle:
         fn(&dyn NativeServices, &owned::Resource, &Identified) -> Result<(), ServiceError>,
+    /// The words of Linux's command line the driver needs for the device,
+    /// as far as its PCI identity tells them, for a GPU that may be claimed
+    /// after Linux started, in place of one that could not draw: Linux reads
+    /// its command line once, at its start.
+    pub(super) ahead: fn(&gpu::Adapter) -> Vec<String>,
 }
 
 /// The part for `stack`'s kernel driver, if the boot has one.
 pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
-    match stack.vendor {
-        Vendor::Nvidia => Some(&NOUVEAU),
-        Vendor::Amd => Some(&AMDGPU),
-        Vendor::Intel => Some(&XE),
+    match stack.kernel.driver {
+        "nouveau" => Some(&NOUVEAU),
+        #[cfg(feature = "amdgpu")]
+        "amdgpu" => Some(&AMDGPU),
+        // One part for both: either driver may bind the device.
+        #[cfg(feature = "intel")]
+        "xe" | "i915" => Some(&intel::INTEL),
         _ => None,
     }
 }
@@ -81,6 +114,7 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
 /// nouveau: the chip is `PMC_BOOT_0`'s, its GSP-RM files are that chip's, and
 /// a Turing-to-Ada GPU's own firmware must have booted again after the reset.
 static NOUVEAU: Before = Before {
+    ahead: |_| Vec::new(),
     // Its files are the chip's, which only its registers name.
     admits: |_, _| Ok(()),
     identify: |observed, catalog| {
@@ -105,8 +139,10 @@ static NOUVEAU: Before = Before {
             chip: Some(chip.name),
             parameters: None,
             searched: Vec::new(),
+            stolen: None,
         })
     },
+    register_page: Protection::ReadOnly,
     settle: |services, registers, identified| match identified
         .identity
         .and_then(gpu::nouveau_chip::Chip::from_boot0)
@@ -117,17 +153,26 @@ static NOUVEAU: Before = Before {
     },
 };
 
-/// amdgpu: the files are those its IP blocks ask for on the PCI device ID's
-/// GPU, as pinned. The driver reads which blocks the device has from the
-/// device's own discovery table and loads every engine's firmware itself,
-/// so nothing boots by itself after the reset and nothing waits here.
+/// amdgpu: the files are those it may ask for on the PCI device ID's GPU,
+/// as pinned: its family's for a device its table names; for one it
+/// identifies by the device's own IP discovery table, the files of the
+/// block versions that table names, read here before the reset as amdgpu
+/// reads it ([`ip_discovery`]), or every file named after an IP version
+/// where it cannot be read. The driver loads every engine's firmware
+/// itself, so nothing boots by itself after the reset and nothing waits
+/// here.
+#[cfg(feature = "amdgpu")]
 static AMDGPU: Before = Before {
+    ahead: |_| Vec::new(),
     admits: |adapter, catalog| {
-        on_usb(
-            &amdgpu_files(adapter.device)?,
-            &format!("{:04x}", adapter.device),
-            catalog,
-        )
+        use stela_loader::host_firmware::recipes::AmdGpu;
+        let files = amdgpu_files(adapter.device)?;
+        // A discovered GPU's files are known only from its table, which
+        // `identify` reads; it checks them there.
+        if AmdGpu::of(adapter.device) == AmdGpu::Discovered {
+            return Ok(());
+        }
+        on_usb(&files, &format!("{:04x}", adapter.device), catalog)
     },
     identify: |observed, catalog| {
         use stela_loader::host_firmware::recipes;
@@ -137,190 +182,254 @@ static AMDGPU: Before = Before {
             .registers
             .read32(0)
             .map_err(ServiceError::Mapping)?;
-        let inventory = amdgpu_files(adapter.device)?;
         let name = format!("{:04x}", adapter.device);
+        let inventory = if recipes::AmdGpu::of(adapter.device) == recipes::AmdGpu::Discovered {
+            discovered_files(&observed)?
+        } else {
+            amd_claim_notes(&observed, None);
+            amdgpu_files(adapter.device)?
+        };
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, None)?,
             identity: None,
             chip: recipes::amd_gpu_family(adapter.device),
             parameters: None,
             searched: Vec::new(),
+            stolen: None,
         })
     },
+    // The IP discovery read writes the index registers in it.
+    register_page: Protection::ReadWrite,
     settle: |_, _, _| Ok(()),
 };
 
-/// xe: the platform is the PCI device ID's, as in xe's own table, and its
-/// GuC, HuC, GSC and DMC files are that platform's. Nothing of the GPU's
-/// boots by itself after a reset: xe loads all of it. The display code's
-/// Video BIOS Table is the one file the PC itself holds.
-static XE: Before = Before {
-    admits: |adapter, catalog| {
-        on_usb(
-            &xe_files(adapter.device)?,
-            &format!("{:04x}", adapter.device),
-            catalog,
-        )
-    },
-    identify: |mut observed, catalog| {
-        use stela_loader::host_firmware::recipes;
-        let adapter = observed.adapter;
-        // Register 0 identifies nothing here; the read proves the window.
-        observed
-            .registers
-            .read32(0)
-            .map_err(ServiceError::Mapping)?;
-        let inventory = xe_files(adapter.device)?;
-        let target = inventory
-            .requests()
-            .first()
-            .ok_or(ServiceError::Refused(
-                "the GPU has no pinned firmware recipe",
-            ))?
-            .view()
-            .target;
-        let table = video_bios_table(&mut observed, target);
-        let name = format!("{:04x}", adapter.device);
-        Ok(Identified {
-            firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
-            identity: None,
-            chip: recipes::intel_gpu_platform(adapter.device),
-            // The display code asks the firmware service for the table this
-            // parameter names before it looks anywhere else (`intel_bios.c`).
-            parameters: table.map(|_| format!("xe.vbt_firmware={VBT}")),
-            searched: chipset_bridges(&observed),
-        })
-    },
-    settle: |_, _, _| Ok(()),
-};
-
-/// The PCI-to-ISA bridges of the GPU's segment, with one line each. The
-/// display code names the PCH by the bridge's IDs (`intel_pch.c` searches
-/// the class) and takes its panel power sequencer and port map from that;
-/// with none it detects no PCH.
-fn chipset_bridges(observed: &Observed<'_>) -> Vec<stela_linux::function::Identity> {
-    let address = observed.adapter.address;
-    let bridges: Vec<_> = observed
-        .isa_bridges
-        .iter()
-        .filter(|bridge| bridge.identity.address.segment == address.segment)
-        .collect();
-    if bridges.is_empty() {
-        output::arguments(format_args!(
-            "GPU {address}: no PCI-to-ISA bridge was found, so the display code detects no PCH\n"
-        ));
-    }
-    bridges
-        .into_iter()
-        .map(|bridge| {
-            let (at, class) = (bridge.identity.address, bridge.identity.class);
-            output::arguments(format_args!(
-                "GPU {address}: PCI-to-ISA bridge {at} {:04x}:{:04x} is shown to xe for its \
-                 chipset search\n",
-                bridge.identity.vendor, bridge.identity.device
-            ));
-            stela_linux::function::Identity {
-                bus: u32::from(at.bus),
-                devfn: u32::from(at.device << 3 | at.function),
-                vendor: bridge.identity.vendor,
-                device: bridge.identity.device,
-                subsystem_vendor: bridge.subsystem_vendor,
-                subsystem_device: bridge.subsystem_device,
-                class_revision: u32::from_be_bytes([class[0], class[1], class[2], bridge.revision]),
-            }
-        })
-        .collect()
-}
-
-/// The name the display code asks for the PC's Video BIOS Table by.
-const VBT: &str = "intel/vbt.bin";
-
-/// The Video BIOS Table of the OpRegion the function's `ASLS` register
-/// points at, as an image of `target`, and one line saying where it came
-/// from or why there is none. Linux reads it through its ACPI OpRegion
-/// driver, which Stela's Linux profile does not build; the OpRegion is plain
-/// firmware memory, read here through its owner.
-fn video_bios_table(
-    observed: &mut Observed<'_>,
-    target: firmware::Target<'_>,
-) -> Option<Image<'static>> {
-    let address = observed.adapter.address;
-    let absent = |why: &dyn core::fmt::Display| {
-        output::arguments(format_args!(
-            "GPU {address}: no Video BIOS Table from the OpRegion ({why}): panels are found \
-             by probing only\n"
-        ));
-    };
-    let asls = match observed.function.config().read32(opregion::ASLS) {
-        Ok(asls) => asls,
-        Err(error) => {
-            absent(&format_args!("its address could not be read: {error:?}"));
-            return None;
-        }
-    };
-    let table = match opregion::read(u64::from(asls), |physical, into| {
-        observed.services.read_firmware_memory(physical, into)
-    }) {
-        Ok(table) => table,
-        Err(why) => {
-            absent(&why);
-            return None;
-        }
-    };
-    let (bytes, place, (major, minor)) = (table.bytes.len(), table.place, table.version);
-    let revision = format!("{major}.{minor}");
-    let catalog = Catalog::from_handoff(alloc::vec![Resource {
-        name: VBT,
-        target,
-        provenance: Provenance {
-            source: "ACPI OpRegion",
-            revision: &revision,
-            member: "vbt",
-            license: "the PC's firmware",
-        },
-        expected_length: bytes,
-        expected_sha256: Sha256::digest(&table.bytes).into(),
-        bytes: table.bytes,
-    }]);
-    // The table is held for the boot, like the stored catalog's images.
-    let image = catalog.ok().and_then(|catalog| {
-        let held: &'static Catalog = alloc::boxed::Box::leak(alloc::boxed::Box::new(catalog));
-        held.load(Requirement {
-            name: VBT,
-            target,
-            minimum_bytes: 1,
-        })
-        .ok()
-    });
-    match image {
-        Some(_) => output::arguments(format_args!(
-            "GPU {address}: Video BIOS Table of {bytes} bytes from the OpRegion's {place} \
-             (OpRegion {major}.{minor})\n"
-        )),
-        None => absent(&"it cannot be held as a firmware image"),
-    }
-    image
-}
-
-/// The files amdgpu asks for on the AMD GPU with PCI device ID `device`.
+/// The files amdgpu may ask for on the AMD GPU with PCI device ID `device`.
+#[cfg(feature = "amdgpu")]
 fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
-        ServiceError::Refused(
-            "Stela pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
-                 not for this GPU",
-        )
+        ServiceError::Refused("amdgpu leaves this GPU to an older driver and loads no files for it")
     })?;
     Ok(inventory)
 }
 
-/// The files xe and the display code ask for on the Intel GPU with PCI
-/// device ID `device`.
-fn xe_files(device: u16) -> Result<Inventory, ServiceError> {
+/// The files amdgpu asks for on the AMD GPU it identifies by its IP
+/// discovery table: those of the block versions the table names, else
+/// every file named after an IP version, with a line saying which.
+#[cfg(feature = "amdgpu")]
+fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> {
+    use stela_boot_core::amd_discovery::{self as discovery, Ip};
+    use stela_loader::host_firmware::recipes::{self, DiscoveredIp};
+    let address = observed.adapter.address;
+    let device = observed.adapter.device;
+    let ips = match ip_discovery(observed.services, observed.registers, observed.register_bar) {
+        Ok(ips) => ips,
+        Err(why) => {
+            output::arguments(format_args!(
+                "GPU {address}: its IP discovery table was not read before its reset ({why}); \
+                 its driver is given every firmware file named after an IP version\n"
+            ));
+            amd_claim_notes(observed, None);
+            return amdgpu_files(device);
+        }
+    };
+    amd_claim_notes(observed, Some(&ips));
+    // A compute accelerator is refused here, before its reset, as the
+    // port's rule leaves out every GPU RADV opens no device on.
+    #[cfg(feature = "amdgpu")]
+    if let Some(graphics) = discovery::version(&ips, discovery::GC) {
+        gpu::amdgpu::discovered_serves(graphics).map_err(ServiceError::Refused)?;
+    }
+    let named: Vec<String> = [
+        ("GC", discovery::GC),
+        ("MP0", discovery::MP0),
+        ("MP1", discovery::MP1),
+        ("SDMA", discovery::SDMA0),
+        ("VCN", discovery::VCN),
+        ("VPE", discovery::VPE),
+        ("DCN", discovery::DMU),
+    ]
+    .iter()
+    .filter_map(|&(block, hw_id)| {
+        discovery::version(&ips, hw_id)
+            .map(|(major, minor, revision)| format!("{block} {major}.{minor}.{revision}"))
+    })
+    .collect();
+    output::arguments(format_args!(
+        "GPU {address}: its IP discovery table names {}; its driver is given those blocks' \
+         firmware but the media engines' (VCN, VPE), which it leaves out\n",
+        named.join(", ")
+    ));
+    let ips: Vec<DiscoveredIp> = ips
+        .iter()
+        .map(
+            |&Ip {
+                 hw_id,
+                 major,
+                 minor,
+                 revision,
+                 ..
+             }| DiscoveredIp {
+                hw_id,
+                major,
+                minor,
+                revision,
+            },
+        )
+        .collect();
+    // A block amdgpu requires and cannot start would fail its probe after
+    // the reset; refused here, the GPU keeps what the firmware left.
+    if let Some((block, (major, minor, revision))) = recipes::discovered_lacks(&ips) {
+        output::arguments(format_args!(
+            "GPU {address}: its IP discovery table names {block} {major}.{minor}.{revision}, \
+             and no pinned amdgpu firmware file is that block's (linux-firmware does not \
+             publish it, or the block is newer than the pinned driver); amdgpu could not start \
+             it, so it stays as the firmware left it\n"
+        ));
+        return Err(ServiceError::Refused(
+            "no pinned amdgpu firmware for a block the GPU's IP discovery table names",
+        ));
+    }
     let mut inventory = Inventory::default();
-    stela_loader::host_firmware::recipes::require_xe(&mut inventory, device)
-        .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
+    recipes::require_amdgpu_discovered(&mut inventory, device, &ips)
+        .map_err(|_| ServiceError::Refused("the GPU's discovered firmware cannot be selected"))?;
     Ok(inventory)
+}
+
+/// What an AMD GPU's claim reads for its triage, before its reset: where
+/// its IP discovery table lists its security processor (MP0), that
+/// processor's state as the previous owner left it, which amdgpu's own start
+/// then meets; and for an integrated GPU, the memory it is given: its share
+/// of RAM, the GTT and TTM limits that follow from it, its VRAM carve-out
+/// and the most Metal may tell the guest. One line each.
+#[cfg(feature = "amdgpu")]
+fn amd_claim_notes(observed: &Observed<'_>, ips: Option<&[stela_boot_core::amd_discovery::Ip]>) {
+    use stela_boot_core::amd_discovery::{self as discovery};
+    let adapter = observed.adapter;
+    let address = adapter.address;
+    let bar = observed.register_bar.physical_span().bytes() as usize;
+    let read = |offset: usize| {
+        if offset + 4 <= bar {
+            read_register(observed.services, observed.register_bar, offset).unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        }
+    };
+    if let Some((major, minor, revision)) =
+        ips.and_then(|ips| discovery::version(ips, discovery::MP0))
+        && bar >= discovery::SECURITY_PROCESSOR_BYTES
+    {
+        output::arguments(format_args!(
+            "GPU {address}: its security processor (MP0 {major}.{minor}.{revision}) before its \
+             reset: {}\n",
+            discovery::security_processor(
+                read(discovery::MP0_SMN_C2PMSG_33),
+                read(discovery::MP0_SMN_C2PMSG_64),
+                read(discovery::MP0_SMN_C2PMSG_81),
+            )
+        ));
+    }
+    // Its kind as the loader took it: the driver's table, else the
+    // graphics version its IP discovery table lists, else integrated.
+    let integrated = GpuStack::select(adapter)
+        .ok()
+        .and_then(|stack| {
+            let discovered = stack.kernel.discovered_integrated;
+            stack
+                .kernel
+                .table_integrated(adapter)
+                .or_else(|| discovered.and_then(|discovered| (discovered.named)(adapter)))
+                .or_else(|| {
+                    let graphics = discovery::version(ips?, discovery::GC)?;
+                    Some((discovered?.graphics)(graphics))
+                })
+        })
+        .unwrap_or(true);
+    if !integrated {
+        return;
+    }
+    let mib = |bytes: u64| bytes >> 20;
+    let carve_out = match read(discovery::RCC_CONFIG_MEMSIZE) {
+        u32::MAX => String::from("was not read (RCC_CONFIG_MEMSIZE reads all ones)"),
+        megabytes => {
+            format!("is {megabytes}M (RCC_CONFIG_MEMSIZE), which the share does not count")
+        }
+    };
+    let share = crate::native_memory::gpu_share();
+    if share == 0 {
+        let heap = crate::ALLOCATOR.usage();
+        let bound = match crate::native_memory::gpu_page_limit() {
+            Some(pages) => format!("at most {}M of them", mib(pages as u64 * 4096)),
+            None => String::from("with no bound of their own"),
+        };
+        output::arguments(format_args!(
+            "GPU {address}: integrated, and the memory plan gave it no share of RAM: Linux's \
+             pages for it come from Stela's heap of {}M, {bound}; its VRAM carve-out \
+             {carve_out}\n",
+            mib(heap.total as u64),
+        ));
+        return;
+    }
+    #[cfg(feature = "nvk")]
+    let told = format!(
+        "; Metal tells the guest at most {}M, 0.8M less for each 1M Linux holds as it opens",
+        mib(stela_drivers::gpu::metal::device::share::working_set(
+            stela_drivers::gpu::metal::device::share::ShareState {
+                held: 0,
+                limit: share,
+            }
+        ))
+    );
+    #[cfg(not(feature = "nvk"))]
+    let told = String::new();
+    output::arguments(format_args!(
+        "GPU {address}: integrated: its share of RAM is {}M, the most Linux may hold (the page \
+         catalog's limit); amdgpu caps its GTT at it and TTM's page limit is {}M; its VRAM \
+         carve-out {carve_out}{told}\n",
+        mib(share),
+        mib(share.saturating_mul(2))
+    ));
+}
+
+/// The IP blocks of the AMD GPU whose register BAR is `registers`, from
+/// its IP discovery table, read before the reset as amdgpu reads it at its
+/// probe ([`stela_boot_core::amd_discovery::read`]): through the `MM_INDEX`
+/// and `MM_DATA` registers of `page`, the BAR's first page mapped
+/// read-write, whose index is put back after.
+#[cfg(feature = "amdgpu")]
+fn ip_discovery(
+    services: &dyn NativeServices,
+    page: &Mapping,
+    registers: &owned::Resource,
+) -> Result<Vec<stela_boot_core::amd_discovery::Ip>, String> {
+    use stela_boot_core::amd_discovery::{self as discovery, INDEX_PAGE_BYTES};
+    if (registers.physical_span().bytes() as usize) < discovery::REGISTER_BYTES {
+        return Err(String::from(
+            "its register BAR is smaller than amdgpu's discovery reads",
+        ));
+    }
+    struct Bar<'a> {
+        services: &'a dyn NativeServices,
+        page: &'a Mapping,
+        registers: &'a owned::Resource,
+    }
+    impl discovery::Registers for Bar<'_> {
+        fn read(&self, offset: usize) -> u32 {
+            if offset < INDEX_PAGE_BYTES {
+                return self.page.read32(offset).unwrap_or(u32::MAX);
+            }
+            read_register(self.services, self.registers, offset).unwrap_or(u32::MAX)
+        }
+        fn write(&self, offset: usize, value: u32) -> bool {
+            offset < INDEX_PAGE_BYTES && self.page.write32(offset, value).is_ok()
+        }
+    }
+    discovery::read(&Bar {
+        services,
+        page,
+        registers,
+    })
+    .map_err(|failure| format!("{failure}"))
 }
 
 /// The image `selection` names in `stored`: its exact binding, else the
@@ -352,6 +461,7 @@ fn find<'a>(
 /// missing and why ([`lacks`]), and the refusal [`select_firmware`] would
 /// give for them later.
 /// A file the driver starts without (`recipes::optional`) may be missing.
+#[cfg_attr(not(any(feature = "amdgpu", feature = "intel")), allow(dead_code))]
 fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), ServiceError> {
     use stela_loader::host_firmware::recipes;
     let plan = recipes::Plan::select(inventory)
@@ -458,15 +568,20 @@ fn select_firmware(
     let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
     let mut bindings = Vec::new();
     let mut missing = Vec::new();
+    // A driver that chooses among many files by what the device reports
+    // (amdgpu by IP discovery) gets one line for them, not one each.
+    let summarized = plan.selections().len() > SUMMARIZED;
     for selection in plan.selections() {
         let request = &selection.request;
         let found = find(stored, selection);
         if let Ok(image) = found {
-            output::arguments(format_args!(
-                "GPU {name}: firmware {} of {} bytes\n",
-                request.name,
-                image.bytes().len()
-            ));
+            if !summarized {
+                output::arguments(format_args!(
+                    "GPU {name}: firmware {} of {} bytes\n",
+                    request.name,
+                    image.bytes().len()
+                ));
+            }
             bindings.push((image, request));
         }
         match found {
@@ -504,6 +619,28 @@ fn select_firmware(
     }
     if !missing.is_empty() {
         return Err(lacks(name, &missing, names.len()));
+    }
+    if summarized {
+        // Each file by its name less its directory and `.bin`, so a file
+        // the selection left out shows without a line for each.
+        let given: Vec<&str> = bindings
+            .iter()
+            .map(|(_, request)| {
+                let file = request.name.as_str();
+                let file = file.rsplit('/').next().unwrap_or(file);
+                file.strip_suffix(".bin").unwrap_or(file)
+            })
+            .collect();
+        output::arguments(format_args!(
+            "GPU {name}: {} firmware files of {} bytes, of which its driver loads those the \
+             device names: {}\n",
+            bindings.len(),
+            bindings
+                .iter()
+                .map(|(image, _)| image.bytes().len())
+                .sum::<usize>(),
+            given.join(" ")
+        ));
     }
     names.extend(read.iter().map(|(_, name)| String::from(*name)));
     // Each file under the exact name and target the driver asks for.
@@ -635,6 +772,9 @@ fn wait_for_firmware_boot(
         }
     }
 }
+
+/// More firmware files than this for one GPU are logged as one line.
+const SUMMARIZED: usize = 16;
 
 /// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 pub(super) const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";

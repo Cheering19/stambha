@@ -284,6 +284,12 @@ fn start(handoff: u64) -> Started {
             layout::physical(0),
         )
     };
+    crate::native_memory::set_gpu_share(
+        handoff.gpu_share,
+        handoff.gpu_pages,
+        handoff.gpu_pages_held,
+        handoff.heap.bytes,
+    );
     // SAFETY: original private reservation held in the shared physmap, before
     // any remapper or AP has started.
     if let Err(error) = unsafe { crate::native_memory::initialize_amd_tables(handoff.amd_tables) } {
@@ -903,15 +909,17 @@ fn describe_host(
 }
 
 /// A part of "Setting up the Mac's hardware" begins: named on the log and,
-/// in an image with amdgpu, whose parts may wait on a GPU it is still
-/// bringing up, stored on the USB first. The step stores the log only at its
-/// end, so a part that never returns showed no line of its own: this one
-/// names it. Other images keep the step's single store, whose wait each
-/// part's store would add to every boot.
+/// where a bound GPU's driver may hang the parts that wait on it
+/// ([`gpu::bound_gpu_may_hang`]), stored on the USB first. The step stores
+/// the log only at its end, so a part that never returns showed no line of
+/// its own: this one names it. Other boots keep the step's single store,
+/// whose wait each part's store would add.
 fn hardware_step(name: &str) {
     output::arguments(format_args!("HARDWARE {name}\n"));
-    #[cfg(feature = "amdgpu")]
-    output::flush_log();
+    #[cfg(feature = "nvk")]
+    if gpu::bound_gpu_may_hang() {
+        output::flush_log();
+    }
 }
 
 fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
@@ -1515,9 +1523,21 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
     })
 }
 
+/// What probe found of the GPUs and the platform around them: the display
+/// controllers, the chipset functions, each GPU's ACPI companion and the
+/// ports above each GPU.
+type FoundGpus = (
+    Vec<stela_drivers::gpu::Adapter>,
+    Vec<stela_drivers::probe::ChipsetFunction>,
+    Vec<(stela_drivers::bus::pci::Address, String)>,
+    stela_drivers::probe::GpuPorts,
+);
+
 /// Claim the GPUs from probe and start them in the host's Linux environment.
-/// A GPU that cannot start is reported, and the Mac boots without it; whether
-/// any started is the answer.
+/// A GPU that cannot start is reported, and the Mac boots without it; where a
+/// GPU chosen to draw does not start, the GPUs that draw in its place are
+/// claimed and started ([`gpu::Fallback`]). When any started, the answer
+/// claims more should a Metal device not open on them.
 fn open_gpus(
     work: &'static kernel_work::KernelWork,
     mmio: Option<&'static crate::native_mmio::Source>,
@@ -1525,33 +1545,29 @@ fn open_gpus(
     acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    (adapters, isa_bridges, companions): (
-        Vec<stela_drivers::gpu::Adapter>,
-        Vec<stela_drivers::probe::IsaBridge>,
-        Vec<(stela_drivers::bus::pci::Address, String)>,
-    ),
-) -> bool {
+    (adapters, chipset, companions, ports): FoundGpus,
+) -> Option<gpu::Fallback> {
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
-    let guest_ram = handoff.guest[..handoff.guest_count]
+    let guest_ram: Vec<_> = handoff.guest[..handoff.guest_count]
         .iter()
         .map(|region| region.physical..region.physical + region.bytes)
         .collect();
     let Some(window) = mmio.and_then(|mmio| mmio.window()) else {
         crate::status::warn("this PC cannot map a GPU's memory, so it is left unused");
-        return false;
+        return None;
     };
-    let Some(mmio) = mmio else { return false };
+    let mmio = mmio?;
     if let Err(error) = work.service_clock().and_then(|clock| clock.epoch()) {
         crate::status::warn(&stela_boot_core::work_status::gpu_without_clock(
             crate::cpu::INVARIANT_TSC.present(),
             &format!("{error}"),
         ));
-        return false;
+        return None;
     }
     let tsc_hz = handoff.tsc_hz;
     #[cfg(feature = "nvk")]
     let heap_bytes = heap.end - heap.start;
-    crate::status::begin("Starting the GPU");
+    crate::status::begin(stela_boot_core::gpu_step::TITLE);
     let gop = if handoff.screen.is_some() {
         mmio.verified_framebuffer()
     } else {
@@ -1564,7 +1580,7 @@ fn open_gpus(
     // bounded firmware call.
     #[cfg(feature = "nvk")]
     if let Some(acpi) = acpi {
-        let adapters = adapters.clone();
+        let (adapters, companions) = (adapters.clone(), companions.clone());
         acpi.firmware(
             "GPU ACPI data",
             "GSP-RM gets none of it",
@@ -1572,73 +1588,65 @@ fn open_gpus(
             move |session| gpu::acpi_backlight::load(session, &adapters, &companions),
         );
     }
-    #[cfg(not(feature = "nvk"))]
-    let _ = companions;
     let claiming = host::rdtsc();
-    let claimed = work.call_owned(60_000_000, move || {
-        // The firmware's memory is read through the ACPI owner: a GPU's
-        // configuration may point at a table there.
-        let services = services::Services::new(mmio, remappers, acpi, heap, tsc_hz, Vec::new())
-            .with_guest_ram(guest_ram);
-        let random = stela_drivers::probe::NativeServices::entropy(&services)
-            .ok()
-            .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
-        let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(
-                &services,
-                &adapters,
-                &isa_bridges,
-                gop,
-                firmware.as_ref(),
-                &|address| gpu::link::port_above(mmio, address),
-            )
-        });
-        (claimed, refused, random)
+    // What a claim reads beyond the adapter, for the start's claims and a
+    // fallback's.
+    let inputs = alloc::rc::Rc::new((chipset, ports, firmware));
+    // The firmware's memory is read through the ACPI owner: a GPU's
+    // configuration may point at a table there.
+    let services = {
+        let (heap, guest_ram) = (heap.clone(), guest_ram.clone());
+        move || {
+            services::Services::new(mmio, remappers, acpi, heap.clone(), tsc_hz, Vec::new())
+                .with_guest_ram(guest_ram.clone())
+        }
+    };
+    let claimed = work.call_owned(60_000_000, {
+        let (inputs, services) = (inputs.clone(), services.clone());
+        move || {
+            let services = services();
+            let random = stela_drivers::probe::NativeServices::entropy(&services)
+                .ok()
+                .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
+            let (chipset, ports, firmware) = &*inputs;
+            let (claimed, refused, census) = match random {
+                Some(_) => gpu::claim_all(
+                    &services,
+                    &adapters,
+                    gop,
+                    &gpu::ClaimInputs {
+                        chipset,
+                        ports,
+                        catalog: firmware.as_ref(),
+                        port_above: &|address| gpu::link::port_above(mmio, address),
+                    },
+                ),
+                None => (Vec::new(), Vec::new(), None),
+            };
+            (claimed, refused, census, random)
+        }
     });
-    let (claimed, random) = match claimed {
-        Ok((claimed, _, Some(random))) if !claimed.is_empty() => (claimed, random),
-        Ok((_, refused, _)) => {
+    let (claimed, refused, census, random) = match claimed {
+        Ok((claimed, refused, census, Some(random))) if !claimed.is_empty() => {
+            (claimed, refused, census, random)
+        }
+        Ok((_, refused, ..)) => {
             // Each GPU that did not start, and why, or that there is none.
-            use stela_boot_core::gpu_status;
-            match refused.split_first() {
-                None => crate::status::warn(&gpu_status::none(&found)),
-                Some((first, rest)) => {
-                    crate::status::warn(&gpu_status::refused(
-                        first.vendor,
-                        &first.address,
-                        first.device,
-                        first.reason,
-                        &first.why,
-                    ));
-                    for gpu in rest {
-                        crate::status::info(&gpu_status::refused(
-                            gpu.vendor,
-                            &gpu.address,
-                            gpu.device,
-                            gpu.reason,
-                            &gpu.why,
-                        ));
-                    }
-                }
-            }
-            // The display adapters no driver here runs, and why: the
-            // refused ones were named above.
-            for adapter in found.iter().filter(|adapter| {
-                stela_drivers::gpu::stack::GpuStack::select(adapter).is_err()
-                    && !refused
-                        .iter()
-                        .any(|gpu| gpu.address == format!("{}", adapter.address))
-            }) {
-                crate::status::info(&gpu_status::unused(adapter));
-            }
-            return false;
+            let ports: Vec<_> = stela_drivers::gpu::stack::STACKS
+                .iter()
+                .map(|stack| stack.vendor)
+                .collect();
+            show_gpu_step(stela_boot_core::gpu_step::not_started(
+                &found, &refused, &ports,
+            ));
+            return None;
         }
         Err(error) => {
             crate::status::warn(&format!(
                 "the GPU could not be claimed: {error}. This is a Stela bug; the boot log on \
                  this USB holds the details"
             ));
-            return false;
+            return None;
         }
     };
     let machine = gpu::Machine {
@@ -1647,15 +1655,49 @@ fn open_gpus(
         random,
         tsc_hz,
         wall: handoff.wall,
+        fallback_words: census
+            .as_ref()
+            .map_or_else(Vec::new, gpu::Census::fallback_words),
         #[cfg(feature = "nvk")]
         heap_bytes,
     };
+    // A fallback's claims run as the start's did, in a continuation of
+    // their own.
+    #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
+    let mut fallback = gpu::Fallback::new(
+        census,
+        alloc::boxed::Box::new(move |census, failed| {
+            let (inputs, services) = (inputs.clone(), services.clone());
+            work.call_owned(60_000_000, move || {
+                let mut census = census;
+                let (chipset, ports, firmware) = &*inputs;
+                let (claimed, refused) = gpu::claim_fallback(
+                    &services(),
+                    &mut census,
+                    &failed,
+                    &gpu::ClaimInputs {
+                        chipset,
+                        ports,
+                        catalog: firmware.as_ref(),
+                        port_above: &|address| gpu::link::port_above(mmio, address),
+                    },
+                );
+                (census, claimed, refused)
+            })
+            .ok()
+        }),
+    );
+    gpu::amd_acpi_methods(acpi, &claimed, found.clone(), companions);
+    let starting = gpu::claimed_adapters(&claimed, &found);
     // Store the claim's lines before Linux starts, so the USB keeps them
     // even when the start never returns.
     output::flush_log();
     let opening = host::rdtsc();
     // A stop inside the start stores the USB's log from there.
     let opened = storage::in_gpu_start(|| gpu::open(machine, claimed));
+    // A GPU chosen to draw that no driver bound gives way to the next.
+    #[cfg(feature = "nvk")]
+    let opened = storage::in_gpu_start(|| gpu::fall_back_after_probe(opened, &mut fallback));
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
     // functions, starting Linux, and the drivers' probe: nouveau's boots the
     // GSP and binds DRM.
@@ -1670,12 +1712,19 @@ fn open_gpus(
     ));
     let ok = match opened {
         Ok(()) => {
-            crate::status::done("started");
+            // The GPU that draws, then why each other GPU found does not.
+            show_gpu_step(gpu::started(&refused));
             true
+        }
+        // Each GPU no driver bound said so as its probe ended.
+        #[cfg(feature = "nvk")]
+        Err(gpu::Error::NoDevices) => {
+            crate::status::warn(stela_boot_core::gpu_status::NONE_BOUND);
+            false
         }
         Err(error) => {
             crate::status::warn(&stela_boot_core::gpu_status::failed(
-                &found,
+                &starting,
                 &format!("{error}"),
             ));
             false
@@ -1685,7 +1734,25 @@ fn open_gpus(
     // start, rather than at the next periodic store: a stop in what follows
     // keeps them.
     output::flush_log();
-    ok
+    ok.then_some(fallback)
+}
+
+/// Shows the GPU step's lines ([`stela_boot_core::gpu_step`]): the first
+/// ends the step, the others are lines of their own.
+fn show_gpu_step(lines: Vec<(stela_boot_core::gpu_step::Mark, String)>) {
+    use stela_boot_core::gpu_step::Mark;
+    let mut lines = lines.into_iter();
+    match lines.next() {
+        Some((Mark::Ok, text)) => crate::status::done(&text),
+        Some((_, text)) => crate::status::warn(&text),
+        None => crate::status::done(""),
+    }
+    for (mark, text) in lines {
+        match mark {
+            Mark::Info => crate::status::info(&text),
+            Mark::Ok | Mark::Warn => crate::status::warning(&text),
+        }
+    }
 }
 
 /// What the board's devices are placed from besides the board itself.
@@ -2984,6 +3051,9 @@ fn start_platform(
     // SAFETY: before any GPU claim, with the loader root that maps the
     // ACPI tables, as the remapping units' were read above.
     unsafe { super::gpu::keep_video_bios_table(handoff.rsdp, handoff.root) };
+    // SAFETY: as above; the loader root maps the pages the boot kept.
+    unsafe { super::gpu::keep_pci_map(handoff.pci_map, handoff.root) };
+    super::gpu::keep_census(handoff.gpu_census);
     // The IOAPICs are the operating system's after ExitBootServices, as
     // every OS takes them: firmware and SMM program no routes at runtime.
     if let Some(pci) = &contained_pci {
@@ -3360,7 +3430,8 @@ fn start_devices(
                 network_account,
                 gpus,
                 gpu_companions,
-                isa_bridges,
+                chipset,
+                gpu_ports,
                 usb,
                 bluetooth: host_controller,
                 usb_disks,
@@ -3411,14 +3482,14 @@ fn start_devices(
             });
             if options.boots_macos()
                 && let Ok(work) = work
-                && open_gpus(
+                && let Some(mut fallback) = open_gpus(
                     work,
                     mmio,
                     remappers,
                     host_acpi,
                     handoff,
                     host_firmware,
-                    (gpus, isa_bridges, gpu_companions),
+                    (gpus, chipset, gpu_companions, gpu_ports),
                 )
             {
                 let firmware = handoff
@@ -3429,6 +3500,7 @@ fn start_devices(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                     options.display_size,
+                    &mut fallback,
                 );
                 gpu::panel_brightness(host_acpi);
             }

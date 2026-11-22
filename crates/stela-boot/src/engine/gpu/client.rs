@@ -161,7 +161,7 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     let minors = match unsafe { MINORS.load(Ordering::Acquire).as_ref() } {
         Some(minors) => minors,
         None => {
-            let found = Box::into_raw(Box::new(find_minors()?));
+            let found = Box::into_raw(Box::new(find_minors(&[])?));
             match MINORS.compare_exchange(
                 ptr::null_mut(),
                 found,
@@ -182,8 +182,26 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     minors.get(index).copied().flatten()
 }
 
-/// Each bound GPU's primary minor, by the PCI function its master names.
-fn find_minors() -> Option<Vec<Option<u32>>> {
+/// Finds the minors of the GPUs a fallback bound after [`minor`] found the
+/// others' ([`super::start_more`]): the nodes found already are not opened
+/// again, as the display may hold one as its master. The minors found
+/// before stay, so a reader keeps them.
+pub(super) fn find_new_minors() {
+    // SAFETY: published below or by `minor`, and leaked.
+    let Some(known) = (unsafe { MINORS.load(Ordering::Acquire).as_ref() }) else {
+        // None found yet: the first `minor` finds every GPU's.
+        return;
+    };
+    if let Some(found) = find_minors(known)
+        && found.len() > known.len()
+    {
+        MINORS.store(Box::into_raw(Box::new(found)), Ordering::Release);
+    }
+}
+
+/// Each bound GPU's primary minor, by the PCI function its master names;
+/// `known` gives the first GPUs', whose nodes are not opened again.
+fn find_minors(known: &[Option<u32>]) -> Option<Vec<Option<u32>>> {
     let bound = &installed()?.start.bound;
     // A function by its bus, slot and function; DRM puts its domain first.
     let functions: Vec<_> = bound
@@ -197,8 +215,12 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             )
         })
         .collect();
-    let mut minors = alloc::vec![None; bound.len()];
+    let mut minors = known.to_vec();
+    minors.resize(bound.len().max(known.len()), None);
     for minor in 0..PRIMARY_MINORS {
+        if known.contains(&Some(minor)) {
+            continue;
+        }
         let Some(fd) = open_node(minor) else {
             continue;
         };
@@ -214,12 +236,13 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             continue;
         };
         if let Some(index) = functions.iter().position(|name| name == function)
+            && index >= known.len()
             && minors[index].is_none()
         {
             minors[index] = Some(minor);
         }
     }
-    for (gpu, minor) in bound.iter().zip(&minors) {
+    for (gpu, minor) in bound.iter().zip(&minors).skip(known.len()) {
         if minor.is_none() {
             output::arguments(format_args!(
                 "GPU {}: its driver bound it, but no DRM node of it was found\n",
@@ -269,7 +292,11 @@ enum Operation {
         offset: u64,
         size: usize,
     },
-    Unmap(u64),
+    /// Linux's munmap: any page-aligned run of a mapping.
+    Unmap {
+        address: u64,
+        bytes: u64,
+    },
     Fault {
         address: u64,
         write: bool,
@@ -426,10 +453,60 @@ pub(super) fn shutdown(seconds: u64) -> bool {
     )
 }
 
+/// What the GPUs' unload before a fatal stop came to.
+pub(super) enum StopUnload {
+    /// Every driver stopped.
+    Stopped,
+    /// A driver was still stopping at the deadline.
+    Stopping,
+    /// Linux could not run for it on the boot CPU: refused for this
+    /// reason, or none when another processor kept the host drivers' lock.
+    NotRun(Option<WorkError>),
+}
+
 /// [`shutdown`] for a fatal stop, which allocates nothing: the stop never
-/// returns, so its stack keeps the request for a wait that gives up.
-pub(super) fn shutdown_for_fatal(seconds: u64) -> bool {
-    unload(&Request::new(Operation::Shutdown), seconds)
+/// returns, so its stack keeps the request for a wait that gives up. On
+/// the boot CPU, outside Linux (the caller's check), this processor runs
+/// Linux for the unload itself; a refusal there is returned, never a second
+/// stop that would replace the first one's reason.
+pub(super) fn shutdown_for_fatal(seconds: u64) -> StopUnload {
+    let request = Request::new(Operation::Shutdown);
+    if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+        return match unload(&request, seconds) {
+            true => StopUnload::Stopped,
+            false => StopUnload::Stopping,
+        };
+    }
+    let Some(gpu) = installed() else {
+        return StopUnload::Stopped;
+    };
+    super::close_moves();
+    let gpus = gpu.start._attached.len().max(1) as u64;
+    let ticks = seconds.saturating_mul(gpus).saturating_mul(gpu.tsc_hz);
+    let deadline = host::rdtsc().saturating_add(ticks);
+    post(&request);
+    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
+    // The lock is waited for within the deadline: a processor that keeps it
+    // past that is stuck itself, and the unload could not finish anyway.
+    let micros = seconds.saturating_mul(gpus).saturating_mul(1_000_000);
+    let ran = gpu.work.dispatch_linux_within(micros, |runtime| {
+        while waiting() {
+            gpu.advance_children();
+            start(gpu)?;
+            if waiting() {
+                runtime.step_or_idle()?;
+                CHILDREN_STALE.store(true, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    });
+    match ran {
+        Some(Ok(())) if request.done.load(Ordering::Acquire) != 0 => StopUnload::Stopped,
+        Some(Ok(())) => StopUnload::Stopping,
+        Some(Err(super::kernel_work::Error::Work(error))) => StopUnload::NotRun(Some(error)),
+        Some(Err(_)) => StopUnload::NotRun(Some(WorkError::Unavailable)),
+        None => StopUnload::NotRun(None),
+    }
 }
 
 fn unload(request: &Request, seconds: u64) -> bool {
@@ -534,35 +611,37 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 refused::map(fd, offset, size, result);
                 result
             }
-            Operation::Unmap(address) => {
-                let Some(ClientMap { mapping, pages, .. }) =
-                    gpu.mappings.borrow_mut().remove(&address)
-                else {
-                    return EFAULT;
-                };
-                client::unmap(mapping);
-                MAPPINGS.fetch_sub(1, Ordering::Relaxed);
-                // A processor that kept the translation keeps the addresses too.
-                if gpu.window.remove(address, pages) {
-                    gpu.window.release(address, pages);
+            Operation::Unmap { address, bytes } => {
+                let unmapped = gpu.mappings.borrow_mut().unmap(address, bytes);
+                match unmapped {
+                    Ok(Some((mapping, span))) => release_mapping(gpu, mapping, span),
+                    // Pages of it remain, or the last fault running in it
+                    // releases it.
+                    Ok(None) => {}
+                    Err(client_fault::Refused::NotMapped) => return EFAULT,
+                    Err(client_fault::Refused::Invalid) => return EINVAL,
                 }
                 0
             }
             Operation::Fault { address, write } => {
-                let mappings = gpu.mappings.borrow();
-                let span = |(&start, map): (&u64, &ClientMap)| map.span(start);
-                let below = mappings.range(..=address).next_back();
-                let above = mappings.range(address.saturating_add(1)..).next();
-                let place = client_fault::place(below.map(span), above.map(span), address);
-                let result = match place {
-                    Place::Inside { .. } => {
-                        let (_, map) = below.expect("a place inside has its mapping");
-                        if client::fill_around(map.mapping, address, write) {
+                // The fault may sleep in Linux (TTM waits for a buffer's
+                // move), and other calls run meanwhile: the table is not
+                // borrowed across it, and the mapping is held instead.
+                let lookup = gpu.mappings.borrow_mut().begin_fault(address);
+                let result = match (lookup.place, lookup.held) {
+                    (Place::Inside { span, .. }, Some(mapping)) => {
+                        let served = client::fill_around(mapping, address, write);
+                        let released = gpu.mappings.borrow_mut().end_fault(span.start);
+                        if let Some((mapping, span)) = released {
+                            release_mapping(gpu, mapping, span);
+                        }
+                        if served {
                             return 0;
                         }
                         EFAULT
                     }
-                    Place::Outside { .. } => ENXIO,
+                    (Place::Inside { .. }, None) => EFAULT,
+                    (Place::Released { .. } | Place::Outside { .. }, _) => ENXIO,
                 };
                 // No allocation: the faulting code may hold the heap's lock.
                 output::arguments(format_args!(
@@ -570,7 +649,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     Unserved {
                         address,
                         write,
-                        place
+                        place: lookup.place
                     }
                 ));
                 result
@@ -592,10 +671,12 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                         "GPU completion waiter still open at the stop\n"
                     ));
                 }
-                gpu.start
-                    ._attached
-                    .iter()
-                    .for_each(|attached| attached.shutdown());
+                // Every bound GPU, those a fallback started after the
+                // start among them, whose attachments the start's list does
+                // not hold.
+                for bound in gpu.start.bound.iter() {
+                    stela_linux::function::shutdown_device(bound.device as *mut c_void);
+                }
                 0
             }
         }
@@ -625,13 +706,13 @@ unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64
     match unsafe { client::map(fd, address, size, offset) } {
         Ok(mapping) => {
             gpu.mappings.borrow_mut().insert(
-                address,
-                ClientMap {
-                    mapping,
-                    pages,
+                Span {
+                    start: address,
+                    pages: pages as u64,
                     fd,
                     offset,
                 },
+                mapping,
             );
             MAPPINGS.fetch_add(1, Ordering::Relaxed);
             address as i64
@@ -643,23 +724,19 @@ unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64
     }
 }
 
-/// A client's mapping of a file in the window.
-pub(super) struct ClientMap {
-    mapping: client::Mapping,
-    pages: usize,
-    /// The descriptor and file offset it maps, which name it in a line.
-    fd: c_int,
-    offset: u64,
-}
-
-impl ClientMap {
-    fn span(&self, start: u64) -> Span {
-        Span {
-            start,
-            pages: self.pages as u64,
-            fd: self.fd,
-            offset: self.offset,
-        }
+/// Ends a client's mapping once no fault runs in it: Linux's, then the
+/// window's pages.
+///
+/// # Safety
+/// As [`perform`]; `mapping` left the table, and no fault holds it.
+unsafe fn release_mapping(gpu: &Installed, mapping: client::Mapping, span: Span) {
+    // SAFETY: the function's contract.
+    unsafe { client::unmap(mapping) };
+    MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+    let pages = span.pages as usize;
+    // A processor that kept the translation keeps the addresses too.
+    if gpu.window.remove(span.start, pages) {
+        gpu.window.release(span.start, pages);
     }
 }
 
@@ -982,7 +1059,7 @@ fn request_code(operation: &Operation) -> u32 {
         Operation::Duplicate(_) => HostCall::Duplicate,
         Operation::Device(_) => HostCall::Device,
         Operation::Map { .. } => HostCall::Map,
-        Operation::Unmap(_) => HostCall::Unmap,
+        Operation::Unmap { .. } => HostCall::Unmap,
         Operation::Fault { .. } => HostCall::Fault,
         Operation::Thread(_) => HostCall::Thread,
         Operation::Wake => HostCall::Wake,
@@ -1720,7 +1797,10 @@ pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
 
 /// Removes the mapping [`map`] gave at `address`.
 pub(super) fn unmap(address: NonNull<u8>) {
-    let result = submit(Operation::Unmap(address.as_ptr() as u64));
+    let result = submit(Operation::Unmap {
+        address: address.as_ptr() as u64,
+        bytes: u64::MAX,
+    });
     if result != 0 {
         output::arguments(format_args!("GPU unmap of {address:p} refused: {result}\n"));
     }
@@ -1747,13 +1827,42 @@ pub(super) fn query<T>(
 static MEMORY_BYTES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Asks the kernel driver of the bound GPU at `index` for its device memory
-/// once, before the GPU's first work, for [`vram_bytes`].
-pub(super) fn remember_memory(index: u32, stack: &GpuStack) {
-    if let Some(bytes) = query(index, stack.kernel.memory_bytes)
+/// once, before the GPU's first work, for [`vram_bytes`], and answers what
+/// the driver says of itself and the chip for the boot log's summary of the
+/// GPU: its DRM version, which the build read from the driver's source,
+/// then its stack's own description
+/// ([`stela_drivers::gpu::stack::Kernel::describe`]). Both queries are
+/// asked on one render file; the version needs none.
+pub(super) fn remember_memory(index: u32, stack: &GpuStack) -> alloc::string::String {
+    let mut facts = stack
+        .kernel
+        .version
+        .map(|(major, minor, patch)| alloc::format!("{major}.{minor}.{patch}"))
+        .unwrap_or_default();
+    let Some(fd) = minor(index as usize)
+        .map(|minor| submit(Operation::Open(RENDER_MINOR + minor)) as c_int)
+        .filter(|&fd| fd >= 0)
+    else {
+        return facts;
+    };
+    let mut control = device_control(fd);
+    if let Some(bytes) = (stack.kernel.memory_bytes)(&mut control)
         && let Some(kept) = MEMORY_BYTES.get(index as usize)
     {
         kept.store(bytes, Ordering::Relaxed);
     }
+    if let Some(described) = stack
+        .kernel
+        .describe
+        .and_then(|describe| describe(&mut control))
+    {
+        if !facts.is_empty() {
+            facts.push(' ');
+        }
+        facts.push_str(&described);
+    }
+    close_descriptor(fd);
+    facts
 }
 
 /// The device memory bytes of the GPU of Metal service `service`, for the
@@ -1773,7 +1882,8 @@ pub(in crate::engine) fn vram_bytes(service: u32) -> Option<u64> {
 /// A kernel driver's watch for resets on a file of its own, made before a
 /// GPU's first work ([`stela_drivers::gpu::stack::Reset`]). Its file stays
 /// open for the boot: closing a file of a GPU in reset waits for the
-/// reset's end.
+/// reset's end. A lost device's reopen asks it too.
+#[derive(Clone, Copy)]
 pub(super) struct ResetWatch {
     fd: c_int,
     context: u32,
@@ -1956,9 +2066,17 @@ unsafe extern "C" fn stela_libc_fatal(message: *const c_char) -> ! {
     output::fatal(text(message))
 }
 
+/// The system's RAM, as Linux would tell a process (`_SC_PHYS_PAGES`,
+/// `MemTotal`): the RAM Linux sees, which the kernel drivers report as
+/// system memory too. ANV compares the two on xe (`anv_restrict_sys_heap_size`)
+/// and keeps all of xe's system memory for its heap when xe reports at most
+/// 60% of this, which on Linux means an older xe that halved it already; at
+/// the same figure it takes three quarters, as it does on i915. With the
+/// heap's capacity here instead, the share an integrated GPU's Linux sees
+/// against a larger heap fell under 60% and ANV took all of it on xe.
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_memory_bytes() -> u64 {
-    installed().map_or(0, |gpu| gpu.heap_bytes)
+    installed().map_or(0, |_| stela_linux::pages::ram_bytes())
 }
 
 #[unsafe(no_mangle)]
@@ -2109,12 +2227,15 @@ extern "C" fn stela_libc_drm_mmap(fd: c_int, offset: u64, size: usize) -> *mut c
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn stela_libc_drm_munmap(address: *mut c_void, _size: usize) -> c_int {
+extern "C" fn stela_libc_drm_munmap(address: *mut c_void, size: usize) -> c_int {
     let mapped = installed().is_some_and(|gpu| gpu.window.contains(address as u64));
     if !mapped {
         return 0;
     }
-    let result = submit(Operation::Unmap(address as u64));
+    let result = submit(Operation::Unmap {
+        address: address as u64,
+        bytes: size as u64,
+    });
     if result < 0 { result as c_int } else { 1 }
 }
 

@@ -193,6 +193,28 @@ pub(super) struct Bridge {
     pub(super) aspm: u16,
 }
 
+/// The ports between the function at `address` and its root complex,
+/// nearest first, as Linux's `pci_upstream_bridge` walk finds them, each as
+/// the scan read it. The walk ends at the root bus, or at a bridge whose
+/// configuration did not read.
+pub(super) fn ports_above(
+    bridges: &[Bridge],
+    ports: &[super::UpstreamPort],
+    address: Address,
+) -> Vec<super::UpstreamPort> {
+    let mut above = Vec::new();
+    let mut bus = address.bus;
+    // Each step goes to a lower bus, so the walk ends.
+    while let Some(bridge) = upstream(bridges, address.segment, bus) {
+        let Some(port) = ports.iter().find(|port| port.address == bridge.address) else {
+            break;
+        };
+        above.push(*port);
+        bus = bridge.address.bus;
+    }
+    above
+}
+
 /// The bridge whose secondary bus is `bus`: Linux's `bus->self`.
 fn upstream(bridges: &[Bridge], segment: u16, bus: u8) -> Option<&Bridge> {
     bridges.iter().find(|bridge| {
@@ -2363,6 +2385,53 @@ mod tests {
             device: 0,
             function: 0,
         }
+    }
+
+    /// A discrete Navi card in a root port's slot: the card's own switch
+    /// (its upstream port on bus 1, its downstream port on bus 2) above the
+    /// GPU on bus 3, beside another slot's port.
+    #[test]
+    fn a_gpus_ports_run_from_its_switch_to_the_root_port() {
+        let at = |bus, device, function| Address {
+            segment: 0,
+            bus,
+            device,
+            function,
+        };
+        let bridge = |address, secondary| Bridge {
+            address,
+            secondary,
+            aspm: 0,
+        };
+        let port = |address: Address| super::super::UpstreamPort {
+            address,
+            config: [u32::from(address.bus); 64],
+        };
+        let (root, upstream, downstream, other) =
+            (at(0, 1, 1), at(1, 0, 0), at(2, 0, 0), at(0, 2, 0));
+        let bridges = [
+            bridge(other, 4),
+            bridge(downstream, 3),
+            bridge(root, 1),
+            bridge(upstream, 2),
+        ];
+        let ports = [port(upstream), port(root), port(downstream), port(other)];
+        let above = ports_above(&bridges, &ports, at(3, 0, 0));
+        assert_eq!(
+            above.iter().map(|port| port.address).collect::<Vec<_>>(),
+            [downstream, upstream, root]
+        );
+        assert_eq!(above[1].config, [1; 64]);
+        // A function on the root bus has none.
+        assert!(ports_above(&bridges, &ports, at(0, 8, 1)).is_empty());
+        // A port whose configuration did not read ends the walk there.
+        let above = ports_above(&bridges, &ports[..1], at(3, 0, 0));
+        assert!(above.is_empty());
+        let above = ports_above(&bridges, &[ports[2], ports[0]], at(3, 0, 0));
+        assert_eq!(
+            above.iter().map(|port| port.address).collect::<Vec<_>>(),
+            [downstream, upstream]
+        );
     }
 
     #[test]

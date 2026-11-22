@@ -41,6 +41,7 @@ mod network_check;
 mod preboot;
 mod report;
 mod storage;
+mod vfio;
 
 /// `isa-debug-exit` reports `(code << 1) | 1`; a timeout reports 124.
 const TIMEOUT_EXIT: u8 = 124;
@@ -114,22 +115,16 @@ enum Scenario {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Build `stela.efi` with its NVK GPU stack and guest components.
+    /// Build `stela.efi` with its GPU stacks and guest components: NVK
+    /// over nouveau, and, outside a release, amdgpu and the Intel port,
+    /// whose GPUs draw on RADV and ANV where the image's Mesa build holds
+    /// them ([`linked_features`]).
     Build {
         #[arg(long)]
         release: bool,
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
-        /// Carry amdgpu beside nouveau and the image's Mesa drivers, for a
-        /// Radeon RX 9070 (Navi 48) or RX 6800-6950 XT (Navi 21): amdgpu
-        /// binds it in the Linux environment.
-        #[arg(long, conflicts_with = "radv")]
-        amdgpu: bool,
-        /// Carry amdgpu and require RADV among the image's Mesa drivers:
-        /// amdgpu binds the GPU and RADV backs the Metal device over it.
-        #[arg(long)]
-        radv: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -260,10 +255,15 @@ pub struct Run {
     #[arg(long, value_enum)]
     iommu: Option<Iommu>,
     /// Hand the mount a physical GPU through VFIO: this PCI function of the
-    /// host (such as `0000:01:00.0`) and the other functions of its slot, in
-    /// a slot of their own behind a PCIe root port. The emulated VGA stays as
-    /// the firmware's display, for a card with no monitor; one with a monitor
-    /// takes the display. `xtask/scripts/vfio-gpu.sh` binds it for a run.
+    /// host (such as `0000:01:00.0`) and the functions of its slot that
+    /// belong to its GPU (a discrete card's whole slot, an integrated GPU's
+    /// display and HD audio), in a slot of their own behind a PCIe root
+    /// port. The emulated VGA stays as the firmware's display, for a card
+    /// with no monitor; one with a monitor takes the display.
+    /// `xtask/scripts/vfio-gpu.sh` binds it for a run.
+    /// The host's ACPI VFCT table, which holds an integrated AMD GPU's video
+    /// BIOS, joins the run's ACPI tables when it holds a lent function's;
+    /// `STELA_HOST_VFCT` names a readable copy, which vfio-gpu.sh makes.
     #[arg(long, requires = "kvm", conflicts_with = "iommu", value_parser = parse_pci_function)]
     vfio_gpu: Option<String>,
     /// Boot an existing USB disk image, such as a copy of a stick `stela
@@ -501,20 +501,13 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::Build {
             release,
             diagnostics,
-            amdgpu,
-            radv,
         } => {
             crate::gpu::fetch::fetch(false)?;
             crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            let gpu = if radv {
-                crate::gpu::require_vulkan_driver("amd")?;
-                Gpu::Radv
-            } else if amdgpu {
-                Gpu::Amdgpu
-            } else {
-                Gpu::Nvk
-            };
-            println!("{}", build_for_boot(release, diagnostics, gpu)?.display());
+            println!(
+                "{}",
+                build_for_boot(release, diagnostics, Gpu::Linked)?.display()
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(arguments) => launch(*arguments),
@@ -523,7 +516,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
 
 pub fn build(release: bool) -> Result<PathBuf> {
     crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, Gpu::Nvk)
+    build_with_diagnostics(release, false, Gpu::Linked)
 }
 
 /// The GPU drivers a `stela.efi` carries beyond its Linux environment.
@@ -531,13 +524,18 @@ pub fn build(release: bool) -> Result<PathBuf> {
 enum Gpu {
     /// None: nouveau binds nothing without NVK.
     None,
-    /// NVK, NIR and NAK over nouveau, from `cargo xtask gpu nvk`.
-    Nvk,
-    /// amdgpu beside NVK: the GPU claims run in an image with the Mesa
-    /// drivers.
-    Amdgpu,
-    /// amdgpu with RADV, ACO and NIR among the image's Mesa drivers.
-    Radv,
+    /// The image's Mesa drivers and kernel drivers ([`linked_features`]).
+    Linked,
+}
+
+/// stela-boot's features for an image with its Mesa drivers: NVK over
+/// nouveau, and, outside a release, amdgpu and the Intel port. Which GPUs
+/// draw is then the image's own detection: AMD's stack gives RADV and
+/// Intel's ANV where `gpu nvk` built them (`stela_vulkan_amd`,
+/// `stela_vulkan_intel`), and otherwise their GPUs show frames another GPU
+/// draws. A release leaves the AMD and Intel ports and their firmware out.
+pub(crate) fn linked_features(release: bool) -> &'static str {
+    if release { "nvk" } else { "nvk,amdgpu,intel" }
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -594,14 +592,8 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
     }
     match gpu {
         Gpu::None => {}
-        Gpu::Nvk => {
-            command.args(["--features", "nvk"]);
-        }
-        Gpu::Amdgpu => {
-            command.args(["--features", "nvk,amdgpu"]);
-        }
-        Gpu::Radv => {
-            command.args(["--features", "radv"]);
+        Gpu::Linked => {
+            command.args(["--features", linked_features(crate::tools::release_build())]);
         }
     }
     // A test build that holds the Metal device to that much device memory.
@@ -879,7 +871,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
         &mut command,
     );
     machine::attach_display(&arguments, bundle, &mut command);
-    machine::attach_vfio_gpu(&arguments, &mut command)?;
+    vfio::attach(&arguments, &mut command)?;
     machine::attach_audio(&arguments, &mut command);
     network::attach(&arguments, &paths.output, &mut command)?;
     machine::attach_usb(&arguments, &mut command);

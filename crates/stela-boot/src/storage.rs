@@ -293,28 +293,40 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
             )
         })
         .collect();
-    // An image that links another vendor's Vulkan driver drives that
-    // vendor's display controllers itself: one of them is the GPU macOS
-    // starts with, so the NVIDIA-only notice does not apply.
+    // An image that links another vendor's Vulkan driver drives the display
+    // controllers that vendor's stack takes (`GpuStack::select`): one of
+    // them is the GPU macOS starts with, so the NVIDIA-only notice does not
+    // apply. A controller its stack leaves out, as one whose Vulkan device
+    // cannot serve the Metal device, is no such GPU.
     let driven = functions
         .iter()
-        .map(crate::pci_io::FunctionObservation::identity)
-        .filter(|identity| identity.vendor != NVIDIA && identity.class[0] == 0x03)
-        .find_map(|identity| {
-            let vendor = stela_drivers::gpu::Vendor::from_pci(identity.vendor);
-            stela_drivers::gpu::stack::STACKS
-                .iter()
-                .find(|stack| stack.vendor == vendor && stack.draws())
+        // The revision names an AMD GPU's market name.
+        .map(|function| (function.identity(), function.header[8]))
+        .filter(|(identity, _)| identity.vendor != NVIDIA && identity.class[0] == 0x03)
+        .find_map(|(identity, revision)| {
+            let adapter = stela_drivers::gpu::Adapter {
+                address: identity.address,
+                vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
+                device: identity.device,
+                class: identity.class,
+                revision,
+            };
+            stela_drivers::gpu::stack::GpuStack::select(&adapter)
+                .ok()
+                .filter(|stack| stack.draws())
+                .map(|stack| (adapter, stack))
         });
     let notice = if driven.is_some() {
         NvidiaNotice::Driven
     } else {
         nvidia_notice(&census)
     };
-    if let Some(stack) = driven {
+    if let Some((adapter, stack)) = driven {
         output::arguments(format_args!(
-            "HOST GPU: a {:?} display controller, which this image drives with {}\n",
-            stack.vendor, stack.kernel.driver
+            "HOST GPU: the {} at {}, which this image drives with {}\n",
+            adapter.name(),
+            adapter.address,
+            stack.kernel.driver
         ));
     } else {
         match notice {
@@ -337,6 +349,245 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
         }
     }
     GPU_NOTICE.store(notice as u8, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How the GPUs that will start use this PC's RAM, as the census and the
+/// GPU stacks know it before any GPU is claimed, for the memory plan
+/// ([`stela_drivers::gpu::selection::memory`], the selection's own rule
+/// with every claim taken as made). Each GPU a stack drives is integrated
+/// as its driver's table says, or, for a driver that decides by the GPU's
+/// IP discovery table, as the graphics version that table lists says, read
+/// here through the firmware. A GPU whose kind stays unknown counts as
+/// integrated: a share a discrete GPU leaves unused costs the guest that
+/// memory, where a heap short of an integrated GPU's pages stops the boot.
+/// The firmware's screen is on the function whose BAR holds it; where no
+/// function is found, it may be on any GPU, so a GPU that would only show
+/// another's frames counts as started. Once per boot.
+fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
+    use stela_boot_core::host_memory::GpuMemory;
+    use stela_drivers::gpu::{
+        Adapter, Vendor,
+        selection::{self, Found, Memory, Planned},
+        stack::GpuStack,
+    };
+    if GPU_MEMORY.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return;
+    }
+    let screen = crate::console::Framebuffer::firmware_function();
+    let mut found = Vec::new();
+    // The BAR each GPU's driver maps whole, where it does, and its kernel.
+    let mut apertures = Vec::new();
+    let mut kernels = Vec::new();
+    let mut addresses = Vec::new();
+    for identity in functions
+        .iter()
+        .map(crate::pci_io::FunctionObservation::identity)
+        .filter(|identity| identity.class[0] == 0x03)
+    {
+        // The stack and the kind do not depend on the revision.
+        let adapter = Adapter {
+            address: identity.address,
+            vendor: Vendor::from_pci(identity.vendor),
+            device: identity.device,
+            class: identity.class,
+            revision: 0,
+        };
+        let firmware_screen = match screen {
+            Ok(Some(address)) => address == adapter.address,
+            Ok(None) => false,
+            Err(()) => true,
+        };
+        addresses.push(adapter.address);
+        let stack = match GpuStack::select(&adapter) {
+            Ok(stack) => stack,
+            Err(_) => {
+                found.push(Found {
+                    stack: Err("no stack of this image drives it"),
+                    firmware_screen,
+                });
+                apertures.push(None);
+                kernels.push(None);
+                continue;
+            }
+        };
+        let (integrated, how) = gpu_kind(stack, &adapter);
+        output::arguments(format_args!(
+            "HOST GPU {} {}{}: {how}\n",
+            adapter.address,
+            if integrated {
+                "integrated, sharing this PC's RAM"
+            } else {
+                "with memory of its own"
+            },
+            match stack.draws() {
+                true => ", draws",
+                false => ", shows only",
+            }
+        ));
+        // The engine's census takes the same kind from the plan
+        // (`Planned`), so both select the same GPUs.
+        found.push(Found {
+            stack: Ok(selection::driven(stack, &adapter, Some(integrated))),
+            firmware_screen,
+        });
+        apertures.push(stack.kernel.aperture.map(|bar| (adapter.address, bar)));
+        kernels.push(Some(&stack.kernel));
+    }
+    let started = stela_drivers::gpu::selection::started(&found);
+    let aperture: u64 = started
+        .iter()
+        .filter_map(|&index| apertures[index])
+        .map(|(address, bar)| aperture_tables(address, bar))
+        .sum();
+    GPU_APERTURE.store(aperture, core::sync::atomic::Ordering::Relaxed);
+    GPU_BOUNDED.store(
+        stela_drivers::gpu::stack::pages_bounded(
+            started.iter().filter_map(|&index| kernels[index]),
+        ),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    GPU_FALLBACK.store(
+        selection::integrated_may_draw_instead(&found),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    let planned_memory = selection::memory(&found);
+    let mut planned = Planned::new(planned_memory);
+    for (&address, found) in addresses.iter().zip(&found) {
+        planned.see(
+            address,
+            found.stack.ok().and_then(|driven| driven.integrated),
+        );
+    }
+    GPU_CENSUS.try_with(|census| *census = Some(planned));
+    let memory = match planned_memory {
+        Memory::Own => GpuMemory::Own,
+        Memory::Shared => GpuMemory::Shared,
+        Memory::Display => GpuMemory::Display,
+    };
+    if screen.is_err() && memory == GpuMemory::Display {
+        output::arguments(format_args!(
+            "HOST GPU the firmware's screen is on no function found, so an integrated GPU that \
+             would only show it counts as started\n"
+        ));
+    }
+    GPU_MEMORY.store(
+        match memory {
+            GpuMemory::Own => 1,
+            GpuMemory::Shared => 2,
+            GpuMemory::Display => 3,
+        },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The page tables of the BAR `bar` of the GPU at `address`, which its
+/// driver maps whole as it starts (`host_memory::aperture_tables`), said in
+/// a line. A BAR whose size is not read is taken at 256 MiB, the size of a
+/// BAR no Resizable BAR control widened.
+fn aperture_tables(address: stela_drivers::bus::pci::Address, bar: u8) -> u64 {
+    use stela_boot_core::host_memory;
+    const UNRESIZED: u64 = 256 << 20;
+    let (bytes, how) = match crate::pci_io::bar_bytes(address, bar) {
+        Ok((bytes, how)) => (bytes, alloc::string::String::from(how)),
+        Err(why) => (UNRESIZED, alloc::format!("taken as 256M: {why}")),
+    };
+    let tables = host_memory::aperture_tables(bytes);
+    output::arguments(format_args!(
+        "HOST GPU {address} has its driver map its BAR {bar} of {}M whole ({how}): {}M of page \
+         tables for it\n",
+        bytes >> 20,
+        tables >> 20
+    ));
+    tables
+}
+
+/// Whether the GPU at `adapter` is integrated, by `stack`'s table or its IP
+/// discovery table, and how that was told; one that cannot be told counts
+/// as integrated.
+fn gpu_kind(
+    stack: &stela_drivers::gpu::stack::GpuStack,
+    adapter: &stela_drivers::gpu::Adapter,
+) -> (bool, alloc::string::String) {
+    let table = stack.kernel.table_integrated(adapter).or_else(|| {
+        stack
+            .kernel
+            .discovered_integrated
+            .and_then(|discovered| (discovered.named)(adapter))
+    });
+    match table {
+        Some(integrated) => (
+            integrated,
+            alloc::format!("{}'s table", stack.kernel.driver),
+        ),
+        None => match stack.kernel.discovered_integrated.map(|discovered| {
+            let registers = (stack.kernel.registers)(adapter) as u8;
+            crate::pci_io::amd_graphics_version(adapter.address, registers)
+                .map(|graphics| ((discovered.graphics)(graphics), graphics))
+        }) {
+            Some(Ok((integrated, (major, minor, revision)))) => (
+                integrated,
+                alloc::format!("graphics {major}.{minor}.{revision} by its IP discovery table"),
+            ),
+            Some(Err(why)) => (
+                true,
+                alloc::format!(
+                    "not known: its IP discovery table was not read ({why}); taken as integrated"
+                ),
+            ),
+            None => (
+                true,
+                alloc::string::String::from("not known; taken as integrated"),
+            ),
+        },
+    }
+}
+
+/// [`plan_gpu_memory`]'s answer: [`GpuMemory::Own`] where no census ran.
+///
+/// [`GpuMemory::Own`]: stela_boot_core::host_memory::GpuMemory::Own
+pub fn gpu_memory() -> stela_boot_core::host_memory::GpuMemory {
+    match GPU_MEMORY.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => stela_boot_core::host_memory::GpuMemory::Shared,
+        3 => stela_boot_core::host_memory::GpuMemory::Display,
+        _ => stela_boot_core::host_memory::GpuMemory::Own,
+    }
+}
+
+/// [`plan_gpu_memory`]'s answer: 0 before it ran, 1 own memory, 2 shared,
+/// 3 display beside a discrete GPU.
+static GPU_MEMORY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The page tables of the apertures the started GPUs' drivers map whole.
+static GPU_APERTURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether every GPU that starts has a driver whose heap need was measured
+/// (`GpuPlan::bounded`).
+static GPU_BOUNDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether an integrated GPU this image draws with may draw in place of the
+/// discrete GPU the plan gives the Metal device (`GpuPlan::fallback`).
+static GPU_FALLBACK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// What [`plan_gpu_memory`] saw of the display controllers, for the
+/// engine's census (`Handoff::gpu_census`).
+static GPU_CENSUS: stela_boot_core::screen::Exclusive<
+    Option<stela_drivers::gpu::selection::Planned>,
+> = stela_boot_core::screen::Exclusive::new(None);
+
+/// The display controllers the memory plan saw and the kinds it took for
+/// them; `None` where no census ran.
+pub fn gpu_census() -> Option<stela_drivers::gpu::selection::Planned> {
+    GPU_CENSUS.try_with(|census| *census).flatten()
+}
+
+/// [`plan_gpu_memory`]'s answer with the apertures' tables.
+pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {
+    stela_boot_core::host_memory::GpuPlan {
+        memory: gpu_memory(),
+        aperture: GPU_APERTURE.load(core::sync::atomic::Ordering::Relaxed),
+        bounded: GPU_BOUNDED.load(core::sync::atomic::Ordering::Relaxed),
+        fallback: GPU_FALLBACK.load(core::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 const NVIDIA: u16 = 0x10de;
@@ -452,6 +703,7 @@ fn discover_sizing(nvme: bool) -> Result<Handoff> {
                 ));
             }
             report_census(&census.functions);
+            plan_gpu_memory(&census.functions);
             for function in census.functions {
                 let identity = function.identity();
                 if !stela_drivers::probe::claims_identity(&identity) {

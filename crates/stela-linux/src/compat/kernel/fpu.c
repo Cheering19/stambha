@@ -3,6 +3,7 @@
 #include <linux/bug.h>
 #include <linux/fpu.h>
 #include <linux/preempt.h>
+#include <stela/linux.h>
 
 /* x86's MXCSR_DEFAULT: round to nearest, every exception masked, no flag. */
 #define STELA_MXCSR_DEFAULT 0x1f80u
@@ -23,6 +24,11 @@ void kernel_fpu_begin(void)
 	in_section = true;
 	asm volatile("stmxcsr %0" : "=m"(entered_mxcsr));
 	asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+}
+
+bool stela_linux_kernel_fpu_open(void)
+{
+	return in_section;
 }
 
 void kernel_fpu_end(void)

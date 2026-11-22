@@ -10,6 +10,7 @@ pub use stela_contracts::Refusal;
 /// A refused request names the values that decided it.
 pub type Result<T, E = Refusal> = core::result::Result<T, E>;
 
+pub mod amd_discovery;
 pub mod aperture;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
@@ -36,6 +37,7 @@ pub mod disk_speed;
 pub mod dmar;
 pub mod doorbell;
 pub mod drivers_turn;
+pub mod drm_calls;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
@@ -45,6 +47,7 @@ pub mod fiber;
 pub mod file_kind;
 pub mod firmware_connect;
 pub mod firmware_pages;
+pub mod firmware_picture;
 pub mod firmware_runtime;
 pub mod firmware_screen;
 pub mod firmware_state;
@@ -53,6 +56,8 @@ pub mod first_stop;
 pub mod gpu_loss;
 pub mod gpu_requests;
 pub mod gpu_status;
+pub mod gpu_step;
+pub mod gpu_triage;
 pub mod guarded_stacks;
 pub mod guest_bluetooth;
 pub mod guest_screen;
@@ -101,6 +106,7 @@ pub mod paging_controls;
 pub mod panic_region;
 pub mod parking;
 pub mod passthrough;
+pub mod pci_map;
 pub mod pe;
 pub mod pm_timer;
 pub mod poll_timer;
@@ -112,6 +118,7 @@ pub mod ram;
 pub mod random;
 pub mod record;
 pub mod remapping;
+pub mod repeated_lines;
 #[cfg(target_arch = "x86_64")]
 pub mod requester;
 pub mod reset_reason;
@@ -139,6 +146,7 @@ pub mod tsc;
 pub mod uart;
 pub mod usb_legacy;
 pub mod vfct;
+pub mod video_bios;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
 pub mod wifi_saved;

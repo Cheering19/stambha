@@ -35,8 +35,8 @@ use super::{
 };
 use crate::metal::{
     abi::{
-        LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, StoreAction,
-        StoreActionOptions, VisibilityResultType,
+        LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+        PrimitiveTopologyClass, StoreAction, StoreActionOptions, VisibilityResultType,
     },
     binding::ResourceId,
     command_buffer::{
@@ -1716,6 +1716,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 work.push_str("; ");
             }
             let load = in_flight.workload;
+            // Whose work it is: the connection that committed it, or the
+            // device's own (key 0).
+            match in_flight.key {
+                0 => work.push_str("the device's own "),
+                key => work.push_str(&format!("connection {key}'s ")),
+            }
             work.push_str(&format!(
                 "command buffer {} ({} draws, largest {}, {} indirect, {} passes, {} dispatches, \
                  {} transfers, {} waited queries, {} conditional, {} internal):",
@@ -2773,8 +2779,9 @@ impl<B: Backend, C: Compiler> Resolver for DeviceResolver<'_, B, C> {
         &mut self,
         state: &RenderPipelineState,
         bicubic: [u32; 2],
+        class: PrimitiveTopologyClass,
     ) -> Result<Pipeline> {
-        self.device.render_variant(state.id, bicubic)
+        self.device.render_variant(state.id, bicubic, class)
     }
 
     fn mesh_pipeline(

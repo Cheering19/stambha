@@ -15,9 +15,9 @@ void stela_libc_log(const char *text, size_t size);
 _Noreturn void stela_libc_fatal(const char *message);
 /* Monotonic nanoseconds. */
 uint64_t stela_libc_now_ns(void);
-/* The bytes this image can allocate. */
+/* The system's RAM, as Linux would tell a process: the RAM Linux sees. */
 uint64_t stela_libc_memory_bytes(void);
-/* Of those, the bytes not yet allocated. */
+/* The bytes of the host's heap not yet allocated, at most its capacity. */
 uint64_t stela_libc_available_memory_bytes(void);
 /* This host processor or Mesa thread, below STELA_LIBC_CORES. */
 unsigned int stela_libc_core(void);
@@ -49,8 +49,10 @@ long long stela_libc_drm_seek(int fd, long long offset, int whence);
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument);
 /* A pointer, or a negative errno. Every page is mapped on return. */
 void *stela_libc_drm_mmap(int fd, uint64_t offset, size_t size);
-/* 0: not a DRM mapping; +1: DRM unmap completed; negative errno: recognized
- * DRM mapping remains owned/mapped because cleanup failed. */
+/* Linux's munmap of `size` bytes at `address`, which may be any page-aligned
+ * run of a mapping: the mapping goes once every page of it is released. 0: not
+ * a DRM mapping; +1: DRM unmap completed; negative errno: recognized DRM
+ * mapping remains owned/mapped because cleanup failed. */
 int stela_libc_drm_munmap(void *address, size_t size);
 /* Anonymous files, on descriptors from STELA_LIBC_FILE_BASE. These return a
  * negative errno on failure, and the mappings share the file's pages. */

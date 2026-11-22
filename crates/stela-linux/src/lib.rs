@@ -61,6 +61,25 @@ extern "C" fn stela_linux_heap_alloc(size: usize, align: usize) -> *mut c_void {
     }
 }
 
+/// [`stela_linux_heap_alloc`] without zeroing, for metadata whose entries
+/// are initialized only when first used (the page catalog's per-page
+/// arrays): the start then writes none of the memory Linux is not given.
+#[cfg(feature = "kernel")]
+#[unsafe(no_mangle)]
+extern "C" fn stela_linux_heap_alloc_uninit(size: usize, align: usize) -> *mut c_void {
+    match Layout::from_size_align(size, align) {
+        Ok(layout) if size != 0 => {
+            // SAFETY: a nonzero layout.
+            let object = unsafe { alloc::alloc::alloc(layout) };
+            if !object.is_null() {
+                heap::note_allocated(size);
+            }
+            object.cast()
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
 /// # Safety
 /// `object` is a live ordinary or registered nonblocking canonical-global
 /// heap allocation of `size` and `align`, freed once through that same heap.

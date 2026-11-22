@@ -549,7 +549,11 @@ fn test_hosted(
     let sources = LIBC
         .iter()
         .map(|name| libc.join(format!("{name}.c")))
-        .chain([libc.join("tests/host.c"), tests.join("llvm_test.c")]);
+        .chain([
+            libc.join("tests/host.c"),
+            libc.join("tests/string.c"),
+            tests.join("llvm_test.c"),
+        ]);
     for source in sources {
         let stem = source.file_stem().unwrap_or_default().to_string_lossy();
         let object = output.join(format!("{stem}.o"));

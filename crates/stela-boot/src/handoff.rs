@@ -102,6 +102,9 @@ pub struct Handoff {
     pub efi_reset: u64,
     /// The firmware's ACPI RSDP; zero without one.
     pub rsdp: u64,
+    /// The firmware's PCI map, with copies of the display functions' option
+    /// ROMs (`pci_io::firmware_map`); empty without one.
+    pub pci_map: Region,
     /// The `--wifi-key` file's bytes, read from the ESP; empty when
     /// `--wifi` names no network or the file could not be read. The engine
     /// parses and wipes them.
@@ -127,6 +130,22 @@ pub struct Handoff {
     /// ESP beside the key; empty without `--wifi` or the file. The engine
     /// parses and wipes them, as it does the key's.
     pub(crate) wifi_saved: Region,
+    /// The bytes at `heap`'s end kept for an integrated GPU's pages
+    /// (`host_memory::Sizes::gpu`), zero for a GPU with memory of its own:
+    /// Linux holds at most this many bytes of pages at once.
+    pub(crate) gpu_share: u64,
+    /// The most bytes of pages Linux may hold at once
+    /// (`host_memory::page_bound`): `gpu_share` where it is set, else what
+    /// the heap holds past its own needs. The page catalog's limit, and
+    /// TTM's where no share is set, when `gpu_pages_held`; an integrated GPU
+    /// that draws without a share budgets its Metal device by it either way.
+    pub(crate) gpu_pages: u64,
+    /// The plan holds Linux to `gpu_pages` (`host_memory::held_bound`).
+    pub(crate) gpu_pages_held: bool,
+    /// The display controllers the memory plan saw and the kinds it took
+    /// for them, which the engine's census takes so that both select the
+    /// same GPUs; `None` where no census ran.
+    pub(crate) gpu_census: Option<stela_drivers::gpu::selection::Planned>,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,

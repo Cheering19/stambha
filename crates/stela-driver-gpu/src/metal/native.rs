@@ -38,7 +38,7 @@ use super::{
         SampleCounts,
         backend::{
             Backend, BufferAllocation, Descriptor, HeapUse, IdleStep, MemoryBlocks, Object,
-            Outside, PreparedImport, Requirements, requirements,
+            Outside, PreparedImport, Requirements, unmet,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -89,9 +89,15 @@ pub struct Loader {
     pub refusals: Option<Refusals>,
     /// The device is never released once its GPU may have hung: releasing
     /// it closes the driver's file, whose close waits for the kernel
-    /// driver's recovery from the hang, which may never end. Its open waits
-    /// for a first submission before the device is served.
+    /// driver's recovery from the hang, which may never end. Such a driver
+    /// checks its first submission too ([`Self::check_first_submission`]).
     pub keep_lost: bool,
+    /// The open waits for a first submission to signal before the device is
+    /// served, and a device reopened after a loss serves only once one
+    /// signals: a GPU whose engines do not run after the boot's reset, or
+    /// that hangs again after its kernel driver's recovery, takes no
+    /// client's work.
+    pub check_first_submission: bool,
     /// Waits a moment, as the platform's waits do: a call outside the
     /// service's turn may wait for the boot processor.
     pub relax: fn(),
@@ -115,6 +121,8 @@ pub struct Driver {
     pub refusals: Option<Refusals>,
     /// [`Loader::keep_lost`].
     pub keep_lost: bool,
+    /// [`Loader::check_first_submission`].
+    pub check_first_submission: bool,
 }
 
 impl Driver {
@@ -126,6 +134,7 @@ impl Driver {
             submit_thread: self.submit_thread,
             refusals: self.refusals,
             keep_lost: self.keep_lost,
+            check_first_submission: self.check_first_submission,
             relax,
         }
     }
@@ -144,6 +153,33 @@ pub struct Refusals {
     /// refused submission's signals are made, and lower it by each it drops
     /// unasked.
     pub count: unsafe extern "C" fn(vk::Queue, *mut u32),
+}
+
+/// Whether the driver exports timeline semaphores as file descriptors,
+/// which the guest's completion waits take: a driver whose timelines are
+/// kernel timeline objects can, one that emulates them on binary ones
+/// cannot, and its completions are polled instead.
+///
+/// # Safety
+///
+/// `physical` is a physical device of `instance`.
+unsafe fn exportable_timelines(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let mut timeline =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+        .push_next(&mut timeline);
+    let mut properties = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: the caller's guarantee; the chain outlives the call.
+    unsafe {
+        instance.get_physical_device_external_semaphore_properties(physical, &info, &mut properties)
+    };
+    properties
+        .external_semaphore_features
+        .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
+        && properties
+            .compatible_handle_types
+            .contains(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
 }
 
 /// What a device whose CPU reaches only part of its memory (no Resizable
@@ -187,12 +223,11 @@ struct Messenger {
 }
 
 impl Messenger {
-    /// # Safety
-    ///
-    /// `instance` was created from `entry` with `VK_EXT_debug_utils`.
-    unsafe fn new(entry: &ash::Entry, instance: &ash::Instance, log: fn(&str)) -> Option<Self> {
-        let fns = ext::debug_utils::Instance::new(entry, instance);
-        let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+    /// What a messenger forwarding to `log` is made with; chained into the
+    /// instance's create info too, so the driver's messages while it
+    /// creates the instance reach `log` before any messenger exists.
+    fn info(log: fn(&str)) -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+        vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                     | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
@@ -203,7 +238,15 @@ impl Messenger {
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
             )
             .pfn_user_callback(Some(forward))
-            .user_data(log as *mut c_void);
+            .user_data(log as *mut c_void)
+    }
+
+    /// # Safety
+    ///
+    /// `instance` was created from `entry` with `VK_EXT_debug_utils`.
+    unsafe fn new(entry: &ash::Entry, instance: &ash::Instance, log: fn(&str)) -> Option<Self> {
+        let fns = ext::debug_utils::Instance::new(entry, instance);
+        let info = Self::info(log);
         // SAFETY: the instance enables the extension; `forward` reads the
         // user data as the `fn(&str)` given here, which is 'static.
         let handle = unsafe { fns.create_debug_utils_messenger(&info, None) }.ok()?;
@@ -699,32 +742,8 @@ impl NativeBackend {
         exporter: Box<dyn MemoryExporter>,
         kernels: impl FnOnce(vk::PhysicalDevice) -> Result<InternalKernels>,
     ) -> Result<Self> {
-        let static_fn = ash::StaticFn {
-            get_instance_proc_addr: loader.get_instance_proc_addr,
-        };
-        // SAFETY: the caller guarantees the entry point.
-        let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
-        let application = vk::ApplicationInfo::default()
-            .application_name(c"Stela Metal")
-            .engine_name(c"Stela")
-            .api_version(vk::API_VERSION_1_3);
-        // SAFETY: the caller guarantees the entry point.
-        let debug_utils =
-            unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|offered| {
-                offered
-                    .iter()
-                    .any(|offer| offer.extension_name_as_c_str() == Ok(ext::debug_utils::NAME))
-            });
-        let names = [ext::debug_utils::NAME.as_ptr()];
-        let info = vk::InstanceCreateInfo::default()
-            .application_info(&application)
-            .enabled_extension_names(if debug_utils { &names } else { &[] });
-        // SAFETY: the create info and its application info outlive the call.
-        let instance = unsafe { entry.create_instance(&info, None) }.map_err(failure)?;
-        // SAFETY: the instance enables the extension when the driver offers it.
-        let messenger = debug_utils
-            .then(|| unsafe { Messenger::new(&entry, &instance, loader.log) })
-            .flatten();
+        // SAFETY: the caller's guarantee.
+        let (entry, instance, messenger) = unsafe { Self::instance(&loader) }?;
         // SAFETY: the instance was just created and nothing else uses it.
         let destroy_instance = |instance: &ash::Instance| unsafe {
             if let Some(messenger) = &messenger {
@@ -737,16 +756,9 @@ impl NativeBackend {
             destroy_instance(&instance);
             return Err(Error::Unsupported("Vulkan device of the GPU"));
         };
-        if let Some(missing) = requirements(&snapshot.features)
-            .iter()
-            .find(|requirement| !requirement.present)
-        {
+        if let Some(missing) = unmet(&snapshot).first() {
             destroy_instance(&instance);
-            return Err(Error::Unsupported(missing.name));
-        }
-        if !snapshot.limits.dma_buf_import {
-            destroy_instance(&instance);
-            return Err(Error::Unsupported("VK_EXT_external_memory_dma_buf"));
+            return Err(Error::Unsupported(missing));
         }
 
         let mut features = FeatureChain::new(&extensions, false);
@@ -767,6 +779,9 @@ impl NativeBackend {
         let device = match unsafe { instance.create_device(physical, &info, None) } {
             Ok(device) => device,
             Err(error) => {
+                (loader.log)(&format!(
+                    "Vulkan device not created for the GPU at {pci:?}: {error:?}"
+                ));
                 destroy_instance(&instance);
                 return Err(failure(error));
             }
@@ -826,10 +841,13 @@ impl NativeBackend {
         let memories = memory::Memories::new(snapshot.limits.buffer_image_granularity);
         let zeroing = zero::Zeroing::new(snapshot.limits.max_buffer_size, loader.log);
         let exporter: Arc<dyn MemoryExporter> = Arc::from(exporter);
+        // SAFETY: `physical` came from this instance.
+        let exportable = fns.external_semaphore_fd.is_some()
+            && unsafe { exportable_timelines(&instance, physical) };
         let outside = Arc::new(NativeOutside::new(
             device.clone(),
             exporter.clone(),
-            fns.external_semaphore_fd.is_some(),
+            exportable,
             loader.relax,
         ));
         let mut backend = Self {
@@ -915,6 +933,80 @@ impl NativeBackend {
         backend.decode_astc = backend.create_compute(&kernel(kernels.decode_astc))?;
         backend.compose = backend.create_compute(&kernel(kernels.compose))?;
         Ok(backend)
+    }
+
+    /// The instance [`Self::new`] creates, with the driver's messages sent to
+    /// `loader.log` when it offers `VK_EXT_debug_utils`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::new`].
+    unsafe fn instance(loader: &Loader) -> Result<(ash::Entry, ash::Instance, Option<Messenger>)> {
+        let static_fn = ash::StaticFn {
+            get_instance_proc_addr: loader.get_instance_proc_addr,
+        };
+        // SAFETY: the caller guarantees the entry point.
+        let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
+        let application = vk::ApplicationInfo::default()
+            .application_name(c"Stela Metal")
+            .engine_name(c"Stela")
+            .api_version(vk::API_VERSION_1_3);
+        // SAFETY: the caller guarantees the entry point.
+        let debug_utils =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|offered| {
+                offered
+                    .iter()
+                    .any(|offer| offer.extension_name_as_c_str() == Ok(ext::debug_utils::NAME))
+            });
+        let names = [ext::debug_utils::NAME.as_ptr()];
+        let mut capture = Messenger::info(loader.log);
+        let mut info = vk::InstanceCreateInfo::default()
+            .application_info(&application)
+            .enabled_extension_names(if debug_utils { &names } else { &[] });
+        if debug_utils {
+            info = info.push_next(&mut capture);
+        }
+        // SAFETY: the create info, its application info and the chained
+        // messenger info outlive the call.
+        let instance = match unsafe { entry.create_instance(&info, None) } {
+            Ok(instance) => instance,
+            Err(error) => {
+                (loader.log)(&format!("Vulkan instance not created: {error:?}"));
+                return Err(failure(error));
+            }
+        };
+        // SAFETY: the instance enables the extension when the driver offers it.
+        let messenger = debug_utils
+            .then(|| unsafe { Messenger::new(&entry, &instance, loader.log) })
+            .flatten();
+        Ok((entry, instance, messenger))
+    }
+
+    /// What the driver offers for the GPU at `pci`, as [`Self::new`] finds
+    /// it before it creates the device, and every requirement it lacks
+    /// ([`unmet`]); `None` when the driver offers no device there.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::new`].
+    pub unsafe fn survey(
+        loader: Loader,
+        pci: PciBusInfo,
+    ) -> Result<Option<(PhysicalDevice, Vec<&'static str>)>> {
+        // SAFETY: the caller's guarantee.
+        let (_entry, instance, messenger) = unsafe { Self::instance(&loader) }?;
+        let surveyed = Self::select(&instance, pci, loader.log).map(|(_, _, snapshot, _)| {
+            let missing = unmet(&snapshot);
+            (snapshot, missing)
+        });
+        // SAFETY: nothing else uses the instance.
+        unsafe {
+            if let Some(messenger) = &messenger {
+                messenger.destroy();
+            }
+            instance.destroy_instance(None);
+        }
+        Ok(surveyed)
     }
 
     /// The device at `pci` with a universal queue family, its supported
@@ -1341,7 +1433,7 @@ impl NativeBackend {
     }
 
     /// The memory type an import of the dma-buf `fd` takes: the first of
-    /// NVK's types for it that prefers coherent memory.
+    /// the driver's types for it that prefers coherent memory.
     fn import_memory_type(&self, fd: i32) -> Result<u32> {
         let bits = self
             .fns
@@ -2333,12 +2425,11 @@ impl NativeOutside {
     }
 
     /// A timeline semaphore at `initial`, exportable when the device's
-    /// semaphores can be.
+    /// timelines can be ([`exportable_timelines`]).
     fn create_semaphore(&self, initial: u64) -> Result<vk::Semaphore> {
         let mut timeline = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(initial);
-        // Every timeline can be exported: NVK's are DRM syncobjs either way.
         let mut export = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
         let mut create = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
@@ -3089,6 +3180,9 @@ impl Backend for NativeBackend {
     }
 
     fn export_semaphore(&mut self, semaphore: Semaphore) -> Option<i32> {
+        if !self.outside.exportable {
+            return None;
+        }
         let fns = self.fns.external_semaphore_fd.as_ref()?;
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(handle(semaphore.0))

@@ -444,6 +444,7 @@ unsafe fn park_back(slot: &mut Slot, config: UnpublishedConfig) {
                     address: None,
                     cause: Cause::Claim(ClaimError::Mapping(error)),
                     effect: ConfigEffect::None,
+                    control: None,
                 },
                 original,
             );

@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <stela/host.h>
 #include "host.h"
@@ -270,6 +271,80 @@ static void test_meminfo(void)
 	const char *volatile none = NULL;
 	CHECK(open(none, O_RDONLY) == -1 && errno == EFAULT);
 	CHECK(stat(none, &status) == -1 && errno == EFAULT);
+}
+
+/* Two render nodes of the host's, descriptors 3 and 4. */
+static void list_two_gpus(void)
+{
+	drm_device_count = 2;
+	drm_devices[0] = (struct stela_libc_drm_device){.vendor = 0x1002, .minor = 0};
+	drm_devices[1] = (struct stela_libc_drm_device){.vendor = 0x1002, .minor = 1};
+}
+
+static void test_render_node_status(void)
+{
+	list_two_gpus();
+	/* A render node's status comes from the host's list; Linux's stat opens
+	 * nothing, and an open of an amdgpu node makes a GPU address space. */
+	struct stat status;
+	CHECK(!stat("/dev/dri/renderD129", &status) && S_ISCHR(status.st_mode));
+	CHECK(major(status.st_rdev) == 226 && minor(status.st_rdev) == 129);
+	CHECK(drm_opens == 0);
+	errno = 0;
+	CHECK(stat("/dev/dri/renderD130", &status) == -1 && errno == ENOENT);
+	CHECK(stat("/dev/dri/renderD", &status) == -1 && stat("/dev/dri/renderD12x", &status) == -1);
+	CHECK(stat("/dev/dri/card0", &status) == -1 && errno == ENOENT);
+	CHECK(drm_opens == 0);
+	drm_device_count = 0;
+}
+
+/* compat/mesa/drm.c's, which the test links. */
+char *drmGetPrimaryDeviceNameFromFd(int fd);
+
+static void test_primary_node_names(void)
+{
+	list_two_gpus();
+	/* Two GPUs' descriptors name two primary nodes: libdrm_amdgpu takes two
+	 * descriptors whose names match, or that have none, for one device. */
+	char *first = drmGetPrimaryDeviceNameFromFd(3);
+	char *second = drmGetPrimaryDeviceNameFromFd(4);
+	CHECK(first && !strcmp(first, "/dev/dri/card0"));
+	CHECK(second && !strcmp(second, "/dev/dri/card1"));
+	CHECK(!drmGetPrimaryDeviceNameFromFd(5));
+	free(first);
+	free(second);
+	drm_device_count = 0;
+}
+
+int libdrm_amdgpu_report(FILE *stream, const char *format, ...);
+
+static unsigned int occurrences(const char *text, const char *part)
+{
+	unsigned int count = 0;
+	for (const char *at = strstr(text, part); at; at = strstr(at + 1, part))
+		count++;
+	return count;
+}
+
+static void test_libdrm_amdgpu_lines(void)
+{
+	/* What libdrm_amdgpu prints for each AMD device it opens: the table it
+	 * lacks, then /proc/cpuinfo's error alone. One named line says both,
+	 * once; any other line is named. */
+	logging = 1;
+	logged_bytes = 0;
+	for (int device = 0; device < 3; device++) {
+		libdrm_amdgpu_report(stderr, "%s: %s\n", "/usr/share/libdrm/amdgpu.ids",
+				     strerror(ENOENT));
+		libdrm_amdgpu_report(stderr, "%s\n", strerror(ENOENT));
+	}
+	libdrm_amdgpu_report(stderr, "%s: amdgpu_get_auth (1) failed (%i)\n", "init", -13);
+	fflush(stderr);
+	logging = 0;
+	CHECK(occurrences(logged, "\n") == 2);
+	CHECK(occurrences(logged, "GPU libdrm_amdgpu: ") == 2);
+	CHECK(occurrences(logged, "/usr/share/libdrm/amdgpu.ids") == 1);
+	CHECK(strstr(logged, "GPU libdrm_amdgpu: init: amdgpu_get_auth (1) failed (-13)\n"));
 }
 
 static void test_refusals(void)
@@ -763,6 +838,9 @@ int main(void)
 	test_unmap_refusal();
 	test_anonymous_files();
 	test_meminfo();
+	test_render_node_status();
+	test_primary_node_names();
+	test_libdrm_amdgpu_lines();
 	test_refusals();
 	test_loading();
 	test_futex();

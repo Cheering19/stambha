@@ -81,11 +81,6 @@ const OPEN: super::image::Open = &[
     ("platform devices", &["platform_device_register_full"]),
     // Only the NUMA placement of an accelerator's memory partitions asks.
     ("the firmware's memory map", &["page_is_ram"]),
-    // As nouveau's list has them, through hwmon.c and backlight.c.
-    (
-        "the driver core's device lists",
-        &["class_find_device", "device_find_child"],
-    ),
 ];
 
 /// The unit of amdgpu's own `module_init`.
@@ -93,9 +88,9 @@ const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "amdgpu",
-        group_ordinal: 34,
+        group_ordinal: 38,
         unit_ordinal: 1,
-        global_ordinal: 34,
+        global_ordinal: 38,
     },
     source: "drivers/gpu/drm/amd/amdgpu/amdgpu_drv",
     module: MODULE.name,
@@ -325,6 +320,7 @@ pub fn port(linux: &Linux) -> super::image::Driver {
         name: MODULE.name,
         spec: INITCALLS,
         captured,
+        more: Vec::new(),
         archive: stela_c_build::linux_build::out_dir().join("libstela-amdgpu.a"),
         open: OPEN,
     }
@@ -379,20 +375,90 @@ pub fn tables() {
             "a revision quirk moves {listed} to {quirked}, which sets another DMA mask"
         );
     }
-    let mut text = String::from(
-        "/// amdgpu's `pciidlist` entries that name a device: its ID, the bits of\n\
-         /// the DMA mask its family's memory controller sets, and the probe's answer.\n\
-         pub(crate) const DEVICES: &[(u16, u8, Support)] = &[\n",
+    // The register window's BAR (`rmmio_base`), the same for every family
+    // Stela drives: asserted below for each.
+    let window = RegisterWindow::read(
+        &source("amdgpu_device.c"),
+        &read(PathBuf::from(
+            "../../third_party/linux/include/drm/amd_asic_type.h",
+        )),
+    )
+    .unwrap_or_else(|error| panic!("amdgpu's register window: {error}"));
+    // The graphics generation of each family: the oldest graphics block its
+    // IP block list can hold.
+    let mut generations = BTreeMap::new();
+    let mut generation = |list: &str| {
+        *generations.entry(list.to_owned()).or_insert_with(|| {
+            graphics(&source(&format!("{list}.c")))
+                .into_iter()
+                .min()
+                .unwrap_or_else(|| panic!("{list}.c adds no graphics block"))
+        })
+    };
+    let discovery_generation = generation(&lists.default);
+    let mut family_generation = |family: &str| match lists.families.get(family) {
+        Some(list) => generation(list),
+        None => discovery_generation,
+    };
+    // A generation RADV's device cannot serve the Metal device on is left
+    // out (`stela_driver_core::amd_metal`): the image holds no support for
+    // it, and holds it for every family that serves. Every family that
+    // serves has its registers in the same BAR, so the table carries
+    // neither the probe's answer nor the BAR.
+    for (family, _) in table.devices.values() {
+        let generation = family_generation(family);
+        let serves = generation >= stela_driver_core::amd_metal::FIRST_GENERATION;
+        assert!(
+            serves || table.unbuilt.contains_key(family),
+            "the profile builds amdgpu's support for {family}, of graphics generation \
+             {generation}, which cannot serve the Metal device: leave its Kconfig symbol unset"
+        );
+        assert!(
+            !serves || !table.unbuilt.contains_key(family),
+            "the profile leaves out amdgpu's support for {family}, of graphics generation \
+             {generation}, which serves the Metal device: set its Kconfig symbol"
+        );
+        assert!(
+            !serves || window.drives(family),
+            "{family}, which serves the Metal device, has its registers in BAR {}, not {}",
+            window.older,
+            window.newer
+        );
+    }
+    assert!(
+        window.drives("CHIP_IP_DISCOVERY"),
+        "a device IP discovery identifies has its registers in BAR {}, not {}",
+        window.older,
+        window.newer
     );
-    for (device, family) in &table.devices {
+    for (listed, quirked) in &table.quirks {
+        assert!(
+            family_generation(listed) == family_generation(quirked),
+            "a revision quirk moves {listed} to {quirked}, of another graphics generation"
+        );
+    }
+    // The graphics versions IP discovery gives a block without graphics
+    // queues, on which RADV opens no device (`radv_is_gpu_supported`).
+    let compute_only = compute_only(&source("amdgpu_discovery.c"), &source)
+        .unwrap_or_else(|error| panic!("amdgpu's graphics blocks: {error}"));
+    // The graphics versions IP discovery flags as built into the processor.
+    let apus = apu_graphics(&source("amdgpu_discovery.c"))
+        .unwrap_or_else(|error| panic!("amdgpu's integrated graphics blocks: {error}"));
+    let mut text = String::from(
+        "/// amdgpu's `pciidlist` entries that name a device: its ID, its family\n\
+         /// (`CHIP_*` without the prefix), its graphics generation (the oldest\n\
+         /// graphics block the family's list holds), the bits of the DMA mask\n\
+         /// its family's memory controller sets, and whether the table flags it\n\
+         /// `AMD_IS_APU`.\n\
+         pub(crate) const DEVICES: &[(u16, &str, u8, u8, bool)] = &[\n",
+    );
+    for (device, (family, apu)) in &table.devices {
         let bits = family_mask(family);
-        let support = match table.unbuilt.get(family) {
-            Some(generation) => {
-                format!("Support::NotBuilt(\"amdgpu built without {generation} support\")")
-            }
-            None => "Support::Probed".to_owned(),
-        };
-        text.push_str(&format!("    ({device:#06x}, {bits}, {support}),\n"));
+        let generation = family_generation(family);
+        let name = family.strip_prefix("CHIP_").unwrap_or(family);
+        text.push_str(&format!(
+            "    ({device:#06x}, {name:?}, {generation}, {bits}, {apu}),\n"
+        ));
     }
     text.push_str(
         "];\n/// The classes (base, sub-class, interface) of which the table takes any\n\
@@ -411,7 +477,18 @@ pub fn tables() {
     }
     text.push_str(&format!(
         "];\n/// The narrowest mask of the memory controllers IP discovery chooses from.\n\
-         pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n"
+         pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n\
+         /// The BAR of the register window of every device Stela drives.\n\
+         pub(crate) const REGISTERS: u8 = {};\n\
+         /// The oldest graphics generation IP discovery chooses a block of.\n\
+         pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n\
+         /// The graphics versions (major, minor, revision) whose block\n\
+         /// IP discovery adds has no graphics queue: compute accelerators.\n\
+         pub(crate) const COMPUTE_ONLY: &[(u8, u8, u8)] = &{compute_only:?};\n\
+         /// The graphics versions (major, minor, revision) of a GPU IP\n\
+         /// discovery identifies that amdgpu flags `AMD_IS_APU`.\n\
+         pub(crate) const DISCOVERED_APUS: &[(u8, u8, u8)] = &{apus:?};\n",
+        window.newer
     ));
     text.push_str(
         "/// amdgpu's interface's families (`AMDGPU_FAMILY_*`), by number.\n\
@@ -449,8 +526,9 @@ fn families(header: &str) -> Vec<(u32, String)> {
 /// `amdgpu_drv.c`'s device table and probe rules.
 #[derive(Debug, Default, PartialEq)]
 struct Table {
-    /// Each device the table names, with its family (`CHIP_*`).
-    devices: BTreeMap<u16, String>,
+    /// Each device the table names, with its family (`CHIP_*`) and whether
+    /// the table flags it `AMD_IS_APU`.
+    devices: BTreeMap<u16, (String, bool)>,
     /// The class entries, as `class << 8`.
     classes: Vec<u32>,
     unsupported: BTreeSet<u16>,
@@ -512,18 +590,22 @@ impl Table {
             }
             let mut flags = flags.split('|');
             let family = flags.next().unwrap_or("");
+            let flags = flags.collect::<Vec<_>>();
             // Mobility and APU do not change the probe's answer; a flag that
             // does (experimental support) needs its rule here first.
             if !family.starts_with("CHIP_")
-                || flags.any(|flag| !["AMD_IS_MOBILITY", "AMD_IS_APU"].contains(&flag))
+                || flags
+                    .iter()
+                    .any(|flag| !["AMD_IS_MOBILITY", "AMD_IS_APU"].contains(flag))
             {
                 return Err(format!(
                     "entry {entry:?} has flags this reader does not know"
                 ));
             }
+            let apu = flags.contains(&"AMD_IS_APU");
             if table
                 .devices
-                .insert(hex(device)?, family.to_owned())
+                .insert(hex(device)?, (family.to_owned(), apu))
                 .is_some()
             {
                 return Err(format!("{device} is listed twice"));
@@ -602,7 +684,7 @@ impl Table {
             let [device, _, family] = fields.as_slice() else {
                 return Err(format!("quirk {quirk:?}"));
             };
-            let listed = table
+            let (listed, _) = table
                 .devices
                 .get(&hex(device)?)
                 .ok_or_else(|| format!("quirk {quirk:?} names no listed device"))?;
@@ -612,6 +694,67 @@ impl Table {
             table.quirks.push((listed.clone(), (*family).to_owned()));
         }
         Ok(table)
+    }
+}
+
+/// `amdgpu_device_init`'s choice of the register window's BAR: `newer` for
+/// the families from `first` on in `enum amd_asic_type`'s order, `older`
+/// for those before it.
+#[derive(Debug, PartialEq)]
+struct RegisterWindow {
+    order: Vec<String>,
+    first: String,
+    newer: u8,
+    older: u8,
+}
+
+impl RegisterWindow {
+    fn read(device: &str, types: &str) -> Result<Self, String> {
+        let order = between(types, "enum amd_asic_type {", "};")?
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().split([' ', ',', '=', '\t']).next()?;
+                name.starts_with("CHIP_").then(|| name.to_owned())
+            })
+            .collect::<Vec<_>>();
+        // The first assignment of the window's base and the family test
+        // that guards it, then the assignment of its `else`.
+        let at = device
+            .find("\t\tadev->rmmio_base = pci_resource_start(")
+            .ok_or("no rmmio_base assignment")?;
+        let (_, condition) = device[..at]
+            .rsplit_once("if (adev->asic_type >= ")
+            .ok_or("the rmmio_base assignment has no family test")?;
+        let first = condition
+            .strip_suffix(") {\n")
+            .ok_or_else(|| format!("register window rule {condition:?}"))?;
+        let rest = &device[at..];
+        let older = between(rest, "} else {\n\t\tadev->rmmio_base = ", ";")?;
+        let bar = |text: &str| -> Result<u8, String> {
+            between(text, "pci_resource_start(adev->pdev, ", ")")?
+                .parse()
+                .map_err(|_| format!("register window BAR in {text:?}"))
+        };
+        if !order.iter().any(|name| name == first) {
+            return Err(format!("{first} is no amd_asic_type"));
+        }
+        Ok(Self {
+            first: first.to_owned(),
+            newer: bar(rest)?,
+            older: bar(older)?,
+            order,
+        })
+    }
+
+    /// Whether `family` (`CHIP_*`) has its registers in the `newer` BAR.
+    fn drives(&self, family: &str) -> bool {
+        let position = |name: &str| {
+            self.order
+                .iter()
+                .position(|known| known == name)
+                .unwrap_or_else(|| panic!("{name} is no amd_asic_type"))
+        };
+        position(family) >= position(&self.first)
     }
 }
 
@@ -659,6 +802,15 @@ fn controllers(list: &str) -> BTreeSet<u32> {
         .collect()
 }
 
+/// The major versions of the graphics blocks `list` adds, which Mesa names
+/// the generations by (`gfx_v8_0_ip_block` is GFX8's).
+fn graphics(list: &str) -> BTreeSet<u8> {
+    list.split("&gfx_v")
+        .skip(1)
+        .filter_map(|rest| rest.split('_').next()?.parse().ok())
+        .collect()
+}
+
 /// The bits of the DMA mask a memory controller's source sets: the number
 /// in its `DMA_BIT_MASK`, or the least the variable there is assigned.
 fn mask_bits(controller: &str) -> Result<u8, String> {
@@ -686,4 +838,110 @@ fn mask_bits(controller: &str) -> Result<u8, String> {
         })
         .min()
         .ok_or_else(|| format!("{argument} is assigned no mask width"))
+}
+
+/// The graphics IP versions `amdgpu_discovery_set_gc_ip_blocks` gives a
+/// graphics block that makes no graphics queue: every version of a block
+/// whose source never sets `num_gfx_rings` (`gfx_v9_4_3.c`), and those a
+/// block's source tests for when it sets the count to zero (Arcturus' and
+/// Aldebaran's in `gfx_v9_0.c`). `source` reads a file of amdgpu's.
+fn compute_only(
+    discovery: &str,
+    source: &dyn Fn(&str) -> String,
+) -> Result<Vec<(u8, u8, u8)>, String> {
+    let body = between(
+        discovery,
+        "static int amdgpu_discovery_set_gc_ip_blocks(",
+        "\n}\n",
+    )?;
+    let (mut blocks, mut pending) = (BTreeMap::<String, Vec<(u8, u8, u8)>>::new(), Vec::new());
+    for line in body.lines() {
+        if let Some(version) = line.trim().strip_prefix("case ").and_then(ip_version) {
+            pending.push(version);
+        } else if let Some(rest) = line.split_once("amdgpu_device_ip_block_add(adev, &gfx_v") {
+            let block = rest
+                .1
+                .split_once("_ip_block")
+                .ok_or_else(|| format!("graphics block in {line:?}"))?
+                .0;
+            blocks
+                .entry(format!("gfx_v{block}"))
+                .or_default()
+                .append(&mut pending);
+        } else if line.trim() == "default:" {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        return Err(String::from("no graphics block is added"));
+    }
+    let mut versions = Vec::new();
+    for (block, listed) in blocks {
+        let text = source(&format!("{block}.c"));
+        if !text.contains("num_gfx_rings =") {
+            versions.extend(listed);
+            continue;
+        }
+        for (before, _) in text
+            .match_indices("num_gfx_rings = 0;")
+            .map(|(at, found)| (&text[..at], found))
+        {
+            let condition = before
+                .rsplit_once("if (")
+                .map_or("", |(_, condition)| condition);
+            versions.extend(
+                condition
+                    .split("IP_VERSION")
+                    .skip(1)
+                    .filter_map(ip_version)
+                    .filter(|version| listed.contains(version)),
+            );
+        }
+    }
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(versions)
+}
+
+/// The graphics IP versions `amdgpu_discovery_set_ip_blocks` flags
+/// `AMD_IS_APU`: the cases of its switch on the graphics block's version
+/// whose only statement sets the flag.
+fn apu_graphics(discovery: &str) -> Result<Vec<(u8, u8, u8)>, String> {
+    let marker = "switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {";
+    for (at, _) in discovery.match_indices(marker) {
+        let mut versions = Vec::new();
+        for line in discovery[at + marker.len()..].lines().map(str::trim) {
+            if let Some(version) = line.strip_prefix("case ").and_then(ip_version) {
+                versions.push(version);
+            } else if line.is_empty() {
+                continue;
+            } else {
+                if line == "adev->flags |= AMD_IS_APU;" && !versions.is_empty() {
+                    versions.sort_unstable();
+                    return Ok(versions);
+                }
+                break;
+            }
+        }
+    }
+    Err(String::from(
+        "no switch on the graphics version sets AMD_IS_APU",
+    ))
+}
+
+/// The version of an `IP_VERSION(major, minor, revision)` that `text`
+/// starts with, after its name.
+fn ip_version(text: &str) -> Option<(u8, u8, u8)> {
+    let arguments = text
+        .strip_prefix("IP_VERSION")
+        .unwrap_or(text)
+        .trim_start()
+        .strip_prefix('(')?
+        .split_once(')')?
+        .0;
+    let mut numbers = arguments
+        .split(',')
+        .map(|number| number.trim().parse().ok());
+    let version = (numbers.next()??, numbers.next()??, numbers.next()??);
+    numbers.next().is_none().then_some(version)
 }

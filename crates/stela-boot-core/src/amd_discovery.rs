@@ -1,0 +1,413 @@
+//! An AMD GPU's IP discovery table, which names the version of each of its
+//! IP blocks, as amdgpu reads it at its probe (`amdgpu_discovery.c`). The
+//! boot reads it before the GPU's reset so the firmware it gives amdgpu is
+//! the files of those versions only.
+//!
+//! The table lies in the GPU's memory, 64 KiB below the top of its VRAM as
+//! `RCC_CONFIG_MEMSIZE` gives it, or where the GPU's security processor
+//! says in the driver scratch registers (`amdgpu_discovery_get_tmr_info`).
+//! amdgpu reads it through the `MM_INDEX`/`MM_DATA` window, which needs no
+//! mapping of the GPU's memory (`amdgpu_device_mm_access`). The checks here
+//! are `amdgpu_discovery_init`'s; the walk is
+//! `amdgpu_discovery_reg_base_init`'s.
+use alloc::vec::Vec;
+
+/// Registers, as byte offsets in the register BAR (`amdgpu_discovery.c`:
+/// "consistent across all the SOCs").
+pub const MM_INDEX: usize = 0;
+pub const MM_DATA: usize = 4;
+pub const MM_INDEX_HI: usize = 0x6 * 4;
+pub const DRIVER_SCRATCH_0: usize = 0x94 * 4;
+pub const DRIVER_SCRATCH_1: usize = 0x95 * 4;
+pub const DRIVER_SCRATCH_2: usize = 0x96 * 4;
+pub const RCC_CONFIG_MEMSIZE: usize = 0xde3 * 4;
+pub const MP0_SMN_C2PMSG_33: usize = 0x16061 * 4;
+/// The security processor's ring command and response register, and its
+/// secure OS's sign of life (`psp_v11_0.c`, `psp_v13_0.c`), at the place
+/// amdgpu's discovery reads `C2PMSG_33` on every SOC.
+pub const MP0_SMN_C2PMSG_64: usize = 0x16080 * 4;
+pub const MP0_SMN_C2PMSG_81: usize = 0x16091 * 4;
+/// The register window the read needs.
+pub const REGISTER_BYTES: usize = MP0_SMN_C2PMSG_33 + 4;
+/// The register window the security processor's state needs.
+pub const SECURITY_PROCESSOR_BYTES: usize = MP0_SMN_C2PMSG_81 + 4;
+/// `C2PMSG_33` bit 31: the GPU's firmware finished its start and placed the
+/// table.
+pub const FIRMWARE_READY: u32 = 1 << 31;
+
+/// `DISCOVERY_TMR_SIZE` and `DISCOVERY_TMR_OFFSET`.
+pub const TABLE_BYTES: usize = 10 << 10;
+pub const BELOW_TOP: u64 = 64 << 10;
+/// The most a scratch-register size may ask to read.
+const MOST_BYTES: usize = 64 << 10;
+
+/// `BINARY_SIGNATURE` and `DISCOVERY_TABLE_SIGNATURE` of
+/// `include/discovery.h`, as little-endian dwords: the latter is "IPDS".
+pub const BINARY_SIGNATURE: u32 = 0x2821_1407;
+const DISCOVERY_TABLE_SIGNATURE: u32 = 0x5344_5049;
+
+/// The hardware IDs of the blocks whose firmware amdgpu names after their
+/// versions (`soc15_hw_ip.h`).
+pub const MP1: u16 = 1;
+pub const GC: u16 = 11;
+pub const VCN: u16 = 12;
+pub const VPE: u16 = 21;
+pub const SDMA0: u16 = 42;
+pub const DMU: u16 = 271;
+pub const MP0: u16 = 255;
+/// `HW_ID_MAX` and `HWIP_MAX_INSTANCE`: entries past these are skipped.
+const HW_ID_MAX: u16 = 300;
+const MAX_INSTANCE: u8 = 44;
+
+/// One IP block as the table lists it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip {
+    pub hw_id: u16,
+    pub instance: u8,
+    pub major: u8,
+    pub minor: u8,
+    pub revision: u8,
+}
+
+/// Why the table was not read or not taken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// `RCC_CONFIG_MEMSIZE` reads all ones: the GPU does not answer.
+    NoAnswer,
+    /// The GPU's firmware has not placed the table yet (`C2PMSG_33`).
+    NotReady,
+    /// The table is in system memory (no VRAM size and no scratch place),
+    /// where amdgpu finds it through ACPI.
+    InSystemMemory,
+    Signature,
+    Checksum,
+    Version(u16),
+    TableSignature,
+    TableChecksum,
+    Truncated,
+    DieId,
+    /// No memory for the table's bytes.
+    Memory,
+}
+
+/// Where to read the table: the VRAM offset and length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Place {
+    pub offset: u64,
+    pub bytes: usize,
+}
+
+/// Where the table lies, as `amdgpu_discovery_get_tmr_info` finds it on a
+/// GPU that is no virtual function: `read` reads a register of the
+/// register BAR, `signature_at` the dword at a VRAM offset.
+pub fn place(
+    mut read: impl FnMut(usize) -> u32,
+    mut signature_at: impl FnMut(u64) -> u32,
+) -> Result<Place, Error> {
+    if read(MP0_SMN_C2PMSG_33) & FIRMWARE_READY == 0 {
+        return Err(Error::NotReady);
+    }
+    let vram_mib = read(RCC_CONFIG_MEMSIZE);
+    if vram_mib == u32::MAX {
+        return Err(Error::NoAnswer);
+    }
+    if vram_mib != 0 {
+        let offset = (u64::from(vram_mib) << 20).saturating_sub(BELOW_TOP);
+        if signature_at(offset) == BINARY_SIGNATURE {
+            return Ok(Place {
+                offset,
+                bytes: TABLE_BYTES,
+            });
+        }
+    }
+    let size = read(DRIVER_SCRATCH_2);
+    if size != 0 {
+        return Ok(Place {
+            offset: u64::from(read(DRIVER_SCRATCH_1)) << 32 | u64::from(read(DRIVER_SCRATCH_0)),
+            bytes: (size as usize).min(MOST_BYTES),
+        });
+    }
+    if vram_mib == 0 {
+        return Err(Error::InSystemMemory);
+    }
+    Ok(Place {
+        offset: (u64::from(vram_mib) << 20).saturating_sub(BELOW_TOP),
+        bytes: TABLE_BYTES,
+    })
+}
+
+/// The security processor's state as a function's previous owner left it,
+/// from `C2PMSG_33` (its boot loader), `C2PMSG_64` (its ring's command and
+/// answer) and `C2PMSG_81` (its secure OS), in words: what amdgpu's own
+/// start then meets, such as a ring a previous driver made.
+pub fn security_processor(c2pmsg_33: u32, c2pmsg_64: u32, c2pmsg_81: u32) -> alloc::string::String {
+    use alloc::format;
+    let read = format!(
+        "C2PMSG_33={c2pmsg_33:#010x} C2PMSG_64={c2pmsg_64:#010x} C2PMSG_81={c2pmsg_81:#010x}"
+    );
+    if [c2pmsg_33, c2pmsg_64, c2pmsg_81] == [u32::MAX; 3] {
+        return format!("{read}: it does not answer");
+    }
+    let loader = if c2pmsg_33 & FIRMWARE_READY != 0 {
+        "its boot loader is ready"
+    } else {
+        "its boot loader is not ready"
+    };
+    let os = if c2pmsg_81 != 0 {
+        "its secure OS runs, as the firmware or a previous driver left it"
+    } else {
+        "no secure OS runs"
+    };
+    let ring = match c2pmsg_64 {
+        0 => alloc::string::String::from("no ring command waits"),
+        answer if answer & (1 << 31) != 0 => format!(
+            "its last ring command was answered with status {:#06x}",
+            answer & 0xffff
+        ),
+        command => format!("ring command {command:#x} waits for its answer"),
+    };
+    format!("{read}: {loader}; {os}; {ring}")
+}
+
+/// The register BAR's first page: the index registers and the driver
+/// scratch registers lie in it.
+pub const INDEX_PAGE_BYTES: usize = 4096;
+
+/// The register BAR as the read before the reset reaches it. The read
+/// writes the index registers, so the page that holds them is the one
+/// mapping of it the read uses: a second mapping of a page already mapped
+/// is refused.
+pub trait Registers {
+    /// A dword of the register BAR; all ones when it does not answer.
+    fn read(&self, offset: usize) -> u32;
+    /// Writes a dword of the first page ([`INDEX_PAGE_BYTES`]); false when
+    /// the write was refused.
+    fn write(&self, offset: usize, value: u32) -> bool;
+}
+
+/// The IP blocks the table lists, read from VRAM through the `MM_INDEX`,
+/// `MM_INDEX_HI` and `MM_DATA` window one dword at a time, as
+/// `amdgpu_device_mm_access` reads it; the index registers hold their
+/// earlier values again after.
+pub fn read(registers: &impl Registers) -> Result<Vec<Ip>, Failure> {
+    let index = (registers.read(MM_INDEX), registers.read(MM_INDEX_HI));
+    let vram = |position: u64| -> u32 {
+        let selected = registers.write(MM_INDEX, position as u32 | 0x8000_0000)
+            && registers.write(MM_INDEX_HI, (position >> 31) as u32);
+        if selected {
+            registers.read(MM_DATA)
+        } else {
+            u32::MAX
+        }
+    };
+    let result = place(|offset| registers.read(offset), vram)
+        .map_err(Failure::from)
+        .and_then(|place| {
+            let mut binary = Vec::new();
+            binary
+                .try_reserve_exact(place.bytes)
+                .map_err(|_| Failure::from(Error::Memory))?;
+            for at in (0..place.bytes as u64).step_by(4) {
+                binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
+            }
+            parse(&binary).map_err(|error| Failure::found(error, place, &binary))
+        });
+    registers.write(MM_INDEX, index.0);
+    registers.write(MM_INDEX_HI, index.1);
+    result
+}
+
+/// Why [`read`] took no table, with what it found where it read one: the
+/// VRAM offset, the binary's first bytes and, past a good binary header,
+/// where its IP discovery table was and that table's first bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Failure {
+    pub error: Error,
+    pub read: Option<(Place, [u8; 4])>,
+    pub table: Option<(u16, [u8; 4])>,
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            read: None,
+            table: None,
+        }
+    }
+}
+
+impl Failure {
+    fn found(error: Error, place: Place, binary: &[u8]) -> Self {
+        let first = |at: usize| -> Option<[u8; 4]> { binary.get(at..at + 4)?.try_into().ok() };
+        // Past a binary that is none, no table is placed.
+        let entry = match u16_at(binary, 4) {
+            _ if error == Error::Signature => None,
+            Ok(0 | 1) => Some(12),
+            Ok(2) => Some(16),
+            _ => None,
+        };
+        let table = entry
+            .and_then(|entry| u16_at(binary, entry).ok())
+            .and_then(|offset| Some((offset, first(usize::from(offset))?)));
+        Self {
+            error,
+            read: first(0).map(|bytes| (place, bytes)),
+            table,
+        }
+    }
+}
+
+impl Error {
+    /// What the error means of the GPU, where its name does not say it.
+    fn meaning(self) -> Option<&'static str> {
+        Some(match self {
+            Self::NoAnswer => "RCC_CONFIG_MEMSIZE reads all ones: the GPU does not answer",
+            Self::NotReady => {
+                "MP0 C2PMSG_33 bit 31 is clear: the GPU's firmware has not placed the table"
+            }
+            Self::InSystemMemory => {
+                "RCC_CONFIG_MEMSIZE reads 0 and the scratch registers name no place: the table \
+                 is in system memory, where amdgpu finds it through ACPI"
+            }
+            Self::Memory => "no memory for the table's bytes",
+            _ => return None,
+        })
+    }
+}
+
+impl core::fmt::Display for Failure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.error)?;
+        if let Some(meaning) = self.error.meaning() {
+            write!(f, " ({meaning})")?;
+        }
+        if let Some((place, bytes)) = self.read {
+            write!(
+                f,
+                "; read {:#x} bytes at VRAM offset {:#x}, whose first word is {:#010x}",
+                place.bytes,
+                place.offset,
+                u32::from_le_bytes(bytes)
+            )?;
+            if self.error == Error::Signature {
+                write!(f, " where a table binary's is {BINARY_SIGNATURE:#010x}")?;
+            }
+        }
+        if let Some((offset, bytes)) = self.table {
+            write!(
+                f,
+                "; its table at {offset:#x} starts {:#010x}",
+                u32::from_le_bytes(bytes)
+            )?;
+            if self.error == Error::TableSignature {
+                write!(
+                    f,
+                    " where an IP discovery table's is {DISCOVERY_TABLE_SIGNATURE:#010x} (IPDS)"
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> Result<u16, Error> {
+    bytes
+        .get(at..at + 2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .ok_or(Error::Truncated)
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Result<u32, Error> {
+    bytes
+        .get(at..at + 4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .ok_or(Error::Truncated)
+}
+
+fn sum(bytes: &[u8]) -> u16 {
+    bytes
+        .iter()
+        .fold(0u16, |sum, &byte| sum.wrapping_add(u16::from(byte)))
+}
+
+/// The IP blocks the table `binary` lists, with its binary and data table
+/// checked as amdgpu checks them. VCN's revision loses its two capability
+/// bits, as amdgpu masks them.
+pub fn parse(binary: &[u8]) -> Result<Vec<Ip>, Error> {
+    if u32_at(binary, 0)? != BINARY_SIGNATURE {
+        return Err(Error::Signature);
+    }
+    // The byte sum of the binary after its checksum field, to its size.
+    let checksum = u16_at(binary, 8)?;
+    let size = usize::from(u16_at(binary, 10)?);
+    let body = binary.get(10..size.max(10)).ok_or(Error::Truncated)?;
+    if sum(body) != checksum {
+        return Err(Error::Checksum);
+    }
+    // The IP discovery table's entry: version 0 and 1 list tables from 12,
+    // version 2 after a count and padding.
+    let entry = match u16_at(binary, 4)? {
+        0 | 1 => 12,
+        2 => 16,
+        version => return Err(Error::Version(version)),
+    };
+    let offset = usize::from(u16_at(binary, entry)?);
+    let table_checksum = u16_at(binary, entry + 2)?;
+    if u32_at(binary, offset)? != DISCOVERY_TABLE_SIGNATURE {
+        return Err(Error::TableSignature);
+    }
+    let table_bytes = usize::from(u16_at(binary, offset + 6)?);
+    let table = binary
+        .get(offset..offset + table_bytes)
+        .ok_or(Error::Truncated)?;
+    if sum(table) != table_checksum {
+        return Err(Error::TableChecksum);
+    }
+    let version = u16_at(binary, offset + 4)?;
+    let dies = usize::from(u16_at(binary, offset + 12)?).min(16);
+    // After the 16 die entries, version 4's flag byte: 64-bit base
+    // addresses.
+    let wide = version == 4 && binary.get(offset + 14 + 16 * 4).ok_or(Error::Truncated)? & 1 != 0;
+    let mut ips = Vec::new();
+    for die in 0..dies {
+        let die_offset = usize::from(u16_at(binary, offset + 14 + die * 4 + 2)?);
+        if usize::from(u16_at(binary, die_offset)?) != die {
+            return Err(Error::DieId);
+        }
+        let count = u16_at(binary, die_offset + 2)?;
+        let mut at = die_offset + 4;
+        for _ in 0..count {
+            let entry = binary.get(at..at + 8).ok_or(Error::Truncated)?;
+            let hw_id = u16::from_le_bytes([entry[0], entry[1]]);
+            let instance = entry[2];
+            let bases = usize::from(entry[3]);
+            let mut revision = entry[6];
+            if hw_id == VCN {
+                revision &= !0xc0;
+            }
+            if hw_id < HW_ID_MAX && instance < MAX_INSTANCE {
+                ips.push(Ip {
+                    hw_id,
+                    instance,
+                    major: entry[4],
+                    minor: entry[5],
+                    revision,
+                });
+            }
+            at += 8 + bases * if wide { 8 } else { 4 };
+        }
+    }
+    Ok(ips)
+}
+
+/// The version of the first instance of `hw_id`, if the table lists it.
+pub fn version(ips: &[Ip], hw_id: u16) -> Option<(u8, u8, u8)> {
+    ips.iter()
+        .filter(|ip| ip.hw_id == hw_id)
+        .min_by_key(|ip| ip.instance)
+        .map(|ip| (ip.major, ip.minor, ip.revision))
+}
+
+#[cfg(test)]
+mod tests;

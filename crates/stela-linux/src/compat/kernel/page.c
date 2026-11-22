@@ -11,6 +11,9 @@
 #include <linux/irqflags.h>
 #include <linux/limits.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
+#include <linux/oom.h>
 #include <linux/poison.h>
 #include <linux/printk.h>
 #include <linux/preempt.h>
@@ -84,6 +87,20 @@ static struct {
 	size_t free_records;
 	size_t retired;
 	size_t live_pages;
+	/* Ordinary pages held now, and the most Linux may hold at once (zero:
+	 * the whole ordinary inventory), which it reports as its RAM. */
+	size_t ordinary_live;
+	size_t page_limit;
+	/* The first request the limit refused was said (`say_limit`). */
+	bool limit_said;
+	/* One bit per section of descriptors, set once its descriptors and
+	 * page states are initialized. Registration initializes none of an
+	 * ordinary extent's: a section is made ready when the provider first
+	 * hands out a page in it, so neither the start nor its memory grows
+	 * with pages Linux has not been given. Records are taken fresh in
+	 * order before the free list is used. */
+	unsigned long *ready;
+	size_t fresh_records;
     size_t stack_admissions;
     bool kernel_roots;
     bool hosted;
@@ -146,6 +163,13 @@ void si_meminfo(struct sysinfo *info)
 	*info = (struct sysinfo){.totalram = totalram_pages(), .mem_unit = PAGE_SIZE};
 }
 
+/* The RAM Linux sees, in pages, as si_meminfo reports it: a plain read for
+ * any processor. */
+u64 stela_linux_ram_pages(void)
+{
+	return totalram_pages();
+}
+
 #ifdef STELA_LINUX_PAGE_TEST
 static size_t metadata_fail_after = NO_INDEX;
 static size_t metadata_live;
@@ -161,6 +185,29 @@ static void *allocate_metadata(size_t size, size_t align)
 	}
 #endif
 	void *object = stela_linux_heap_alloc(size, align);
+#ifdef STELA_LINUX_PAGE_TEST
+	if (object)
+		metadata_live++;
+#endif
+	return object;
+}
+
+/* The provider of metadata that need not be zeroed, for the per-page arrays
+ * whose entries are initialized only when first used. Without one, the
+ * zeroed heap serves them. */
+void *stela_linux_heap_alloc_uninit(size_t size, size_t align) __weak;
+
+static void *allocate_uninit_metadata(size_t size, size_t align)
+{
+#ifdef STELA_LINUX_PAGE_TEST
+	if (metadata_fail_after != NO_INDEX) {
+		if (!metadata_fail_after)
+			return NULL;
+		metadata_fail_after--;
+	}
+#endif
+	void *object = stela_linux_heap_alloc_uninit ? stela_linux_heap_alloc_uninit(size, align) :
+						       stela_linux_heap_alloc(size, align);
 #ifdef STELA_LINUX_PAGE_TEST
 	if (object)
 		metadata_live++;
@@ -199,11 +246,9 @@ static void require_catalog(void)
 		__builtin_trap();
 }
 
-unsigned long stela_linux_page_boot_capacity(void)
+static size_t ordinary_pages(void)
 {
-	require_quiescence();
-	require_catalog();
-	unsigned long pages = 0;
+	size_t pages = 0;
 
 	for (size_t i = 0; i < catalog.extent_count; i++) {
 		const struct registered_extent *extent = catalog.extents + i;
@@ -212,6 +257,61 @@ unsigned long stela_linux_page_boot_capacity(void)
 			pages += extent->page_count;
 	}
 	return pages;
+}
+
+unsigned long stela_linux_page_boot_capacity(void)
+{
+	require_quiescence();
+	require_catalog();
+	size_t pages = ordinary_pages();
+	return catalog.page_limit ? min(pages, catalog.page_limit) : pages;
+}
+
+/* Whether `count` more ordinary pages stay within the limit. */
+static bool within_limit(size_t count)
+{
+	return !catalog.page_limit ||
+	       (count <= catalog.page_limit && catalog.ordinary_live <= catalog.page_limit - count);
+}
+
+int stela_linux_page_catalog_limit(u64 generation, size_t pages)
+{
+	require_quiescence();
+	if (!catalog.pages || catalog.generation != generation)
+		return -EINVAL;
+	if (!pages || pages > ordinary_pages())
+		return -EINVAL;
+	if (catalog.ordinary_live > pages)
+		return -EBUSY;
+	catalog.page_limit = pages;
+	catalog.limit_said = false;
+	/* The RAM Linux's sizing reads (si_meminfo, the zone's managed pages)
+	 * is what it may hold, so TTM's and the drivers' limits derive from it. */
+	atomic_long_set(&contig_page_data.node_zones[ZONE_NORMAL].managed_pages, (long)pages);
+	atomic_long_set(&_totalram_pages, (long)pages);
+	return 0;
+}
+
+/* The first request of `count` pages the limit refuses is said once, with
+ * the numbers: Linux's pages reached the bound the memory plan set, and the
+ * allocation fails as a full GPU memory's does. */
+static void say_limit(size_t count)
+{
+	if (catalog.limit_said)
+		return;
+	catalog.limit_said = true;
+	pr_warn("stela: Linux's pages reached the bound the memory plan set: %zu pages (%zuM) held of %zu (%zuM); a request of %zu pages failed, and later ones past it fail too, as the GPU's memory being full\n",
+		catalog.ordinary_live, catalog.ordinary_live >> (20 - PAGE_SHIFT), catalog.page_limit,
+		catalog.page_limit >> (20 - PAGE_SHIFT), count);
+}
+
+/* The ordinary pages Linux holds and its limit, 0 for none, read from any
+ * processor without the catalog's owner: a snapshot that may be a page or
+ * two behind, for a budget that keeps a margin. */
+void stela_linux_page_catalog_use(size_t *held, size_t *limit)
+{
+	*held = READ_ONCE(catalog.ordinary_live);
+	*limit = READ_ONCE(catalog.page_limit);
 }
 
 int stela_linux_page_owner_context(const struct stela_linux_owner *expected)
@@ -259,6 +359,65 @@ static void initialize_page(struct page *page)
 	INIT_LIST_HEAD(&page->lru);
 	atomic_set(&page->_mapcount, -1);
 	set_page_count(page, 0);
+}
+
+/* Descriptors per section: 2 MiB of pages. */
+#define SECTION_PAGES 512UL
+
+static bool slot_ready(size_t index)
+{
+	return test_bit(index / SECTION_PAGES, catalog.ready);
+}
+
+/* Initialize every not yet ready section that slots `first`..+`count` touch:
+ * its descriptors, and its page states as unowned. */
+static void prepare_slots(size_t first, size_t count)
+{
+	if (!count)
+		return;
+	for (size_t section = first / SECTION_PAGES;
+	     section <= (first + count - 1) / SECTION_PAGES; section++) {
+		if (test_bit(section, catalog.ready))
+			continue;
+		size_t start = section * SECTION_PAGES;
+		size_t end = min(start + SECTION_PAGES, catalog.page_count);
+		for (size_t i = start; i < end; i++) {
+			initialize_page(catalog.pages + i);
+			catalog.state[i] = (struct page_state){.allocation = NO_INDEX};
+		}
+		__set_bit(section, catalog.ready);
+	}
+}
+
+/* Whether a slot holds a live page; a slot of a section never made ready
+ * holds none. */
+static bool slot_live(size_t index)
+{
+	return slot_ready(index) && catalog.state[index].live;
+}
+
+/* Whether an allocation record can be taken: one freed, or one never used. */
+static bool record_available(void)
+{
+	return catalog.free_records != NO_INDEX || catalog.fresh_records < catalog.page_count;
+}
+
+static size_t take_record(void)
+{
+	if (catalog.free_records != NO_INDEX) {
+		size_t index = catalog.free_records;
+		catalog.free_records = catalog.allocations[index].next;
+		return index;
+	}
+	return catalog.fresh_records++;
+}
+
+/* Whether `address` is the address of a record that was ever taken. */
+static bool taken_record(unsigned long address)
+{
+	unsigned long base = (unsigned long)catalog.allocations;
+	return address >= base && address - base < catalog.fresh_records * sizeof(*catalog.allocations) &&
+	       !((address - base) % sizeof(*catalog.allocations));
 }
 
 static int register_inventory(
@@ -312,16 +471,18 @@ static int register_inventory(
         count > (size_t)SSIZE_MAX / sizeof(struct page_state) ||
         count > (size_t)SSIZE_MAX / sizeof(struct allocation_record))
         return -EINVAL;
-    struct page *pages = allocate_metadata(count * sizeof(*pages), __alignof__(*pages));
+    size_t sections = BITS_TO_LONGS(DIV_ROUND_UP(count, SECTION_PAGES));
+    struct page *pages = allocate_uninit_metadata(count * sizeof(*pages), __alignof__(*pages));
     if (!pages)
         return -ENOMEM;
-    struct page_state *state = allocate_metadata(count * sizeof(*state), __alignof__(*state));
+    struct page_state *state = allocate_uninit_metadata(count * sizeof(*state),
+                                                        __alignof__(*state));
     if (!state) {
         free_metadata(pages, count * sizeof(*pages), __alignof__(*pages));
         return -ENOMEM;
     }
-    struct allocation_record *allocations = allocate_metadata(count * sizeof(*allocations),
-                                                              __alignof__(*allocations));
+    struct allocation_record *allocations = allocate_uninit_metadata(
+        count * sizeof(*allocations), __alignof__(*allocations));
     if (!allocations) {
         free_metadata(state, count * sizeof(*state), __alignof__(*state));
         free_metadata(pages, count * sizeof(*pages), __alignof__(*pages));
@@ -329,7 +490,12 @@ static int register_inventory(
     }
     struct registered_extent *inventory = allocate_metadata(extent_count * sizeof(*inventory),
                                                              __alignof__(*inventory));
-    if (!inventory) {
+    unsigned long *ready = inventory ?
+        allocate_metadata(sections * sizeof(*ready), __alignof__(*ready)) : NULL;
+    if (!ready) {
+        if (inventory)
+            free_metadata(inventory, extent_count * sizeof(*inventory),
+                          __alignof__(*inventory));
         free_metadata(allocations, count * sizeof(*allocations), __alignof__(*allocations));
         free_metadata(state, count * sizeof(*state), __alignof__(*state));
         free_metadata(pages, count * sizeof(*pages), __alignof__(*pages));
@@ -344,13 +510,6 @@ static int register_inventory(
         };
         first += extents[i].page_count;
     }
-    for (size_t i = 0; i < count; i++) {
-        initialize_page(pages + i);
-        state[i].allocation = NO_INDEX;
-        allocations[i] = (struct allocation_record){
-            .next = i + 1 < count ? i + 1 : NO_INDEX,
-        };
-    }
     catalog.generation = generation;
     catalog.page_count = count;
     catalog.extents = inventory;
@@ -361,7 +520,15 @@ static int register_inventory(
     catalog.pages = pages;
     catalog.state = state;
     catalog.allocations = allocations;
-    catalog.free_records = 0;
+    catalog.ready = ready;
+    catalog.free_records = NO_INDEX;
+    catalog.fresh_records = 0;
+    /* Stack slots and a hosted model's pages are read before any provider
+     * allocation; an ordinary extent's sections wait for their first page. */
+    for (size_t i = 0; i < extent_count; i++) {
+        if (hosted || inventory[i].kind != STELA_LINUX_PAGE_ORDINARY)
+            prepare_slots(inventory[i].first, inventory[i].page_count);
+    }
     catalog.retired = NO_INDEX;
     catalog.next_stack_nonce = 1;
     catalog.hosted = hosted;
@@ -507,7 +674,7 @@ static size_t page_index(const struct page *page)
 	    (address - base) % sizeof(*catalog.pages))
 		__builtin_trap();
 	size_t index = (address - base) / sizeof(*catalog.pages);
-	if (!catalog.state[index].live)
+	if (!slot_live(index))
 		__builtin_trap();
 	return index;
 }
@@ -547,7 +714,7 @@ static size_t physical_index(phys_addr_t address)
 {
     require_catalog();
     size_t index = physical_slot(address);
-    if (index == NO_INDEX || !catalog.state[index].live)
+    if (index == NO_INDEX || !slot_live(index))
         __builtin_trap();
     return index;
 }
@@ -560,7 +727,7 @@ void *stela_linux_page_dma_pin(u64 physical)
     if (!catalog.pages || (physical & (PAGE_SIZE - 1)))
         return NULL;
     size_t index = physical_slot(physical);
-    if (index == NO_INDEX || !catalog.state[index].live)
+    if (index == NO_INDEX || !slot_live(index))
         return NULL;
     struct allocation_record *record = catalog.allocations + catalog.state[index].allocation;
     if (!record->pin || !record->live || record->dma_refs == SIZE_MAX)
@@ -576,11 +743,7 @@ void stela_linux_page_dma_unpin(void *pin)
     if (stela_linux_kernel_hosted())
         stela_linux_fatal("native DMA unpin from a hosted page catalogue");
     require_catalog();
-    unsigned long address = (unsigned long)pin;
-    unsigned long base = (unsigned long)catalog.allocations;
-    size_t bytes = catalog.page_count * sizeof(*catalog.allocations);
-    if (address < base || address - base >= bytes ||
-        (address - base) % sizeof(*catalog.allocations))
+    if (!taken_record((unsigned long)pin))
         __builtin_trap();
     struct allocation_record *record = pin;
     if (!record->pin || !record->dma_refs)
@@ -603,7 +766,7 @@ int stela_linux_page_mapping_pin(u64 generation, const void *context,
  if (!catalog.pages || generation!=catalog.generation || context!=catalog.context ||
      (physical & (PAGE_SIZE-1))) return -EINVAL;
  size_t index=physical_slot(physical);
- if (index==NO_INDEX || !catalog.state[index].live) return -ENOENT;
+ if (index==NO_INDEX || !slot_live(index)) return -ENOENT;
  const struct registered_extent *extent=index_extent(index);
  if (extent->kind!=STELA_LINUX_PAGE_ORDINARY) return -EOPNOTSUPP;
  struct allocation_record *record=catalog.allocations+catalog.state[index].allocation;
@@ -622,9 +785,7 @@ int stela_linux_page_mapping_unpin(u64 generation, const void *context,
  if (error) return error;
  if (!catalog.pages || generation!=catalog.generation || context!=catalog.context)
   return -EINVAL;
- unsigned long address=(unsigned long)token, base=(unsigned long)catalog.allocations;
- size_t bytes=catalog.page_count*sizeof(*catalog.allocations);
- if (address<base || address-base>=bytes || (address-base)%sizeof(*catalog.allocations))
+ if (!taken_record((unsigned long)token))
   return -EINVAL;
  struct allocation_record *record=token;
  if (!record->pin || !record->dma_refs || record->external_nonce) return -EINVAL;
@@ -658,7 +819,7 @@ static size_t cpu_index(unsigned long address, size_t *offset)
         if (address >= base && address - base < extent->page_count * PAGE_SIZE) {
             size_t delta = address - base;
             size_t index = extent->first + (delta >> PAGE_SHIFT);
-            if (!catalog.state[index].live)
+            if (!slot_live(index))
                 __builtin_trap();
             *offset = delta & (PAGE_SIZE - 1);
             return index;
@@ -769,6 +930,9 @@ int stela_linux_available_page_frames(unsigned long *available)
 			return error;
 		total += count;
 	}
+	if (catalog.page_limit)
+		total = min(total, (unsigned long)(catalog.page_limit -
+						   min(catalog.page_limit, catalog.ordinary_live)));
 	*available = total;
 	return 0;
 }
@@ -861,6 +1025,9 @@ int stela_linux_page_catalog_unregister(u64 generation)
 	size_t count = catalog.page_count;
     free_metadata(catalog.extents, catalog.extent_count * sizeof(*catalog.extents),
                   __alignof__(*catalog.extents));
+    free_metadata(catalog.ready,
+                  BITS_TO_LONGS(DIV_ROUND_UP(count, SECTION_PAGES)) * sizeof(*catalog.ready),
+                  __alignof__(*catalog.ready));
 	free_metadata(catalog.allocations, count * sizeof(*catalog.allocations),
 		      __alignof__(*catalog.allocations));
 	free_metadata(catalog.state, count * sizeof(*catalog.state), __alignof__(*catalog.state));
@@ -891,6 +1058,7 @@ static bool validate_range(void *cpu_base, const u64 *physical_pages,
     size_t index = physical_slot(physical);
     if (index == NO_INDEX || count > catalog.page_count - index)
         return false;
+    prepare_slots(index, count);
     size_t total = catalog.page_count;
     if (overlaps(cpu, bytes, catalog.pages, total * sizeof(*catalog.pages)) ||
         overlaps(cpu, bytes, catalog.state, total * sizeof(*catalog.state)) ||
@@ -924,13 +1092,12 @@ static bool validate_allocation(const struct stela_linux_page_allocation *alloca
 static int reserve_stack_record(size_t first, size_t count,
                                 struct stela_linux_stack_ticket *ticket)
 {
-    if (catalog.free_records == NO_INDEX)
+    if (!record_available())
         return -ENOMEM;
     if (catalog.next_stack_nonce == U64_MAX || catalog.stack_admissions == SIZE_MAX)
         return -EOVERFLOW;
-    size_t index = catalog.free_records;
+    size_t index = take_record();
     struct allocation_record *record = catalog.allocations + index;
-    catalog.free_records = record->next;
     u64 nonce = catalog.next_stack_nonce++;
     *record = (struct allocation_record){
         .first = first, .count = count, .external_nonce = nonce,
@@ -1157,7 +1324,59 @@ int stela_linux_page_stack_retire(const struct stela_linux_stack_ticket *ticket,
     return stack_remove(ticket, record);
 }
 
-static bool reclaim_catalog_pages(gfp_t gfp)
+/* mm/oom_kill.c's out-of-memory notifiers. Linux calls them from
+ * out_of_memory after reclaim found nothing and before it would kill a task;
+ * Stela kills no task, so a failed allocation then returns NULL. */
+static struct notifier_block *oom_notifiers;
+static DEFINE_MUTEX(oom_notifiers_mutex);
+
+int register_oom_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &oom_notifiers;
+
+	mutex_lock(&oom_notifiers_mutex);
+	while (*link && (*link)->priority >= nb->priority)
+		link = &(*link)->next;
+	nb->next = *link;
+	*link = nb;
+	mutex_unlock(&oom_notifiers_mutex);
+	return 0;
+}
+
+int unregister_oom_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &oom_notifiers;
+	int error = -ENOENT;
+
+	mutex_lock(&oom_notifiers_mutex);
+	for (; *link; link = &(*link)->next)
+		if (*link == nb) {
+			*link = nb->next;
+			error = 0;
+			break;
+		}
+	mutex_unlock(&oom_notifiers_mutex);
+	return error;
+}
+
+/* __alloc_pages_may_oom's rule: costly orders and requests that may fail
+ * without retrying do not reach out_of_memory. */
+static unsigned long notify_oom(gfp_t gfp, unsigned int order)
+{
+	unsigned long freed = 0;
+
+	if (order > PAGE_ALLOC_COSTLY_ORDER ||
+	    (gfp & (__GFP_NORETRY | __GFP_RETRY_MAYFAIL | __GFP_THISNODE)))
+		return 0;
+	mutex_lock(&oom_notifiers_mutex);
+	for (struct notifier_block *nb = oom_notifiers; nb; nb = nb->next)
+		if (nb->notifier_call(nb, 0, &freed) & NOTIFY_STOP_MASK)
+			break;
+	mutex_unlock(&oom_notifiers_mutex);
+	return freed;
+}
+
+static bool reclaim_catalog_pages(gfp_t gfp, unsigned int order)
 {
 	if (!catalog.kernel_roots || !gfpflags_allow_blocking(gfp) ||
 	    !stela_linux_quiescent())
@@ -1178,6 +1397,8 @@ static bool reclaim_catalog_pages(gfp_t gfp)
 	/* Only slab reclaim is available here. Make one pressure pass using
 	 * the original shrinker budgets, outside provider and record custody. */
 	unsigned long reclaimed = shrink_slab(gfp, 0, NULL, 0);
+	if (!reclaimed)
+		reclaimed = notify_oom(gfp, order);
 	if (!stela_linux_quiescent() || !stela_linux_lease_matches(&lease) ||
 	    current != task)
 		__builtin_trap();
@@ -1253,11 +1474,10 @@ retry:
 	}
 	if (!atomic)
 		stela_linux_pages_finish();
-	if (catalog.free_records == NO_INDEX)
+	if (!record_available() || !within_limit((size_t)1 << order))
 		goto exhausted;
-	size_t record_index = catalog.free_records;
+	size_t record_index = take_record();
 	struct allocation_record *record = catalog.allocations + record_index;
-	catalog.free_records = record->next;
 	*record = (struct allocation_record){0};
 	struct stela_linux_page_allocation allocation = {0};
 	size_t count = (size_t)1 << order;
@@ -1307,6 +1527,7 @@ retry:
 		};
 	}
 	catalog.live_pages += count;
+	catalog.ordinary_live += count;
 	struct page *page = catalog.pages + first;
 	set_page_count(page, 1);
 	if (gfp & __GFP_ZERO)
@@ -1316,10 +1537,12 @@ retry:
 	return page;
 
 exhausted:
-	if (!retried && reclaim_catalog_pages(gfp)) {
+	if (!retried && reclaim_catalog_pages(gfp, order)) {
 		retried = true;
 		goto retry;
 	}
+	if (!within_limit((size_t)1 << order))
+		say_limit((size_t)1 << order);
 	return NULL;
 }
 
@@ -1453,6 +1676,8 @@ static void retire_pages(size_t first, size_t count)
 	}
 	record->live -= count;
 	catalog.live_pages -= count;
+	if (!record->external_nonce)
+		catalog.ordinary_live -= count;
 	if (!record->live) {
         if (record->external_nonce) {
             /* Original free_thread_stack/__free_pages ended logical pages.
@@ -1676,6 +1901,18 @@ struct test_provider {
 };
 
 static struct test_provider fixture;
+
+/* Metadata that need not be zeroed comes back poisoned, so that any read of
+ * a descriptor or record before its initialization shows. */
+void *stela_linux_heap_alloc_uninit(size_t size, size_t align)
+{
+	if (align < sizeof(void *))
+		align = sizeof(void *);
+	void *object = aligned_alloc(align, (size + align - 1) / align * align);
+	if (object)
+		memset(object, 0xa5, size);
+	return object;
+}
 
 static int test_validate(void *context, u32 gfp, unsigned int order, bool atomic)
 {
@@ -2063,6 +2300,53 @@ static void capacity(void)
 	assert(page && fixture.releases == releases + TEST_PAGES);
 	__free_page(page);
 	stela_linux_pages_finish();
+}
+
+/* A limit holds Linux to fewer pages than the inventory: a request past it
+ * fails before the provider is asked, freed pages make room again, and the
+ * RAM Linux reads is the limit. */
+static void page_limit(void)
+{
+	struct zone *zone = &contig_page_data.node_zones[ZONE_NORMAL];
+	assert(totalram_pages() == TEST_PAGES && zone_managed_pages(zone) == TEST_PAGES);
+	assert(stela_linux_page_catalog_limit(catalog.generation + 1, 4) == -EINVAL);
+	assert(stela_linux_page_catalog_limit(catalog.generation, 0) == -EINVAL);
+	assert(stela_linux_page_catalog_limit(catalog.generation, TEST_PAGES + 1) == -EINVAL);
+	struct page *held = alloc_pages(GFP_KERNEL, 2);
+	assert(held);
+	assert(stela_linux_page_catalog_limit(catalog.generation, 3) == -EBUSY);
+	assert(!stela_linux_page_catalog_limit(catalog.generation, 6));
+	{
+		size_t held, limit;
+
+		stela_linux_page_catalog_use(&held, &limit);
+		assert(limit == 6 && held == catalog.ordinary_live);
+	}
+	assert(totalram_pages() == 6 && zone_managed_pages(zone) == 6);
+	assert(stela_linux_page_boot_capacity() == 6);
+	unsigned long available = 0;
+	assert(!stela_linux_available_page_frames(&available) && available == 2);
+	unsigned int allocations = fixture.allocations;
+	assert(!catalog.limit_said);
+	assert(!alloc_pages(GFP_KERNEL, 2) && fixture.allocations == allocations);
+	/* The first refusal at the limit is said, once. */
+	assert(catalog.limit_said);
+	struct page *pair = alloc_pages(GFP_KERNEL, 1);
+	assert(pair && fixture.allocations == allocations + 1);
+	assert(!alloc_page(GFP_KERNEL) && fixture.allocations == allocations + 1);
+	assert(!stela_linux_available_page_frames(&available) && !available);
+	__free_pages(held, 2);
+	stela_linux_pages_finish();
+	struct page *again = alloc_pages(GFP_KERNEL, 2);
+	assert(again);
+	__free_pages(again, 2);
+	__free_pages(pair, 1);
+	stela_linux_pages_finish();
+	assert(!catalog.ordinary_live);
+	catalog.page_limit = 0;
+	catalog.limit_said = false;
+	atomic_long_set(&zone->managed_pages, TEST_PAGES);
+	atomic_long_set(&_totalram_pages, TEST_PAGES);
 }
 
 static void sg_markers_and_traversal(void)
@@ -2812,6 +3096,9 @@ int main(void)
 	}
 	metadata_fail_after = NO_INDEX;
 	assert(!stela_linux_page_catalog_register(&reservation, &test_ops, &fixture));
+	/* Registration initializes no ordinary descriptor and takes no record:
+	 * the first page the provider hands out readies its section. */
+	assert(!slot_ready(0) && !catalog.fresh_records);
 	assert(stela_linux_page_catalog_register(&reservation, &test_ops, &fixture) == -EBUSY);
 	assert(stela_linux_page_catalog_verify(2) == -EINVAL);
 	assert(!stela_linux_page_catalog_verify(1));
@@ -2866,6 +3153,7 @@ int main(void)
 	compound_and_split();
 	stela_linux_enter(&owner);
 	capacity();
+	page_limit();
 	sg_markers_and_traversal();
 	sg_iterator_geometry();
 	sg_chained_allocation();

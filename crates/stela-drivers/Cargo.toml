@@ -21,10 +21,10 @@ irq-diagnostics = ["stela-driver-base/irq-diagnostics"]
 nouveau-port = ["stela-driver-gpu/nouveau-port"]
 amdgpu-port = ["stela-driver-gpu/amdgpu-port"]
 xe-port = ["stela-driver-gpu/xe-port"]
+i915-port = ["stela-driver-gpu/i915-port"]
 metal = ["stela-driver-gpu/metal"]
 metal-vulkan = ["stela-driver-gpu/metal-vulkan"]
 metal-linked = ["stela-driver-gpu/metal-linked"]
-radv = ["amdgpu-port", "metal-linked", "stela-driver-gpu/radv"]
 # Test builds only: the Metal device's memory cap.
 vram-cap = ["stela-driver-gpu/vram-cap"]
 

@@ -178,6 +178,37 @@ pub(super) fn program_link(
     words
 }
 
+/// The driver's link made a shared library of the test's own at `library`:
+/// its objects first, then the driver's inputs, without Mesa's export list
+/// and name, so every symbol the test's objects export stays visible, then
+/// `extra`.
+pub(super) fn library_link(
+    link: &[String],
+    library: &Path,
+    objects: &[PathBuf],
+    extra: &[String],
+) -> Vec<String> {
+    let mut words = vec![link[0].clone(), "-shared".into(), "-o".into()];
+    words.push(library.display().to_string());
+    words.extend(objects.iter().map(|object| object.display().to_string()));
+    let mut skip = false;
+    for word in &link[1..] {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        match word.as_str() {
+            "-o" | "-Wl,--version-script" => skip = true,
+            "-shared" | "-Wl,--as-needed" => {}
+            other
+                if other.starts_with("-Wl,-soname")
+                    || other.starts_with("-Wl,--version-script=") => {}
+            _ => words.push(word.clone()),
+        }
+    }
+    words.extend(extra.iter().cloned());
+    words
+}
+
 /// A preloaded shim library's link, Meson's with its output at `library`
 /// and undefined symbols allowed: the shim's libdrm calls resolve in the
 /// test program, whose libdrm stand-in is exported.
@@ -225,6 +256,25 @@ pub(super) fn registered_ioctls(source: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// The ioctls of a kernel driver's table that serve a render node: those
+/// registered with `DRM_RENDER_ALLOW` and a handler of the driver's own, not
+/// the DRM core's `drm_noop` or `drm_invalid_op`, which answer legacy
+/// ioctls without doing anything.
+pub(super) fn render_ioctls(source: &str, prefix: &str) -> Vec<String> {
+    source
+        .split(&format!("DRM_IOCTL_DEF_DRV({prefix}"))
+        .skip(1)
+        .filter_map(|rest| {
+            let entry = rest.split(')').next()?;
+            let mut fields = entry.split(',').map(str::trim);
+            let (name, handler, flags) = (fields.next()?, fields.next()?, fields.next()?);
+            (flags.contains("DRM_RENDER_ALLOW")
+                && !matches!(handler, "drm_noop" | "drm_invalid_op"))
+            .then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// What a test's exit line `marker NAME=count ...` says the driver used.
 pub(super) fn used_ioctls(output: &str, marker: &str) -> BTreeMap<String, u32> {
     output
@@ -250,6 +300,19 @@ mod tests {
             \t\t\t  DRM_AUTH|DRM_RENDER_ALLOW),\n};\n";
         assert_eq!(registered_ioctls(source, "AMDGPU_"), ["GEM_CREATE", "CTX"]);
         assert!(registered_ioctls(source, "XE_").is_empty());
+    }
+
+    #[test]
+    fn a_render_node_serves_only_its_drivers_own_render_ioctls() {
+        let source = "static const struct drm_ioctl_desc i915_ioctls[] = {\n\
+            \tDRM_IOCTL_DEF_DRV(I915_INIT, drm_noop, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GETPARAM, i915_getparam_ioctl, DRM_RENDER_ALLOW),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_EXECBUFFER, drm_invalid_op, DRM_AUTH),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_PIN, i915_gem_reject_pin_ioctl, DRM_AUTH|DRM_ROOT_ONLY),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_WAIT, i915_gem_wait_ioctl,\n\
+            \t\t\t  DRM_RENDER_ALLOW),\n};\n";
+        assert_eq!(render_ioctls(source, "I915_"), ["GETPARAM", "GEM_WAIT"]);
+        assert_eq!(registered_ioctls(source, "I915_").len(), 5);
     }
 
     #[test]
@@ -302,6 +365,45 @@ mod tests {
             built_inputs(&link),
             ["x.o", "a.a"],
             "only what the build makes"
+        );
+    }
+
+    #[test]
+    fn a_hosted_library_keeps_its_exports_and_the_drivers_inputs() {
+        let link: Vec<String> = [
+            "cc",
+            "-o",
+            "src/amd/vulkan/libvulkan_radeon.so",
+            "-shared",
+            "-Wl,-soname,libvulkan_radeon.so",
+            "-Wl,--version-script",
+            "vulkan.sym",
+            "-Wl,--as-needed",
+            "-Wl,--no-undefined",
+            "src/amd/vulkan/libvulkan_radeon.so.p/radv_device.c.o",
+            "src/util/libmesa_util.a",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let words = library_link(
+            &link,
+            Path::new("/t/libhost.so"),
+            &[PathBuf::from("/t/own.o")],
+            &["-lllvm".to_owned()],
+        );
+        assert_eq!(
+            words,
+            [
+                "cc",
+                "-shared",
+                "-o",
+                "/t/libhost.so",
+                "/t/own.o",
+                "-Wl,--no-undefined",
+                "src/amd/vulkan/libvulkan_radeon.so.p/radv_device.c.o",
+                "src/util/libmesa_util.a",
+                "-lllvm",
+            ]
         );
     }
 

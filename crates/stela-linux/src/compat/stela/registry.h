@@ -165,9 +165,11 @@ int stela_linux_registry_parse_result(const struct stela_linux_registry *, unsig
 int stela_linux_registry_retire(struct stela_linux_registry **,
  const struct stela_linux_registry_retirement *);
 /* Run an image's initcalls as start_kernel does, once per boot, after its
- * built-in modules' parameters took the command line's values. */
+ * built-in modules' parameters took the command line's values. A refused
+ * word, or the parameter that refused its value, is named in `rejected`. */
 int stela_linux_start(const struct stela_linux_registry_image *,
- const char *command_line, size_t length, struct stela_linux_registry **);
+ const char *command_line, size_t length, struct stela_linux_registry **,
+ char *rejected, size_t rejected_size);
 
 static_assert(sizeof(void *) == 8 && sizeof(size_t) == 8 && sizeof(long) == 8 && sizeof(int) == 4);
 static_assert(sizeof(initcall_t) == 8 && sizeof(exitcall_t) == 8);
