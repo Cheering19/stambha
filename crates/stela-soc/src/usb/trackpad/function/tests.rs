@@ -299,10 +299,25 @@ fn mode_switch_logged() {
     let mut t = configured();
     t.take_trace();
     // Linux's and Windows' switch: SET_REPORT wValue 0x0302, wIndex 1.
-    transfer(&mut t, setup(0x21, SET_REPORT, 0x0302, 1, 2), &[0x02, 0x01]).unwrap();
+    let mode = |t: &mut Trackpad, value: u8| {
+        transfer(t, setup(0x21, SET_REPORT, 0x0302, 1, 2), &[0x02, value]).unwrap();
+    };
+    mode(&mut t, 1);
     assert_eq!(t.take_trace(), [TrackpadEvent::Mode(1)]);
     // Windows reads it first.
     assert_eq!(get_feature(&mut t, 0x02, 2).unwrap(), [0x02, 0x01]);
+    // Linux sends it again after each reset-resume: one line per change.
+    mode(&mut t, 1);
+    t.reset().unwrap();
+    enumerate(&mut t);
+    mode(&mut t, 1);
+    assert!(
+        !t.take_trace().contains(&TrackpadEvent::Mode(1)),
+        "the same mode again"
+    );
+    mode(&mut t, 0);
+    mode(&mut t, 0);
+    assert_eq!(t.take_trace(), [TrackpadEvent::Mode(0)]);
 }
 
 #[test]

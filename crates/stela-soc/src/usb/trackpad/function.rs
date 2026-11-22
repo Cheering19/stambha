@@ -95,6 +95,8 @@ struct State {
     pending: Vec<u8>,
     /// The information query armed by SET_REPORT feature 0x01.
     query: Option<u8>,
+    /// The mode the guest last set, which the trace says once per change.
+    mode: Option<u8>,
     halted: [bool; INTERFACES],
     /// Feature reports and queries already reported.
     features: Vec<u8>,
@@ -118,6 +120,7 @@ impl Trackpad {
                 queue: VecDeque::with_capacity(QUEUE),
                 pending: Vec::new(),
                 query: None,
+                mode: None,
                 halted: [false; INTERFACES],
                 features: Vec::new(),
                 queries: Vec::new(),
@@ -292,7 +295,10 @@ impl State {
                     Ok(Outcome::Done)
                 }
                 (MODE, [MODE, mode, ..]) => {
-                    self.note(TrackpadEvent::Mode(*mode));
+                    // Linux sends it again after each reset-resume.
+                    if self.mode.replace(*mode) != Some(*mode) {
+                        self.note(TrackpadEvent::Mode(*mode));
+                    }
                     Ok(Outcome::Done)
                 }
                 _ => self.unknown(setup),
