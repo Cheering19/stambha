@@ -36,6 +36,10 @@ pub enum Error {
     NativeCoreCapacity,
     DuplicateGuestPes,
     GuestPeCount,
+    CodeWindow,
+    DuplicateCodeWindow,
+    TimerDelay,
+    DuplicateTimerDelay,
     DisplaySize,
     MissingRestoreSource,
     DuplicateRestoreSource,
@@ -159,6 +163,12 @@ impl Error {
             }
             Self::DuplicateGuestPes => "--guest-pes must occur once",
             Self::GuestPeCount => "--guest-pes needs a processor count",
+            Self::CodeWindow => {
+                "--code-window needs MiB in steps of 16, from 64 to 2048, such as 1536"
+            }
+            Self::DuplicateCodeWindow => "--code-window must occur once",
+            Self::TimerDelay => "--timer-delay-us needs microseconds from 100 to 100000",
+            Self::DuplicateTimerDelay => "--timer-delay-us must occur once",
             Self::DisplaySize => "--display-size needs WIDTHxHEIGHT, such as 1920x1080",
             Self::MissingRestoreSource => "missing restore source partition",
             Self::DuplicateRestoreSource => "duplicate restore source",

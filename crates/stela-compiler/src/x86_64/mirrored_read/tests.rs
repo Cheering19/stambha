@@ -22,17 +22,28 @@ const TPIDR_EL0: u32 = 0xd53b_d040;
 
 /// The thread pointer's cell is the second.
 fn reads() -> Reads {
-    Reads {
-        reads: [
-            Some(Read {
-                word: TPIDR_EL1,
-                cell: size_of::<Cell>() as u32,
-            }),
-            None,
-            None,
-            None,
-        ],
-    }
+    let mut reads = Reads::NONE;
+    reads.reads[0] = Some(Read {
+        word: TPIDR_EL1,
+        cell: size_of::<Cell>() as u32,
+        stored: false,
+    });
+    reads
+}
+
+/// MRS X0,TPIDRRO_EL0, the user thread pointer's word with Rt 0.
+const TPIDRRO_EL0: u32 = 0xd53b_d060;
+
+/// [`reads`] and the user thread pointer's stored cell, the third: its
+/// value is the address of the register's storage.
+fn stored_reads() -> Reads {
+    let mut reads = reads();
+    reads.reads[1] = Some(Read {
+        word: TPIDRRO_EL0,
+        cell: 2 * size_of::<Cell>() as u32,
+        stored: true,
+    });
+    reads
 }
 
 fn compile(words: &[u32], mirrored: Reads) -> crate::block::CompiledBlock {
@@ -53,9 +64,11 @@ fn compile(words: &[u32], mirrored: Reads) -> crate::block::CompiledBlock {
 
 #[test]
 fn cells_match_the_register_whatever_rt_and_never_a_write() {
-    let reads = reads();
+    let reads = stored_reads();
     for rt in [0, 2, 8, 30, 31] {
-        assert_eq!(reads.cell(TPIDR_EL1 | rt), Some(16));
+        assert_eq!(reads.cell(TPIDR_EL1 | rt).map(|read| read.cell), Some(16));
+        let stored = reads.cell(TPIDRRO_EL0 | rt).expect("a stored cell");
+        assert_eq!((stored.cell, stored.stored), (32, true));
     }
     assert_eq!(reads.cell(TPIDR_EL0), None);
     // MSR TPIDR_EL1,X2 is not admitted by the parser (L clear); the table
@@ -139,6 +152,56 @@ fn reads_complete_from_an_open_cell_and_exit_at_a_closed_one() {
         (PC + 12, ExitKind::Fallthrough as u64)
     );
     assert_eq!(state.x[0], 2);
+}
+
+/// A stored cell's read takes the register from the storage the cell's
+/// value names while the cell is readable, into a frame register, a pinned
+/// one and XZR alike, and leaves at the MRS while it is not; the block runs
+/// on past every one of them.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn stored_reads_complete_from_the_storage_their_cell_names() {
+    // ADD X0,X0,#1; MRS X2,TPIDRRO_EL0; MRS X8,TPIDRRO_EL0; ADD X3,X8,#1;
+    // MRS XZR,TPIDRRO_EL0; ADD X4,X4,#1
+    let words = [
+        0x9100_0400,
+        TPIDRRO_EL0 | 2,
+        TPIDRRO_EL0 | 8,
+        0x9100_0503,
+        TPIDRRO_EL0 | 31,
+        0x9100_0484,
+    ];
+    let block = compile(&words, stored_reads());
+    assert_eq!(block.source_bytes, 4 * words.len());
+    let code = block.native.x86_64_code;
+    let storage: u64 = 0x0000_0001_7654_3000;
+    let mut cells = [Cell::default(); 3];
+    let start = |cells: &[Cell; 3]| {
+        let mut state = crate::GuestState::default();
+        state.anchors[Anchor::Cells] = cells.as_ptr() as u64;
+        for register in 0..9 {
+            state.x[register] = 0x100 * register as u64;
+        }
+        state
+    };
+    cells[2] = Cell {
+        readable: 1,
+        value: &storage as *const u64 as u64,
+    };
+    let mut state = start(&cells);
+    let exit = run(&code, &mut state);
+    assert_eq!(
+        exit,
+        (PC + 4 * words.len() as u64, ExitKind::Fallthrough as u64)
+    );
+    assert_eq!(
+        (state.x[0], state.x[2], state.x[8], state.x[3], state.x[4]),
+        (1, storage, storage, storage + 1, 0x401)
+    );
+    cells[2].readable = 0;
+    let mut state = start(&cells);
+    assert_eq!(run(&code, &mut state), (PC + 4, ExitKind::System as u64));
+    assert_eq!((state.x[0], state.x[2], state.x[3]), (1, 0x200, 0x300));
 }
 
 /// A conditional branch ending a block with a mirrored read still takes its

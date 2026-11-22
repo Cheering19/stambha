@@ -60,6 +60,16 @@ pub(super) const MRS_READ: u32 = 1 << 21;
 /// an exit, over 100,000 a second on each PE running them.
 pub(super) const STORED_CELLS: usize = 256;
 
+/// The user thread pointers, which every board's stored cells number first
+/// (`numbering::Numbering`), before any code is installed: their cells then
+/// lie at the same place in every boot, so the blocks that read them inside
+/// themselves (`regime_state::inline_mirrored_reads`) translate alike, and
+/// none of a boot's other registers takes their place.
+pub(super) const USER_THREAD_POINTERS: [Encoding; 2] = [
+    registers::encodings::TPIDRRO_EL0,
+    registers::encodings::TPIDR_EL0,
+];
+
 /// The cells of the [`MIRRORED`] registers, in its order, and the
 /// [`STORED_CELLS`]: native code reads those of the PE's EL and GXF state,
 /// the bank of `banks` that `state` names. A read's value and plainness

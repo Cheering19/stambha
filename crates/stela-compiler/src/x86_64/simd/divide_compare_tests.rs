@@ -340,6 +340,72 @@ fn float_comparisons_complete_inline() {
     assert!(runs > 0);
 }
 
+/// S and D FCMP and FCMPE of two registers over every input class pair:
+/// with the trap enables, FZ, FIZ and AH clear (outside the DIT profile)
+/// every pair completes inline, an unordered one (a NaN on either side)
+/// too, with 0011 and IOC for FCMPE or a signalling NaN; under the other
+/// controls a pair completes or exits with the state unchanged. Every
+/// completion matches the reference flags and FPSR.
+#[test]
+fn single_and_double_flag_comparisons_complete_unordered_pairs_inline() {
+    let mut unordered = 0;
+    for target in targets() {
+        for format in [Format::Single, Format::Double] {
+            let all = floats(format);
+            let double = u32::from(format == Format::Double) << 22;
+            for (base, signal_all) in [(0x1e20_2000u32, false), (0x1e20_2010, true)] {
+                let word = base | double | M << 16 | N << 5;
+                let code = compile(word, target);
+                for &left in &all {
+                    for &right in &all {
+                        for fpcr in controls() {
+                            let mut initial = GuestState {
+                                fpcr,
+                                fpsr: 0x0800_0000,
+                                nzcv: 0x9000_0000,
+                                ..GuestState::default()
+                            };
+                            initial.x[30] = RETURN;
+                            let mut n = [0x5a5a_a5a5_3c3c_c3c3u64, 0x0123_4567_89ab_cdef];
+                            let mut m = [0x7654_3210_fedc_ba98u64, 0xc3c3_3c3c_a5a5_5a5a];
+                            set_lane(&mut n, format, 0, left);
+                            set_lane(&mut m, format, 0, right);
+                            initial.v[N as usize] = n;
+                            initial.v[M as usize] = m;
+                            let label = alloc::format!(
+                                "{word:08x} {left:#x} {right:#x} {fpcr:#x} {target:?}"
+                            );
+                            let quick = fpcr
+                                & (FPCR_EXCEPTION_ENABLE_MASK | FPCR_FZ | FPCR_FIZ | FPCR_AH)
+                                == 0
+                                && !target.data_independent_timing();
+                            let mut actual = initial.clone();
+                            let exit = run(&code, &mut actual);
+                            if exit == PC.0 {
+                                assert_eq!(actual, initial, "{label}");
+                                assert!(!quick, "exited: {label}");
+                                continue;
+                            }
+                            assert_eq!(exit, RETURN, "{label}");
+                            let outcome =
+                                floating::comparison::flags(format, signal_all, fpcr, left, right)
+                                    .expect("completed with traps");
+                            let mut expected = initial.clone();
+                            expected.nzcv = outcome.nzcv;
+                            expected.fpsr |= outcome.exceptions;
+                            assert_eq!(actual, expected, "{label}");
+                            if quick && outcome.nzcv == 0x3000_0000 {
+                                unordered += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(unordered > 0);
+}
+
 /// Half FCMP and FCMPE, by register and with zero, over every input class
 /// pair: every lane completes inline unless a trap is enabled (FZ16
 /// flushing subnormals, NaNs unordered with IOC for FCMPE or a signalling

@@ -1199,6 +1199,17 @@ fn run_machine<H: Host>(
             "IDLE SKIP unavailable: {reason}; waits use host time\n"
         ));
     }
+    if let Some(micros) = options.timer_delay {
+        match machine.set_timer_delay(micros) {
+            Ok(()) => output::arguments(format_args!(
+                "CLOCK TIMER DELAY {micros}us (--timer-delay-us): a busy PE's timer interrupt \
+                 comes at most this long after its last\n"
+            )),
+            Err(reason) => output::arguments(format_args!(
+                "CLOCK TIMER DELAY unavailable: {reason}\n"
+            )),
+        }
+    }
     machine.set_step_timing(options.profile);
     if options.profile {
         host::pmu::start(machine.processor());

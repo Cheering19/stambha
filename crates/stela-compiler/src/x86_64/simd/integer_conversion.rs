@@ -370,7 +370,13 @@ fn fast_to_integer(
         Rdx,
         (bias + fast_exponent_limit(integer, truncate)) as i32,
     );
-    full.push(branch(code, Condition::Above));
+    let beyond = branch(code, Condition::Above);
+    // FCVTZS saturates what lies past the limit inline (`saturate`);
+    // FJCVTZS wraps instead.
+    let saturating = truncate && integer.signed && negative_zero_exact;
+    if !saturating {
+        full.push(beyond);
+    }
     let source = if directed {
         let opcode = if double {
             Host::RoundScalarDouble
@@ -432,7 +438,108 @@ fn fast_to_integer(
     asm.alu(Alu::Xor, Size::Dword, Rax, Rax);
     asm.alu(Alu::Xor, Size::Dword, Rcx, Rcx);
     success.push(jump(code));
+    if saturating {
+        let start = code.len();
+        resolve(code, beyond, start);
+        success.extend(saturate(code, format, integer.width));
+    }
     Some((full, success))
+}
+
+/// Scalar FCVTZS of the S/D input whose bits RCX holds, past the fast
+/// path's limit: a NaN, an infinity, or a value of at least 2^(n-1) in
+/// magnitude for an n-bit integer. Arm's `FPToFixed` gives a NaN 0 and a
+/// value past the integer's range its nearer bound, each with IOC alone,
+/// whatever FPCR holds but its trap enables (an out-of-range input is no
+/// subnormal, so FZ and FIZ flush nothing). Of the negative values, those
+/// that truncate to -2^(n-1) are in range: -2^(n-1) itself, exactly, and
+/// for D to W those above -2^31 - 1, inexact; for the other forms the next
+/// value below -2^(n-1) is out of range. Leaves RAX and ECX as the fast
+/// path does; returns the jumps to its completion.
+fn saturate(code: &mut Code, format: Format, width: IntegerWidth) -> Vec<usize> {
+    let double = format == Format::Double;
+    let wide = width == IntegerWidth::Bits64;
+    let input_size = Size::of(double);
+    let fraction_bits = format.fraction_bits();
+    // Magnitudes shifted past the sign: the infinity's, -2^(n-1)'s, and the
+    // first below -2^(n-1) out of range.
+    let infinity = format.exponent_mask() << 1;
+    let bound_exponent = u64::from(format.exponent_bias()) + u64::from(width.bits()) - 1;
+    let bound = bound_exponent << fraction_bits << 1;
+    let past = if double && !wide {
+        // -2^31 - 1: a unit at 2^31 is the fraction's bit 21.
+        bound | 1 << (fraction_bits - 31) << 1
+    } else {
+        bound + (1 << 1)
+    };
+    // RDX against a shifted magnitude; RAX is free until the result.
+    let compare = |code: &mut Code, magnitude: u64| {
+        let mut asm = code.asm();
+        if double {
+            asm.mov_imm64(Rax, magnitude);
+            asm.alu(Alu::Cmp, Size::Qword, Rdx, Rax);
+        } else {
+            asm.alu_imm32(Alu::Cmp, Size::Dword, Rdx, magnitude as u32 as i32);
+        }
+    };
+    // RAX = the integer's bound on the side of `negative`.
+    let bound_value = |code: &mut Code, negative: bool| {
+        let mut asm = code.asm();
+        match (wide, negative) {
+            (true, true) => asm.mov_imm64(Rax, 1 << 63),
+            (true, false) => asm.mov_imm64(Rax, (1 << 63) - 1),
+            (false, true) => asm.mov_imm32(Rax, 1 << 31),
+            (false, false) => asm.mov_imm32(Rax, (1 << 31) - 1),
+        }
+    };
+    let mut asm = code.asm();
+    asm.mov(input_size, Rdx, Rcx);
+    asm.shift_one(ShiftOp::Shl, input_size, Rdx);
+    compare(code, infinity);
+    let nan = branch(code, Condition::Above);
+    code.asm()
+        .bit_imm(BitTest::Bt, input_size, Rcx, (format.bits() - 1) as u8);
+    let negative = branch(code, Condition::Below);
+    // A positive value or infinity: the upper bound.
+    bound_value(code, false);
+    let positive = jump(code);
+    let negative_start = code.len();
+    resolve(code, negative, negative_start);
+    compare(code, past);
+    let beyond = branch(code, Condition::AboveOrEqual);
+    // In range: the lower bound, inexact unless the input is exactly it.
+    compare(code, bound);
+    let mut asm = code.asm();
+    asm.setcc(Cond::Ne, Rcx);
+    asm.movzx(Size::Dword, Rcx, Size::Byte, Rcx);
+    asm.shift_imm(
+        ShiftOp::Shl,
+        Size::Dword,
+        Rcx,
+        MXCSR_INEXACT.trailing_zeros() as u8,
+    );
+    bound_value(code, true);
+    let in_range = jump(code);
+    // Past it: the lower bound, with IOC.
+    let beyond_start = code.len();
+    resolve(code, beyond, beyond_start);
+    bound_value(code, true);
+    let below = jump(code);
+    let nan_start = code.len();
+    resolve(code, nan, nan_start);
+    code.asm().alu(Alu::Xor, Size::Dword, Rax, Rax);
+    let raise = code.len();
+    resolve(code, positive, raise);
+    resolve(code, below, raise);
+    let mut asm = code.asm();
+    asm.alu_imm8(
+        Alu::Or,
+        Size::Dword,
+        super::numerical::state(core::mem::offset_of!(crate::GuestState, fpsr)),
+        INVALID as i8,
+    );
+    asm.alu(Alu::Xor, Size::Dword, Rcx, Rcx);
+    vec![in_range, jump(code)]
 }
 
 /// The scalar W/X to S/D conversion without an MXCSR environment, under

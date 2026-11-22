@@ -602,6 +602,11 @@ pub struct Counts {
     /// Why its TTBR0 changes took the engine path
     /// ([`super::Statistics::switch_misses`]).
     pub switch_misses: [u64; super::table_switches::miss::REASONS],
+    /// Its guest context changes ([`super::Statistics::prediction_isolations`],
+    /// which counts native TTBR0 switches too where the host isolates
+    /// predictions) and its native TTBR0 switches
+    /// ([`super::Statistics::native_table_switches`]).
+    pub contexts: [u64; 2],
     /// Why its runs ended at branch-kind exits, in kind order
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
@@ -844,6 +849,25 @@ impl Hub {
     /// last call ([`SharedClock::take_stalled`]).
     pub fn clock_stalled(&self) -> u64 {
         self.clock.take_stalled()
+    }
+
+    /// Since the last call, the timer interrupts every PE took, those a
+    /// busy PE's gate held past their deadline, the counts it held them in
+    /// all and the longest hold ([`SharedClock::take_timer_gates`]).
+    pub fn clock_timer_gates(&self) -> [u64; 4] {
+        self.clock.take_timer_gates()
+    }
+
+    /// The latest a busy PE's timer interrupt comes, in microseconds
+    /// ([`SharedClock::set_timer_delay`]).
+    pub fn clock_timer_delay(&self) -> u64 {
+        self.clock.timer_delay_micros()
+    }
+
+    /// Hold every PE's timer interrupts while busy at most `micros` after
+    /// its last one ([`SharedClock::set_timer_delay`]).
+    pub fn set_timer_delay(&self, micros: u64) {
+        self.clock.set_timer_delay(micros);
     }
 
     /// Host counts of those a lease held while a kernel spin was old,
@@ -2752,6 +2776,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             ],
             transition_misses: statistics.transition_misses,
             switch_misses: statistics.switch_misses,
+            contexts: [
+                statistics.prediction_isolations,
+                statistics.native_table_switches,
+            ],
             branch_misses: statistics.branch_misses,
             stamped: {
                 let mut stamped = [0; chain::STAMP_COUNTS + 11];

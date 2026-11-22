@@ -916,7 +916,15 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         native_processors,
     } = boot;
     let target = target(options.parallel);
-    let speculation = speculation::probe();
+    let speculation = speculation::probe(!options.no_ibpb);
+    if options.no_ibpb {
+        output::arguments(format_args!(
+            "PREDICTION ISOLATION off (--no-ibpb): guest context switches issue no IBPB or \
+             return stack refill and the guest sees no FEAT_CSV2, so its address spaces share \
+             branch predictions; the CPU has the barrier: {}\n",
+            speculation::enumerated()
+        ));
+    }
     let boot_image::GuestImage {
         entry,
         x0,

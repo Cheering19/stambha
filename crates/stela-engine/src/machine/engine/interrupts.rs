@@ -392,7 +392,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .timer_deadline()
                 .is_some_and(|deadline| now >= deadline)
             {
-                self.clock.timer_taken(now, self.cpu.retired);
+                // The timers' own deadline, before the gate held it.
+                let deadline = self.timers.flatten();
+                self.clock.timer_taken(now, self.cpu.retired, deadline);
             }
         }
         self.take(Exception {

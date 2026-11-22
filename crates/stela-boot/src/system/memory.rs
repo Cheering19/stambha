@@ -109,8 +109,13 @@ pub(super) fn prepare_image(snapshot: &Snapshot) -> Result<EngineImage> {
 /// Reserve the engine's working memory and each physical worker's resources.
 /// The other cores start from a page below 1 MiB, taken first: a free one,
 /// or else a boot services page; firmware that left neither boots on one
-/// core.
-pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemory> {
+/// core. `window` is `--code-window`'s MiB, which replaces the sized code
+/// window (`host_memory::with_window`).
+pub(super) fn reserve(
+    cores: usize,
+    ram: &[(usize, usize)],
+    window: Option<u64>,
+) -> Result<EngineMemory> {
     let (cores, sipi, sipi_taken) = match cores {
         1 => (1, 0, false),
         _ => match sipi_page() {
@@ -138,6 +143,25 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     // the guest share it.
     let room = crate::engine::translations::PACK_ROOM.load(core::sync::atomic::Ordering::Acquire);
     let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, room)?;
+    let sizes = match window {
+        Some(mib) => {
+            let chosen = stela_boot_core::host_memory::with_window(sizes, mib << 20);
+            output::arguments(format_args!(
+                "HOST CODE WINDOW requested={mib}M sized={}M chosen={}M guest={}M->{}M{}\n",
+                sizes.code.window >> 20,
+                chosen.code.window >> 20,
+                sizes.guest >> 20,
+                chosen.guest >> 20,
+                if chosen.code.window >> 20 < mib {
+                    " (the guest keeps its floor)"
+                } else {
+                    ""
+                },
+            ));
+            chosen
+        }
+        None => sizes,
+    };
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M\n",
         free >> 20,

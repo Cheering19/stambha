@@ -640,6 +640,58 @@ fn small_hosts_move_their_kept_code_into_the_window() {
     }
 }
 
+/// `--code-window` trades the window and its block records (a heap byte per
+/// window byte) with the guest: on 8, 16,
+/// 32 and 64 GiB hosts the window the option names, or where the guest's
+/// floor leaves too little room for it, the largest whole step that keeps
+/// the floor. The pool and the kept code stay, and the parts still add up to
+/// the free RAM.
+#[test]
+fn a_chosen_window_trades_with_the_guest_down_to_its_floor() {
+    for (installed, sized, requested, chosen) in [
+        // The 8 GiB host's guest (4112 MiB) has 1040 MiB above its floor:
+        // 512 MiB more window and 512 MiB of records.
+        (8, 624, 2048, 1136),
+        (8, 624, 512, 512),
+        (16, 1200, 2048, 2048),
+        (16, 1200, 768, 768),
+        (32, 2048, 2048, 2048),
+        (32, 2048, 1024, 1024),
+        (64, 2048, 2048, 2048),
+        (64, 2048, 64, 64),
+    ] {
+        let name = alloc::format!("{installed} GiB, {requested} MiB");
+        let free = free(installed);
+        let before = sizes(free, 8, 8).unwrap();
+        assert_eq!(before.code.window, sized * MIB, "{name}");
+        let after = with_window(before, requested * MIB);
+        assert_eq!(after.code.window, chosen * MIB, "{name}");
+        let grown = |after: u64, before: u64| after as i64 - before as i64;
+        let moved = grown(after.code.window, before.code.window);
+        assert_eq!(grown(after.code.bytes, before.code.bytes), moved, "{name}");
+        assert_eq!(grown(after.heap, before.heap), moved, "{name}");
+        assert_eq!(grown(after.guest, before.guest), -2 * moved, "{name}");
+        assert_eq!(
+            (after.pool, after.kept),
+            (before.pool, before.kept),
+            "{name}"
+        );
+        assert_eq!(after.code.parts, before.code.parts, "{name}");
+        assert_eq!(
+            after.heap + after.code.bytes + after.pool + after.guest,
+            free,
+            "{name}"
+        );
+        assert!(after.guest >= GUEST_FLOOR, "{name}");
+        if chosen < requested {
+            let more = after.guest - 2 * CODE_ALIGNMENT;
+            assert!(more < GUEST_FLOOR, "{name}: a step more would fit");
+        }
+        // The window the sizing chose changes nothing.
+        assert_eq!(with_window(before, before.code.window), before, "{name}");
+    }
+}
+
 /// A pack read on demand, its merges too, holds its indexes alone; the
 /// room it leaves goes to the window up to the knee, then half to the
 /// window up to [`SHARED_PER_RUNNER`] and half to the guest, then all to

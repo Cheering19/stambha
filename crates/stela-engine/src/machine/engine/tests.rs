@@ -7845,6 +7845,17 @@ fn guarded_exception_register_cells_open_on_the_bank() {
     );
 }
 
+/// The first stored cell a test's register takes: past the user thread
+/// pointers', which every board numbers first ([`USER_THREAD_POINTERS`]).
+const FIRST_STORED: usize = MIRRORED.len() + USER_THREAD_POINTERS.len();
+
+/// The stored reads of a board whose code read `encoding` alone.
+fn stored_after_user_pointers(encoding: Encoding) -> alloc::vec::Vec<Encoding> {
+    let mut reads = USER_THREAD_POINTERS.to_vec();
+    reads.push(encoding);
+    reads
+}
+
 /// A plain read of a register an exception writes opens a cell on its
 /// storage, through which native code sees each later value.
 #[test]
@@ -7861,9 +7872,9 @@ fn stored_reads_complete_natively_from_the_live_register() {
     machine.step().unwrap();
     assert_eq!(
         machine.stored_reads.to_vec(),
-        [Encoding::new(3, 0, 4, 0, 1)]
+        stored_after_user_pointers(Encoding::new(3, 0, 4, 0, 1))
     );
-    let index = MIRRORED.len();
+    let index = FIRST_STORED;
     let cell = cell_place(index);
     let thunk = register_read::stored_thunk(GuestAddress(base + 4), 8, cell);
     assert_eq!(machine.host.installed.last(), Some(&thunk.code));
@@ -7930,9 +7941,9 @@ fn apctl_reads_complete_natively_from_the_levels_word() {
     machine.step().unwrap();
     assert_eq!(
         machine.stored_reads.to_vec(),
-        [registers::encodings::APCTL_EL1]
+        stored_after_user_pointers(registers::encodings::APCTL_EL1)
     );
-    let index = MIRRORED.len();
+    let index = FIRST_STORED;
     let thunk = register_read::stored_thunk(GuestAddress(base + 4), 8, cell_place(index));
     assert_eq!(machine.host.installed.last(), Some(&thunk.code));
     for el in [2, 1] {
@@ -8158,11 +8169,14 @@ fn implementation_defined_values_complete_natively_after_the_engine_does() {
     assert_eq!((cell.readable, cell.value), (1, address));
     // A read completes from the same value.
     machine.step().unwrap();
-    assert_eq!(machine.stored_reads.to_vec(), [encoding]);
+    assert_eq!(
+        machine.stored_reads.to_vec(),
+        stored_after_user_pointers(encoding)
+    );
     machine.cpu.pc = base + 12;
     machine.system_instruction(MRS).unwrap();
     assert_eq!(machine.cpu.state.x[8], 0x77);
-    let cell = machine.mirrors[MIRRORED.len()];
+    let cell = machine.mirrors[FIRST_STORED];
     assert_eq!((cell.readable, cell.value), (1, address));
     // A register that takes only zero completes natively for XZR alone.
     machine.step().unwrap();
@@ -8369,11 +8383,14 @@ fn pstate_fields_complete_natively_after_the_engine_does() {
     let cell = machine.mirrors[stored_write_cell(0)];
     assert_eq!((cell.readable, cell.value), (1, address));
     machine.step().unwrap();
-    assert_eq!(machine.stored_reads.to_vec(), [PSTATE_FIELDS[0].0]);
+    assert_eq!(
+        machine.stored_reads.to_vec(),
+        stored_after_user_pointers(PSTATE_FIELDS[0].0)
+    );
     machine.cpu.pc = base + 12;
     machine.system_instruction(MRS).unwrap();
     assert_eq!(machine.cpu.state.x[2], DIT);
-    let cell = machine.mirrors[MIRRORED.len()];
+    let cell = machine.mirrors[FIRST_STORED];
     assert_eq!((cell.readable, cell.value), (1, address));
     // Native code sees PSTATE in the words and leaves what it wrote there.
     machine.cpu.pstate.ssbs = true;

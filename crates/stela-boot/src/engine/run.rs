@@ -2122,6 +2122,18 @@ impl Heartbeat {
             }
             self.clock_count = count;
             output::arguments(format_args!("CLOCK count={count:#x}\n"));
+            // The timer interrupts the PEs took since the last beat, those
+            // a busy PE's gate held past their deadline, and how long: the
+            // average and the longest.
+            let hub = machine.devices.hub();
+            let [taken, held, held_counts, longest] = hub.clock_timer_gates();
+            let micros = |counts: u64| u128::from(counts) * 1_000_000 / u128::from(host::COUNTER_HZ);
+            output::arguments(format_args!(
+                "CLOCK TIMERS taken={taken} held={held} held_us={}/{} delay_us={}\n",
+                micros(held_counts) / u128::from(held.max(1)),
+                micros(longest),
+                hub.clock_timer_delay(),
+            ));
             report_stalls(machine);
         }
         let per_pe = parallel::counts(machine);
@@ -2210,6 +2222,9 @@ impl Heartbeat {
             let mut transition_misses = [0u64; 36];
             // All PEs: why TTBR0 changes took the engine path.
             let mut switch_misses = [0u64; stela_engine::machine::SWITCH_MISS_REASONS];
+            // All PEs: their guest context changes and native TTBR0
+            // switches (`PES PREDICTION`).
+            let mut contexts = [0u64; 2];
             // All PEs: why runs ended at fallthrough, direct, indirect, call
             // and return exits.
             let mut branch_misses = [0u64; 40];
@@ -2443,6 +2458,12 @@ impl Heartbeat {
                 for (total, (now, before)) in switch_misses
                     .iter_mut()
                     .zip(now.switch_misses.iter().zip(&before.switch_misses))
+                {
+                    *total += now.saturating_sub(*before);
+                }
+                for (total, (now, before)) in contexts
+                    .iter_mut()
+                    .zip(now.contexts.iter().zip(&before.contexts))
                 {
                     *total += now.saturating_sub(*before);
                 }
@@ -2766,6 +2787,14 @@ impl Heartbeat {
             output::arguments(format_args!(
                 "PES SWITCH MISSES closed/never/forgotten/context/set/class/other ttbr0={closed}/{never}/{forgotten}/{context}/{set}/{class}/{other}\n"
             ));
+            let [isolations, native] = contexts;
+            let prediction = stela_boot_core::prediction_lines::Contexts {
+                isolating: super::speculation::isolates(),
+                isolations,
+                native,
+                engine_barriers: super::speculation::take_issued(),
+            };
+            output::arguments(format_args!("{}", prediction.line()));
             let [fallthrough, direct, indirect, call, ret] = [0, 1, 2, 3, 4].map(|kind| {
                 branch_misses[kind * 8..kind * 8 + 8]
                     .iter()

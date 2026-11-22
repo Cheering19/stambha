@@ -69,6 +69,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Ok(())
     }
 
+    /// Hold a busy PE's timer interrupts at most `micros` after its last
+    /// one, in place of the engine's 10 ms (`clock::TIMER_DELAY_HZ`), on
+    /// every PE of the board. Only PEs that run in parallel hold them.
+    pub fn set_timer_delay(&mut self, micros: u64) -> Result<(), &'static str> {
+        let Some(hub) = &self.parallel else {
+            return Err("only PEs that run in parallel hold their timers");
+        };
+        hub.set_timer_delay(micros);
+        Ok(())
+    }
+
     /// Time the step loop's phases and exits from now on ([`step_timing`]).
     pub fn set_step_timing(&mut self, on: bool) {
         self.step_timing = on.then(step_timing::StepTiming::default);

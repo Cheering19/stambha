@@ -361,6 +361,74 @@ fn native_core_counts_refuse_duplicates_zero_and_over_capacity() {
     );
 }
 
+/// `--timer-delay-us` bounds how late a busy PE's timer interrupt comes,
+/// from 100 us to 100 ms; without it the engine's 10 ms holds.
+#[test]
+fn a_timer_delay_takes_microseconds_within_its_bounds() {
+    assert_eq!(System::default().timer_delay, None);
+    let options = round_trip("--system --timer-delay-us 2000");
+    assert_eq!(options.timer_delay, Some(2000));
+    assert_eq!(options.to_string(), "--system --timer-delay-us 2000");
+    for micros in [100, 10_000, 100_000] {
+        let line = format!("--system --timer-delay-us {micros}");
+        assert_eq!(round_trip(&line).timer_delay, Some(micros), "{line}");
+    }
+    for (text, error) in [
+        ("--system --timer-delay-us", Error::TimerDelay),
+        ("--system --timer-delay-us x", Error::TimerDelay),
+        ("--system --timer-delay-us 0", Error::TimerDelay),
+        ("--system --timer-delay-us 99", Error::TimerDelay),
+        ("--system --timer-delay-us 100001", Error::TimerDelay),
+        (
+            "--system --timer-delay-us 1000 --timer-delay-us 1000",
+            Error::DuplicateTimerDelay,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+/// `--no-ibpb` drops the prediction barrier at guest context switches; a
+/// boot without it isolates as before.
+#[test]
+fn prediction_isolation_stays_on_unless_no_ibpb_is_given() {
+    assert!(!System::default().no_ibpb);
+    assert!(!System::parse("--system").unwrap().no_ibpb);
+    let options = round_trip("--system --no-ibpb");
+    assert!(options.no_ibpb);
+    assert_eq!(options.to_string(), "--system --no-ibpb");
+}
+
+/// `--code-window` names the board's code window in MiB: whole 16 MiB
+/// steps from 64 MiB to 2 GiB, the window's own bounds, once.
+#[test]
+fn a_code_window_takes_whole_steps_within_the_windows_bounds() {
+    let options = round_trip("--system --code-window 1536");
+    assert_eq!(options.code_window, Some(1536));
+    assert_eq!(options.to_string(), "--system --code-window 1536");
+    assert_eq!(System::default().code_window, None);
+    assert!(!System::default().to_string().contains("--code-window"));
+    for mib in [64, 784, 2048] {
+        let line = format!("--system --code-window {mib}");
+        assert_eq!(round_trip(&line).code_window, Some(mib), "{line}");
+    }
+    for (text, error) in [
+        ("--system --code-window", Error::CodeWindow),
+        ("--system --code-window x", Error::CodeWindow),
+        ("--system --code-window 0", Error::CodeWindow),
+        ("--system --code-window 48", Error::CodeWindow),
+        ("--system --code-window 1000", Error::CodeWindow),
+        ("--system --code-window 2064", Error::CodeWindow),
+        ("--system --code-window 0x600", Error::CodeWindow),
+        (
+            "--system --code-window 1024 --code-window 1024",
+            Error::DuplicateCodeWindow,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
 #[test]
 fn guest_pes_bound_the_executors_that_run_them() {
     for text in [

@@ -3,8 +3,8 @@
 //! left for the guest, and what is left of it for the translation pack.
 use crate::Result;
 use crate::native_resources::{
-    CODE_ALIGNMENT, CodeReservation, MAX_WINDOW, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
-    code_reservation_within, parked_reserve, window_share,
+    CODE_ALIGNMENT, CodeReservation, MAX_WINDOW, MIN_WINDOW, SMALL_WINDOW_PER_RUNNER,
+    WINDOW_PER_RUNNER, code_reservation_within, parked_reserve, window_share,
 };
 use stela_contracts::refuse;
 
@@ -292,6 +292,38 @@ fn give_room(sizes: Sizes, room: u64, runners: usize) -> Sizes {
             ..sizes.code
         },
         guest: sizes.guest + room - grown * per_byte,
+        ..sizes
+    }
+}
+
+/// `sizes` with the board's code window `window` bytes in place of the one
+/// they chose (`--code-window`), for a boot that measures another window
+/// against the sized one. The window and its block records
+/// ([`HEAP_PER_WINDOW`] heap bytes a window byte, which moves the heap's
+/// floor alike) come from the guest, or go back to it, so each byte past
+/// the sized window costs the guest two: on a 16 GiB host with 8 PEs the
+/// sized 1200 MiB window and 9538 MiB guest become 2048 MiB and 7842 MiB.
+/// A window the guest's floor ([`GUEST_FLOOR`]) leaves too little room for
+/// is the largest whole [`CODE_ALIGNMENT`]s that keep the floor; the pool
+/// and the code kept beside the window stay as sized.
+pub fn with_window(sizes: Sizes, window: u64) -> Sizes {
+    let per_byte = 1 + HEAP_PER_WINDOW;
+    let sized = sizes.code.window;
+    let window = window.clamp(MIN_WINDOW, MAX_WINDOW) / CODE_ALIGNMENT * CODE_ALIGNMENT;
+    let window = if window > sized {
+        let room = sizes.guest.saturating_sub(GUEST_FLOOR) / per_byte;
+        sized + (window - sized).min(room / CODE_ALIGNMENT * CODE_ALIGNMENT)
+    } else {
+        window
+    };
+    Sizes {
+        heap: sizes.heap + HEAP_PER_WINDOW * window - HEAP_PER_WINDOW * sized,
+        code: CodeReservation {
+            bytes: sizes.code.bytes + window - sized,
+            window,
+            ..sizes.code
+        },
+        guest: sizes.guest + per_byte * sized - per_byte * window,
         ..sizes
     }
 }

@@ -350,10 +350,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
 /// The [`MIRRORED`] registers whose MRS blocks complete inside themselves
 /// (`x86_64::mirrored_read`): those whose thunk reads the cell's value
 /// alone (`register_read::thunk`), with the kernel's thread pointer first.
-/// The guarded, count, counter and DAIF mirrors keep their thunks.
-fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
+/// The guarded, count, counter and DAIF mirrors keep their thunks. Then
+/// the user thread pointers, whose stored cells every board numbers first
+/// ([`USER_THREAD_POINTERS`]) and whose reads load the register's storage
+/// (`register_read::stored_thunk`): user space reads TPIDRRO_EL0 for every
+/// thread-local access (malloc, the Objective-C and Swift runtimes, errno,
+/// lock owners), each of which ended its block at the MRS.
+pub(super) fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
     use registers::encodings::{CURRENT_EL, MPIDR_EL1, TPIDR_EL1, TPIDR_GL2};
     use stela_compiler::x86_64::mirrored_read::{Read, Reads};
+    let stored = |index: usize| {
+        let cell = cell_place(MIRRORED.len() + index);
+        Some(Read {
+            word: read_word(USER_THREAD_POINTERS[index]),
+            cell: u32::try_from(cell.offset).expect("a cell offset"),
+            stored: true,
+        })
+    };
     let read = |encoding| {
         let index = MIRRORED
             .iter()
@@ -370,6 +383,7 @@ fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
         Some(Read {
             word: read_word(encoding),
             cell: u32::try_from(cell.offset).expect("a cell offset"),
+            stored: false,
         })
     };
     Reads {
@@ -378,6 +392,8 @@ fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
             read(TPIDR_GL2),
             read(MPIDR_EL1),
             read(CURRENT_EL),
+            stored(0),
+            stored(1),
         ],
     }
 }

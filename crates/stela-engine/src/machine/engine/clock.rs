@@ -195,8 +195,15 @@ const REPORT_PARTS: u64 = 50;
 pub(super) const TIMER_WORK: u64 = 1 << 18;
 
 /// The latest a busy PE's timer interrupt comes: one in this many parts of
-/// a second after the previous one, about a scheduler quantum.
+/// a second after the previous one, about a scheduler quantum, unless the
+/// boot sets another delay ([`SharedClock::set_timer_delay`]). It binds a PE
+/// slower than [`TIMER_WORK`] in that time, 26 MIPS at 10 ms; a faster one's
+/// timers wait only its share of work, 2.6 ms at 100 MIPS. A shorter delay
+/// would bring a slow PE's timers closer to their deadlines and spend more
+/// of its time on them, which is what the gate keeps from starving it.
 pub(super) const TIMER_DELAY_HZ: u64 = 100;
+/// [`TIMER_DELAY_HZ`]⁻¹ in microseconds.
+pub(super) const TIMER_DELAY_MICROS: u64 = 1_000_000 / TIMER_DELAY_HZ;
 
 /// No ceiling, or no stop.
 const UNBOUNDED: u64 = u64::MAX;
@@ -230,6 +237,13 @@ pub struct SharedClock {
     /// latest a busy PE's timer interrupt comes.
     stall: AtomicU64,
     timer_delay: AtomicU64,
+    /// That delay in microseconds, and the count's frequency once seeded.
+    timer_delay_micros: AtomicU64,
+    frequency: AtomicU64,
+    /// Since the last [`Self::take_timer_gates`]: the timer interrupts its
+    /// PEs took, those the gate held past their deadline, the counts it
+    /// held them in all, and the longest hold.
+    timer_gates: TimerGates,
     /// [`SPIN_MILLIS`] and [`LEASE_MILLIS`] in counts.
     spin_limit: AtomicU64,
     lease: AtomicU64,
@@ -262,6 +276,12 @@ pub struct SharedClock {
 #[derive(Debug, Default)]
 #[repr(align(64))]
 struct Summary(AtomicU64);
+
+/// [`SharedClock::timer_gates`], on a cache line of its own: taken, held,
+/// held counts, longest hold.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct TimerGates([AtomicU64; 4]);
 
 /// What one read of a [`SharedClock`] saw: its offset, its lag, the host
 /// count its slew steps from, and the host's counter then.
@@ -330,6 +350,9 @@ impl SharedClock {
                 .collect(),
             stall: AtomicU64::new(0),
             timer_delay: AtomicU64::new(0),
+            timer_delay_micros: AtomicU64::new(TIMER_DELAY_MICROS),
+            frequency: AtomicU64::new(0),
+            timer_gates: TimerGates::default(),
             spin_limit: AtomicU64::new(0),
             lease: AtomicU64::new(0),
             stalled: AtomicU64::new(0),
@@ -639,8 +662,8 @@ impl SharedClock {
         self.next_scan.0.store(0, Ordering::Relaxed);
         self.stall
             .store(frequency * STALL_MILLIS / 1000, Ordering::Relaxed);
-        self.timer_delay
-            .store(frequency / TIMER_DELAY_HZ, Ordering::Relaxed);
+        self.frequency.store(frequency, Ordering::Relaxed);
+        self.store_timer_delay();
         self.spin_limit
             .store(frequency * SPIN_MILLIS / 1000, Ordering::Relaxed);
         self.lease
@@ -715,6 +738,49 @@ impl SharedClock {
     /// since the last call.
     pub fn take_leased(&self) -> u64 {
         self.leased.swap(0, Ordering::Relaxed)
+    }
+
+    /// Hold a busy PE's timer interrupts at most `micros` after its last
+    /// one (`--timer-delay-us`), in place of [`TIMER_DELAY_HZ`]⁻¹, from each
+    /// PE's next timer interrupt on.
+    pub fn set_timer_delay(&self, micros: u64) {
+        self.timer_delay_micros.store(micros, Ordering::Relaxed);
+        self.store_timer_delay();
+    }
+
+    /// The latest a busy PE's timer interrupt comes, in microseconds.
+    pub fn timer_delay_micros(&self) -> u64 {
+        self.timer_delay_micros.load(Ordering::Relaxed)
+    }
+
+    /// The delay in counts, once the frequency is known.
+    fn store_timer_delay(&self) {
+        let frequency = u128::from(self.frequency.load(Ordering::Relaxed));
+        let micros = u128::from(self.timer_delay_micros());
+        self.timer_delay
+            .store((frequency * micros / 1_000_000) as u64, Ordering::Relaxed);
+    }
+
+    /// A PE took a timer interrupt the gate held `held` counts past its
+    /// deadline, 0 for none.
+    fn note_timer(&self, held: u64) {
+        let [taken, holds, counts, longest] = &self.timer_gates.0;
+        taken.fetch_add(1, Ordering::Relaxed);
+        if held != 0 {
+            holds.fetch_add(1, Ordering::Relaxed);
+            counts.fetch_add(held, Ordering::Relaxed);
+            longest.fetch_max(held, Ordering::Relaxed);
+        }
+    }
+
+    /// Since the last call: the timer interrupts every PE took, those the
+    /// gate held past their deadline, the counts it held them in all, and
+    /// the longest hold.
+    pub fn take_timer_gates(&self) -> [u64; 4] {
+        self.timer_gates
+            .0
+            .each_ref()
+            .map(|count| count.swap(0, Ordering::Relaxed))
     }
 
     /// The counts in a millisecond, once seeded.
@@ -1377,12 +1443,16 @@ impl Clock {
     /// instructions retired. Attached and busy since the last one, its
     /// timers next signal once it has had the time to retire
     /// [`TIMER_WORK`] more at the rate it ran since, and no later than the
-    /// timer delay; one that waited meanwhile had time to spare.
-    pub(super) fn timer_taken(&mut self, count: u64, retired: u64) {
+    /// timer delay; one that waited meanwhile had time to spare. The shared
+    /// clock counts the interrupt, and how long the gate held it past its
+    /// timers' `deadline` ([`SharedClock::take_timer_gates`]).
+    pub(super) fn timer_taken(&mut self, count: u64, retired: u64, deadline: Option<u64>) {
         let Some(attachment) = &mut self.shared else {
             return;
         };
         let gate = &mut attachment.timers;
+        let held = deadline.map_or(0, |deadline| gate.until.saturating_sub(deadline));
+        attachment.clock.note_timer(held);
         let delay = attachment.clock.timer_delay.load(Ordering::Relaxed);
         let spacing = match gate.taken {
             Some((then, before)) if !gate.waited => {
