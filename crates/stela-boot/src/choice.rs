@@ -618,8 +618,10 @@ fn asked() -> bool {
     pressed().is_some() || matches!(key(Some(GLANCE)), Wait::Key(_))
 }
 
-/// `menu` until one of `choices` is chosen; its options. Install macOS that
-/// chooses its disk always opens the disk picker first
+/// `menu` until one of `choices` is chosen; its options. Install macOS asks
+/// first on a PC with no graphics card Stela drives
+/// ([`crate::install_caution`]). Install macOS that chooses its disk always
+/// opens the disk picker first
 /// ([`installer::choose`]), where the partition chosen before can be chosen
 /// again, and returns to the menu when the picker is left. The picker gives
 /// a plan and writes nothing to the disk; the plan goes with the options. A
@@ -645,6 +647,14 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 continue;
             }
         };
+        // Install macOS on a PC with no graphics card Stela drives asks
+        // first, once a boot: the install would finish and the Mac then not
+        // start ([`crate::install_caution`]).
+        if matches!(menu.items[index], Item::Choice(_, ChoiceKind::Setup))
+            && !crate::install_caution::confirmed()
+        {
+            continue;
+        }
         let n = match &menu.items[index] {
             Item::Choice(n, ChoiceKind::Setup)
                 if unchosen(choices.entries[*n].options.as_bytes()) =>
