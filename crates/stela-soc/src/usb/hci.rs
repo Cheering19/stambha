@@ -114,7 +114,9 @@ pub const TRACED_COMMANDS: u16 = 48;
 /// daemon that restarts begins each bring-up with one and need not
 /// configure the function again.
 const TRACED_BRING_UPS: u8 = 4;
-/// Parameter bytes a traced command shows.
+/// Parameter bytes a traced command shows, masked as the capture masks them
+/// (`capture`): an address keeps its last byte and vendor half, and names,
+/// keys, vendor parameters and anything no rule names are `xx`.
 pub const TRACED_BYTES: usize = 4;
 /// Trace entries held until the owner takes them; later ones are dropped.
 const TRACE_ENTRIES: usize = 64;
@@ -126,13 +128,13 @@ const UNKNOWN_COMMAND: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Traced {
     /// A command the model answered: its opcode, parameter length and
-    /// first parameter bytes (a vendor command's sub-command), and the
+    /// first parameter bytes, `None` where the mask hides one, and the
     /// event that answered it, if any, with its status and the length of
     /// its return parameters after the status.
     Command {
         opcode: u16,
         parameters: u8,
-        first: [u8; TRACED_BYTES],
+        first: [Option<u8>; TRACED_BYTES],
         answer: Option<Answered>,
     },
     /// The guest set the configuration to this value (0: unconfigured).
@@ -183,14 +185,21 @@ fn answered_opcode(event: &[u8]) -> Option<u16> {
     }
 }
 
-/// A command's first parameter bytes, zero past its parameters.
-fn first_bytes(packet: &[u8]) -> [u8; TRACED_BYTES] {
-    let mut first = [0; TRACED_BYTES];
-    let shown = packet[COMMAND_HEADER..].iter().take(TRACED_BYTES);
+/// A command's first parameter bytes as the capture masks the whole
+/// command, `None` for a hidden one or past its parameters. The raw bytes
+/// are never held: the trace is in every boot's log.
+fn first_bytes(packet: &[u8]) -> [Option<u8>; TRACED_BYTES] {
+    let masked = capture::Captured::new(
+        capture::Direction::FromGuest,
+        capture::Kind::Command,
+        packet,
+    );
+    let mut first = [None; TRACED_BYTES];
+    let shown = masked.bytes.iter().zip(&masked.hidden).skip(COMMAND_HEADER);
     first
         .iter_mut()
         .zip(shown)
-        .for_each(|(to, from)| *to = *from);
+        .for_each(|(to, (&byte, &hidden))| *to = (!hidden).then_some(byte));
     first
 }
 
@@ -208,7 +217,11 @@ impl core::fmt::Display for Traced {
                 if !shown.is_empty() {
                     f.write_str("[")?;
                     for (index, byte) in shown.iter().enumerate() {
-                        write!(f, "{}{byte:02x}", if index == 0 { "" } else { " " })?;
+                        f.write_str(if index == 0 { "" } else { " " })?;
+                        match byte {
+                            Some(byte) => write!(f, "{byte:02x}")?,
+                            None => f.write_str("xx")?,
+                        }
                     }
                     f.write_str("] ")?;
                 }
@@ -337,7 +350,7 @@ struct State {
     bridge: Option<Box<bridge::Bridge>>,
     /// Traced commands of the bridge whose answers have not reached the
     /// guest yet: opcode, parameter length, first parameter bytes.
-    awaiting: VecDeque<(u16, u8, [u8; TRACED_BYTES])>,
+    awaiting: VecDeque<(u16, u8, [Option<u8>; TRACED_BYTES])>,
 }
 
 /// The function: its pipes and queues.
@@ -1381,25 +1394,26 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c03,
                     parameters: 0,
-                    first: [0; 4],
+                    first: [None; 4],
                     answer: complete(0, 0),
                 },
                 Traced::Command {
                     opcode: 0x1004,
                     parameters: 1,
-                    first: [2, 0, 0, 0],
+                    first: [Some(2), None, None, None],
                     answer: complete(0, 10),
                 },
+                // A vendor command's parameters are hidden.
                 Traced::Command {
                     opcode: 0xfc4c,
                     parameters: 1,
-                    first: [9, 0, 0, 0],
+                    first: [None; 4],
                     answer: complete(UNKNOWN_COMMAND, 0),
                 },
                 Traced::Command {
                     opcode: 0x0401,
                     parameters: 5,
-                    first: [0x33, 0x8b, 0x9e, 1],
+                    first: [Some(0x33), Some(0x8b), Some(0x9e), Some(1)],
                     answer: Some(Answered {
                         event: COMMAND_STATUS,
                         status: 0,
@@ -1409,7 +1423,7 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c35,
                     parameters: 5,
-                    first: [1, 0x40, 0, 1],
+                    first: [Some(1), Some(0x40), Some(0), Some(1)],
                     answer: None,
                 },
             ]
@@ -1421,6 +1435,10 @@ mod tests {
         assert_eq!(
             traced[1].to_string(),
             "command 0x1004 parameters=1 [02] answered complete status=0x00 returns=10"
+        );
+        assert_eq!(
+            traced[2].to_string(),
+            "command 0xfc4c parameters=1 [xx] answered complete status=0x01 returns=0"
         );
         assert_eq!(
             traced[4].to_string(),
@@ -1456,6 +1474,66 @@ mod tests {
         assert_eq!(traced[0], Traced::Configured(1));
         assert_eq!(traced.len(), 2);
         assert_eq!(Traced::Reset.to_string(), "bus reset");
+    }
+
+    /// The trace is in every boot's log, so its bytes are the capture's
+    /// masked ones: the Mac's name, the middle of the address bluetoothd
+    /// writes and of a neighbour's, and LE Encrypt's key show as `xx`, for
+    /// the model and for a lent controller alike.
+    #[test]
+    fn the_always_on_trace_shows_no_name_address_middle_or_key() {
+        // A synthetic name and addresses, in HCI order.
+        const NAME: &[u8] = b"Tester's Mac";
+        const PLATFORM: [u8; 6] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+        const NEIGHBOUR: [u8; 6] = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5];
+        let with = |opcode: u16, parameters: &[u8]| {
+            let mut packet = opcode.to_le_bytes().to_vec();
+            packet.push(parameters.len() as u8);
+            packet.extend_from_slice(parameters);
+            packet
+        };
+        let mut name = NAME.to_vec();
+        name.resize(248, 0);
+        let mut request = NEIGHBOUR.to_vec();
+        request.extend_from_slice(&[1, 0, 0, 0]);
+        let mut eir = vec![0, NAME.len() as u8 + 1, 0x09];
+        eir.extend_from_slice(NAME);
+        eir.resize(241, 0);
+        let commands = [
+            (with(0x0c13, &name), "parameters=248 [xx xx xx xx] "),
+            (with(0xfc01, &PLATFORM), "parameters=6 [a0 xx xx a3] "),
+            (with(0x0419, &request), "parameters=10 [b0 xx xx b3] "),
+            (with(0x2017, &[0x5a; 32]), "parameters=32 [xx xx xx xx] "),
+            (with(0x0c52, &eir), "parameters=241 [00 0d 09 xx] "),
+        ];
+        for mut hci in [modeled(), bridged()] {
+            hci.take_trace();
+            for (packet, shown) in &commands {
+                command(&mut hci, packet).unwrap();
+                // A lent controller answers what reaches it.
+                while let Some(Outbound::Command(sent)) = hci.take() {
+                    hci.deliver_event(&[COMMAND_STATUS, 4, 0, 1, sent[0], sent[1]]);
+                }
+                while hci.ready_at(EVENTS) == Some(0) {
+                    read(&mut hci, EVENTS, EVENT_PACKET);
+                }
+                let traced = hci.take_trace();
+                let [Traced::Command { first, .. }] = traced[..] else {
+                    panic!("one traced command: {traced:?}");
+                };
+                let line = traced[0].to_string();
+                assert!(line.contains(shown), "{line}");
+                for secret in [&NAME[..2], &PLATFORM[1..3], &NEIGHBOUR[1..3], &[0x5a, 0x5a]] {
+                    let hex = alloc::format!("{:02x} {:02x}", secret[0], secret[1]);
+                    assert!(!line.contains(&hex), "{line}");
+                    assert!(
+                        !first
+                            .windows(2)
+                            .any(|w| w == [Some(secret[0]), Some(secret[1])])
+                    );
+                }
+            }
+        }
     }
 
     /// `--bluetooth-trace`: once the owner asks, every packet after each
@@ -1625,7 +1703,7 @@ mod tests {
         );
         assert_eq!(
             traced[2].to_string(),
-            "command 0xfc4c parameters=1 [09] answered complete status=0x01 returns=0"
+            "command 0xfc4c parameters=1 [xx] answered complete status=0x01 returns=0"
         );
     }
 
