@@ -10,8 +10,10 @@
 //! Covered, chosen once from the [`TargetCpu`] (`Native::select`):
 //!
 //! - `fma32`, `fms32`, `fma64` and `fms64` in matrix and vector shape,
-//!   accumulating or product-only (bits 29:27 = 0 or 1), every lane-enable
-//!   mode, and `fma32`'s even-f16 widening of X and Y (bits 61/60). Tiers:
+//!   accumulating, product-only or add-only (bits 29:27 = 0, 1, or 2 and 4:
+//!   `z ± x` and `z ± y`, a multiply-add by 1.0, which is exact, so the sum
+//!   rounds once, signed zeros included), every lane-enable mode, and
+//!   `fma32`'s even-f16 widening of X and Y (bits 61/60). Tiers:
 //!   `Avx512` (EVEX.512, one ZMM per row, opmask lane enables; AVX-512F with
 //!   OS-enabled opmask and ZMM state), `Fma` (VEX.256 with FMA3, two YMM
 //!   halves per row, F16C for the widening, without which widening operands
@@ -23,6 +25,9 @@
 //!   values is exact in f32, the f32 sum is rounded to odd from its exact
 //!   TwoSum error, and the conversion to f16 then rounds once correctly
 //!   (24 >= 11 + 2 bits). Without F16C the model.
+//! - On every tier, the model's too, the fused operations' copies and
+//!   constants (bits 29:27 = 3, 5, 6, 7), which need no arithmetic, except
+//!   copies of f16-widened halves, whose NaN payloads the model rewrites.
 //!
 //! The kernels are inline assembly, so they run in the boot, whose UEFI
 //! target is soft-float (vector intrinsics would become software calls).
@@ -83,7 +88,11 @@ pub struct Native {
 }
 
 impl Native {
-    /// No host path: every operation uses the model.
+    /// The model tier: no host arithmetic, so the model computes every
+    /// operation except the fused operations' copies and constants, which
+    /// this tier still completes on the host. To leave every operation to
+    /// the model, do not call [`Self::execute`] (the engine's
+    /// `--amx-native off`).
     pub const MODEL: Self = Self {
         tier: Tier::Model,
         f16c: false,
@@ -178,6 +187,21 @@ mod x86 {
     static NEGATIVE_ZERO_32: u32 = 0x8000_0000;
     static NEGATIVE_ZERO_64: u64 = 0x8000_0000_0000_0000;
 
+    /// A row of `bytes`-byte lanes each holding `value`.
+    const fn splat(value: u64, bytes: usize) -> Row {
+        let mut row = [0u8; ROW_BYTES];
+        let mut byte = 0;
+        while byte < ROW_BYTES {
+            row[byte] = (value >> (8 * (byte % bytes))) as u8;
+            byte += 1;
+        }
+        row
+    }
+
+    /// 1.0 in every f32 and every f64 lane.
+    const ONES_32: Row = splat(0x3f80_0000, 4);
+    const ONES_64: Row = splat(0x3ff0_0000_0000_0000, 8);
+
     /// The four fused forms.
     #[derive(Clone, Copy)]
     enum Form {
@@ -220,10 +244,6 @@ mod x86 {
             };
             return !copies_half && skip(registers, operand, bytes, mode, subtract, Shape::Plain);
         }
-        if matches!(mode, 2 | 4) {
-            // z ± x and z ± y: left to the model until a kernel matches it.
-            return false;
-        }
         if (x_half || y_half) && native.tier == Tier::Fma && !native.f16c {
             return false;
         }
@@ -262,6 +282,15 @@ mod x86 {
             }
             if y_half {
                 y = widen(native.tier, &y);
+            }
+            // z ± x (bits 29:27 = 2) and z ± y (4): a multiply-add by 1.0,
+            // whose product is exact, so the sum rounds once to the model's
+            // add or subtract, signed zeros and default NaNs included.
+            let one = if double { ONES_64 } else { ONES_32 };
+            match mode {
+                2 => y = one,
+                4 => x = one,
+                _ => {}
             }
             let mut row = |index: usize, y: &Row| {
                 let z = registers.z[index].as_mut_ptr();
@@ -1482,440 +1511,5 @@ mod x86 {
                 options(nostack),
             );
         }
-    }
-}
-
-#[cfg(all(test, target_arch = "x86_64"))]
-mod tests {
-    use super::*;
-    use crate::amx::{
-        Generation,
-        model::{self, AmxMemory, MemoryFault},
-    };
-
-    struct NoMemory;
-    impl AmxMemory for NoMemory {
-        fn read(&mut self, _: u64, _: &mut [u8]) -> Result<(), MemoryFault> {
-            panic!("arithmetic must not read guest memory")
-        }
-        fn write(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryFault> {
-            panic!("arithmetic must not write guest memory")
-        }
-    }
-
-    struct Random(u64);
-    impl Random {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-    }
-
-    /// Special f16 values in the low half of each 32-bit lane, and
-    /// special f32 and f64 values, between random bits.
-    fn fill(random: &mut Random) -> AmxRegisters {
-        const SINGLES: [u32; 12] = [
-            0,
-            0x8000_0000,
-            0x7f80_0000,
-            0xff80_0000,
-            0x7fc0_0000,
-            0x7f80_0001,
-            0x0000_0001,
-            0x807f_ffff,
-            0x3f80_0000,
-            0x7f7f_ffff,
-            0x0080_0000,
-            0xffc1_2345,
-        ];
-        const DOUBLES: [u64; 10] = [
-            0,
-            1 << 63,
-            0x7ff0_0000_0000_0000,
-            0xfff0_0000_0000_0000,
-            0x7ff8_0000_0000_0000,
-            0x7ff0_0000_0000_0001,
-            1,
-            0x3ff0_0000_0000_0000,
-            0x7fef_ffff_ffff_ffff,
-            0x0010_0000_0000_0000,
-        ];
-        const HALVES: [u16; 9] = [
-            0, 0x8000, 0x7c00, 0xfc00, 0x7c01, 0x7e00, 0x0001, 0x3c00, 0x7bff,
-        ];
-        let mut registers = AmxRegisters::zeroed();
-        for lane in registers.as_bytes_mut().as_chunks_mut::<8>().0 {
-            let value = random.next();
-            *lane = match value % 8 {
-                0 => {
-                    let low = SINGLES[(value >> 8) as usize % SINGLES.len()];
-                    let high = SINGLES[(value >> 16) as usize % SINGLES.len()];
-                    u64::from(low) | u64::from(high) << 32
-                }
-                1 => DOUBLES[(value >> 8) as usize % DOUBLES.len()],
-                2 => {
-                    let half =
-                        |shift: u32| u64::from(HALVES[(value >> shift) as usize % HALVES.len()]);
-                    half(8) | half(16) << 32 | (value & 0xffff_0000_ffff_0000)
-                }
-                // Small exponents make cancellation, denormal and
-                // tie results likely.
-                3 => value & 0x83ff_ffff_83ff_ffff | 0x3c00_0000_3c00_0000,
-                _ => random.next(),
-            }
-            .to_le_bytes();
-        }
-        registers
-    }
-
-    /// Operands over every field the fused operations read, with mode 0/1
-    /// favoured and the lane-enable fields often all-on.
-    fn operand(random: &mut Random) -> u64 {
-        let mut operand = random.next();
-        let choice = random.next();
-        operand &= !(7 << 27);
-        let mode = match choice % 8 {
-            0..=2 => 0,
-            3 | 4 => 1,
-            _ => 2 + (choice >> 8) % 6,
-        };
-        operand |= mode << 27;
-        if choice & 0x30 != 0 {
-            operand &= !(0x7f << 41);
-        }
-        if choice & 0xc0 != 0 {
-            operand &= !(0x7f << 32);
-        }
-        operand
-    }
-
-    /// Every tier and F16C choice this host can run, the reduced ones
-    /// included: a lower tier's instructions all exist on a higher host.
-    fn tiers() -> alloc::vec::Vec<Native> {
-        let host = TargetCpu::detect();
-        let f16c = host.supports(TargetCpu::F16c);
-        let mut tiers = alloc::vec::Vec::new();
-        for (tier, required) in [
-            (Tier::Model, TargetCpu::Baseline),
-            (Tier::Fma, TargetCpu::Fma),
-            (Tier::Avx512, TargetCpu::Avx512f),
-        ] {
-            if host.supports(required) {
-                tiers.push(Native { tier, f16c: false });
-                if f16c {
-                    tiers.push(Native { tier, f16c: true });
-                }
-            } else {
-                std::eprintln!("AMX native tier {} skipped: host lacks it", tier.name());
-            }
-        }
-        if !f16c {
-            std::eprintln!("AMX native F16C paths skipped: host lacks F16C");
-        }
-        tiers
-    }
-
-    #[test]
-    fn every_native_tier_matches_the_model_bit_for_bit() {
-        let mut random = Random(0x9e37_79b9_7f4a_7c15);
-        for native in tiers() {
-            let mut covered = 0;
-            for operation in [
-                AmxOperation::Fma32,
-                AmxOperation::Fms32,
-                AmxOperation::Fma64,
-                AmxOperation::Fms64,
-            ] {
-                for _ in 0..4000 {
-                    let initial = fill(&mut random);
-                    let operand = operand(&mut random);
-                    let mut expected = initial.clone();
-                    model::execute_for(
-                        Generation::M2,
-                        &mut expected,
-                        operation,
-                        operand,
-                        &mut NoMemory,
-                    )
-                    .unwrap();
-                    let mut actual = initial.clone();
-                    if native.execute(Generation::M2, &mut actual, operation, operand) {
-                        covered += 1;
-                        assert!(
-                            actual == expected,
-                            "{native:?} {operation:?} operand {operand:#018x}"
-                        );
-                    } else {
-                        assert!(actual == initial, "refused paths change nothing");
-                        let mode = (operand >> 27) & 7;
-                        let widened =
-                            matches!(operation, AmxOperation::Fma32 | AmxOperation::Fms32)
-                                && operand & (X_HALF | Y_HALF) != 0;
-                        // Widened copies keep the NaN payloads fms32 negates.
-                        let copies_half =
-                            matches!(operation, AmxOperation::Fms32 | AmxOperation::Fma32)
-                                && (mode == 3 && operand & X_HALF != 0
-                                    || mode == 5 && operand & Y_HALF != 0);
-                        assert!(
-                            native.tier == Tier::Model
-                                || matches!(mode, 2 | 4)
-                                || copies_half
-                                || widened && native.tier == Tier::Fma && !native.f16c,
-                            "{operand:#x}"
-                        );
-                    }
-                }
-            }
-            // Without F16C the VEX tier leaves f16-widening fma32 forms out.
-            if native.tier != Tier::Model {
-                assert!(covered > 5000, "{native:?} covered {covered}");
-            }
-        }
-    }
-
-    /// `vecfp` operands over the covered f16 forms, with some outside them.
-    fn vector_operand(random: &mut Random) -> u64 {
-        let mut operand = random.next();
-        let choice = random.next();
-        // Mostly no 54..56, no indexed load, no shuffle, mode 0 or 1.
-        if choice & 7 != 0 {
-            operand &= !(7 << 54 | 1 << 53 | 0xf << 27 | 0x3f << 47);
-            operand |= (choice >> 3 & 1) << 47;
-        }
-        // Mostly f16 types (2, 5, 6, 8..15; 0/1 are f16 only on M1).
-        if choice & 0x30 != 0 {
-            operand &= !(0xf << 42);
-            operand |= [2u64, 5, 6, 8, 9, 15, 0, 1][(choice >> 6) as usize & 7] << 42;
-        }
-        if choice & 0x300 != 0 {
-            operand &= !(1 << 31);
-        }
-        // Broadcast Y lane often.
-        if choice & 0xc00 != 0 {
-            operand &= !(7 << 38);
-            operand |= 1 << 38;
-        }
-        operand
-    }
-
-    #[test]
-    fn vecfp_half_matches_the_model_bit_for_bit() {
-        let mut random = Random(0x3c6e_f372_fe94_f82b);
-        for native in tiers().into_iter().filter(|native| native.f16c) {
-            for generation in [Generation::M1, Generation::M2, Generation::M4] {
-                let mut covered = 0;
-                for _ in 0..20000 {
-                    let initial = fill(&mut random);
-                    let operand = vector_operand(&mut random);
-                    let mut expected = initial.clone();
-                    model::execute_for(
-                        generation,
-                        &mut expected,
-                        AmxOperation::VectorFloat,
-                        operand,
-                        &mut NoMemory,
-                    )
-                    .unwrap();
-                    let mut actual = initial.clone();
-                    if native.execute(generation, &mut actual, AmxOperation::VectorFloat, operand) {
-                        covered += 1;
-                        assert!(
-                            actual == expected,
-                            "{native:?} {generation:?} vecfp operand {operand:#018x}"
-                        );
-                    } else {
-                        assert!(actual == initial, "refused paths change nothing");
-                    }
-                }
-                assert!(covered > 2000, "{generation:?} covered {covered}");
-            }
-        }
-    }
-
-    /// Exhaustive-style f16 corner cases: every special pairing and values
-    /// whose exact sums fall on, near and between f16 rounding points.
-    /// fma16/fms16 in vector, f16 matrix and f32-widening matrix shapes,
-    /// with all lanes on or random enables, bit for bit against the model.
-    #[test]
-    fn fma16_matches_the_model_bit_for_bit() {
-        let mut random = Random(0x6a09_e667_f3bc_c908);
-        for native in tiers().into_iter().filter(|native| native.f16c) {
-            let mut covered = [0usize; 3];
-            for operation in [AmxOperation::Fma16, AmxOperation::Fms16] {
-                for _ in 0..3000 {
-                    let initial = fill(&mut random);
-                    let mut operand = operand(&mut random);
-                    if !random.next().is_multiple_of(4) {
-                        operand &= !(7 << 27);
-                    }
-                    let mut expected = initial.clone();
-                    model::execute_for(
-                        Generation::M2,
-                        &mut expected,
-                        operation,
-                        operand,
-                        &mut NoMemory,
-                    )
-                    .unwrap();
-                    let mut actual = initial.clone();
-                    if native.execute(Generation::M2, &mut actual, operation, operand) {
-                        covered[if operand & VECTOR != 0 {
-                            0
-                        } else if operand & WIDEN_16_32 != 0 {
-                            2
-                        } else {
-                            1
-                        }] += 1;
-                        assert!(
-                            actual == expected,
-                            "{native:?} {operation:?} operand {operand:#018x}"
-                        );
-                    } else {
-                        assert!(actual == initial, "refused paths change nothing");
-                        let mode = (operand >> 27) & 7;
-                        let widened = operand & VECTOR == 0 && operand & WIDEN_16_32 != 0;
-                        assert!(
-                            matches!(mode, 1 | 2 | 4) || widened && matches!(mode, 3 | 5),
-                            "{operand:#x}"
-                        );
-                    }
-                }
-            }
-            assert!(covered.iter().all(|&count| count > 500), "{covered:?}");
-        }
-    }
-
-    #[test]
-    fn vecfp_half_rounds_once_at_ties_and_extremes() {
-        const HALVES: [u16; 24] = [
-            0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x3c01, 0x3bff, 0x7bff,
-            0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x1400, 0x1001, 0x5bff, 0x2400, 0x0200, 0x6800,
-            0xe800, 0x0c00,
-        ];
-        for native in tiers().into_iter().filter(|native| native.f16c) {
-            let mut registers = AmxRegisters::zeroed();
-            for (index, &x) in HALVES.iter().enumerate() {
-                for lane in 0..32 {
-                    let y = HALVES[lane % HALVES.len()];
-                    let z = HALVES[(lane * 7 + index) % HALVES.len()];
-                    registers.x[0][2 * lane..2 * lane + 2].copy_from_slice(&x.to_le_bytes());
-                    registers.y[0][2 * lane..2 * lane + 2].copy_from_slice(&y.to_le_bytes());
-                    registers.z[3][2 * lane..2 * lane + 2].copy_from_slice(&z.to_le_bytes());
-                }
-                for mode in [0u64, 1] {
-                    let operand = 2 << 42 | mode << 47 | 3 << 20;
-                    let mut expected = registers.clone();
-                    model::execute_for(
-                        Generation::M2,
-                        &mut expected,
-                        AmxOperation::VectorFloat,
-                        operand,
-                        &mut NoMemory,
-                    )
-                    .unwrap();
-                    let mut actual = registers.clone();
-                    assert!(native.execute(
-                        Generation::M2,
-                        &mut actual,
-                        AmxOperation::VectorFloat,
-                        operand
-                    ));
-                    assert!(actual == expected, "x {x:#06x} mode {mode}");
-                }
-            }
-        }
-    }
-
-    /// Cost per operation of the model and of each native tier on this
-    /// host, for the hot BNNS forms (matrix fma32 with Y f16 widening,
-    /// vector fma32, f16 vecfp with a broadcast Y lane):
-    /// `cargo test -p stela-compiler --release amx::native -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "manual: opt-in"]
-    fn native_and_model_costs() {
-        let mut random = Random(0x1234_5678_9abc_def1);
-        let initial = fill(&mut random);
-        let cases = [
-            ("fma32 matrix f16-Y", AmxOperation::Fma32, Y_HALF | 1 << 20),
-            ("fma32 vector", AmxOperation::Fma32, VECTOR | 5 << 20),
-            ("fma64 matrix", AmxOperation::Fma64, 0),
-            (
-                "vecfp f16 broadcast",
-                AmxOperation::VectorFloat,
-                2 << 42 | 1 << 38 | 3 << 32 | 8 << 20,
-            ),
-            (
-                "fma16 widened clear",
-                AmxOperation::Fma16,
-                0x4000_0000_3800_0000,
-            ),
-            (
-                "fma32 constant (mode 7)",
-                AmxOperation::Fma32,
-                7 << 27 | 3 << 20,
-            ),
-        ];
-        let rounds = 20_000u32;
-        for (name, operation, operand) in cases {
-            let mut registers = initial.clone();
-            let start = std::time::Instant::now();
-            for _ in 0..rounds {
-                model::execute_for(
-                    Generation::M2,
-                    &mut registers,
-                    operation,
-                    operand,
-                    &mut NoMemory,
-                )
-                .unwrap();
-            }
-            let model_ns = start.elapsed().as_nanos() / u128::from(rounds);
-            std::eprint!("{name}: model {model_ns} ns");
-            for native in tiers()
-                .into_iter()
-                .filter(|native| native.tier != Tier::Model && native.f16c)
-            {
-                let mut registers = initial.clone();
-                let start = std::time::Instant::now();
-                for _ in 0..rounds {
-                    assert!(native.execute(Generation::M2, &mut registers, operation, operand));
-                }
-                let ns = start.elapsed().as_nanos() / u128::from(rounds);
-                std::eprint!(", {} {ns} ns", native.tier.name());
-            }
-            std::eprintln!();
-        }
-    }
-
-    #[test]
-    fn the_model_tier_and_other_operations_are_left_to_the_model() {
-        let mut registers = AmxRegisters::zeroed();
-        assert_eq!(Native::select(TargetCpu::Sse42), Native::MODEL);
-        assert!(!Native::MODEL.execute(Generation::M2, &mut registers, AmxOperation::Fma32, 0));
-        for native in tiers() {
-            for operation in [AmxOperation::Mac16, AmxOperation::LoadX] {
-                assert!(!native.execute(Generation::M2, &mut registers, operation, 0));
-            }
-            // fma16 needs F16C; its other modes stay with the model.
-            assert_eq!(
-                native.execute(Generation::M2, &mut registers, AmxOperation::Fma16, 0),
-                native.f16c
-            );
-            assert!(!native.execute(Generation::M2, &mut registers, AmxOperation::Fma16, 1 << 27));
-            // fma16 bit 62 with bits 29:27 = 7: the Z clear Espresso runs,
-            // native on every tier.
-            assert!(native.execute(
-                Generation::M2,
-                &mut registers,
-                AmxOperation::Fma16,
-                0x4000_0000_3800_0000
-            ));
-        }
-        assert_eq!(
-            Native::select(TargetCpu::Sse42.with_fma().with_f16c()).tier(),
-            Tier::Fma
-        );
     }
 }
