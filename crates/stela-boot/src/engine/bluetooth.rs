@@ -157,9 +157,11 @@ pub struct HostBluetooth {
     /// What its bridge reported last: the fallback, its counters, and
     /// whether the guest wrote another address than the controller's.
     lend: Option<(Option<UsbBluetoothFallback>, UsbBluetoothLendCounters, bool)>,
-    /// Whether the fallback and the address were reported.
+    /// Whether the fallback and the address were reported, and the
+    /// restarts reported.
     fell_back: bool,
     address_differs: bool,
+    restarts: u64,
 }
 
 /// The controller is dropped in the loader's root. An install runs without
@@ -215,6 +217,7 @@ impl HostBluetooth {
             lend: None,
             fell_back: false,
             address_differs: false,
+            restarts: 0,
         })
     }
 
@@ -238,6 +241,7 @@ impl HostBluetooth {
             lend: None,
             fell_back: false,
             address_differs: false,
+            restarts: 0,
         }
     }
 
@@ -340,6 +344,16 @@ impl HostBluetooth {
             output::arguments(format_args!("{LOG_PREFIX}{packet}\n"));
         }
         let (fallback, lend, differs) = self.lend.unwrap_or_default();
+        if lend.restarts > self.restarts {
+            self.restarts = lend.restarts;
+            output::arguments(format_args!(
+                "BLUETOOTH LEND bluetoothd reset the guest's controller after its start-up \
+                 ({} of {}); at {} the model takes over\n",
+                lend.restarts,
+                stela_soc::usb::hci::bridge::RESTARTS,
+                stela_soc::usb::hci::bridge::RESTARTS,
+            ));
+        }
         if let Some(fallback) = fallback.filter(|_| !self.fell_back) {
             self.fell_back = true;
             output::arguments(format_args!("BLUETOOTH LEND FELL BACK {fallback}\n"));

@@ -610,3 +610,42 @@ fn a_fallback_ends_the_procedures_the_controller_was_running() {
     assert!(events(bridge.chip_failed(0)).is_empty());
     assert!(events(bridge.advance(u64::MAX)).is_empty());
 }
+
+/// bluetoothd restarts, and resets its controller, when it rejects even a
+/// well-formed answer (reason 108), and Setup's first screen waits for it:
+/// a second restart after the start-up falls back, so the model answers it.
+#[test]
+fn bluetoothd_restarting_twice_after_its_start_up_falls_back() {
+    let mut bridge = Bridge::new(ADDRESS);
+    let reset = packet(0x0c03, &[]);
+    // The start-up's reset, then one restart: both the controller's.
+    for _ in 0..2 {
+        chip(bridge.command(&reset, 0));
+        events(bridge.chip_event(&complete(0x0c03, 1, 0, &[]), 0));
+    }
+    assert_eq!((bridge.fallen(), bridge.counters().restarts), (None, 1));
+    // The second restart: the model answers it and everything after.
+    assert_eq!(
+        events(bridge.command(&reset, 0)),
+        [complete(0x0c03, 1, 0, &[])]
+    );
+    let fallback = bridge.fallen().expect("fell back");
+    assert_eq!(
+        (fallback.opcode, fallback.cause),
+        (Some(0x0c03), Cause::Restarted)
+    );
+    assert_eq!(
+        fallback.to_string(),
+        "0x0c03 bluetoothd reset the controller twice after its start-up, \
+         as it does when it rejects the bring-up"
+    );
+    assert_eq!(bridge.counters().restarts, 2);
+    events(bridge.command(&packet(0x1009, &[]), 0));
+    // Resets before the controller answered one are the start-up's own.
+    let mut bridge = Bridge::new(ADDRESS);
+    for _ in 0..3 {
+        chip(bridge.command(&reset, 0));
+        bridge.resync();
+    }
+    assert_eq!((bridge.fallen(), bridge.counters().restarts), (None, 0));
+}

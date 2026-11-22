@@ -388,3 +388,37 @@ fn a_bus_reset_mid_inquiry_keeps_the_old_results_out() {
     assert_eq!(rig.hci.fallback(), None);
     assert_eq!(rig.chip.opcodes().last(), Some(&0x0c03));
 }
+
+/// bluetoothd that keeps restarting its start-up, as it does when it rejects
+/// what it was answered: the first restart still reaches the controller,
+/// the second is the model's, and the start-up completes on it.
+#[test]
+fn bluetoothd_restarting_its_start_up_twice_falls_back_to_the_model() {
+    let mut rig = Rig::started(Chip::new());
+    let mut model = Model::new(ADDRESS);
+    for restart in 1..=2 {
+        for command in commands(BRING_UP) {
+            let answer = rig.command(&command);
+            let answer = answer
+                .iter()
+                .find(|e| answers(e, opcode(&command)))
+                .unwrap();
+            let (code, status, returns, _) = summary(&model.command(&command, 0)[0]);
+            assert_eq!(
+                summary(answer),
+                (code, status, returns, 1),
+                "restart {restart}"
+            );
+        }
+    }
+    let fallback = rig.hci.fallback().expect("fell back");
+    assert_eq!(
+        (fallback.opcode, fallback.cause),
+        (Some(0x0c03), Cause::Restarted)
+    );
+    assert_eq!(
+        rig.chip.received.len(),
+        2 * 18,
+        "the second restart is the model's"
+    );
+}

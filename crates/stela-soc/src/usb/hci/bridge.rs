@@ -73,7 +73,15 @@ pub enum Cause {
     Malformed,
     /// The host's controller failed.
     HostFailed,
+    /// bluetoothd reset the controller [`RESTARTS`] times after its
+    /// start-up: it restarts so when it rejects the bring-up's answers, and
+    /// Setup's first screen waits for it.
+    Restarted,
 }
+
+/// HCI Resets after the start-up's first answered one at which the bridge
+/// falls back: one restart passes, the second is the model's.
+pub const RESTARTS: u64 = 2;
 
 impl fmt::Display for Cause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,6 +90,10 @@ impl fmt::Display for Cause {
             Self::Refused(status) => write!(f, "status {status:#04x} where the model succeeds"),
             Self::Malformed => f.write_str("an answer of another kind or length than the model's"),
             Self::HostFailed => f.write_str("the host controller failed"),
+            Self::Restarted => f.write_str(
+                "bluetoothd reset the controller twice after its start-up, \
+                 as it does when it rejects the bring-up",
+            ),
         }
     }
 }
@@ -115,6 +127,8 @@ pub struct Counters {
     /// alone, stale answers, what comes while it is kept out after a guest
     /// reset, and everything after the fallback.
     pub dropped: u64,
+    /// HCI Resets of the guest after the first the controller answered.
+    pub restarts: u64,
 }
 
 /// The forwarded command in flight.
@@ -146,6 +160,8 @@ pub struct Bridge {
     address_differs: bool,
     /// The controller's procedures the guest saw start and not yet end.
     running: Vec<Running>,
+    /// Whether the controller answered an HCI Reset: the start-up ran.
+    started: bool,
     counters: Counters,
 }
 
@@ -245,6 +261,7 @@ impl Bridge {
             written: None,
             address_differs: false,
             running: Vec::new(),
+            started: false,
             counters: Counters::default(),
         }
     }
@@ -342,14 +359,26 @@ impl Bridge {
             self.counters.local += 1;
             return guest(shadow);
         };
-        self.counters.forwarded += 1;
-        self.pending = Some(Pending {
+        let pending = Pending {
             opcode: opcode(packet),
             parameters: packet[3..].to_vec(),
             kind,
             shadow,
             deadline: now.saturating_add(DEADLINE),
-        });
+        };
+        // A reset after the start-up is bluetoothd restarting; at the
+        // second, the model takes over, answering this reset. A reset ends
+        // the controller's procedures with no event.
+        if pending.opcode == RESET && self.started {
+            self.counters.restarts += 1;
+            if self.counters.restarts >= RESTARTS {
+                self.running.clear();
+                self.pending = Some(pending);
+                return self.fall(Cause::Restarted, now);
+            }
+        }
+        self.counters.forwarded += 1;
+        self.pending = Some(pending);
         vec![Step::Chip(command)]
     }
 
@@ -469,7 +498,10 @@ impl Bridge {
             (INQUIRY_CANCEL, _) if chip.status == 0 => {
                 self.running.retain(|r| *r != Running::Inquiry);
             }
-            (RESET, _) if chip.status == 0 => self.running.clear(),
+            (RESET, _) if chip.status == 0 => {
+                self.running.clear();
+                self.started = true;
+            }
             _ => {}
         }
         match pending.opcode {
