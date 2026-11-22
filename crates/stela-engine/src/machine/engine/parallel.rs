@@ -248,12 +248,15 @@ fn context_word(regime: mmu::Regime, asid: u16) -> u32 {
 }
 
 /// The lower half's addresses a PE may hold global translations of, only
-/// ever widened. A TLBI by ASID removes those too, so it is not private
-/// ([`tlbi::Private`]) there.
+/// ever widened, and the smallest leaf it took one through. A TLBI by ASID
+/// removes those too, so it is not private ([`tlbi::Private`]) there.
 #[derive(Debug)]
 pub struct GlobalSpan {
     first: AtomicU64,
     last: AtomicU64,
+    /// The smallest leaf taken in, as its bytes less one: `u64::MAX` before
+    /// any. Only ever narrowed.
+    leaf: AtomicU64,
 }
 
 impl GlobalSpan {
@@ -261,13 +264,20 @@ impl GlobalSpan {
         Self {
             first: AtomicU64::new(u64::MAX),
             last: AtomicU64::new(0),
+            leaf: AtomicU64::new(u64::MAX),
         }
     }
 
-    /// Take in `first..=last` before using a translation there. When that
-    /// widens the span, a broadcast may have passed the PE by while it
-    /// walked, so it walks again: the caller's walk could predate the TLBI.
+    /// Take in the leaf `first..=last` ([`mmu::shadow::leaf`]) before using
+    /// a translation there. When that widens the span, a broadcast may have
+    /// passed the PE by while it walked, so it walks again: the caller's walk
+    /// could predate the TLBI.
     pub fn widen(&self, first: u64, last: u64) -> bool {
+        // Read first: past the first leaf, the smallest one rarely changes.
+        let leaf = last.wrapping_sub(first);
+        if self.leaf.load(Ordering::Relaxed) > leaf {
+            self.leaf.fetch_min(leaf, Ordering::SeqCst);
+        }
         let lower = self.first.fetch_min(first, Ordering::SeqCst);
         let upper = self.last.fetch_max(last, Ordering::SeqCst);
         first < lower || last > upper
@@ -277,39 +287,62 @@ impl GlobalSpan {
         self.first.load(Ordering::SeqCst) <= last && self.last.load(Ordering::SeqCst) >= first
     }
 
-    /// The span as it is now, `None` while the PE took no lower-half global
-    /// translation: what a mailbox merges around ([`Mail::keep`]). A hint
-    /// only: a merge removes at least what its scopes remove, wherever it
-    /// lies, so a span widened since changes no TLBI's effect.
-    fn now(&self) -> Option<(u64, u64)> {
+    /// The span and its smallest leaf as they are now, `None` while the PE
+    /// took no lower-half global translation: what a mailbox merges around
+    /// ([`Mail::keep`]). A hint only: a merge removes at least what its
+    /// scopes remove, wherever it lies, so a span widened or a leaf taken
+    /// since changes no TLBI's effect.
+    fn now(&self) -> Option<Globals> {
         let (first, last) = (
             self.first.load(Ordering::Relaxed),
             self.last.load(Ordering::Relaxed),
         );
-        (first <= last).then_some((first, last))
+        let leaf = self.leaf.load(Ordering::Relaxed).saturating_add(1);
+        (first <= last).then_some(Globals { first, last, leaf })
     }
 }
 
+/// A PE's lower-half global span as [`GlobalSpan::now`] reads it: its first
+/// and last addresses, and the bytes of the smallest leaf it took in, which
+/// every global entry it holds there is at least and is aligned to.
+#[derive(Debug, Clone, Copy)]
+struct Globals {
+    first: u64,
+    last: u64,
+    leaf: u64,
+}
+
 /// Whether the range a merge of the spans `held` and `new` makes takes in,
-/// besides the 16 KiB granules (the largest) they touch, an address of
-/// `globals`, the lower-half span a PE may hold global translations of
-/// ([`GlobalSpan`]): the granules between two spans of one ASID, which
-/// neither TLBI reaches, are all the merged range adds, and at a global
-/// page's address it removes that page's entry in every address space (Arm
-/// `TLBIMatch`: an entry with nG 0 matches any ASID). The shared cache's
-/// pages lie between a process's own (its image and stacks below, its heaps
-/// above), so such a merge drops each PE's whole shared region.
-fn bridges(globals: Option<(u64, u64)>, held: (u64, u64), new: (u64, u64)) -> bool {
-    const GRANULE: u64 = 0x4000;
-    let Some((first, last)) = globals else {
+/// besides the granules they touch, an address of `globals`, the lower-half
+/// span a PE may hold global translations of ([`Globals`]): the granules
+/// between two spans of one ASID, which neither TLBI reaches, are all the
+/// merged range adds, and at a global page's address it removes that page's
+/// entry in every address space (Arm `TLBIMatch`: an entry with nG 0 matches
+/// any ASID). The shared cache's pages lie between a process's own (its
+/// image and stacks below, its heaps above), so such a merge drops each PE's
+/// whole shared region.
+///
+/// The granule is the PE's smallest global leaf. A TLBI by VA removes the
+/// whole leaf at its address, so a global leaf the merged range reaches and
+/// neither TLBI does lies between the two spans and, being at least that
+/// size and aligned to it, between the granules they touch. A fixed 16 KiB
+/// granule missed a 4 KiB global page between the TLBIs of the pages on its
+/// two sides (0x2000, between 0x1000 and 0x3000); a fixed 4 KiB one would
+/// count TLBIs of neighbouring 16 KiB pages, as macOS maps them, as a
+/// bridge where they add no entry.
+fn bridges(globals: Option<Globals>, held: (u64, u64), new: (u64, u64)) -> bool {
+    let Some(Globals { first, last, leaf }) = globals else {
         return false;
     };
+    // Leaves are powers of two of at least 4 KiB (`mmu::shadow::leaf`);
+    // rounding down keeps the granule no larger than the leaf.
+    let granule = 1u64 << leaf.max(0x1000).ilog2();
     let (low, high) = if held.0 <= new.0 {
         (held, new)
     } else {
         (new, held)
     };
-    let (after, before) = (low.1 | (GRANULE - 1), high.0 & !(GRANULE - 1));
+    let (after, before) = (low.1 | (granule - 1), high.0 & !(granule - 1));
     // Spans in the same granule or the next add nothing between them.
     if after.saturating_add(1) >= before {
         return false;
@@ -392,7 +425,7 @@ impl Mail {
     /// Every kept scope removes at least what the TLBIs it stands for
     /// remove, and TLB invalidations commute: the PE applies all its mail
     /// before it translates again.
-    fn keep(&mut self, maintenance: Maintenance, globals: Option<(u64, u64)>) {
+    fn keep(&mut self, maintenance: Maintenance, globals: Option<Globals>) {
         let held = |kind: fn(&Maintenance) -> bool, list: &[Maintenance]| {
             list.iter().filter(|posted| kind(posted)).count()
         };

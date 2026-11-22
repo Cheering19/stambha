@@ -857,7 +857,11 @@ fn merged_mail_removes_every_entry_its_tlbis_remove() {
         let mut mail = Mail::default();
         // Half the rounds for a PE with global pages around the lower
         // half's third place, which merges go around.
-        let globals = (round / 3 % 2 == 1).then_some((2 << 36, (3 << 36) - 1));
+        let globals = (round / 3 % 2 == 1).then_some(Globals {
+            first: 2 << 36,
+            last: (3 << 36) - 1,
+            leaf: 0x4000,
+        });
         let mut sent = Vec::new();
         let count = [20, 300, 2000][round % 3];
         for _ in 0..count {
@@ -957,7 +961,11 @@ fn canonical_page(page: u64) -> u64 {
 #[test]
 fn a_mailbox_merges_no_scope_across_the_pes_global_pages() {
     use crate::machine::system::TlbiKind::VA;
-    const GLOBALS: (u64, u64) = (0x1_8000_0000, 0x2_7fff_ffff);
+    const GLOBALS: Globals = Globals {
+        first: 0x1_8000_0000,
+        last: 0x2_7fff_ffff,
+        leaf: 0x4000,
+    };
     const BELOW: u64 = 0x1_0000_0000;
     const ABOVE: u64 = 0x6_0000_0000;
     let mut mail = Mail::default();
@@ -988,7 +996,7 @@ fn a_mailbox_merges_no_scope_across_the_pes_global_pages() {
     assert_eq!(kept.len() + mail.merged as usize, sent.len());
     for scope in &kept {
         let (first, last) = scope.span().unwrap();
-        assert!(last < GLOBALS.0 || first > GLOBALS.1, "{scope:x?}");
+        assert!(last < GLOBALS.first || first > GLOBALS.last, "{scope:x?}");
         assert_eq!(scope.named_asid(), Some(9));
     }
     for scope in &sent {
@@ -1020,6 +1028,37 @@ fn a_mailbox_merges_no_scope_across_the_pes_global_pages() {
         mail.keep(tlbi(VA, 9 << 48 | va >> 12), Some(GLOBALS));
     }
     assert_eq!((mail.maintenance.len(), mail.merged), (1, 3));
+}
+
+/// A merge bridges a PE's global pages at the granule of the smallest
+/// global leaf it took: of 4 KiB leaves, the merge of TLBIs of the pages at
+/// 0x1000 and 0x3000 takes in the global page at 0x2000, which neither TLBI
+/// reaches; of 16 KiB leaves, both TLBIs reach the leaf that holds all
+/// three, and the merge adds nothing.
+#[test]
+fn a_merge_bridges_global_pages_at_the_pes_smallest_global_leaf() {
+    let span = GlobalSpan::new();
+    assert!(span.now().is_none());
+    assert!(span.widen(0, 0x3fff));
+    let large = span.now();
+    assert_eq!(large.map(|globals| globals.leaf), Some(0x4000));
+    for (held, new) in [(0x1000, 0x3000), (0x3000, 0x1000), (0, 0x4000)] {
+        assert!(!bridges(large, (held, held), (new, new)), "{held:#x} {new:#x}");
+    }
+    // A 16 KiB global leaf between the two TLBIs' leaves is a bridge.
+    assert!(!bridges(large, (0, 0), (0x8000, 0x8000)));
+    assert!(span.widen(0x4000, 0x7fff));
+    assert!(bridges(span.now(), (0, 0), (0x8000, 0x8000)));
+    // A 4 KiB leaf narrows the granule: the page between two pages of one
+    // 16 KiB granule is a bridge, and pages side by side still are not.
+    assert!(!span.widen(0x2000, 0x2fff));
+    let small = span.now();
+    assert_eq!(small.map(|globals| globals.leaf), Some(0x1000));
+    assert!(bridges(small, (0x1000, 0x1000), (0x3000, 0x3000)));
+    assert!(bridges(small, (0x3000, 0x3000), (0x1000, 0x1000)));
+    assert!(!bridges(small, (0x1000, 0x1000), (0x2000, 0x2000)));
+    assert!(!bridges(small, (0x1000, 0x1ff8), (0x2000, 0x2008)));
+    assert!(!bridges(None, (0x1000, 0x1000), (0x3000, 0x3000)));
 }
 
 /// Another PE's TLBI by VA or range reaches this PE through its mail and
