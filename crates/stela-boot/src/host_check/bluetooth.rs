@@ -7,7 +7,12 @@
 //! The host check's probe gives its drivers no native services, so it starts
 //! no USB controller (`probe::probe`); and with them it would start every
 //! driver, the Windows disk's NVMe among them. This check runs no probe at
-//! all. Before ExitBootServices ([`prepare`]) it reads the firmware's PCI
+//! all, and sizes no NVMe host memory buffer either
+//! (`storage::discover_without_nvme`), so no NVMe command of Stela's reaches
+//! it, not even through the firmware's pass-through. (Before the check, the
+//! host firmware bundle's search may open other volumes through the
+//! firmware's own file system driver, as every start does, to read.) Before
+//! ExitBootServices ([`prepare`]) it reads the firmware's PCI
 //! census and its USB interfaces, and `bluetooth_target::choose` names the
 //! one function it may start, or refuses: when that xHCI also holds a USB
 //! disk other than the boot stick, or the firmware's USB devices could not

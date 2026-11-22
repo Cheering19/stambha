@@ -381,6 +381,20 @@ pub fn gpu_notice_found() -> Option<&'static str> {
 /// DMA pages below 4 GiB, the TSC rate and every range to map uncached.
 /// Runs before ExitBootServices.
 pub fn discover() -> Result<Handoff> {
+    discover_sizing(true)
+}
+
+/// [`discover`] for a run that starts no NVMe driver, the host check's
+/// `--bluetooth-check`: no host memory buffer is sized for one, so the
+/// firmware's NVMe pass-through is sent no Identify Controller.
+#[cfg(feature = "diagnostics")]
+pub fn discover_without_nvme() -> Result<Handoff> {
+    discover_sizing(false)
+}
+
+/// [`discover`], with the pool's room for NVMe host memory buffers sized
+/// when `nvme` ([`host_memory_pages`]).
+fn discover_sizing(nvme: bool) -> Result<Handoff> {
     let rsdp = rsdp().ok_or(refuse!("firmware has no ACPI tables"))?;
     // SAFETY: the firmware's RSDP, its tables mapped while boot services last.
     let mcfg =
@@ -419,7 +433,7 @@ pub fn discover() -> Result<Handoff> {
     // Without room for the host memory buffers the controllers run without
     // them, as Linux's do when that allocation fails. They come before the
     // larger pool, whose lack only packs a Realtek ring's buffers.
-    let extra = host_memory_pages();
+    let extra = if nvme { host_memory_pages() } else { 0 };
     let (dma, pages) = [
         DMA_PAGES + extra,
         DMA_PAGES_LEAST + extra,

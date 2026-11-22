@@ -303,7 +303,14 @@ fn prepare(
     if machine.options.bluetooth_check {
         machine.bluetooth = bluetooth::prepare(host_firmware);
     }
-    match storage::discover() {
+    // `--bluetooth-check` starts no NVMe driver, so it sizes no host
+    // memory buffer, whose Identify Controller would reach the NVMe.
+    let discovered = if machine.options.bluetooth_check {
+        storage::discover_without_nvme()
+    } else {
+        storage::discover()
+    };
+    match discovered {
         Ok(handoff) => machine.storage = Some(handoff),
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
     }
