@@ -515,6 +515,113 @@ mod tests {
         );
     }
 
+    /// Extended inquiry data with a structure whose length runs past the
+    /// data's end: from there no structure's start can be trusted, so it
+    /// and all after it stay hidden, a plain type's data too.
+    #[test]
+    fn a_structure_past_the_datas_end_hides_the_rest() {
+        let mut eir = vec![3, 0x03, 0x0b, 0x11, 240, 0x03];
+        eir.extend_from_slice(NAME);
+        eir.resize(240, 0x77);
+        let mut write = vec![0x52, 0x0c, 241, 0];
+        write.extend_from_slice(&eir);
+        let captured = Captured::new(Direction::FromGuest, Kind::Command, &write);
+        assert!(!holds(&captured, NAME), "{captured}");
+        assert!(captured.hidden[8..].iter().all(|&h| h), "{captured}");
+        assert!(
+            captured
+                .to_string()
+                .starts_with("> cmd 52 0c f1 00 03 03 0b 11 xx xx xx"),
+            "{captured}"
+        );
+        // The same past the event's end in an extended inquiry result.
+        let mut result = vec![0x2f, 255, 1];
+        result.extend_from_slice(&NEIGHBOUR);
+        result.extend_from_slice(&[1, 0, 0x04, 0x04, 0x24, 0x34, 0x12, 0xd0]);
+        result.extend_from_slice(&eir);
+        let captured = Captured::new(Direction::FromChip, Kind::Event, &result);
+        assert!(!holds(&captured, NAME), "{captured}");
+        assert!(captured.hidden[21..].iter().all(|&h| h), "{captured}");
+    }
+
+    /// Several inquiry results in one event may be laid out device by device
+    /// or parameter by parameter; a rule for either would show the other's
+    /// address bytes, so only the count shows. One reads the same both ways.
+    #[test]
+    fn several_inquiry_results_in_one_event_show_only_their_count() {
+        const OTHER: [u8; 6] = [0x20, 0xc7, 0xc8, 0x40, 0x41, 0x42];
+        for code in [0x02u8, 0x22] {
+            // Two responses, parameter by parameter: both addresses first.
+            let mut arrays = vec![code, 29, 2];
+            arrays.extend_from_slice(&NEIGHBOUR);
+            arrays.extend_from_slice(&OTHER);
+            arrays.extend_from_slice(&[1, 1, 0, 0, 0, 0, 4, 4, 0x24, 4, 4, 0x24, 1, 2, 3, 4]);
+            let captured = Captured::new(Direction::FromChip, Kind::Event, &arrays);
+            for secret in [&NEIGHBOUR[1..3], &OTHER[1..3]] {
+                assert!(!holds(&captured, secret), "{captured}");
+            }
+            assert!(!captured.hidden[..3].contains(&true));
+            assert!(captured.hidden[3..].iter().all(|&h| h), "{captured}");
+            // One response: its address's ends and the rest.
+            let mut one = vec![code, 15, 1];
+            one.extend_from_slice(&NEIGHBOUR);
+            one.extend_from_slice(&[1, 0, 0, 0x04, 0x04, 0x24, 0x34, 0x12]);
+            let line = Captured::new(Direction::FromChip, Kind::Event, &one).to_string();
+            assert!(
+                line.ends_with(" 01 10 xx xx 30 31 32 01 00 00 04 04 24 34 12"),
+                "{line}"
+            );
+        }
+        // Two LE advertising reports: the count alone.
+        let mut reports = vec![0x3e, 0, 0x02, 2, 0, 0, 0, 0];
+        reports.extend_from_slice(&NEIGHBOUR);
+        reports.extend_from_slice(&OTHER);
+        reports.extend_from_slice(&[0, 0, 0xc0, 0xc1]);
+        reports[1] = (reports.len() - 2) as u8;
+        let captured = Captured::new(Direction::FromChip, Kind::Event, &reports);
+        assert!(!holds(&captured, &OTHER[1..3]), "{captured}");
+        assert!(captured.hidden[4..].iter().all(|&h| h), "{captured}");
+        // One report: types, the address's ends, the data's length, RSSI.
+        let mut report = vec![0x3e, 0, 0x02, 1, 0, 1];
+        report.extend_from_slice(&NEIGHBOUR);
+        report.extend_from_slice(&[3, 0x02, 0x01, 0x06, 0xc5]);
+        report[1] = (report.len() - 2) as u8;
+        assert_eq!(
+            Captured::new(Direction::FromChip, Kind::Event, &report).to_string(),
+            "chip< evt 3e 0f 02 01 00 01 10 xx xx 30 31 32 03 xx xx xx c5"
+        );
+    }
+
+    /// A rule's "the rest" ends where the header says the packet does: bytes
+    /// trailing past the declared length are hidden, even after a plain
+    /// command's or event's parameters.
+    #[test]
+    fn bytes_past_the_declared_length_are_hidden() {
+        let command = [0x45, 0x0c, 1, 2, 0x99, 0x98];
+        assert_eq!(
+            Captured::new(Direction::FromGuest, Kind::Command, &command).to_string(),
+            "> cmd 45 0c 01 02 xx xx"
+        );
+        let event = [0x13, 5, 1, 0x40, 0, 1, 0, 0x99, 0x98];
+        assert_eq!(
+            Captured::new(Direction::FromChip, Kind::Event, &event).to_string(),
+            "chip< evt 13 05 01 40 00 01 00 xx xx"
+        );
+        let mut request = vec![0x19, 0x04, 6];
+        request.extend_from_slice(&NEIGHBOUR);
+        request.extend_from_slice(&[1, 0, 0x34, 0x12]);
+        assert_eq!(
+            Captured::new(Direction::ToChip, Kind::Command, &request).to_string(),
+            "chip> cmd 19 04 06 10 xx xx 30 31 32 xx xx xx xx"
+        );
+        // An ACL packet shorter than an L2CAP header shows its own bytes.
+        let acl = [0x01, 0x20, 2, 0, 9, 9, 0x99, 0x98];
+        assert_eq!(
+            Captured::new(Direction::FromChip, Kind::Acl, &acl).to_string(),
+            "chip< acl 01 20 02 00 09 09 xx xx"
+        );
+    }
+
     #[test]
     fn other_text_is_no_captured_packet() {
         for bad in [

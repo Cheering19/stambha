@@ -20,7 +20,13 @@
 //!   Long Term Key Request Reply, LE Add Device To Resolving List, the local
 //!   OOB data reads' returns, Return Link Keys, Link Key Notification and LE
 //!   Generate DHKey Complete;
-//! - anything of a command, return or event no rule names.
+//! - anything of a command, return or event no rule names, and every byte
+//!   past the length its header declares;
+//! - of an event with several inquiry results or advertising reports,
+//!   everything past the count: their arrays may come device by device or
+//!   parameter by parameter;
+//! - extended inquiry or advertising data from a structure that runs past
+//!   the data's end.
 //!
 //! Evidence: Bluetooth Core v5.4 Vol 4 Part E 5.4 (packet formats), 7.1-7.8
 //! (parameters) and 7.7 (events); Vol 3 Part C 11 and the Assigned Numbers'
@@ -61,18 +67,35 @@ const VENDOR_GROUP: u16 = 0x3f;
 struct Mask<'a> {
     packet: &'a [u8],
     hidden: Vec<bool>,
+    /// Where the packet's header says it ends, or its own end if that is
+    /// sooner: no rule shows a byte past it, whatever trails there.
+    end: usize,
+}
+
+/// Where `packet`'s header says it ends: its header and the parameter or
+/// data length the header gives (Vol 4 Part E 5.4).
+fn declared_end(kind: super::Kind, packet: &[u8]) -> usize {
+    let declared = match kind {
+        super::Kind::Command => packet.get(2).map(|&length| 3 + usize::from(length)),
+        super::Kind::Event => packet.get(1).map(|&length| 2 + usize::from(length)),
+        super::Kind::Acl => packet
+            .get(2..4)
+            .map(|length| 4 + usize::from(u16::from_le_bytes([length[0], length[1]]))),
+    };
+    declared.unwrap_or(packet.len()).min(packet.len())
 }
 
 impl Mask<'_> {
     fn show(&mut self, range: Range<usize>) {
-        let end = range.end.min(self.hidden.len());
+        let end = range.end.min(self.end);
         if range.start < end {
             self.hidden[range.start..end].fill(false);
         }
     }
 
+    /// The parameters from `from` to the declared end.
     fn rest(&mut self, from: usize) {
-        self.show(from..self.packet.len());
+        self.show(from..self.end);
     }
 
     /// An address at `at`: its last byte and vendor half.
@@ -82,21 +105,26 @@ impl Mask<'_> {
     }
 
     /// Extended inquiry or advertising data in `range`: each structure's
-    /// length and type, and the data of the plain types.
+    /// length and type, and the data of the plain types, up to the first
+    /// structure of length 0, which ends the significant part (Vol 3 Part C
+    /// 11). A structure that runs past the data's end is malformed: it and
+    /// everything after it stay hidden, since no length read from there on
+    /// can be trusted to fall on a structure's start.
     fn data(&mut self, range: Range<usize>) {
-        let end = range.end.min(self.packet.len());
+        let end = range.end.min(self.end);
         let mut at = range.start;
         while at < end {
             let length = usize::from(self.packet[at]);
-            self.show(at..at + 1);
             if length == 0 {
+                self.show(at..at + 1);
                 return;
             }
-            if let Some(&kind) = self.packet.get(at + 1) {
-                self.show(at + 1..at + 2);
-                if PLAIN_AD.contains(&kind) {
-                    self.show(at + 2..(at + 1 + length).min(end));
-                }
+            if at + 1 + length > end {
+                return;
+            }
+            self.show(at..at + 2);
+            if PLAIN_AD.contains(&self.packet[at + 1]) {
+                self.show(at + 2..at + 1 + length);
             }
             at += 1 + length;
         }
@@ -171,13 +199,16 @@ impl Mask<'_> {
             }
             0x0f => self.show(2..6),
             // Inquiry Result (14 bytes a device), with RSSI (14 as well).
+            // Their parameters are arrays, which a controller may send
+            // device by device (as Linux's `inquiry_info` reads them) or
+            // parameter by parameter: one response reads the same either
+            // way, but of several only the count shows, since a rule for one
+            // layout would show the other's address bytes.
             0x02 | 0x22 => {
                 self.show(2..3);
-                let count = usize::from(self.packet.get(2).copied().unwrap_or(0));
-                for device in 0..count {
-                    let at = 3 + 14 * device;
-                    self.address(at);
-                    self.show(at + 6..at + 14);
+                if self.packet.get(2) == Some(&1) {
+                    self.address(3);
+                    self.show(9..17);
                 }
             }
             // Extended Inquiry Result: one device, then its EIR.
@@ -219,20 +250,18 @@ impl Mask<'_> {
                 self.address(8);
                 self.rest(14);
             }
-            // LE Advertising Report: per report the event and address
-            // types, the address, the data's length, hidden data, the RSSI.
+            // LE Advertising Report: the event and address types, the
+            // address, the data's length, hidden data, the RSSI. Its
+            // parameters are arrays too, so as for an inquiry result only
+            // one report shows past the count.
             Some(0x02) => {
                 self.show(3..4);
-                let count = usize::from(self.packet.get(3).copied().unwrap_or(0));
-                let mut at = 4;
-                for _ in 0..count {
-                    self.show(at..at + 2);
-                    self.address(at + 2);
-                    let length = usize::from(self.packet.get(at + 8).copied().unwrap_or(0));
-                    self.show(at + 8..at + 9);
-                    at += 9 + length;
-                    self.show(at..at + 1);
-                    at += 1;
+                if self.packet.get(3) == Some(&1) {
+                    self.show(4..6);
+                    self.address(6);
+                    self.show(12..13);
+                    let length = usize::from(self.packet.get(12).copied().unwrap_or(0));
+                    self.show(13 + length..14 + length);
                 }
             }
             // Others show their status alone, as LE Generate DHKey Complete.
@@ -259,6 +288,7 @@ pub(super) fn hidden(kind: super::Kind, packet: &[u8]) -> Vec<bool> {
     let mut mask = Mask {
         packet,
         hidden: vec![true; packet.len()],
+        end: declared_end(kind, packet),
     };
     match kind {
         super::Kind::Command => mask.command(),
