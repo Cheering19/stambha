@@ -330,12 +330,14 @@ struct Heard {
 }
 
 /// A data frame waiting for room: its MPDU (without its CCMP header when
-/// it goes under a key), the queue's TID, whether it is EAPOL, the peer's
-/// rates, the key it goes under: CAM entry, key ID and its reserved PN, and
-/// the A-MPDU it goes in.
+/// it goes under a key), the queue's TID (0 for non-QoS data) and whether
+/// it is QoS data of that TID, whether it is EAPOL, the peer's rates, the
+/// key it goes under: CAM entry, key ID and its reserved PN, and the A-MPDU
+/// it goes in.
 struct Held {
     bytes: Vec<u8>,
     tid: u8,
+    qos: bool,
     eapol: bool,
     supported: u16,
     key: Option<(u8, u8, u64)>,
@@ -1201,6 +1203,7 @@ impl<C: Chip> Rtl8852c<C> {
         self.held.push_back(Held {
             bytes: mpdu,
             tid: tid.unwrap_or(0),
+            qos: tid.is_some(),
             eapol,
             supported: context.negotiated().legacy.supported,
             key,
@@ -1291,8 +1294,9 @@ impl<C: Chip> Rtl8852c<C> {
     /// mac80211's aggregation work over `rtw89_ops_ampdu_action`
     /// (`mac80211.c:1026-1075`, M4 spec S10.2) after rtw88's
     /// `change_agreements` (`station.rs:992`), each action in turn:
-    /// - Prepare waits while data of its TID the station numbered is held,
-    ///   as mac80211 numbers a frame as it leaves the TXQ, then gives the
+    /// - Prepare waits while QoS data of its TID the station numbered is
+    ///   held (non-QoS data on the same queue is no frame of the TID's), as
+    ///   mac80211 numbers a frame as it leaves the TXQ, then gives the
     ///   TID's next sequence number (TX_START: IMMEDIATE, no I/O).
     /// - A frame goes to the chip at once ([`Self::send_agreement_frame`]),
     ///   waiting at the head for room; one the station no longer sends, or
@@ -1309,7 +1313,7 @@ impl<C: Chip> Rtl8852c<C> {
             let next = match action {
                 tx::Action::Prepare { ticket, session } => {
                     let tid = session.tid();
-                    if self.held.iter().any(|held| held.tid == tid) {
+                    if self.held.iter().any(|held| held.qos && held.tid == tid) {
                         self.changes
                             .push_front(tx::Action::Prepare { ticket, session });
                         return first;
@@ -1382,7 +1386,7 @@ impl<C: Chip> Rtl8852c<C> {
                             *slot = None;
                         }
                         for held in &mut self.held {
-                            if held.tid == tid {
+                            if held.qos && held.tid == tid {
                                 held.aggregate = None;
                             }
                         }

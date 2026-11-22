@@ -3624,6 +3624,26 @@ fn a_reassociation_makes_a_fresh_agreement() {
 }
 
 #[test]
+fn a_prepare_waits_only_for_its_own_tids_numbered_data() {
+    // mac80211 synchronizes a TID's own TX before its ADDBA
+    // (ieee80211_agg_start_txq after the stop); a non-QoS frame, held on
+    // the BE queue as TID 0's would be, is no frame of TID 0's session.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().full_data = true;
+    wifi.transmit(&ip(1)).unwrap();
+    // The held QoS frame is replaced by a non-QoS one on the same queue.
+    let radio = wifi.radio_mut();
+    let mut held = radio.held.pop_front().unwrap();
+    held.bytes[0] = 0x08;
+    held.qos = false;
+    radio.held.push_back(held);
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(block_acks(&model.0.borrow(), 0).len(), 1);
+}
+
+#[test]
 fn an_agreement_takes_the_responses_window_up_to_128() {
     // __ieee80211_start_tx_ba_session's agreement takes min(the response's
     // window, the 128 of TRANSMIT_WINDOW) (agg-tx.c:992-1000), and
