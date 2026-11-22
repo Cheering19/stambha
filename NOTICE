@@ -1048,6 +1048,12 @@ crates/stela-drivers/src/usb/bluetooth/: Intel USB Bluetooth legacy RSA
 crates/stela-drivers/src/usb/bluetooth/: Realtek Bluetooth EPATCH v1 staging
     Linux 59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a01; GPL-2.0-or-later
     drivers/bluetooth/btrtl.c
+crates/stela-drivers/src/usb/bluetooth/: Realtek RTL8852CU identity, its v2
+  then v1 image, the 0xfc66 drop of a running patch and a passive LE scan
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/bluetooth/btrtl.c, drivers/bluetooth/btusb.c,
+    net/bluetooth/hci_core.c, net/bluetooth/hci_event.c,
+    net/bluetooth/hci_sync.c
 crates/stela-drivers/src/usb/bluetooth/: MediaTek MT79xx Bluetooth firmware
   staging
     Linux 59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a01,

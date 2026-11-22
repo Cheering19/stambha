@@ -21,6 +21,11 @@ fn audio_unsupported<'a>(
 pub(crate) const AFTER_BOOT: &str =
     "added after boot, kept unused and not started until the next boot";
 
+/// Why a disk is not started on a controller started without mass storage
+/// ([`Started::without_mass_storage`]): its caller takes no disk from it.
+pub(crate) const NO_MASS_STORAGE: &str =
+    "mass storage, kept unused and not started: this controller was started for no disk";
+
 /// Why a phone's USB tethering is not used ([`Device::offers_tethering`]).
 /// Linux's `ipheth` drives the interface only with userspace that pairs
 /// the phone first (its Kconfig says so): the phone gives the link no
@@ -77,6 +82,7 @@ pub(crate) fn bind_with_provider(
     let mut plans = Vec::new();
     let mut selected_settings = Vec::new();
     let after_boot = shared.borrow().after_boot;
+    let mass_storage_unused = shared.borrow().mass_storage_unused;
     for interface in all.iter().filter(|i| configuration::primary(i)) {
         let plan =
             configuration::plan_with_controller(&device, interface, &all, Some(&shared.borrow()));
@@ -86,6 +92,12 @@ pub(crate) fn bind_with_provider(
             Ok(plan) if after_boot && !matches!(plan, Plan::Hid(..)) => found.unused.push((
                 format!("{} interface {}", device.location, interface.number),
                 AFTER_BOOT,
+            )),
+            // Neither a Bulk-Only nor a UAS disk gets a configuration,
+            // command or settle wait on a controller started for no disk.
+            Ok(Plan::Storage(_)) if mass_storage_unused => found.unused.push((
+                format!("{} interface {}", device.location, interface.number),
+                NO_MASS_STORAGE,
             )),
             // A vendor adapter's chip was not asked for its revision.
             Err(_) if after_boot && ethernet::listed(&device.descriptor) => found.unused.push((

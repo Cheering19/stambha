@@ -4,6 +4,8 @@
 //! native endpoint/DMA, framing and terminal lifecycle owner with MT7925 media,
 //! without its third interface or vendor setup. Pairing, codecs and profiles
 //! remain with the Bluetooth stack. Stream quiescence is no physical suspend.
+//! An RTL8852CU takes CVSD; its wideband voice is refused until its ALT 6
+//! continuous output (btrtl.c:1322-1326, btusb.c:1782-1786) is ported.
 use super::super::mediatek::media as shared;
 use crate::{
     bus::dma::DmaAllocator,

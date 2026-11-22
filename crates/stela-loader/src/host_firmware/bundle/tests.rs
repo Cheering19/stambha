@@ -24,13 +24,13 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // of Navi 21.
     if Ports::BUILT == Ports::ALL {
         assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 122 files, 187.4 MiB.
-        assert_eq!((count, bytes), (122, 196_531_782), "{count} {bytes}");
+        // The recipes' recorded lengths: 125 files, 187.6 MiB.
+        assert_eq!((count, bytes), (125, 196_758_077), "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
-        // Without the AMD port: 89 files, 179.5 MiB.
-        assert_eq!((count, bytes), (89, 188_229_230), "{count} {bytes}");
+        // Without the AMD port: 92 files, 179.7 MiB.
+        assert_eq!((count, bytes), (92, 188_455_525), "{count} {bytes}");
     }
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
@@ -92,12 +92,15 @@ fn members(selection: &Selection) -> Vec<&'static str> {
 }
 
 /// The USB Bluetooth and Ethernet files every boot reads, sorted.
-const USB: [&str; 12] = [
+const USB: [&str; 15] = [
     "intel/ibt-20-1-3.ddc",
     "intel/ibt-20-1-3.sfi",
     "mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin",
     "mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin",
     "mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin",
+    "rtl_bt/rtl8761bu_config.bin",
+    "rtl_bt/rtl8852cu_fw.bin",
+    "rtl_bt/rtl8852cu_fw_v2.bin",
     "rtl_nic/rtl8153a-2.fw",
     "rtl_nic/rtl8153a-3.fw",
     "rtl_nic/rtl8153a-4.fw",
@@ -373,6 +376,48 @@ fn a_stored_file_whose_digest_is_not_the_pin_is_never_bound() {
         ErrorKind::Missing
     );
     assert!(provider.bound.borrow().is_empty());
+}
+
+#[test]
+fn an_rtl8852cu_config_request_gets_the_linked_8761bu_config_under_its_own_name() {
+    use stela_crypto::{Sha256, digest::Digest};
+    // linux-firmware's six-byte empty config: magic, then no entries.
+    let bytes = [0x55, 0xab, 0x23, 0x87, 0, 0];
+    let pin = recipes::REALTEK_BLUETOOTH[2].image;
+    assert_eq!(hex::encode(Sha256::digest(bytes)), pin.sha256);
+    let name: &'static str = Box::leak(name(pin.sha256).into_boxed_str());
+    let catalog: &'static Catalog = Box::leak(Box::new(
+        Catalog::from_handoff(alloc::vec![Resource {
+            name,
+            target: TARGET,
+            provenance: Provenance {
+                source: pin.source,
+                revision: pin.revision,
+                member: pin.member,
+                license: "licenses/rtlwifi.txt",
+            },
+            expected_length: bytes.len(),
+            expected_sha256: Sha256::digest(bytes).into(),
+            bytes: bytes.to_vec(),
+        }])
+        .unwrap(),
+    ));
+    let provider = BundleProvider::new(catalog);
+    let request = Requirement {
+        name: "rtl_bt/rtl8852cu_config.bin",
+        target: Target {
+            driver: "realtek-bluetooth-usb-epatch-v2",
+            hardware: "usb:13d3:3612:0000",
+            revision: "epatch-v2:hci-0c-000c:lmp-0c-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00",
+            board: None,
+        },
+        minimum_bytes: 6,
+    };
+    let image = provider.load(request).unwrap();
+    assert_eq!(image.name(), "rtl_bt/rtl8852cu_config.bin");
+    assert_eq!(image.target(), request.target);
+    assert_eq!(image.bytes(), bytes);
+    assert_eq!(image.provenance().member, "rtl_bt/rtl8761bu_config.bin");
 }
 
 #[test]

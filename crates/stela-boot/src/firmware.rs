@@ -386,11 +386,15 @@ pub(crate) fn ram() -> Result<Vec<(usize, usize)>> {
 
 /// Identity-map RAM and the framebuffer RW+NX with 2 MiB pages where they
 /// fill a whole chunk and 4 KiB pages elsewhere. Page zero and the stack
-/// guard stay unmapped; the image gets its section rights.
+/// guard stay unmapped; the image gets its section rights. Each of
+/// `runtime`'s pages, sorted, gets its rights ([`RuntimePages`]), in RAM
+/// too; without them the firmware's runtime services cannot be called in
+/// these tables.
 pub(crate) fn tables(
     image: &Image,
     holes: [usize; 2],
     screen: Option<&Framebuffer>,
+    runtime: &[(usize, u64)],
 ) -> Result<Tables> {
     let mut ram = ram()?;
     if let Some(screen) = screen {
@@ -400,12 +404,28 @@ pub(crate) fn tables(
     }
     let covered = |start: usize, end: usize| ram.iter().any(|r| r.0 <= start && end <= r.1);
     let overlaps = |start: usize, end: usize| ram.iter().any(|r| r.0 < end && start < r.1);
+    let runtime_in = |start: usize, end: usize| {
+        runtime
+            .get(runtime.partition_point(|&(page, _)| page < start))
+            .is_some_and(|&(page, _)| page < end)
+    };
+    let runtime_rights = |page: usize| {
+        runtime
+            .binary_search_by_key(&page, |&(page, _)| page)
+            .ok()
+            .map(|index| runtime[index].1)
+    };
     let mut tables = Tables::new()?;
-    let top = ram.last().map_or(0, |r| r.1).max(image.end);
+    let top = ram
+        .last()
+        .map_or(0, |r| r.1)
+        .max(image.end)
+        .max(runtime.last().map_or(0, |&(page, _)| page + PAGE));
     for chunk in (0..top).step_by(LARGE_PAGE) {
         let end = chunk + LARGE_PAGE;
         let special = holes.iter().any(|&hole| (chunk..end).contains(&hole))
-            || (image.start < end && chunk < image.end);
+            || (image.start < end && chunk < image.end)
+            || runtime_in(chunk, end);
         if covered(chunk, end) && !special {
             tables.large(chunk)?;
         } else if overlaps(chunk, end) || special {
@@ -415,6 +435,8 @@ pub(crate) fn tables(
                     continue;
                 } else if (image.start..image.end).contains(&page) {
                     image.rights(page)
+                } else if let Some(rights) = runtime_rights(page) {
+                    rights
                 } else if covered(page, page + PAGE) {
                     PRESENT | WRITABLE | NX
                 } else {
@@ -425,6 +447,98 @@ pub(crate) fn tables(
         }
     }
     Ok(tables)
+}
+
+/// The firmware's runtime regions as [`tables`] maps them for a boot that
+/// calls its variable services after its exit in its own tables, not the
+/// loader's root (`--host-check --keep-lines`). Stela never calls
+/// `SetVirtualAddressMap`, so the services run at their physical addresses
+/// (`firmware_runtime`), and the regions are mapped as the loader's root
+/// maps them: runtime code writable and executable, in RAM too, as Linux
+/// maps it without a memory attributes table; outside RAM, MMIO and regions
+/// the firmware does not mark write-back capable uncached, the rest
+/// write-back, RW+NX. Pages over `devices`, which the caller maps uncached
+/// itself, are left to it.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct RuntimePages {
+    /// (page, rights), sorted by page, for [`tables`].
+    pub(crate) pages: Vec<(usize, u64)>,
+    /// (start, pages) of every region the map declared.
+    declared: Vec<(u64, u64)>,
+    /// The RAM the identity map holds, as the pages were decided against.
+    ram: Vec<(u64, u64)>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl RuntimePages {
+    /// Read the firmware's map while its boot services run; each region is
+    /// one `FIRMWARE RUNTIME REGION` line.
+    pub(crate) fn capture(devices: &[(u64, u64)]) -> Result<Self> {
+        use crate::paging::DEVICE;
+        use stela_boot_core::{
+            firmware_map::{self, RuntimeMapping},
+            firmware_runtime,
+        };
+        let ram: Vec<(u64, u64)> = ram()?
+            .into_iter()
+            .map(|(start, end)| (start as u64, end as u64))
+            .collect();
+        let map =
+            boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
+        let mut runtime = Self::default();
+        for entry in map
+            .entries()
+            .filter(|entry| entry.att.bits() & firmware_map::MEMORY_RUNTIME != 0)
+        {
+            let (start, pages, kind, attributes) = (
+                entry.phys_start,
+                entry.page_count,
+                entry.ty.0,
+                entry.att.bits(),
+            );
+            let region = firmware_runtime::plan(start, pages, kind, attributes, &ram, devices);
+            crate::output::arguments(format_args!("{}", region.line()));
+            let mapping = firmware_map::runtime_mapping(kind, attributes);
+            let (rights, kept_ram): (u64, &[(u64, u64)]) = match mapping {
+                // Every page, those in RAM made executable.
+                RuntimeMapping::Code => (PRESENT | WRITABLE, &[]),
+                RuntimeMapping::WriteBack => (PRESENT | WRITABLE | NX, &ram),
+                RuntimeMapping::Uncached => (DEVICE, &ram),
+            };
+            runtime.pages.extend(
+                firmware_runtime::pages_to_map(start, pages, kept_ram, devices)
+                    .map(|page| (page as usize, rights)),
+            );
+            runtime.declared.push((start, pages));
+        }
+        runtime.pages.sort_unstable_by_key(|&(page, _)| page);
+        runtime.pages.dedup_by_key(|&mut (page, _)| page);
+        runtime.ram = ram;
+        Ok(runtime)
+    }
+
+    /// Whether the firmware's final map, `entries` (start, pages, type,
+    /// attributes), lists a runtime region these pages do not reach: added
+    /// at its exit, after the tables were built. Each is one line.
+    pub(crate) fn added_at_exit(
+        &self,
+        entries: impl Iterator<Item = (u64, u64, u32, u64)>,
+    ) -> bool {
+        use stela_boot_core::{firmware_map, firmware_runtime};
+        let mut added = false;
+        for (start, pages, kind, attributes) in entries {
+            if attributes & firmware_map::MEMORY_RUNTIME == 0
+                || firmware_runtime::reached(start, pages, &self.declared, &self.ram)
+            {
+                continue;
+            }
+            let region = firmware_runtime::Region::at_exit(start, pages, kind, attributes);
+            crate::output::arguments(format_args!("{}", region.line()));
+            added = true;
+        }
+        added
+    }
 }
 
 /// Run install mode, or collect what the host storage check needs and leave
@@ -451,7 +565,7 @@ pub fn take_over(
     let guard = pages(STACK_PAGES + 1)?;
     let image = Image::loaded()?;
     let screen = Framebuffer::from_firmware();
-    let mut tables = tables(&image, [0, guard], screen.as_ref())?;
+    let mut tables = tables(&image, [0, guard], screen.as_ref(), &[])?;
     storage.map(&mut tables)?;
     let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();

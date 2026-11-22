@@ -2,7 +2,7 @@
 //! (so no LA57) and no write to any internal disk.
 //!
 //! `stela.cfg`: `--host-check [--nor-file GUID:/PATH] [--deadline SECONDS]
-//! [--key-seconds SECONDS]`.
+//! [--key-seconds SECONDS] [--bluetooth-check] [--keep-lines]`.
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
@@ -21,12 +21,34 @@
 //! - `display`, `keyboard`, `display-seen`: colour bars in the GOP
 //!   framebuffer's bottom band, read back; then a USB keyboard key, which
 //!   also answers whether the bars are visible.
+//! - `bluetooth-found`, `bluetooth-rom`, `bluetooth-firmware`,
+//!   `bluetooth-download`, `bluetooth-version`, `bluetooth-scan` and
+//!   `bluetooth`, before `apic`: with `--bluetooth-check`, in place of the
+//!   storage probe, the one xHCI the firmware's USB stack found a Realtek
+//!   USB Bluetooth controller on is started alone, the controller brought up
+//!   with the USB stick's verified host firmware, then scanned for 8 s, reset
+//!   and closed ([`bluetooth`]). No other PCI function is touched, so
+//!   `storage`, `gpt` and `log` are skipped, and nothing writes to the
+//!   stick, which that xHCI may hold and its start then resets. Without the
+//!   option, one `CHECK bluetooth SKIP` line.
 //!
-//! `HOST CHECK END` and the summary follow, all flushed to the log; then a
-//! key restarts the machine (back to the boot manager), the power button
-//! powers it off, and `--deadline` (counted from the start) stops it with
-//! `STELA STOPPED`. Every wait prints `BEAT` every 10 s and flushes the log;
-//! a fatal error, panic or x86 exception flushes it too (`output`).
+//! `HOST CHECK END` and the summary follow, all flushed to the log. With
+//! `--keep-lines` the newest lines, up to 24 KiB with the summary at their
+//! end, then go into the firmware's stop-record variables
+//! (`output::keep_lines_in_firmware`, `stela_boot_core::stop_record`):
+//! `StelaStopHeader` and `StelaStop0` onwards under vendor GUID
+//! b3e1f6a4-2c5d-4e8f-9a17-6d0c53a7e142, which Windows can read without the
+//! screen and the next start of Stela on the PC copies into the USB's log
+//! and deletes. For that call after ExitBootServices the check's tables map
+//! the firmware's runtime regions (`firmware::RuntimePages`); without the
+//! option they do not, and the check keeps nothing itself. One line says
+//! whether the firmware holds them. Then a key restarts the machine (back
+//! to the boot manager), the power button powers it off, and `--deadline`
+//! (counted from the start) stops it with `STELA STOPPED`, the lines so far
+//! kept first with `--keep-lines` when the deadline comes before the
+//! summary. Every wait prints `BEAT` every 10 s and flushes the log, the
+//! Bluetooth bring-up's and scan's waits in their drivers too; a fatal
+//! error, panic or x86 exception flushes it too (`output`).
 use crate::Result;
 use crate::{
     apic::{self, Apic, rdtsc},
@@ -46,6 +68,7 @@ use alloc::string::ToString;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     arch::asm,
+    cell::RefCell,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -64,6 +87,7 @@ use stela_runtime::pc::{
     gpt::{self, Guid},
     power::HostPower,
 };
+use uefi::mem::memory_map::MemoryMap;
 
 const BEAT_SECONDS: u64 = 10;
 /// The stop code at `--deadline`.
@@ -131,12 +155,16 @@ impl fmt::Display for Check {
     }
 }
 
-/// The TSC rate, the beats and the deadline every wait shares.
+/// The TSC rate, the beats and the deadline every wait shares, and whether
+/// the lines are still to be kept in the firmware.
+#[derive(Clone, Copy)]
 struct Timing {
     tsc_hz: u64,
     started: u64,
     next_beat: u64,
     deadline: Option<u64>,
+    /// `--keep-lines`, until [`Timing::keep_lines`] has kept them.
+    keep_lines: bool,
 }
 
 impl Timing {
@@ -144,7 +172,9 @@ impl Timing {
         (rdtsc() - self.started) / self.tsc_hz
     }
 
-    /// Print a beat when one is due and stop at the deadline.
+    /// Print a beat when one is due and stop at the deadline, the lines so
+    /// far kept in the firmware first with `--keep-lines`, as [`finish`]
+    /// keeps them.
     fn tick(&mut self) {
         let now = rdtsc();
         if now >= self.next_beat {
@@ -159,8 +189,57 @@ impl Timing {
                 "HOST CHECK deadline reached after {}s\n",
                 self.elapsed_seconds()
             ));
+            output::flush_log();
+            self.keep_lines();
             output::terminate(DEADLINE_CODE)
         }
+    }
+
+    /// With `--keep-lines`, the lines so far kept in the firmware's
+    /// variables (`output::keep_lines_in_firmware`), once.
+    fn keep_lines(&mut self) {
+        if !core::mem::take(&mut self.keep_lines) {
+            return;
+        }
+        match output::keep_lines_in_firmware() {
+            Ok(()) => output::arguments(format_args!(
+                "HOST CHECK lines kept in the firmware (StelaStop variables): the next start of \
+                 Stela on this PC copies them into the USB's log and deletes them\n"
+            )),
+            Err(why) => output::arguments(format_args!(
+                "HOST CHECK lines not kept in the firmware: {why}\n"
+            )),
+        }
+        output::flush_log();
+    }
+}
+
+/// The check's [`Timing`] while drivers wait on their own
+/// ([`with_driver_waits`]), `None` otherwise.
+static DRIVER_WAITS: output::Global<Option<Timing>> = output::Global(RefCell::new(None));
+
+/// Run `work` with the beats and the deadline also checked in every driver
+/// wait (`stela_drivers::on_wait`): the Bluetooth bring-up and scan wait in
+/// their drivers, up to two minutes an initialization attempt, without
+/// returning to the check's own waits, so a hang there still ends at the
+/// deadline, the lines kept.
+fn with_driver_waits<T>(machine: &mut Machine, work: impl FnOnce(&mut Machine) -> T) -> T {
+    *DRIVER_WAITS.0.borrow_mut() = Some(machine.timing);
+    stela_drivers::on_wait(driver_waiting);
+    let result = work(machine);
+    if let Some(timing) = DRIVER_WAITS.0.borrow_mut().take() {
+        machine.timing = timing;
+    }
+    result
+}
+
+/// What a driver's wait runs: [`Timing::tick`] while [`with_driver_waits`]
+/// holds the timing, nothing otherwise or when a tick is already running.
+fn driver_waiting() {
+    if let Ok(mut timing) = DRIVER_WAITS.0.try_borrow_mut()
+        && let Some(timing) = timing.as_mut()
+    {
+        timing.tick();
     }
 }
 
@@ -175,6 +254,8 @@ struct Machine {
     /// Board captures for the storage probe; Wi-Fi files are not read here.
     captures: PlatformCaptures,
     power: Option<HostPower>,
+    /// `--bluetooth-check`, from its choice before ExitBootServices.
+    bluetooth: bluetooth::Check,
     apic_base: u64,
     stack_top: usize,
     checks: Vec<Check>,
@@ -193,9 +274,11 @@ impl Machine {
     }
 }
 
-/// Run the host check from `stela.cfg`'s `options`; never returns.
-pub fn boot(options: Vec<u8>) -> ! {
-    let (mut machine, tables) = prepare(&options).unwrap_or_else(|error| output::fatal(error));
+/// Run the host check from `stela.cfg`'s `options`, with the USB stick's
+/// host firmware for `--bluetooth-check`; never returns.
+pub fn boot(options: Vec<u8>, host_firmware: crate::host_firmware::Resources) -> ! {
+    let (mut machine, tables) =
+        prepare(&options, &host_firmware).unwrap_or_else(|error| output::fatal(error));
     let stack = machine.stack_top;
     // SAFETY: boot services have ended; the tables map the image, the heap,
     // the stack, every RAM byte in use, the framebuffer and the registers
@@ -222,7 +305,10 @@ pub fn boot(options: Vec<u8>) -> ! {
 
 /// Before ExitBootServices: the options, the CPU and TSC checks, and what
 /// the rest needs from the firmware; then leave boot services.
-fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
+fn prepare(
+    options: &[u8],
+    host_firmware: &crate::host_firmware::Resources,
+) -> Result<(Machine, paging::Tables)> {
     let text = core::str::from_utf8(options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let options = HostCheck::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let started = rdtsc();
@@ -238,12 +324,14 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
             started,
             next_beat: started,
             deadline: options.deadline.map(|seconds| started + seconds * tsc_hz),
+            keep_lines: options.keep_lines,
         },
         options,
         screen: Framebuffer::from_firmware(),
         storage: None,
         captures: storage::captures(Default::default()),
         power: crate::system::host_power(),
+        bluetooth: bluetooth::Check::off(),
         apic_base: apic::base_msr(),
         stack_top: 0,
         checks: Vec::new(),
@@ -271,24 +359,66 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
             crate::firmware::tsc_source()
         ),
     );
-    match storage::discover() {
+    if machine.options.bluetooth_check {
+        machine.bluetooth = bluetooth::prepare(host_firmware);
+    }
+    // `--bluetooth-check` starts no NVMe driver, so it sizes no host
+    // memory buffer, whose Identify Controller would reach the NVMe.
+    let discovered = if machine.options.bluetooth_check {
+        storage::discover_without_nvme()
+    } else {
+        storage::discover()
+    };
+    match discovered {
         Ok(handoff) => machine.storage = Some(handoff),
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
     }
     let guard = firmware::pages(firmware::STACK_PAGES + 1)?;
     machine.stack_top = guard + (firmware::STACK_PAGES + 1) * PAGE;
     let image = firmware::Image::loaded()?;
-    let mut tables = firmware::tables(&image, [0, guard], machine.screen.as_ref())?;
+    let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
+    // With --keep-lines the firmware's variable services are called after
+    // its exit, in these tables, which then map its runtime regions.
+    let runtime = if machine.options.keep_lines {
+        let devices: Vec<(u64, u64)> = machine
+            .storage
+            .iter()
+            .flat_map(|handoff| &handoff.mapped)
+            .map(|range| (range.start, range.end))
+            .chain([(registers as u64, (registers + PAGE) as u64)])
+            .collect();
+        firmware::RuntimePages::capture(&devices)?
+    } else {
+        firmware::RuntimePages::default()
+    };
+    let mut tables = firmware::tables(&image, [0, guard], machine.screen.as_ref(), &runtime.pages)?;
     for range in machine.storage.iter().flat_map(|handoff| &handoff.mapped) {
         tables.device(range.start as usize, range.end as usize)?;
     }
-    let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
     let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let _ = unsafe { crate::boot_exit::exit(final_map) };
+    let final_map = unsafe { crate::boot_exit::exit(final_map) };
+    // A runtime region the map lists only at the exit is not in the tables,
+    // and the services may use it: they are then not called after the exit.
+    if machine.options.keep_lines
+        && runtime.added_at_exit(final_map.entries().map(|entry| {
+            (
+                entry.phys_start,
+                entry.page_count,
+                entry.ty.0,
+                entry.att.bits(),
+            )
+        }))
+    {
+        crate::stop_record::refuse_after_exit();
+        output::arguments(format_args!(
+            "HOST CHECK lines will not be kept in the firmware: its map at its exit lists \
+             runtime regions these tables do not map, named above\n"
+        ));
+    }
     Ok((machine, tables))
 }
 
@@ -322,9 +452,14 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
         Err(error) => machine.record("native-memory", Verdict::Fail, format!("{error:?}")),
     }
     let mut keyboards = match machine.storage.take() {
+        // In place of the probe, which it would let start every driver.
+        Some(handoff) if machine.bluetooth.on() => {
+            with_driver_waits(machine, |machine| bluetooth::start(machine, &handoff))
+        }
         Some(handoff) => disks(machine, &handoff),
         None => Vec::new(),
     };
+    with_driver_waits(machine, bluetooth::check);
     timer(machine);
     match (machine.screen, band) {
         (Some(screen), Some(top)) => bars(machine, &screen, top),
@@ -665,9 +800,15 @@ fn key(keyboards: &mut [InputDevice]) -> Option<u8> {
 /// A key within `--key-seconds`, which also says whether the bars show.
 fn keyboard(machine: &mut Machine, keyboards: &mut [InputDevice]) {
     if keyboards.is_empty() {
+        // `--bluetooth-check` starts no keyboard but one on its xHCI.
+        let verdict = if machine.bluetooth.on() {
+            Verdict::Skip
+        } else {
+            Verdict::Fail
+        };
         machine.record(
             "keyboard",
-            Verdict::Fail,
+            verdict,
             String::from("no keyboard was brought up"),
         );
         machine.record("display-seen", Verdict::Skip, String::from("no keyboard"));
@@ -728,6 +869,8 @@ fn finish(machine: &mut Machine, keyboards: &mut [InputDevice]) -> ! {
         count(Verdict::Skip)
     ));
     output::flush_log();
+    // Once: the deadline in the prompt below does not keep them again.
+    machine.timing.keep_lines();
     // The host check keeps the firmware's tables, which map no runtime
     // services for a firmware power-off.
     let mut power = HostPowerControl::new(
@@ -755,3 +898,6 @@ fn finish(machine: &mut Machine, keyboards: &mut [InputDevice]) -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// `--bluetooth-check`, kept apart from the checks above.
+mod bluetooth;

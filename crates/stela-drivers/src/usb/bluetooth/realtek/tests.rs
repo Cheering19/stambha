@@ -13,6 +13,20 @@ use crate::{
 use alloc::{collections::VecDeque, rc::Rc, string::String};
 use core::cell::{Cell, RefCell};
 use sha2::{Digest, Sha256};
+/// The RTL8852CU's stock-ROM label for its first image, `_v2.bin`.
+const RTL8852CU_V2: &str =
+    "epatch-v2:hci-0c-000c:lmp-0c-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00";
+/// The complete btusb 8852CE group (btusb.c:575-591).
+const RTL8852CE: [(u16, u16); 8] = [
+    (0x04ca, 0x4007),
+    (0x04c5, 0x1675),
+    (0x0cb8, 0xc558),
+    (0x13d3, 0x3587),
+    (0x13d3, 0x3586),
+    (0x13d3, 0x3592),
+    (0x13d3, 0x3612),
+    (0x0489, 0xe122),
+];
 pub(super) fn initialized_report(project: Project) -> OwnedReport {
     let (mut hci, catalog, _) = fixture(project, true);
     initialize(&mut hci, &catalog).unwrap()
@@ -25,6 +39,8 @@ struct Step {
 struct Trace {
     commands: usize,
     closed: usize,
+    /// The model's time when the last command went out.
+    sent_at: u64,
 }
 struct Model {
     steps: VecDeque<Step>,
@@ -44,6 +60,7 @@ impl Io for Model {
         let step = self.steps.pop_front().expect("unexpected command");
         assert_eq!(p, step.parameters);
         self.trace.borrow_mut().commands += 1;
+        self.trace.borrow_mut().sent_at = self.time.get();
         if self.fail_command == Some(self.trace.borrow().commands) {
             return Err(BlockError::Device { status: 0x55 });
         }
@@ -93,18 +110,24 @@ fn cc(op: u16, p: &[u8]) -> Vec<u8> {
     b.extend_from_slice(p);
     b
 }
+/// The projects whose first image is an RTBTCore (EPATCH v2) container.
+fn v2(project: Project) -> bool {
+    matches!(project, Project::Rtl8852Bu | Project::Rtl8852Cu)
+}
 fn version(project: Project, after: bool) -> Vec<u8> {
-    let (hci, lmp) = match project {
-        Project::Rtl8761Bu => (10, 0x8761u16),
-        Project::Rtl8822B => (7, 0x8822),
-        Project::Rtl8852Bu => (11, 0x8852),
+    let (hci, revision, lmp) = match project {
+        Project::Rtl8761Bu => (10, 11, 0x8761u16),
+        Project::Rtl8822B => (7, 11, 0x8822),
+        Project::Rtl8852Bu => (11, 11, 0x8852),
+        // btrtl.c:305-306: IC_INFO(RTL_ROM_LMP_8852A, 0xc, 0xc, HCI_USB).
+        Project::Rtl8852Cu => (12, 12, 0x8852),
     };
-    let mut b = vec![0, hci, 11, 0, hci, 0x5d, 0];
+    let mut b = vec![0, hci, revision, 0, hci, 0x5d, 0];
     b.extend_from_slice(&(if after { 0x5678 } else { lmp }).to_le_bytes());
     b
 }
 fn firmware(project: Project) -> Vec<u8> {
-    if project == Project::Rtl8852Bu {
+    if v2(project) {
         let mut b = b"RTBTCore".to_vec();
         b.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         b.extend_from_slice(&2u32.to_le_bytes());
@@ -114,9 +137,13 @@ fn firmware(project: Project) -> Vec<u8> {
         b.extend_from_slice(&8u32.to_le_bytes());
         b.extend_from_slice(&2u32.to_le_bytes());
         b.extend_from_slice(&[0x99, 0x98]);
-        b.extend_from_slice(&[0xff, 2, 1, 1, 20, 1, 0, 0x51, 4, 0xfd, 0x77]);
+        b.extend_from_slice(&[0xff, 2, 1, 1, project.id(), 1, 0, 0x51, 4, 0xfd, 0x77]);
         return b;
     }
+    v1_image(project)
+}
+/// A Realtech (EPATCH v1) container for `project`: one ROM 0 patch.
+fn v1_image(project: Project) -> Vec<u8> {
     let mut b = vec![0; 36];
     b[..8].copy_from_slice(b"Realtech");
     b[8..12].copy_from_slice(&0x12345678u32.to_le_bytes());
@@ -132,6 +159,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => (0x0bdau16, 0x8771u16, 0x8761u16, 10),
         Project::Rtl8822B => (0x13d3, 0x3526, 0x8822, 7),
         Project::Rtl8852Bu => (0x0bda, 0xb85b, 0x8852, 11),
+        Project::Rtl8852Cu => (0x13d3, 0x3612, 0x8852, 12),
     };
     let mut descriptor = [18, 1, 0, 2, 0xe0, 1, 1, 64, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
     descriptor[8..10].copy_from_slice(&vid.to_le_bytes());
@@ -159,6 +187,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => "usb:0bda:8771:0100",
         Project::Rtl8822B => "usb:13d3:3526:0100",
         Project::Rtl8852Bu => "usb:0bda:b85b:0100",
+        Project::Rtl8852Cu => "usb:13d3:3612:0100",
     };
     let revision = match project {
         Project::Rtl8761Bu => {
@@ -170,9 +199,10 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8852Bu => {
             "epatch-v2:hci-0b-000b:lmp-0b-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00"
         }
+        Project::Rtl8852Cu => RTL8852CU_V2,
     };
     let target = Target {
-        driver: if project == Project::Rtl8852Bu {
+        driver: if v2(project) {
             "realtek-bluetooth-usb-epatch-v2"
         } else {
             "realtek-bluetooth-usb-epatch-v1"
@@ -185,11 +215,13 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         Project::Rtl8761Bu => "rtl_bt/rtl8761bu_fw.bin",
         Project::Rtl8822B => "rtl_bt/rtl8822b_fw.bin",
         Project::Rtl8852Bu => "rtl_bt/rtl8852bu_fw.bin",
+        Project::Rtl8852Cu => "rtl_bt/rtl8852cu_fw_v2.bin",
     };
     let cfgname = match project {
         Project::Rtl8761Bu => "rtl_bt/rtl8761bu_config.bin",
         Project::Rtl8822B => "rtl_bt/rtl8822b_config.bin",
         Project::Rtl8852Bu => "rtl_bt/rtl8852bu_config.bin",
+        Project::Rtl8852Cu => "rtl_bt/rtl8852cu_config.bin",
     };
     let cfg = vec![0x55, 0xab, 0x23, 0x87, 0, 0];
     let fw = firmware(project);
@@ -199,7 +231,8 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
         provenance: Provenance {
             source: "original stateful fixture",
             revision: "model-v1",
-            member: if project == Project::Rtl8852Bu && name == cfgname {
+            // linux-firmware WHENCE links both v2 profiles' configs to it.
+            member: if v2(project) && name == cfgname {
                 "rtl_bt/rtl8761bu_config.bin"
             } else {
                 name
@@ -233,7 +266,7 @@ fn fixture(project: Project, config: bool) -> (Hci<Model>, Catalog, Rc<RefCell<T
     add(0x1001, &[], &version(project, false));
     add(0xfc6d, &[], &[0, 0]);
     add(0xfc61, &[0x10, 0xa4, 0xad, 0, 0xb0], &[0, 0, 0]);
-    let mut data = if project == Project::Rtl8852Bu {
+    let mut data = if v2(project) {
         vec![0x80, 0xde, 0xad, 0xbe, 0xef]
     } else {
         vec![0x80, 0x78, 0x56, 0x34, 0x12]
@@ -591,12 +624,9 @@ fn v2_requires_exact_usb_stock_hci_register_rom_and_key_profile() {
         assert!(Identity::select(usb, v.clone(), 0x8851, None, 1, [0, 0]).is_err());
         assert!(Identity::select(usb, v, 0x8852, None, 1, [1, 0]).is_err());
     }
-    for (vendor, product) in [
-        (0x0bda, 0x8520),
-        (0x0cb8, 0xc558),
-        (0x13d3, 0x3573),
-        (0x1209, 0xb85b),
-    ] {
+    // 0cb8:c558 left this list: btusb.c:580 lists it as an 8852CE, which
+    // the RTL8852CU test below takes.
+    for (vendor, product) in [(0x0bda, 0x8520), (0x13d3, 0x3573), (0x1209, 0xb85b)] {
         assert!(
             UsbIdentity {
                 vendor,
@@ -683,4 +713,644 @@ fn v2_validated_metadata_and_alias_receipt_survive_rejected_upload_or_boot() {
         assert_eq!(trace.borrow().commands, commands);
         assert!(hci.submit_command(&[3, 0x0c, 0]).is_err());
     }
+}
+#[test]
+fn rtl8852cu_requires_the_btusb_8852ce_group_and_its_usb_stock_profile() {
+    // CHIP_ID_8852C (btrtl.c:71, :670).
+    assert_eq!(Project::Rtl8852Cu.id(), 25);
+    for (vendor, product) in RTL8852CE {
+        let usb = UsbIdentity {
+            vendor,
+            product,
+            revision: 0,
+        };
+        assert_eq!(
+            usb.project(),
+            Some(Project::Rtl8852Cu),
+            "{vendor:04x}:{product:04x}"
+        );
+        assert_eq!(
+            crate::usb::bluetooth::Setup::of(vendor, product, false),
+            Some(crate::usb::bluetooth::Setup::Realtek)
+        );
+        let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+        let identity = Identity::select(usb, stock.clone(), 0x8852, None, 1, [0, 0x42]).unwrap();
+        assert_eq!(identity.project, Project::Rtl8852Cu);
+        assert!(
+            identity
+                .revision_label()
+                .ends_with(":rom-01:security-00-42")
+        );
+        // An 8852B's or 8761B's stock readings, another register
+        // subversion and a nonzero key are refused under an 8852CE ID.
+        for wrong in [Project::Rtl8852Bu, Project::Rtl8761Bu] {
+            let other = LocalVersion::parse(&version(wrong, false)).unwrap();
+            assert!(Identity::select(usb, other, 0x8852, None, 0, [0, 0]).is_err());
+        }
+        assert!(Identity::select(usb, stock.clone(), 0x8851, None, 0, [0, 0]).is_err());
+        assert!(Identity::select(usb, stock, 0x8852, None, 0, [1, 0]).is_err());
+    }
+    // An 8852C's readings under an 8852BE ID select nothing.
+    let be = UsbIdentity {
+        vendor: 0x0bda,
+        product: 0xb85b,
+        revision: 0,
+    };
+    let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+    assert!(Identity::select(be, stock, 0x8852, None, 0, [0, 0]).is_err());
+}
+#[test]
+fn rtl8852cu_names_btrtls_v2_image_then_its_v1_image_and_an_optional_config() {
+    let usb = UsbIdentity {
+        vendor: 0x13d3,
+        product: 0x3612,
+        revision: 0,
+    };
+    let stock = LocalVersion::parse(&version(Project::Rtl8852Cu, false)).unwrap();
+    let identity = Identity::select(usb, stock, 0x8852, None, 0, [0, 0]).unwrap();
+    // btrtl.c:1196-1209, :310-311.
+    assert_eq!(
+        identity.firmware_images(),
+        [
+            ("rtl_bt/rtl8852cu_fw_v2.bin", Container::V2),
+            ("rtl_bt/rtl8852cu_fw.bin", Container::V1)
+        ]
+    );
+    assert_eq!(identity.firmware_name(), "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(identity.configuration_name(), "rtl_bt/rtl8852cu_config.bin");
+    assert!(!identity.configuration_required());
+    assert_eq!(identity.revision_label(), RTL8852CU_V2);
+    assert_eq!(
+        identity.revision_label_for(Container::V1),
+        RTL8852CU_V2.replacen("epatch-v2", "epatch-v1", 1)
+    );
+    // The other profiles name their one image, in the container they had.
+    for (project, image) in [
+        (
+            Project::Rtl8761Bu,
+            ("rtl_bt/rtl8761bu_fw.bin", Container::V1),
+        ),
+        (Project::Rtl8822B, ("rtl_bt/rtl8822b_fw.bin", Container::V1)),
+        (
+            Project::Rtl8852Bu,
+            ("rtl_bt/rtl8852bu_fw.bin", Container::V2),
+        ),
+    ] {
+        let (mut hci, catalog, _) = fixture(project, true);
+        let report = initialize(&mut hci, &catalog).unwrap();
+        assert_eq!(report.before.firmware_images(), [image]);
+    }
+}
+#[test]
+fn rtl8852cu_boots_its_v2_image_with_the_linked_empty_config() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    let provider = Recording {
+        catalog: &catalog,
+        requests: RefCell::new(vec![]),
+    };
+    let InitializationReport::Realtek(r) = hci
+        .initialize_with_provider(&provider, PlatformInputs::default())
+        .unwrap()
+    else {
+        panic!("Realtek report expected")
+    };
+    assert_eq!(r.before.project, Project::Rtl8852Cu);
+    assert_eq!(r.before.usb.hardware_label(), "usb:13d3:3612:0100");
+    assert_eq!(r.after.raw, version(Project::Rtl8852Cu, true)[..]);
+    assert_eq!(
+        r.container_version,
+        ContainerVersion::V2([1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    let meta = r.v2.as_ref().unwrap();
+    assert_eq!(meta.project, Project::Rtl8852Cu);
+    assert_eq!(meta.extensions.last().unwrap().value, 25);
+    assert_eq!(r.firmware.name, "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(r.firmware.target_driver, "realtek-bluetooth-usb-epatch-v2");
+    assert_eq!(r.firmware.target_revision, RTL8852CU_V2);
+    // linux-firmware links the 8852C config to the 8761BU's six bytes,
+    // which btrtl appends to the patch (btrtl.c:936-950).
+    let ConfigurationEvidence::Supplied(config) = &r.configuration else {
+        panic!("supplied config expected")
+    };
+    assert_eq!(config.name, "rtl_bt/rtl8852cu_config.bin");
+    assert_eq!(config.member, "rtl_bt/rtl8761bu_config.bin");
+    assert_eq!(
+        r.download,
+        [DownloadResponse {
+            sent_index: 0x80,
+            returned_index: 0x42
+        }]
+    );
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            )
+        ]
+    );
+    drop(requests);
+    assert!(hci.io.steps.is_empty());
+    assert_eq!(trace.borrow().closed, 0);
+}
+/// The RTL8852CU's stock-ROM label for its second image, `.bin`.
+const RTL8852CU_V1: &str =
+    "epatch-v1:hci-0c-000c:lmp-0c-8852:manufacturer-005d:register-8852-none:rom-00:security-00-00";
+fn rtl8852cu_v1_target() -> Target<'static> {
+    Target {
+        driver: "realtek-bluetooth-usb-epatch-v1",
+        hardware: "usb:13d3:3612:0100",
+        revision: RTL8852CU_V1,
+        board: None,
+    }
+}
+/// A catalog resource from the original stateful fixture.
+fn resource(
+    name: &'static str,
+    bytes: Vec<u8>,
+    target: Target<'static>,
+    member: &'static str,
+) -> Resource<'static> {
+    Resource {
+        name,
+        target,
+        provenance: Provenance {
+            source: "original stateful fixture",
+            revision: "model-v1",
+            member,
+            license: "MIT",
+        },
+        expected_length: bytes.len(),
+        expected_sha256: Sha256::digest(&bytes).into(),
+        bytes,
+    }
+}
+#[test]
+fn rtl8852cu_falls_back_to_its_v1_image_only_when_its_v2_image_is_missing() {
+    let (mut hci, _, _) = fixture(Project::Rtl8852Cu, true);
+    let cfg = vec![0x55, 0xab, 0x23, 0x87, 0, 0];
+    let catalog = Catalog::from_handoff(vec![
+        resource(
+            "rtl_bt/rtl8852cu_fw.bin",
+            v1_image(Project::Rtl8852Cu),
+            rtl8852cu_v1_target(),
+            "rtl_bt/rtl8852cu_fw.bin",
+        ),
+        resource(
+            "rtl_bt/rtl8852cu_config.bin",
+            cfg.clone(),
+            rtl8852cu_v1_target(),
+            "rtl_bt/rtl8761bu_config.bin",
+        ),
+    ])
+    .unwrap();
+    // The v1 patch ends in its container version, then the config follows.
+    let mut data = vec![0x80, 0x78, 0x56, 0x34, 0x12];
+    data.extend_from_slice(&cfg);
+    hci.io.steps[4].parameters = command(0xfc20, &data);
+    let provider = Recording {
+        catalog: &catalog,
+        requests: RefCell::new(vec![]),
+    };
+    let r = initialize(&mut hci, &provider).unwrap();
+    assert_eq!(r.firmware.name, "rtl_bt/rtl8852cu_fw.bin");
+    assert_eq!(r.firmware.target_driver, "realtek-bluetooth-usb-epatch-v1");
+    assert_eq!(r.firmware.target_revision, RTL8852CU_V1);
+    assert_eq!(r.before.revision_label_for(Container::V1), RTL8852CU_V1);
+    assert_eq!(r.container_version, ContainerVersion::V1(0x12345678));
+    assert!(r.v2.is_none());
+    let fallback = r.fallback.as_ref().unwrap();
+    assert_eq!(fallback.name, "rtl_bt/rtl8852cu_fw_v2.bin");
+    assert_eq!(fallback.kind, crate::firmware::ErrorKind::Missing);
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.2.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                RTL8852CU_V2,
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            (
+                "rtl_bt/rtl8852cu_fw.bin",
+                RTL8852CU_V1,
+                "realtek-bluetooth-usb-epatch-v1"
+            ),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                RTL8852CU_V1,
+                "realtek-bluetooth-usb-epatch-v1"
+            )
+        ]
+    );
+    drop(requests);
+    assert!(hci.io.steps.is_empty());
+}
+#[test]
+fn a_present_but_refused_rtl8852cu_v2_image_is_never_replaced_by_its_v1_image() {
+    struct Refuse<'a> {
+        catalog: &'a Catalog,
+        kind: crate::firmware::ErrorKind,
+        requests: RefCell<Vec<String>>,
+    }
+    impl Provider for Refuse<'_> {
+        fn load(
+            &self,
+            r: Requirement<'_>,
+        ) -> core::result::Result<Image<'_>, crate::firmware::Error> {
+            self.requests.borrow_mut().push(r.name.into());
+            if r.name == "rtl_bt/rtl8852cu_fw_v2.bin" {
+                return Err(crate::firmware::Error {
+                    name: r.name.into(),
+                    kind: self.kind.clone(),
+                });
+            }
+            self.catalog.load(r)
+        }
+    }
+    for kind in [
+        crate::firmware::ErrorKind::WrongTarget,
+        crate::firmware::ErrorKind::DigestMismatch {
+            expected: [1; 32],
+            actual: [2; 32],
+        },
+    ] {
+        let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+        let provider = Refuse {
+            catalog: &catalog,
+            kind: kind.clone(),
+            requests: RefCell::new(vec![]),
+        };
+        let e = initialize(&mut hci, &provider).unwrap_err();
+        let (cause, a) = attempt(&e);
+        assert!(
+            matches!(cause, Error::Resource(e) if e.name == "rtl_bt/rtl8852cu_fw_v2.bin" && e.kind == kind)
+        );
+        assert!(a.fallback.is_none());
+        assert!(a.download.is_empty());
+        assert_eq!(
+            *provider.requests.borrow(),
+            ["rtl_bt/rtl8852cu_fw_v2.bin", "rtl_bt/rtl8852cu_config.bin"]
+        );
+        assert_eq!(trace.borrow().commands, 4);
+        assert_eq!(hci.state(), State::Closed);
+    }
+}
+#[test]
+fn both_missing_rtl8852cu_images_fail_on_the_v1_name_with_the_v2_absence_kept() {
+    let (mut hci, _, trace) = fixture(Project::Rtl8852Cu, true);
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    let provider = Recording {
+        catalog: &empty,
+        requests: RefCell::new(vec![]),
+    };
+    let e = initialize(&mut hci, &provider).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(
+        cause,
+        Error::Resource(e)
+            if e.name == "rtl_bt/rtl8852cu_fw.bin" && e.kind == crate::firmware::ErrorKind::Missing
+    ));
+    assert!(
+        a.fallback
+            .as_ref()
+            .is_some_and(|e| e.name == "rtl_bt/rtl8852cu_fw_v2.bin")
+    );
+    assert!(a.download.is_empty() && a.v2.is_none());
+    let requests = provider.requests.borrow();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.0.as_str(), r.3.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "rtl_bt/rtl8852cu_fw_v2.bin",
+                "realtek-bluetooth-usb-epatch-v2"
+            ),
+            ("rtl_bt/rtl8852cu_fw.bin", "realtek-bluetooth-usb-epatch-v1"),
+            (
+                "rtl_bt/rtl8852cu_config.bin",
+                "realtek-bluetooth-usb-epatch-v1"
+            )
+        ]
+    );
+    drop(requests);
+    assert_eq!(trace.borrow().commands, 4);
+    assert_eq!(hci.state(), State::Closed);
+}
+/// An RTL8852CU a warm reboot left running its patch, as far as its first
+/// identification: its register still reads the ROM's subversion and Read
+/// Local Version the patch's (lmp_subver 0x5678, no btrtl IC). Then 0xfc66,
+/// answered with `events`, and the stock fixture's identification and upload.
+fn patched_fixture(events: &[&[u8]]) -> (Hci<Model>, Catalog, Rc<RefCell<Trace>>) {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    let first = [
+        Step {
+            parameters: command(0xfc61, &[0x10, 0x38, 4, 0x28, 0x80]),
+            response: cc(0xfc61, &[0, 0x52, 0x88]),
+        },
+        Step {
+            parameters: command(0x1001, &[]),
+            response: cc(0x1001, &version(Project::Rtl8852Cu, true)),
+        },
+        Step {
+            parameters: command(0xfc66, &[]),
+            response: events.concat(),
+        },
+    ];
+    for step in first.into_iter().rev() {
+        hci.io.steps.push_front(step);
+    }
+    (hci, catalog, trace)
+}
+#[test]
+fn a_running_patch_is_dropped_once_with_fc66_and_the_stock_rom_then_boots() {
+    // The controller is silent after 0xfc66; or it completes it granting no
+    // credit, which Linux takes for nothing (btrtl sent it outside the
+    // command flow), and sends a vendor event.
+    let completion = [0x0e, 4, 0, 0x66, 0xfc, 0];
+    let vendor = [0xff, 2, 0x01, 0x02];
+    for events in [&[][..], &[&completion[..], &vendor[..]][..]] {
+        let (mut hci, catalog, trace) = patched_fixture(events);
+        let r = initialize(&mut hci, &catalog).unwrap();
+        assert!(hci.io.steps.is_empty(), "every command in order");
+        assert_eq!(trace.borrow().commands, 10);
+        assert_eq!(r.before.project, Project::Rtl8852Cu);
+        assert_eq!(r.before.version.raw, version(Project::Rtl8852Cu, false)[..]);
+        let dropped = r.dropped.as_ref().unwrap();
+        assert_eq!(dropped.register_subversion, 0x8852);
+        assert_eq!(dropped.register_revision, None);
+        assert_eq!(dropped.version.raw, version(Project::Rtl8852Cu, true)[..]);
+        assert_eq!(dropped.event_count, events.len());
+        assert_eq!(
+            dropped.events,
+            events.iter().map(|e| e.to_vec()).collect::<Vec<_>>()
+        );
+        assert_eq!(r.download.len(), 1);
+    }
+}
+#[test]
+fn readings_matching_no_btrtl_ic_after_the_drop_fail_closed_with_both_kept() {
+    let (mut hci, catalog, trace) = patched_fixture(&[]);
+    // The same patched readings again, then nothing more is asked.
+    hci.io.steps.truncate(4);
+    hci.io.steps.push_back(Step {
+        parameters: command(0x1001, &[]),
+        response: cc(0x1001, &version(Project::Rtl8852Cu, true)),
+    });
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Unsupported(_)));
+    assert!(hci.io.steps.is_empty());
+    assert_eq!(trace.borrow().commands, 5);
+    assert_eq!(
+        a.dropped.as_ref().unwrap().version.raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert_eq!(
+        a.version.as_ref().unwrap().raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert!(a.rom_version.is_none() && a.security.is_none() && a.identity.is_none());
+    assert_eq!(hci.state(), State::Closed);
+}
+#[test]
+fn readings_of_another_btrtl_ic_are_never_dropped() {
+    // An 8852B's stock readings under an 8852CE ID match btrtl's 8852B
+    // entry: no 0xfc66, and the USB-pinned profile then refuses them.
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.io.steps[1].response = cc(0x1001, &version(Project::Rtl8852Bu, false));
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Unsupported(_)));
+    assert!(a.dropped.is_none());
+    assert_eq!(trace.borrow().commands, 4);
+}
+#[test]
+fn btrtls_usb_ic_table_decides_a_drop() {
+    let read = |hci: u8, revision: u16, lmp: u16| {
+        let mut b = vec![0, hci];
+        b.extend_from_slice(&revision.to_le_bytes());
+        b.extend_from_slice(&[hci, 0x5d, 0]);
+        b.extend_from_slice(&lmp.to_le_bytes());
+        LocalVersion::parse(&b).unwrap()
+    };
+    for (hci, revision, lmp, known) in [
+        (0xc, 0xc, 0x8852, true),
+        (0xb, 0xb, 0x8852, true),
+        (0xc, 0x87, 0x8852, true),
+        (0xa, 0xb, 0x8761, true),
+        // 8761CU's entry takes any HCI version (btrtl.c:235, :355-357).
+        (0x33, 0xe, 0x8761, true),
+        (0x6, 0xb, 0x1200, true),
+        (0xb, 0xc, 0x8852, false),
+        (0xc, 0xc, 0x5678, false),
+        // 8822C's USB entry is 0xc/0xa; 0xc/0x8 is UART only.
+        (0x8, 0xc, 0x8822, false),
+    ] {
+        assert_eq!(
+            identity::btrtl_ic(lmp, None, &read(hci, revision, lmp)),
+            known,
+            "{lmp:04x} {revision:04x} {hci:02x}"
+        );
+    }
+    // An 8822E is matched on its registers alone, as hci_ver 0x0c, and no
+    // USB entry has it (btrtl.c:1094-1108).
+    assert!(!identity::btrtl_ic(
+        0x8822,
+        Some(0x000e),
+        &read(0xc, 0xb, 0x8822)
+    ));
+    assert!(identity::btrtl_ic(
+        0x8822,
+        Some(0x000b),
+        &read(0x7, 0xb, 0x8822)
+    ));
+}
+#[test]
+fn an_event_no_command_awaits_fails_an_undropped_identification_closed() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8761Bu, true);
+    let mut response = vec![0xff, 2, 0x01, 0x02];
+    response.extend_from_slice(&hci.io.steps[2].response);
+    hci.io.steps[2].response = response;
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    assert!(matches!(
+        attempt(&e).0,
+        Error::Protocol {
+            requirement: "unexpected initialization event",
+            ..
+        }
+    ));
+    assert!(attempt(&e).1.dropped.is_none());
+    assert_eq!(trace.borrow().commands, 3);
+    assert_eq!(hci.state(), State::Closed);
+}
+/// An LE Advertising Report event (Core v5.4 Vol 4 Part E 7.7.65.2) of
+/// `reports`, each (address type, address, data length, RSSI).
+fn advertising(reports: &[(u8, [u8; 6], usize, i8)]) -> Vec<u8> {
+    let mut b = vec![0x3e, 0, 0x02, reports.len() as u8];
+    for &(kind, address, length, rssi) in reports {
+        b.extend_from_slice(&[0, kind]);
+        b.extend_from_slice(&address);
+        b.push(length as u8);
+        b.extend(core::iter::repeat_n(0x11, length));
+        b.push(rssi as u8);
+    }
+    b[1] = (b.len() - 2) as u8;
+    b
+}
+/// The scan's commands after an initialized fixture's, in order, with the
+/// scan-enable completion followed by `heard`.
+fn scan_steps(hci: &mut Hci<Model>, heard: &[Vec<u8>]) {
+    let mut add = |op: u16, p: &[u8], tail: &[Vec<u8>]| {
+        let mut response = cc(op, &[0]);
+        response.extend(tail.concat());
+        hci.io.steps.push_back(Step {
+            parameters: command(op, p),
+            response,
+        });
+    };
+    add(0x0c03, &[], &[]);
+    add(0x0c01, &[0xff, 0xff, 0xfb, 0xff, 0x01, 0, 0, 0x20], &[]);
+    add(0x2001, &[0x02, 0, 0, 0, 0, 0, 0, 0], &[]);
+    add(0x200b, &[0, 0x60, 0, 0x30, 0, 0, 0], &[]);
+    add(0x200c, &[1, 0], heard);
+    add(0x200c, &[0, 0], &[]);
+    add(0x0c03, &[], &[]);
+}
+const A: [u8; 6] = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6];
+const B: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+const C: [u8; 6] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+#[test]
+fn a_passive_le_scan_counts_advertisers_and_their_best_rssi_then_resets_and_closes() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    let commands = trace.borrow().commands;
+    let heard = [
+        advertising(&[(0, A, 3, -60), (1, B, 0, -45)]),
+        // A again, louder; C without an RSSI (127); A as a random address
+        // is another advertiser.
+        advertising(&[(0, A, 31, -40), (0, C, 5, 127), (1, A, 1, -90)]),
+        // Too long for legacy advertising data: dropped, as Linux drops it.
+        advertising(&[(0, C, 32, -20)]),
+        // Another event, counted alone.
+        vec![0x13, 1, 0],
+    ];
+    scan_steps(&mut hci, &heard);
+    let report = scan(&mut hci, 1_000_000).unwrap();
+    assert!(hci.io.steps.is_empty(), "every command in order");
+    assert_eq!(trace.borrow().commands, commands + 7);
+    assert_eq!(report.reports, 5);
+    assert_eq!(report.devices, 4);
+    assert!(!report.saturated);
+    assert_eq!(report.best_rssi, Some(-40));
+    assert_eq!(report.malformed, 1);
+    assert_eq!(report.other_events, 1);
+    assert_eq!(report.window_us, 1_000_000);
+    assert_eq!(hci.state(), State::Closed);
+    assert_eq!(trace.borrow().closed, 1);
+}
+#[test]
+fn a_scan_needs_the_retained_realtek_initialization_and_sends_nothing_else() {
+    let (mut hci, _, trace) = fixture(Project::Rtl8852Cu, true);
+    assert!(matches!(
+        scan(&mut hci, 1_000_000),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(trace.borrow().commands, 0);
+    // A failed initialization keeps nothing to scan with either.
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    assert!(
+        hci.initialize_with_provider(&empty, PlatformInputs::default())
+            .is_err()
+    );
+    let commands = trace.borrow().commands;
+    assert!(matches!(
+        scan(&mut hci, 1_000_000),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(trace.borrow().commands, commands);
+}
+#[test]
+fn a_refused_scan_command_fails_the_scan_and_closes_the_transport() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    scan_steps(&mut hci, &[]);
+    // LE Set Scan Parameters answered Command Disallowed.
+    hci.io.steps[3].response = cc(0x200b, &[0x0c]);
+    let e = scan(&mut hci, 1_000_000).unwrap_err();
+    assert!(matches!(
+        e,
+        Error::Controller {
+            opcode: 0x200b,
+            status: 0x0c,
+            ..
+        }
+    ));
+    assert_eq!(hci.io.steps.len(), 3);
+    assert_eq!(hci.state(), State::Closed);
+    assert_eq!(trace.borrow().closed, 1);
+}
+#[test]
+fn a_drop_that_could_not_be_sent_is_no_drop() {
+    let (mut hci, catalog, trace) = patched_fixture(&[]);
+    // The third command, 0xfc66, fails on the bus.
+    hci.io.fail_command = Some(3);
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    let (cause, a) = attempt(&e);
+    assert!(matches!(cause, Error::Transport(_)));
+    assert!(a.dropped.is_none());
+    // The readings that asked for the drop are kept as the attempt's own.
+    assert_eq!(
+        a.version.as_ref().unwrap().raw,
+        version(Project::Rtl8852Cu, true)[..]
+    );
+    assert_eq!(a.register_subversion, Some(0x8852));
+    assert_eq!(trace.borrow().commands, 3);
+}
+#[test]
+fn an_unanswered_command_is_waited_for_as_long_as_btrtls_hci_init_timeout() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8761Bu, true);
+    // The download is never answered.
+    hci.io.steps[4].response.clear();
+    let e = initialize(&mut hci, &catalog).unwrap_err();
+    assert!(matches!(
+        attempt(&e).0,
+        Error::Timeout("genuine command completion")
+    ));
+    // HCI_INIT_TIMEOUT, 10 s (hci.h:482), which every btrtl command uses.
+    let waited = hci.io.time.get() - trace.borrow().sent_at;
+    assert!((10_000_000..11_000_000).contains(&waited), "{waited} us");
+}
+
+#[test]
+fn an_unanswered_scan_command_is_waited_for_as_long_as_hci_cmd_timeout() {
+    let (mut hci, catalog, trace) = fixture(Project::Rtl8852Cu, true);
+    hci.initialize_with_provider(&catalog, PlatformInputs::default())
+        .unwrap();
+    scan_steps(&mut hci, &[]);
+    // LE Set Scan Parameters is never answered.
+    hci.io.steps[3].response.clear();
+    let e = scan(&mut hci, 1_000_000).unwrap_err();
+    assert!(matches!(e, Error::Timeout("genuine command completion")));
+    // HCI_CMD_TIMEOUT, 2 s (hci.h:483), which hci_sync's scan commands and
+    // btrtl's shutdown Reset use, not btrtl's own 10 s.
+    let waited = hci.io.time.get() - trace.borrow().sent_at;
+    assert!((2_000_000..2_500_000).contains(&waited), "{waited} us");
+    assert_eq!(hci.state(), State::Closed);
 }

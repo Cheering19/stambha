@@ -4,15 +4,21 @@
 //! See NOTICE for exact provenance and limits. Explicit initialization
 //! observes an exact USB/HCI/ROM/security profile, stages exact Provider images
 //! and requires real download completions and post-upload version/address.
+//! Readings no btrtl IC matches, as a warm reboot's running patch gives, are
+//! dropped once with 0xfc66 and read again, as `btrtl_initialize` does.
 //! This establishes observed protocol execution, never vendor authentication,
 //! radio validation or guest services. Generic firmware status is unchanged.
+//! [`scan()`] is a bounded passive LE scan through an initialized controller,
+//! for the host check; it counts advertisers and keeps no address.
 mod firmware;
 mod identity;
 mod initialize;
 pub mod media;
+mod scan;
 mod v2;
 pub use firmware::{Configuration, Fragment, Patch, Project, Staged};
-pub use identity::{Identity, LocalVersion, UsbIdentity};
+pub use identity::{Container, Identity, LocalVersion, UsbIdentity};
+pub use scan::{MAX_ADVERTISERS, ScanReport, scan};
 pub use v2::{ExtensionRecord, SectionObservation, SubsectionObservation, V2Metadata, V2Patch};
 
 /// Malformed or explicitly unsupported Realtek input. Parsing never emits a
@@ -64,18 +70,36 @@ pub struct DownloadResponse {
 /// acknowledged commands never credit a ready or successfully booted image.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attempt {
+    /// The first identification, when no btrtl IC matched it and 0xfc66
+    /// dropped the running patch; the fields below are the next one's.
+    pub dropped: Option<FirmwareDrop>,
     pub version: Option<LocalVersion>,
     pub register_subversion: Option<u16>,
     pub register_revision: Option<u16>,
     pub rom_version: Option<u8>,
     pub security: Option<[u8; 2]>,
     pub identity: Option<Identity>,
+    /// The absence of the profile's first image when a later one was asked
+    /// for (`Identity::firmware_images`, btrtl.c:1204-1209).
+    pub fallback: Option<crate::firmware::Error>,
     pub firmware: Option<FirmwareReceipt>,
     pub configuration: Option<core::result::Result<FirmwareReceipt, crate::firmware::Error>>,
     pub container_version: Option<ContainerVersion>,
     pub v2: Option<V2Metadata>,
     pub download: Vec<DownloadResponse>,
     pub after: Option<LocalVersion>,
+}
+/// A controller's first identification, which matched no btrtl IC, as a
+/// controller a warm reboot left running its patch reads, and what came in
+/// the 200 ms after the 0xfc66 that dropped the patch (btrtl.c:1140-1169).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareDrop {
+    pub register_subversion: u16,
+    pub register_revision: Option<u16>,
+    pub version: LocalVersion,
+    /// The wait's first events, whole; `event_count` counts all of them.
+    pub events: Vec<Vec<u8>>,
+    pub event_count: usize,
 }
 /// Container versions have different wire layouts. V2 keeps all eight raw
 /// bytes in their original order; no truncation or invented scalar endianness.
@@ -88,15 +112,23 @@ pub enum ContainerVersion {
 /// or vendor-signature authentication. No Image/provider/firmware-byte borrow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedReport {
+    /// The identification before 0xfc66 dropped a running patch, if any.
+    pub dropped: Option<Box<FirmwareDrop>>,
     pub before: Identity,
     pub after: LocalVersion,
     pub address: [u8; 6],
+    /// The absence of the profile's first image, when `firmware` is a later
+    /// one (btrtl.c:1204-1209).
+    pub fallback: Option<Box<crate::firmware::Error>>,
     pub firmware: Box<FirmwareReceipt>,
     pub configuration: ConfigurationEvidence,
     pub container_version: ContainerVersion,
     /// Validated v2 hierarchy/control observations, absent for a v1 container.
     pub v2: Option<V2Metadata>,
     pub download: Vec<DownloadResponse>,
+    /// The commands the controller's last completion let the host send,
+    /// which a later exchange ([`scan()`]) starts from.
+    pub credits: u8,
 }
 #[derive(Debug)]
 pub enum Error {

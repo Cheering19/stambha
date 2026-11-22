@@ -395,3 +395,126 @@ fn c852_chip_binding_falls_back() {
         assert!(select(&[request("realtek-wifi", name, hardware, revision)]).is_err());
     }
 }
+
+/// The Realtek USB Bluetooth driver's requests for a stock-ROM RTL8852CU
+/// at 13d3:3612 of ROM version `rom`, built as its `initialize` builds
+/// them: each image in btrtl's order with the config under its target.
+fn rtl8852cu_requests(rom: u8, security: [u8; 2]) -> Vec<Request> {
+    use stela_drivers::usb::bluetooth::realtek::{Identity, LocalVersion, Project, UsbIdentity};
+    let identity = Identity {
+        usb: UsbIdentity {
+            vendor: 0x13d3,
+            product: 0x3612,
+            revision: 0,
+        },
+        version: LocalVersion {
+            raw: [0, 0x0c, 0x0c, 0, 0x0c, 0x5d, 0, 0x52, 0x88],
+        },
+        register_subversion: 0x8852,
+        register_revision: None,
+        rom_version: rom,
+        security,
+        project: Project::Rtl8852Cu,
+    };
+    let hardware = identity.usb.hardware_label();
+    let mut requests = Vec::new();
+    for &(name, container) in identity.firmware_images() {
+        let revision = identity.revision_label_for(container);
+        let target = identity.target(container, &hardware, &revision);
+        for name in [name, identity.configuration_name()] {
+            requests.push(request(target.driver, name, &hardware, &revision));
+        }
+    }
+    requests
+}
+
+#[test]
+fn rtl8852cu_bluetooth_requests_bind_btrtls_two_images_and_the_linked_config() {
+    for rom in [0, 1] {
+        let requests = rtl8852cu_requests(rom, [0, 0x5a]);
+        let plan = select(&requests).unwrap();
+        assert_eq!(
+            plan.selections()
+                .iter()
+                .map(|selection| (
+                    selection.request.name.as_str(),
+                    selection.recipe.image.member
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("rtl_bt/rtl8852cu_fw_v2.bin", "rtl_bt/rtl8852cu_fw_v2.bin"),
+                ("rtl_bt/rtl8852cu_config.bin", "rtl_bt/rtl8761bu_config.bin"),
+                ("rtl_bt/rtl8852cu_fw.bin", "rtl_bt/rtl8852cu_fw.bin"),
+                ("rtl_bt/rtl8852cu_config.bin", "rtl_bt/rtl8761bu_config.bin"),
+            ]
+        );
+        for selection in plan.selections() {
+            assert_eq!(selection.recipe.image.revision, WIFI_FIRMWARE_REVISION);
+            assert_eq!(
+                selection.recipe.license.member,
+                "LICENSES/LICENCE.rtlwifi_firmware.txt"
+            );
+        }
+        // Three images, one notice.
+        assert_eq!(plan.artifacts().len(), 4);
+        assert_eq!(
+            REALTEK_BLUETOOTH
+                .iter()
+                .map(|recipe| (recipe.image.member, recipe.image.length))
+                .collect::<Vec<_>>(),
+            [
+                ("rtl_bt/rtl8852cu_fw_v2.bin", 112953),
+                ("rtl_bt/rtl8852cu_fw.bin", 113336),
+                ("rtl_bt/rtl8761bu_config.bin", 6),
+            ]
+        );
+    }
+    // A nonzero key, an image under the other container's driver, another
+    // chip's readings or file, or no USB hardware binds nothing.
+    let mut refused = rtl8852cu_requests(0, [1, 0]);
+    let stock = rtl8852cu_requests(0, [0, 0]);
+    let v2 = &stock[0];
+    let swap = |driver: &str| Request {
+        target: super::super::requirements::Identity {
+            driver: driver.into(),
+            ..v2.target.clone()
+        },
+        ..v2.clone()
+    };
+    refused.push(swap("realtek-bluetooth-usb-epatch-v1"));
+    refused.push(Request {
+        target: super::super::requirements::Identity {
+            driver: "realtek-bluetooth-usb-epatch-v2".into(),
+            ..stock[2].target.clone()
+        },
+        ..stock[2].clone()
+    });
+    refused.push(Request {
+        name: "rtl_bt/rtl8852bu_fw.bin".into(),
+        ..v2.clone()
+    });
+    refused.push(Request {
+        target: super::super::requirements::Identity {
+            revision: v2.target.revision.replace("hci-0c-000c", "hci-0b-000b"),
+            ..v2.target.clone()
+        },
+        ..v2.clone()
+    });
+    refused.push(Request {
+        target: super::super::requirements::Identity {
+            revision: format!("{}:extra", v2.target.revision),
+            ..v2.target.clone()
+        },
+        ..v2.clone()
+    });
+    refused.push(Request {
+        target: super::super::requirements::Identity {
+            hardware: "pci:10ec:c852".into(),
+            ..v2.target.clone()
+        },
+        ..v2.clone()
+    });
+    for request in &refused {
+        assert!(recipe(request).is_none(), "{request:?}");
+    }
+}
