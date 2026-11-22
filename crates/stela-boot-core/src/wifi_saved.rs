@@ -102,15 +102,38 @@ fn named_lines(file: &[u8]) -> impl Iterator<Item = (&[u8], Option<Vec<u8>>)> {
 /// name each line holds, whether or not its secret is usable, its secret
 /// never decoded; each name once.
 pub fn names(file: &[u8]) -> Vec<Vec<u8>> {
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    for (_, name) in named_lines(file) {
-        if let Some(name) = name.filter(|name| (1..=SSID_BYTES).contains(&name.len()))
-            && !names.contains(&name)
-        {
-            names.push(name);
+    listing(file)
+        .into_iter()
+        .map(|listed| listed.name)
+        .collect()
+}
+
+/// One saved network as the startup menu's Wi-Fi page lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    /// One to [`SSID_BYTES`] bytes, decoded.
+    pub name: Vec<u8>,
+    /// A line of it is one usable network ([`parse`]); its secret is
+    /// decoded to tell, and wiped, as [`parse`] does.
+    pub usable: bool,
+}
+
+/// The networks `file` saves, in order, each once: the names [`names`]
+/// gives, each with whether a line of it is one a boot can join.
+pub fn listing(file: &[u8]) -> Vec<Listed> {
+    let mut listed: Vec<Listed> = Vec::new();
+    for (line, name) in named_lines(file) {
+        let Some(name) = name.filter(|name| (1..=SSID_BYTES).contains(&name.len())) else {
+            continue;
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line).trim_ascii();
+        let usable = network(line).is_some();
+        match listed.iter_mut().find(|known| known.name == name) {
+            Some(known) => known.usable |= usable,
+            None => listed.push(Listed { name, usable }),
         }
     }
-    names
+    listed
 }
 
 /// `file` without the lines of the network `ssid`, as the menu forgets it
@@ -206,6 +229,36 @@ mod tests {
             super::names(file),
             [b"home".to_vec(), b"Mom's phone".to_vec()]
         );
+    }
+
+    #[test]
+    fn the_listing_tells_which_saved_keys_a_boot_can_use() {
+        let file = b"# mine\nhome bad\ncafe coffee-time\nhome secret-two\nlab short\n";
+        let listed = listing(file);
+        let names: Vec<(&[u8], bool)> = listed
+            .iter()
+            .map(|listed| (&listed.name[..], listed.usable))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (&b"home"[..], true),
+                (&b"cafe"[..], true),
+                (&b"lab"[..], false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_password_with_spaces_and_percent_signs_round_trips() {
+        let written = line(b"Cafe 5G", b"100% pass word");
+        let saved = parse(&written);
+        assert_eq!(saved.unusable, 0);
+        let Secret::Passphrase(phrase) = &saved.networks[0].secret else {
+            panic!("passphrase expected");
+        };
+        assert_eq!(phrase.as_bytes(), b"100% pass word");
+        assert_eq!(listing(&written)[0].name, b"Cafe 5G".to_vec());
     }
 
     #[test]

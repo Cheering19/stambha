@@ -112,19 +112,21 @@ impl Canvas {
         }
     }
 
+    /// One glyph a character ([`Font::index`]).
     pub fn text_width(&self, text: &str, size: usize) -> usize {
-        text.len() * self.font.width * size
+        text.chars().count() * self.font.width * size
     }
 
     /// `text` from (`x`, `y`) at `size` times the font.
     pub fn text(&mut self, x: usize, y: usize, text: &str, size: usize, colour: u32) {
         let s = self.scale * size;
         let (glyph_width, glyph_height) = (self.font.width, self.font.height);
-        for (index, character) in text.bytes().enumerate() {
+        for (index, character) in text.chars().enumerate() {
             let left = (x + index * glyph_width * size) * self.scale;
+            let glyph = self.font.index(character);
             for gy in 0..glyph_height {
                 for gx in 0..glyph_width {
-                    if self.font.pixel(character, gx, gy) {
+                    if self.font.set(glyph, gx, gy) {
                         self.device_fill(left + gx * s, y * self.scale + gy * s, s, s, colour);
                     }
                 }

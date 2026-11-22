@@ -108,6 +108,7 @@ pub mod posted_call;
 pub mod power_button;
 pub mod prediction_lines;
 pub mod process_fault;
+pub mod psf;
 pub mod ram;
 pub mod random;
 pub mod record;
@@ -141,6 +142,7 @@ pub mod usb_legacy;
 pub mod vfct;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod wifi_page;
 pub mod wifi_saved;
 pub mod work_status;
 pub mod worker_bindings;
