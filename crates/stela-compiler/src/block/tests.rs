@@ -2380,3 +2380,27 @@ fn direct_words_skip_the_block_decoders() {
     }
     assert!(direct > 100_000, "{direct}");
 }
+
+/// [`direct_words_skip_the_block_decoders`] for every word at each of
+/// [`crate::aarch64::tests::EVERY_WORD_PCS`]: none of the parse's own
+/// decoders takes a word `aarch64::skips_decoders` sends past them. Opt-in,
+/// in release: `cargo test -p stela-compiler --release --lib every_direct_word
+/// -- --ignored`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn every_direct_word_skips_the_block_decoders() {
+    let wrong = crate::aarch64::tests::first_wrong_word(|pc, word| {
+        crate::aarch64::skips_decoders(pc, word) && {
+            let synchronization = crate::aarch64::system::synchronization::decode(word);
+            synchronization.is_some()
+                || decode_pointer_authentication(pc, word) != Ok(None)
+                || system::decode_system_mode_with_sync(pc, word, synchronization) != Ok(None)
+                || decode_system_instruction(pc, word) != Ok(None)
+                || decode_clock_instruction(pc, word) != Ok(None)
+                || decode_thread_register_instruction(pc, word) != Ok(None)
+                || crate::amx::decode(pc, word) != Ok(None)
+                || decode_terminator(pc, word) != Ok(None)
+        }
+    });
+    assert_eq!(wrong, None);
+}

@@ -73,6 +73,58 @@ fn direct_classes_skip_no_decoder() {
     }
 }
 
+/// The PCs the checks of every word run at: the lowest, a page's, a user
+/// one, a kernel one and the highest, where branch and literal targets
+/// overflow.
+pub(crate) const EVERY_WORD_PCS: [u64; 5] = [
+    0,
+    0x1000,
+    0x1_0000_4000,
+    0xffff_fe00_0bbc_0000,
+    u64::MAX - 3,
+];
+
+/// The first word at each of [`EVERY_WORD_PCS`] that `wrong` holds for, of
+/// every 32-bit word, on all of the host's threads.
+pub(crate) fn first_wrong_word(
+    wrong: impl Fn(GuestAddress, u32) -> bool + Sync,
+) -> Option<(u64, u32)> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = (1u64 << 32).div_ceil(threads as u64);
+    let wrong = &wrong;
+    EVERY_WORD_PCS.into_iter().find_map(|pc| {
+        std::thread::scope(|scope| {
+            let workers: alloc::vec::Vec<_> = (0..threads as u64)
+                .map(|thread| {
+                    scope.spawn(move || {
+                        let end = ((thread + 1) * chunk).min(1 << 32);
+                        (thread * chunk..end)
+                            .map(|word| word as u32)
+                            .find(|&word| wrong(GuestAddress(pc), word))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .min()
+                .map(|word| (pc, word))
+        })
+    })
+}
+
+/// [`direct_classes_skip_no_decoder`] for every word at each of
+/// [`EVERY_WORD_PCS`]: no decoder before [`lift_integer`] takes a word
+/// [`skips_decoders`] sends there. Opt-in, in release: `cargo test -p
+/// stela-compiler --release --lib every_direct_word -- --ignored`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn every_direct_word_skips_every_decoder_before_the_integer_one() {
+    let wrong =
+        first_wrong_word(|pc, word| skips_decoders(pc, word) && taken_before_integer(pc, word));
+    assert_eq!(wrong, None);
+}
+
 #[test]
 fn synchronization_admits_only_context_independent_effects() {
     const YIELD_WORD: u32 = 0xd503_203f;

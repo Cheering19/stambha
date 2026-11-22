@@ -832,4 +832,4 @@ fn lift_integer(pc: GuestAddress, word: u32) -> Result<Operation, UnsupportedRea
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
