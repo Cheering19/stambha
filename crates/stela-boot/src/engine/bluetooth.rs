@@ -399,9 +399,19 @@ impl HostBluetooth {
         }
     }
 
+    /// Whether the lent controller's bridge fell back to the model, after
+    /// which nothing goes to the controller and nothing is taken from it.
+    fn fallen(&self) -> bool {
+        self.lend.is_some_and(|(fallback, _, _)| fallback.is_some())
+    }
+
     pub fn transmit(&mut self, packets: Vec<Outbound>) {
         // The model answers inside the guest's function.
         if self.failed || matches!(self.controller, Controller::Modeled) {
+            return;
+        }
+        if self.fallen() {
+            self.link.clear();
             return;
         }
         self.link.queue(packets);
@@ -418,7 +428,11 @@ impl HostBluetooth {
     /// What the controller has for the guest, at most `room` packets; the
     /// rest waits in the link for a later turn.
     pub fn receive(&mut self, room: usize) -> Vec<Packet> {
-        if self.failed || room == 0 || matches!(self.controller, Controller::Modeled) {
+        if self.failed
+            || room == 0
+            || self.fallen()
+            || matches!(self.controller, Controller::Modeled)
+        {
             return Vec::new();
         }
         // SAFETY: as in `transmit`.

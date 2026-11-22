@@ -113,7 +113,10 @@ impl Rig {
         self.chip.now = self.now;
         self.hci.set_time(self.now);
         let outbound: Vec<_> = core::iter::from_fn(|| self.hci.take()).collect();
-        if self.failed {
+        // As the engine: after a failure or the fallback the controller is
+        // left alone.
+        if self.failed || self.hci.fallback().is_some() {
+            self.link.clear();
             return;
         }
         self.link.queue(outbound);

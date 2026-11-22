@@ -597,9 +597,15 @@ impl Hci {
         self.state.capture.take()
     }
 
-    /// The next packet the guest sent for the host's controller.
+    /// The next packet the guest sent for the host's controller; none once
+    /// the bridge fell back, which drops what was still queued.
     pub fn take(&mut self) -> Option<Outbound> {
-        self.state.outbound.pop_front()
+        let state = &mut self.state;
+        if state.bridge.as_ref().is_some_and(|b| b.fallen().is_some()) {
+            state.outbound.clear();
+            return None;
+        }
+        state.outbound.pop_front()
     }
 
     /// An event from the host's controller for the guest. Dropped (and
@@ -1696,6 +1702,20 @@ mod tests {
         hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
         assert_eq!(hci.ready_at(EVENTS), None, "the stale answer is dropped");
         assert_eq!(hci.fallback(), None);
+    }
+
+    /// After the fallback nothing goes to the host's controller, not even a
+    /// command queued for it before.
+    #[test]
+    fn nothing_goes_to_the_controller_after_the_fallback() {
+        let mut hci = bridged();
+        hci.set_time(0);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        hci.set_time(bridge::DEADLINE);
+        assert!(hci.fallback().is_some());
+        assert_eq!(hci.take(), None, "the command queued before is dropped");
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert_eq!(hci.take(), None);
     }
 
     #[test]
