@@ -228,6 +228,19 @@ fn a_change_line_with_no_battery_says_the_smc_keeps_the_last_reading() {
 }
 
 #[test]
+fn a_held_reading_says_the_smc_shows_it_only_once_the_next_confirms_it() {
+    use alloc::{format, string::ToString};
+    let empty = PowerSnapshot::synthetic(0, TestState::Charging);
+    assert_eq!(
+        Held(&empty).to_string(),
+        format!(
+            "{empty} (held back: a fall to 0 without the firmware's critical bit, which the \
+             SMC shows once the next reading confirms it)"
+        )
+    );
+}
+
+#[test]
 fn the_reading_at_attach_counts_as_the_guests() {
     let relay = Relay::new();
     assert_eq!(relay.take(), None);

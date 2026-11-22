@@ -588,7 +588,8 @@ impl Smc {
     /// keys ([`battery`]) join the table, before the AP first reads it.
     /// Refused once the AP has read the table, which it keeps; without a
     /// reading of a battery with a percentage and a remaining and full
-    /// capacity, which would read 0, empty, to macOS; or a second time.
+    /// capacity, which would read 0, empty, to macOS, or with one at 0
+    /// (`BatteryState::missing`); or a second time.
     pub fn add_battery(&mut self, snapshot: &PowerSnapshot) -> Result<()> {
         if self.battery.is_some() {
             return Err(refuse!("the SMC already has the host's battery"));
@@ -641,6 +642,13 @@ impl Smc {
                 .value = value;
         }
         self.power_due(now_ms)
+    }
+
+    /// The latest reading fell to 0 without the firmware's critical bit, and
+    /// the battery's keys show the one before it until the next confirms it
+    /// ([`battery`]).
+    pub fn battery_held(&self) -> bool {
+        self.battery.as_ref().is_some_and(battery::Battery::held)
     }
 
     /// Queue the battery's notifications due at `now_ms`; when the next

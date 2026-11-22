@@ -12,12 +12,13 @@
 //!
 //! The reading at attach, and each later one that changes what macOS acts
 //! on (the AC adapter, the battery's status, percentage or critical flag),
-//! is a `POWER battery ...` line.
+//! is a `POWER battery ...` line, as is one the SMC holds back, a fall to 0
+//! without the firmware's critical bit.
 use super::{aml::HostAcpi, host, output, parallel};
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use stela_boot_core::options::Battery;
 use stela_drivers::platform::{
-    power_relay::{self, Attached, Change, Mode, Relay, Source},
+    power_relay::{self, Attached, Change, Held, Mode, Relay, Source},
     power_snapshot::{BatteryState, PowerSnapshot, Readings},
 };
 
@@ -67,16 +68,18 @@ pub(super) fn polled(failure: Option<&str>, took_ms: u64) {
         ));
     }
     if polled.recovered {
-        output::arguments(format_args!("POWER battery: the host's battery reads again\n"));
+        output::arguments(format_args!(
+            "POWER battery: the host's battery reads again\n"
+        ));
     }
 }
 
 /// Give the guest's SMC the battery `choice` names, before the guest starts:
 /// the synthetic battery, or the host's latest reading. A host reading
-/// without a percentage, a remaining or a full capacity would read as an
-/// empty battery, so the SMC keeps the Mac mini's keys, the line says why,
-/// and the service tries each new reading ([`serve`]) until macOS has read
-/// the SMC's key table or [`power_relay::WAIT_MILLIS`] pass. An install or
+/// without a percentage, a remaining or a full capacity, or at 0, would read
+/// as an empty battery, so the SMC keeps the Mac mini's keys, the line says
+/// why, and the service tries each new reading ([`serve`]) until macOS has
+/// read the SMC's key table or [`power_relay::WAIT_MILLIS`] pass. An install or
 /// restore (`installing`) runs Apple's restore ramdisk, which gets none.
 pub(super) fn attach(
     devices: &parallel::Board,
@@ -111,8 +114,8 @@ pub(super) fn attach(
             if let Some(missing) = missing(reading.as_ref()) {
                 output::arguments(format_args!(
                     "POWER battery: waiting up to {} s for a reading of the host's battery with \
-                     a percentage and a remaining and full capacity; this one has no {missing}; \
-                     until then the SMC answers as the Mac mini's\n",
+                     a percentage, a remaining and a full capacity and a charge above 0; this one \
+                     has no {missing}; until then the SMC answers as the Mac mini's\n",
                     power_relay::WAIT_MILLIS / 1000
                 ));
                 RELAY.wait(now_ms());
@@ -194,7 +197,8 @@ pub(super) fn serve(devices: &parallel::Board) {
         // takes what this one could not.
         let requests = devices
             .try_with(|devices| {
-                core::iter::from_fn(|| devices.take_smc_key_request()).collect::<alloc::vec::Vec<_>>()
+                core::iter::from_fn(|| devices.take_smc_key_request())
+                    .collect::<alloc::vec::Vec<_>>()
             })
             .unwrap_or_default();
         for request in requests {
@@ -205,21 +209,32 @@ pub(super) fn serve(devices: &parallel::Board) {
         return;
     }
     let next = devices.serve(|devices| match &turn.reading {
-        Some(reading) => devices.power_update(reading, now),
-        None => devices.power_due(now),
+        Some(reading) => devices
+            .power_update(reading, now)
+            .map(|next| (next, devices.power_held())),
+        None => devices.power_due(now).map(|next| (next, false)),
     });
-    match next {
-        Ok(next) => RELAY.delivered(next),
+    let held = match next {
+        Ok((next, held)) => {
+            RELAY.delivered(next);
+            held
+        }
         Err(error) => {
             RELAY.delivered(None);
             if !REFUSED.swap(true, Ordering::Relaxed) {
                 output::arguments(format_args!("POWER battery update refused: {error}\n"));
             }
+            false
         }
-    }
-    if let Some(reading) = turn.reading
-        && RELAY.changed(&reading)
-    {
+    };
+    let Some(reading) = turn.reading else {
+        return;
+    };
+    if held {
+        // Left out of the logged summary, so the reading that confirms it
+        // is logged as a change.
+        output::arguments(format_args!("POWER {}\n", Held(&reading)));
+    } else if RELAY.changed(&reading) {
         output::arguments(format_args!("POWER {}\n", Change(&reading)));
     }
 }

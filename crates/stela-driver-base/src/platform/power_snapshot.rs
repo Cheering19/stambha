@@ -29,7 +29,9 @@
 //! the battery discharges, the level ACPI names for an emergency shutdown,
 //! but only a Low above zero and below a tenth of the full capacity: a
 //! firmware's Low of the whole battery, or of 10-20%, would make it critical
-//! as soon as it discharges, and macOS shuts down at critical.
+//! as soon as it discharges, and macOS shuts down at critical. The bit is
+//! kept alone too (`critical_bit`), the firmware's own word where the
+//! remaining capacity the low one is held against is in doubt.
 //! The times are what the rate gives: the remaining capacity while it
 //! discharges, the capacity still to charge while it charges.
 use core::fmt;
@@ -180,6 +182,9 @@ pub struct BatteryState {
     pub time_to_empty_min: Option<u32>,
     pub time_to_full_min: Option<u32>,
     pub critical: bool,
+    /// The `_BST` critical bit alone, the firmware's own word, which
+    /// `critical` joins with a trusted low capacity.
+    pub critical_bit: bool,
     pub model: Name,
     pub serial: Name,
 }
@@ -273,6 +278,7 @@ impl BatteryState {
             && r.low_capacity
                 .zip(r.remaining_capacity)
                 .is_some_and(|(low, remaining)| remaining <= low);
+        let critical_bit = r.state.is_some_and(|state| state & CRITICAL != 0);
         Self {
             status,
             percent,
@@ -290,8 +296,8 @@ impl BatteryState {
             cycle_count: r.cycle_count,
             time_to_empty_min,
             time_to_full_min,
-            critical: r.state.is_some_and(|state| state & CRITICAL != 0)
-                || (status == Status::Discharging && low),
+            critical: critical_bit || (status == Status::Discharging && low),
+            critical_bit,
             model: r.model,
             serial: r.serial,
         }
@@ -299,8 +305,9 @@ impl BatteryState {
 
     /// What a reading needs before a guest may take it as its battery, the
     /// first it lacks: a percentage, a remaining and a full capacity in
-    /// mAh. Without any of them the guest would read 0, and macOS shuts
-    /// down on a battery it reads as empty.
+    /// mAh, and a charge above 0 ([`Self::reads_empty`]). Without any of
+    /// them the guest would read 0, and macOS shuts down on a battery it
+    /// reads as empty.
     pub fn missing(&self) -> Option<&'static str> {
         if self.percent.is_none() {
             Some("percentage")
@@ -308,9 +315,20 @@ impl BatteryState {
             Some("remaining capacity")
         } else if self.full_mah.is_none() {
             Some("full charge capacity")
+        } else if self.reads_empty() {
+            Some("charge above 0")
         } else {
             None
         }
+    }
+
+    /// A known percentage or remaining capacity of 0, which macOS reads as
+    /// an empty battery. A battery at its end reads so, but so does a
+    /// firmware's fixed `_BST` package before its EC answers, and a battery
+    /// pulled with no notification, whose `_BST` the timed reading still
+    /// runs (it runs `_BST` alone, not `_STA`).
+    pub fn reads_empty(&self) -> bool {
+        self.percent == Some(0) || self.remaining_mah == Some(0)
     }
 
     /// The warning and low capacities, for the line that attaches the

@@ -49,6 +49,15 @@
 //! `BCFW`, `CH0V`, `CHAS`, `B0BL`, `CHCR`, `BMDA`, the adapter detail keys
 //! and the diagnostics tables.
 //!
+//! A reading that falls to 0, a percentage or remaining charge of 0 where the
+//! keys showed more ([`BatteryState::reads_empty`]), without the firmware's
+//! `_BST` critical bit, is held back until the next reading confirms it: the
+//! keys keep the battery before it, and only the AC adapter follows. One
+//! such reading alone may be a firmware's fixed `_BST` package or a battery
+//! pulled with no notification, and macOS shuts down on a battery it reads
+//! as empty. With the bit it shows at once; a critical from the low capacity
+//! alone does not count, as it comes from the very 0 in doubt.
+//!
 //! `MSLD` is the lid: 1 byte, 1 closed and 0 open
 //! (`AppleSMCPMU::_sendLidStateToRootDomainGated`, 0x2db9590). AppleSMCPMU
 //! reads it only on a board whose `smc-pmu` has `has_lid_open_sensor`,
@@ -271,6 +280,9 @@ pub(super) struct Battery {
     /// What the keys show: the latest reading, each unknown value kept from
     /// the readings before it.
     shown: PowerSnapshot,
+    /// The latest reading fell to 0 without the firmware's critical bit, and
+    /// the keys kept the battery before it until another confirms it.
+    held: bool,
     /// The summary the last change was measured against.
     measured: Summary,
     /// When each notification last went out.
@@ -283,20 +295,30 @@ impl Battery {
     pub(super) fn new(snapshot: &PowerSnapshot) -> Self {
         Self {
             shown: *snapshot,
+            held: false,
             measured: snapshot.summary(),
             sent: [None; 2],
             pending: [false; 2],
         }
     }
 
-    /// A new reading: the values the keys take, by key. A change in the AC
-    /// adapter, or the battery turning critical, makes its notification
-    /// wait ([`Self::due`]).
+    /// A new reading: the values the keys take, by key. A fall to 0 without
+    /// the firmware's critical bit keeps the battery before it, the first
+    /// time ([`Self::held`]). A change in the AC adapter, or the battery
+    /// turning critical, makes its notification wait ([`Self::due`]).
     pub(super) fn update(&mut self, snapshot: &PowerSnapshot) -> Vec<(u32, Vec<u8>)> {
         let before = self.shown;
+        let falls = snapshot.battery.is_some_and(|next| {
+            next.reads_empty()
+                && !next.critical_bit
+                && before.battery.is_some_and(|shown| !shown.reads_empty())
+        });
+        // The second fall in a row confirms the first.
+        self.held = falls && !self.held;
+        let next = snapshot.battery.filter(|_| !self.held);
         self.shown = PowerSnapshot {
             ac_online: snapshot.ac_online.or(before.ac_online),
-            battery: match (snapshot.battery, before.battery) {
+            battery: match (next, before.battery) {
                 (Some(next), Some(before)) => Some(merge(next, before)),
                 (next, before) => next.or(before),
             },
@@ -311,6 +333,13 @@ impl Battery {
             .map(|&(name, _)| name)
             .zip(values(&self.shown))
             .collect()
+    }
+
+    /// The latest reading fell to 0 without the firmware's critical bit, and
+    /// the keys show the battery before it until the next reading confirms
+    /// it.
+    pub(super) fn held(&self) -> bool {
+        self.held
     }
 
     /// The notifications due at `now`, in order, given whether the AP takes

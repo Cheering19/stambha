@@ -67,8 +67,9 @@ pub enum Battery {
     /// The host's first ACPI battery and its AC adapter.
     Host,
     /// A synthetic battery, for a machine with none such as a virtual one:
-    /// `PERCENT,STATE`, 0 to 100 and `charging`, `discharging` (from
-    /// [`MIN_DISCHARGING_PERCENT`]) or `full`, which is only at 100.
+    /// `PERCENT,STATE`, 1 to 100 and `charging`, `discharging` (from
+    /// [`MIN_DISCHARGING_PERCENT`]) or `full`, which is only at 100. At 0 the
+    /// SMC takes no battery, as macOS shuts down on one it reads as empty.
     Test { percent: u8, state: TestState },
 }
 
@@ -78,7 +79,10 @@ pub const MIN_DISCHARGING_PERCENT: u8 = 5;
 impl Battery {
     fn parse_test(word: &str) -> Option<Self> {
         let (percent, state) = word.split_once(',')?;
-        let percent: u8 = percent.parse().ok().filter(|&percent| percent <= 100)?;
+        let percent: u8 = percent
+            .parse()
+            .ok()
+            .filter(|percent| (1..=100).contains(percent))?;
         let state = match state {
             "charging" => TestState::Charging,
             // Below 5% the discharging test battery is at or near its 3%

@@ -291,6 +291,10 @@ fn critical_is_the_firmware_bit_or_the_low_capacity_while_discharging() {
     assert!(with(CRITICAL, 1_000).critical);
     assert!(with(DISCHARGING, 150).critical);
     assert!(!with(DISCHARGING, 151).critical);
+    // The bit alone is the firmware's own word; the low capacity is not.
+    assert!(with(DISCHARGING | CRITICAL, 1_000).critical_bit);
+    assert!(with(CRITICAL, 1_000).critical_bit);
+    assert!(!with(DISCHARGING, 150).critical_bit);
     // At the low capacity on AC, charging: not critical.
     assert!(!with(CHARGING, 150).critical);
     // No low capacity, or a zero one, takes nothing from the bit.
@@ -350,6 +354,54 @@ fn a_reading_is_complete_with_a_percentage_a_remaining_and_a_full_capacity() {
             ..energy()
         }),
         Some("remaining capacity")
+    );
+}
+
+#[test]
+fn a_reading_at_0_is_no_battery_to_attach() {
+    let battery = |readings: Readings| BatteryState::from_readings(&readings, Some(true));
+    // A firmware's fixed `_BST` package before its EC answers, or a pulled
+    // battery: a remaining capacity of 0, so 0%.
+    let empty = battery(Readings {
+        remaining_capacity: Some(0),
+        ..charge()
+    });
+    assert_eq!((empty.percent, empty.remaining_mah), (Some(0), Some(0)));
+    assert!(empty.reads_empty());
+    assert_eq!(empty.missing(), Some("charge above 0"));
+    // 20 of 4800 mAh rounds to 0%, which macOS reads as empty too.
+    let rounded = battery(Readings {
+        remaining_capacity: Some(20),
+        ..charge()
+    });
+    assert_eq!(
+        (rounded.percent, rounded.remaining_mah),
+        (Some(0), Some(20))
+    );
+    assert_eq!(rounded.missing(), Some("charge above 0"));
+    // As is a remaining charge of 0 at any percentage.
+    let drained = BatteryState {
+        remaining_mah: Some(0),
+        ..battery(charge())
+    };
+    assert_eq!(drained.percent, Some(25));
+    assert_eq!(drained.missing(), Some("charge above 0"));
+    // 1% is a battery to attach.
+    let low = battery(Readings {
+        remaining_capacity: Some(48),
+        ..charge()
+    });
+    assert_eq!(low.percent, Some(1));
+    assert!(!low.reads_empty());
+    assert_eq!(low.missing(), None);
+    // An unknown value is named before a 0.
+    assert_eq!(
+        BatteryState {
+            full_mah: None,
+            ..empty
+        }
+        .missing(),
+        Some("full charge capacity")
     );
 }
 
@@ -622,6 +674,9 @@ fn the_test_battery_goes_through_the_same_conversion() {
     assert_eq!(battery.percent, Some(5));
     assert_eq!(battery.time_to_empty_min, Some(18));
     assert!(!battery.critical);
+    // The least percentage `--test-battery` charges at attaches.
+    let least = PowerSnapshot::synthetic(1, TestState::Charging);
+    assert_eq!(least.battery.unwrap().missing(), None);
 
     let full = PowerSnapshot::synthetic(100, TestState::Full);
     let battery = full.battery.unwrap();

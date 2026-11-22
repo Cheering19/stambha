@@ -443,6 +443,13 @@ impl AppleDevices {
         Ok(self.smc()?.power(snapshot, now_ms))
     }
 
+    /// The last reading [`Self::power_update`] gave fell to 0 without the
+    /// firmware's critical bit, and the SMC holds it back until the next
+    /// confirms it (`Smc::battery_held`).
+    pub fn power_held(&mut self) -> bool {
+        self.smc().is_ok_and(|smc| smc.battery_held())
+    }
+
     /// The next distinct missing key or write macOS asked of an SMC given
     /// the host's battery, for the log.
     pub fn take_smc_key_request(&mut self) -> Option<smc::KeyRequest> {

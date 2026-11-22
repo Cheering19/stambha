@@ -121,6 +121,7 @@ fn discharging() -> BatteryState {
         time_to_empty_min: Some(77),
         time_to_full_min: None,
         critical: false,
+        critical_bit: false,
         model: Name::new(b"A32-K55"),
         serial: Name::new(b"0123"),
     }
@@ -441,13 +442,23 @@ fn an_incomplete_reading_or_a_table_the_ap_has_read_keeps_the_mac_minis_keys() {
             full_mah: None,
             ..discharging()
         },
+        // A reading at 0, which macOS takes as an empty battery and shuts
+        // down at: a percentage or a remaining charge of 0.
+        BatteryState {
+            percent: Some(0),
+            ..discharging()
+        },
+        BatteryState {
+            remaining_mah: Some(0),
+            ..discharging()
+        },
     ] {
         let (mut smc, _) = mac_mini();
         let reading = PowerSnapshot {
             ac_online: Some(false),
             battery: Some(battery),
         };
-        assert!(smc.add_battery(&reading).is_err());
+        assert!(smc.add_battery(&reading).is_err(), "{battery:?}");
         assert!(smc.battery.is_none());
         assert_eq!(smc.keys.len() as u32, MAC_MINI_KEYS);
     }
@@ -495,6 +506,106 @@ fn the_first_reading_after_attach_that_lost_every_value_keeps_the_attached_ones(
     ] {
         assert_eq!(read(&mut smc, &sram, name), value);
     }
+}
+
+/// A reading at 0 on AC: a firmware's fixed `_BST` package, a pulled
+/// battery, or a battery at its end; `critical` with the firmware's bit.
+fn empty(critical: bool) -> PowerSnapshot {
+    PowerSnapshot {
+        ac_online: Some(true),
+        battery: Some(BatteryState {
+            status: Status::NotCharging,
+            percent: Some(0),
+            remaining_mah: Some(0),
+            current_ma: Some(0),
+            time_to_empty_min: None,
+            critical,
+            critical_bit: critical,
+            ..discharging()
+        }),
+    }
+}
+
+#[test]
+fn a_fall_to_0_without_the_critical_bit_shows_only_once_a_second_reading_confirms_it() {
+    let (mut smc, sram) = with_battery();
+    enable_notifications(&mut smc, &sram);
+    let shows = |smc: &mut Smc, percent: u8, remaining: u16| {
+        assert_eq!(read(smc, &sram, b"BUIC"), [percent]);
+        assert_eq!(read(smc, &sram, b"B0UC"), remaining.to_le_bytes());
+        assert_eq!(read(smc, &sram, b"B0RM"), remaining.to_le_bytes());
+    };
+    // One reading at 0 is held back: the keys keep the battery before it,
+    // and only the AC adapter follows.
+    smc.power(&empty(false), 10_000);
+    assert!(smc.battery_held());
+    shows(&mut smc, 73, 3_650);
+    assert_eq!(read(&mut smc, &sram, b"CHCE"), [1]);
+    assert_eq!(read(&mut smc, &sram, b"BCF0"), [0]);
+    // The AC adapter's notice goes out; no battery one.
+    assert_eq!(notifications(&mut smc), [0x18 | 0x7101_0101 << 32]);
+    // A second confirms it: the battery is empty.
+    smc.power(&empty(false), 40_000);
+    assert!(!smc.battery_held());
+    shows(&mut smc, 0, 0);
+    // Once shown, 0 stays shown.
+    smc.power(&empty(false), 70_000);
+    assert!(!smc.battery_held());
+    shows(&mut smc, 0, 0);
+
+    // A reading back above 0 in between ends the doubt, and the next fall
+    // waits for its own second reading.
+    let (mut smc, sram) = with_battery();
+    smc.power(&empty(false), 0);
+    smc.power(&on_battery(), 30_000);
+    assert!(!smc.battery_held());
+    smc.power(&empty(false), 60_000);
+    assert!(smc.battery_held());
+    assert_eq!(read(&mut smc, &sram, b"BUIC"), [73]);
+    // A remaining charge of 0 alone is a fall too.
+    let (mut smc, sram) = with_battery();
+    let drained = PowerSnapshot {
+        battery: Some(BatteryState {
+            remaining_mah: Some(0),
+            ..discharging()
+        }),
+        ..on_battery()
+    };
+    smc.power(&drained, 0);
+    assert!(smc.battery_held());
+    assert_eq!(read(&mut smc, &sram, b"B0UC"), 3_650u16.to_le_bytes());
+    // A critical from the low capacity alone is no word from the firmware:
+    // it comes from the very 0 in doubt.
+    let (mut smc, sram) = with_battery();
+    let low = PowerSnapshot {
+        ac_online: Some(false),
+        battery: Some(BatteryState {
+            status: Status::Discharging,
+            critical: true,
+            critical_bit: false,
+            ..empty(false).battery.unwrap()
+        }),
+    };
+    smc.power(&low, 0);
+    assert!(smc.battery_held());
+    assert_eq!(read(&mut smc, &sram, b"BCF0"), [0]);
+}
+
+#[test]
+fn a_fall_to_0_with_the_firmwares_critical_bit_shows_at_once() {
+    let (mut smc, sram) = with_battery();
+    enable_notifications(&mut smc, &sram);
+    let at = |smc: &mut Smc, name| read(smc, &sram, name);
+    smc.power(&empty(true), 10_000);
+    assert!(!smc.battery_held());
+    assert_eq!(at(&mut smc, b"BUIC"), [0]);
+    assert_eq!(at(&mut smc, b"B0UC"), [0, 0]);
+    assert_eq!(at(&mut smc, b"BCF0"), [1]);
+    // The AC adapter's notice and the battery turning critical.
+    assert_eq!(
+        notifications(&mut smc),
+        [0x18 | 0x7101_0101 << 32, 0x18 | 0x7102_0000 << 32]
+    );
 }
 
 #[test]

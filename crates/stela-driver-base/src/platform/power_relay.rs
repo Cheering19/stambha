@@ -381,5 +381,21 @@ impl fmt::Display for Change<'_> {
     }
 }
 
+/// The line of a reading the guest's SMC held back (`Smc::battery_held`):
+/// a fall to 0 without the firmware's critical bit, which it shows only once
+/// the next reading confirms it.
+pub struct Held<'a>(pub &'a PowerSnapshot);
+
+impl fmt::Display for Held<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (held back: a fall to 0 without the firmware's critical bit, which the SMC \
+             shows once the next reading confirms it)",
+            self.0
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;

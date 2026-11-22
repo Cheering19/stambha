@@ -414,7 +414,7 @@ fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
     );
     for (text, percent, state) in [
         ("80,charging", 80, TestState::Charging),
-        ("0,charging", 0, TestState::Charging),
+        ("1,charging", 1, TestState::Charging),
         ("5,discharging", 5, TestState::Discharging),
         ("100,full", 100, TestState::Full),
     ] {
@@ -451,6 +451,8 @@ fn the_battery_options_round_trip_and_refuse_a_second_or_a_malformed_one() {
         // capacity: critical at boot, and macOS shuts down.
         "4,discharging",
         "0,discharging",
+        // At 0 the SMC takes no battery: macOS shuts down on an empty one.
+        "0,charging",
     ] {
         let text = format!("--system --test-battery {value}");
         assert_eq!(
