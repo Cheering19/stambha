@@ -1127,7 +1127,7 @@ pub struct Machine<H: Host, D: Devices> {
     /// The AMX register operations the model completes alone, which no
     /// host kernel then touches, by number (bit n: bits 9:5 of the word
     /// equal to n): none by default, every one under `--amx-native off`
-    /// ([`Self::set_amx_native`]).
+    /// ([`Self::set_amx_model`]).
     amx_model: u32,
     /// The longest the waits of every PE in one `run` last in all, in
     /// host counter ticks, before it returns [`Stop::Waiting`]

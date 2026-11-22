@@ -255,7 +255,7 @@ pub struct AmxCell {
     pub forms: AmxForms,
     /// Bit n: the register operation numbered n (bits 9:5 of its word)
     /// runs on the model alone in blocks (`routines::complete`), as the
-    /// engine set it at native entry (`Machine::set_amx_native`).
+    /// engine set it at native entry (`Machine::set_amx_model`).
     pub model: u32,
 }
 

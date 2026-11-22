@@ -39,9 +39,71 @@ pub const GUEST_PES: &str = "--guest-pes";
 /// take the mode its EDID prefers.
 pub const DISPLAY_SIZE: &str = "--display-size";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
-/// Host kernels for AMX register operations (`--amx-native on|off`): on by
-/// default; off leaves every one to the reference model.
+/// Host kernels for AMX register operations (`--amx-native on|off|off:OPS`):
+/// on by default; off leaves every one to the reference model, `off:` and
+/// operations' mnemonics, comma separated, those ([`AmxModel`]).
 pub const AMX_NATIVE: &str = "--amx-native";
+
+/// [`AMX_NATIVE`]'s value: the AMX register operations the reference model
+/// completes alone, which no host kernel then touches, by number (bit n:
+/// bits 9:5 of the word equal to n). `on` is none, `off` every one and
+/// `off:fma16,vecfp` those named, so that a guest misbehaving under host
+/// kernels can be narrowed to an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmxModel(pub u32);
+
+impl AmxModel {
+    /// `on`: host kernels complete every operation they cover.
+    pub const NONE: Self = Self(0);
+    /// `off`: the model completes every operation.
+    pub const ALL: Self = Self(u32::MAX);
+
+    /// The register operations blocks complete through a routine, in
+    /// number order.
+    fn operations() -> impl Iterator<Item = stela_compiler::amx::AmxOperation> {
+        stela_compiler::amx::AmxOperation::ALL
+            .into_iter()
+            .filter(|&operation| stela_compiler::x86_64::amx_routine::calls(operation))
+    }
+
+    /// `on`, `off`, or `off:` and register operations' mnemonics (corsix's,
+    /// such as `fma32`), comma separated; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "on" => Some(Self::NONE),
+            "off" => Some(Self::ALL),
+            _ => text
+                .strip_prefix("off:")?
+                .split(',')
+                .try_fold(0, |bits, name| {
+                    let operation =
+                        Self::operations().find(|operation| operation.mnemonic() == name)?;
+                    Some(bits | 1 << operation.encoding().0)
+                })
+                .map(Self),
+        }
+    }
+}
+
+impl fmt::Display for AmxModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::NONE => f.write_str("on"),
+            Self::ALL => f.write_str("off"),
+            Self(bits) => {
+                f.write_str("off")?;
+                let mut separator = ':';
+                for operation in
+                    Self::operations().filter(|operation| bits >> operation.encoding().0 & 1 != 0)
+                {
+                    write!(f, "{separator}{}", operation.mnemonic())?;
+                    separator = ',';
+                }
+                Ok(())
+            }
+        }
+    }
+}
 /// Boots the installed system to its single-user shell.
 pub const SINGLE_USER: &str = "--single-user";
 /// Keeps the newest presented frame at one logged address.
@@ -301,8 +363,8 @@ pub struct System {
     /// (`--profile`).
     pub profile: bool,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
-    /// ([`Self::amx_native`]).
-    pub amx_native: Option<bool>,
+    /// ([`Self::amx_model`]).
+    pub amx_native: Option<AmxModel>,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -575,10 +637,10 @@ impl System {
         self.preboot.is_some() && !self.upgrade
     }
 
-    /// Host kernels complete AMX register operations, unless
-    /// `--amx-native off` leaves every one to the reference model.
-    pub fn amx_native(&self) -> bool {
-        self.amx_native != Some(false)
+    /// The AMX register operations the reference model completes alone:
+    /// none unless `--amx-native` names some or `off`.
+    pub fn amx_model(&self) -> AmxModel {
+        self.amx_native.unwrap_or(AmxModel::NONE)
     }
 
     /// Whether this boot hides the guest's AGX model (`sgx` and its `gfx-asc`
@@ -872,10 +934,7 @@ impl fmt::Display for System {
             self.native_rounds || self.native_shared_check || self.native_bootstrap_check;
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile)?;
-        line.value(
-            AMX_NATIVE,
-            self.amx_native.map(|on| if on { "on" } else { "off" }),
-        )?;
+        line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

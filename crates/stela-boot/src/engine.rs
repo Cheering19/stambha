@@ -1201,10 +1201,15 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_step_timing(options.profile);
-    machine.set_amx_native(options.amx_native());
-    if !options.amx_native() {
+    let amx_model = options.amx_model();
+    machine.set_amx_model(amx_model.0);
+    if amx_model == stela_boot_core::options::AmxModel::ALL {
         output::arguments(format_args!(
             "AMX NATIVE off: the reference model completes every AMX register operation\n"
+        ));
+    } else if amx_model != stela_boot_core::options::AmxModel::NONE {
+        output::arguments(format_args!(
+            "AMX NATIVE {amx_model}: the reference model completes those AMX register operations\n"
         ));
     }
     if options.profile {

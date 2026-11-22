@@ -727,3 +727,55 @@ fn published_amx_counts_hold_forms_only_under_step_timing() {
     machine.set_step_timing(true);
     assert_eq!(machine.amx_counts().forms.counts[3], [5, 5]);
 }
+
+/// `--amx-native off:fma16`: blocks and the service complete fma16 on the
+/// model alone and every other operation through the host's paths, which
+/// complete a copy natively.
+#[test]
+fn named_operations_alone_are_left_to_the_model() {
+    use stela_compiler::amx::Generation;
+    const FMA16: u32 = 0x0020_11e0;
+    let host = TargetCpu::detect();
+    let mut machine = machine(&[]);
+    machine.target = host;
+    machine.cpu.state.x[1] = 1 << 63;
+    machine.system_instruction(msr(AMX_CTL_EL1, 1)).unwrap();
+    machine.amx(SET).unwrap();
+    machine.set_amx_model(1 << 15);
+    machine.enter_amx_cell();
+    let amx = machine.cpu.amx.native;
+    assert_eq!(
+        amx.cell.routine,
+        super::routines::routine as *const () as usize as u64
+    );
+    assert_eq!(
+        (amx.cell.native, amx.model),
+        (Native::select(host), 1 << 15)
+    );
+    // A vector constant (bits 29:27 = 7), which every host path completes.
+    let operand = 1 << 63 | 7 << 27 | 3 << 20;
+    let cell = &raw mut machine.cpu.amx.native.cell;
+    for number in [15, 12] {
+        // SAFETY: the cell names the PE's live register file, which nothing
+        // else touches during the call, and is an AmxCell's.
+        let done = unsafe { super::routines::routine(cell, number, operand) };
+        assert_eq!(done, 1);
+    }
+    let kernels = machine.cpu.amx.native.cell.kernels;
+    assert_eq!((kernels[15], kernels[12]), ([0, 1], [1, 0]));
+    machine.set_step_timing(true);
+    for word in [FMA16, FMA32] {
+        machine.cpu.state.x[3] = operand;
+        machine.amx(word | 3).unwrap();
+    }
+    let counts = machine.statistics.amx_forms.counts;
+    let form = |operation| super::forms::key(operation, operand, Generation::M2).unwrap();
+    assert_eq!(
+        counts[form(stela_compiler::amx::AmxOperation::Fma16)],
+        [0, 1]
+    );
+    assert_eq!(
+        counts[form(stela_compiler::amx::AmxOperation::Fma32)],
+        [1, 0]
+    );
+}

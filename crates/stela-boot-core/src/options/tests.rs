@@ -191,7 +191,7 @@ fn every_option_survives_a_round_trip() {
     assert!(options.audio_own_hpet);
     assert!(options.display_trace);
     assert!(!System::default().display_trace);
-    assert!(!options.amx_native());
+    assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(
@@ -415,22 +415,40 @@ fn numbers_take_decimal_and_separated_hex() {
 #[test]
 fn amx_native_is_on_unless_turned_off() {
     let default = round_trip("--system");
-    assert!(default.amx_native());
+    assert_eq!(default.amx_model(), AmxModel::NONE);
     assert!(!default.to_string().contains(AMX_NATIVE));
     let off = round_trip(&format!("--system {AMX_NATIVE} off"));
-    assert!(!off.amx_native());
+    assert_eq!(off.amx_model(), AmxModel::ALL);
     assert!(off.to_string().contains("--amx-native off"));
-    assert!(round_trip(&format!("--system {AMX_NATIVE} on")).amx_native());
-    for (text, error) in [
-        ("--system --amx-native", Error::AmxNative),
-        ("--system --amx-native no", Error::AmxNative),
-        (
-            "--system --amx-native off --amx-native on",
-            Error::DuplicateAmxNative,
-        ),
+    assert_eq!(
+        round_trip(&format!("--system {AMX_NATIVE} on")).amx_model(),
+        AmxModel::NONE
+    );
+    // Named operations, by number, printed in number order.
+    let some = round_trip(&format!(
+        "--system {AMX_NATIVE} off:vecfp,fma16,fms16,fma16"
+    ));
+    assert_eq!(some.amx_model(), AmxModel(1 << 19 | 1 << 16 | 1 << 15));
+    assert!(
+        some.to_string()
+            .contains("--amx-native off:fma16,fms16,vecfp")
+    );
+    for text in [
+        "--system --amx-native",
+        "--system --amx-native no",
+        "--system --amx-native off:",
+        "--system --amx-native off:fma32,",
+        "--system --amx-native off:ldx",
+        "--system --amx-native off:set",
+        "--system --amx-native off:FMA32",
+        "--system --amx-native on:fma32",
     ] {
-        assert_eq!(System::parse(text), Err(error), "{text}");
+        assert_eq!(System::parse(text), Err(Error::AmxNative), "{text}");
     }
+    assert_eq!(
+        System::parse("--system --amx-native off --amx-native on"),
+        Err(Error::DuplicateAmxNative)
+    );
 }
 
 mod constraints;

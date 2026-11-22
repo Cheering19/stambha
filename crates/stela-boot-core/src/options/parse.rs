@@ -37,12 +37,8 @@ impl ParseState<'_> {
             "--serialized" => options.parallel = false,
             "--profile" => options.profile = true,
             AMX_NATIVE => {
-                let on = match value() {
-                    Some("on") => true,
-                    Some("off") => false,
-                    _ => return Err(Error::AmxNative),
-                };
-                if options.amx_native.replace(on).is_some() {
+                let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
+                if options.amx_native.replace(model).is_some() {
                     return Err(Error::DuplicateAmxNative);
                 }
             }

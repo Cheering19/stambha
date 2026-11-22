@@ -201,7 +201,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// blocks from their next native entry, the service at once. The code
     /// blocks hold is the same either way.
     pub fn set_amx_native(&mut self, on: bool) {
-        self.amx_model = if on { 0 } else { u32::MAX };
+        self.set_amx_model(if on { 0 } else { u32::MAX });
+    }
+
+    /// Leave the register operations whose numbers (bits 9:5 of the word)
+    /// `operations` sets to the reference model alone, and let host kernels
+    /// complete the rest (`--amx-native off:fma16,vecfp`): blocks from their
+    /// next native entry, the service at once.
+    pub fn set_amx_model(&mut self, operations: u32) {
+        self.amx_model = operations;
     }
 
     /// Host kernels may complete the register operation `operation`.
