@@ -643,7 +643,8 @@ impl Hci {
     }
 
     /// ACL data from the host's controller for the guest, dropped as an
-    /// event is, and while a bridge keeps the controller out.
+    /// event is, and always behind a bridge, which in milestone 1 lends no
+    /// connection (`bridge::Bridge::chip_acl`).
     pub fn deliver_acl(&mut self, packet: &[u8]) {
         if !self.up() {
             return;
@@ -1690,9 +1691,15 @@ mod tests {
             read(&mut hci, EVENTS, EVENT_PACKET),
             [vec![0x13, 5, 1, 1, 0, 1, 0]]
         );
-        // The controller's ACL data reaches the guest.
+        // The controller's ACL data names no connection the guest knows:
+        // it is captured and dropped.
+        let dropped = hci.bridge_counters().unwrap().dropped;
         hci.deliver_acl(&[2, 0, 1, 0, 8]);
-        assert_eq!(read(&mut hci, ACL_IN, 512), [vec![2, 0, 1, 0, 8]]);
+        assert_eq!(hci.ready_at(ACL_IN), None);
+        assert_eq!(hci.counters().acl_to_guest, 0);
+        assert_eq!(hci.bridge_counters().unwrap().dropped, dropped + 1);
+        let captured = hci.take_captured();
+        assert_eq!(captured.last().map(|c| c.direction), Some(FromChip));
         assert_eq!(hci.fallback(), None);
         // The trace names each command with its answer, whoever gave it.
         let traced = hci.take_trace();
@@ -1724,7 +1731,7 @@ mod tests {
             [COMMAND_COMPLETE, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 0x02]
         );
         let fallback = hci.fallback().expect("fell back");
-        assert_eq!(fallback.to_string(), "0x1009 no answer in 1 s");
+        assert_eq!(fallback.to_string(), "0x1009 no answer in 1000 ms");
         command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
         assert_eq!(hci.take(), None, "nothing goes out again");
         assert_eq!(

@@ -107,15 +107,50 @@ fn vendor_and_unlisted_commands_are_the_shadows() {
 #[test]
 fn the_forwarded_commands_are_standard_ones_the_model_lists() {
     let bitmap = super::super::model::supported_commands();
-    for (index, &(opcode, octet, bit, _)) in policy::FORWARDED.iter().enumerate() {
+    for (index, &(opcode, octet, bit, _, _)) in policy::FORWARDED.iter().enumerate() {
         assert!(!policy::vendor(opcode));
         assert!(super::super::model::implements(opcode), "{opcode:#06x}");
         assert_ne!(bitmap[usize::from(octet)] & 1 << bit, 0, "{opcode:#06x}");
-        for &(other, other_octet, other_bit, _) in &policy::FORWARDED[index + 1..] {
+        for &(other, other_octet, other_bit, _, _) in &policy::FORWARDED[index + 1..] {
             assert_ne!(other, opcode);
             assert_ne!((other_octet, other_bit), (octet, bit), "{opcode:#06x}");
         }
     }
+}
+
+/// A listed command goes to the controller only with its specification's
+/// parameter length; any other is the shadow's, so the controller never
+/// reads past what the guest sent or takes bytes no field names.
+#[test]
+fn a_listed_command_of_another_parameter_length_is_the_shadows() {
+    for &(opcode, _, _, length, _) in policy::FORWARDED {
+        let length = usize::from(length);
+        // Read Local Extended Features forwards pages 0 and 1.
+        let page = u8::from(opcode == 0x1004);
+        let mut parameters = vec![0; length];
+        if let Some(first) = parameters.first_mut() {
+            *first = page;
+        }
+        assert!(
+            policy::forward(&packet(opcode, &parameters)).is_some(),
+            "{opcode:#06x}"
+        );
+        for other in [length.wrapping_sub(1), length + 1] {
+            if other > 255 {
+                continue;
+            }
+            let wrong = packet(opcode, &vec![page; other]);
+            assert!(policy::forward(&wrong).is_none(), "{opcode:#06x} {other}");
+            let mut bridge = Bridge::new(ADDRESS);
+            for step in bridge.command(&wrong, 0) {
+                assert!(matches!(step, Step::Guest(_)), "{opcode:#06x} {other}");
+            }
+        }
+    }
+    // A header that disagrees with the packet's length.
+    let mut mask = packet(0x0c01, &[0xff; 8]);
+    mask[2] = 7;
+    assert!(policy::forward(&mask).is_none());
 }
 
 #[test]
@@ -181,7 +216,7 @@ fn a_deadline_gives_the_shadows_answer_and_falls_back_for_good() {
     );
     assert_eq!(
         bridge.fallen().unwrap().to_string(),
-        "0x0c03 no answer in 1 s"
+        "0x0c03 no answer in 1000 ms"
     );
     // The late answer, and every event after, is dropped.
     assert!(
@@ -542,20 +577,77 @@ fn the_shadow_follows_the_controllers_procedures_and_address() {
 
 /// In milestone 1 every connection is the shadow's, so ACL data from the
 /// guest names none of the controller's: the shadow returns its buffer.
-/// The controller's ACL data reaches the guest while the bridge forwards.
+/// The controller's ACL data names none the guest knows, so it is dropped,
+/// whether the bridge forwards, keeps the controller out or fell back.
 #[test]
-fn acl_from_the_guest_is_the_shadows_and_the_controllers_passes() {
+fn acl_from_the_guest_is_the_shadows_and_the_controllers_is_dropped() {
     let mut bridge = Bridge::new(ADDRESS);
     assert_eq!(
         events(bridge.acl(&[0x40, 0x20, 2, 0, 9, 9])),
         [vec![0x13, 5, 1, 0x40, 0, 1, 0]]
     );
-    assert!(bridge.chip_acl());
+    assert!(!bridge.chip_acl());
     bridge.resync();
-    assert!(!bridge.chip_acl(), "until the next reset");
+    assert!(!bridge.chip_acl());
     let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0c03, &[]), 0));
+    events(bridge.chip_event(&complete(0x0c03, 1, 0, &[]), 0));
+    assert!(!bridge.chip_acl(), "after the reset is answered too");
     events(bridge.chip_failed(0));
     assert!(!bridge.chip_acl());
+    assert_eq!(bridge.counters().dropped, 2);
+    assert_eq!(bridge.counters().passed, 1, "the reset's answer alone");
+}
+
+/// A Hardware Error says the controller's firmware failed: the bridge falls
+/// back, the command in flight gets the shadow's answer and the procedures
+/// the controller ran end, and the guest, whose controller the model now
+/// is, never sees the error.
+#[test]
+fn a_hardware_error_falls_back_with_the_answer_in_flight() {
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]), 0));
+    events(bridge.chip_event(&status(0x0401, 1, 0), 0));
+    chip(bridge.command(&packet(0x0c14, &[]), 0));
+    let steps = events(bridge.chip_event(&[0x10, 1, 0x2a], 0));
+    assert_eq!(steps.len(), 2, "{steps:02x?}");
+    assert_eq!(steps[0][..6], [COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0]);
+    assert_eq!(steps[1], [0x01, 1, 0], "the inquiry ends");
+    assert!(steps.iter().all(|e| e[0] != 0x10));
+    let fallback = bridge.fallen().expect("fell back");
+    assert_eq!(
+        (fallback.opcode, fallback.cause),
+        (Some(0x0c14), Cause::HardwareError(0x2a))
+    );
+    assert_eq!(
+        fallback.to_string(),
+        "0x0c14 the host controller reported Hardware Error 0x2a"
+    );
+    // Nothing reaches the controller again.
+    events(bridge.command(&packet(0x0c03, &[]), 0));
+    // Between commands, and while the controller is kept out, alike.
+    let mut bridge = Bridge::new(ADDRESS);
+    bridge.resync();
+    assert!(events(bridge.chip_event(&[0x10, 1, 0], 0)).is_empty());
+    assert_eq!(
+        bridge.fallen().map(|f| (f.opcode, f.cause)),
+        Some((None, Cause::HardwareError(0)))
+    );
+}
+
+/// The log's words for the deadline and the restarts are the constants'.
+#[test]
+fn the_causes_name_the_deadline_and_restarts_the_bridge_uses() {
+    assert_eq!(DEADLINE_MS * FREQUENCY_HZ, DEADLINE * 1000);
+    assert_eq!(
+        Cause::Timeout.to_string(),
+        alloc::format!("no answer in {DEADLINE_MS} ms")
+    );
+    assert!(
+        Cause::Restarted
+            .to_string()
+            .contains(&alloc::format!("controller {RESTARTS} times after"))
+    );
 }
 
 /// A fallback ends what the controller was running: the guest saw the
@@ -636,7 +728,7 @@ fn bluetoothd_restarting_twice_after_its_start_up_falls_back() {
     );
     assert_eq!(
         fallback.to_string(),
-        "0x0c03 bluetoothd reset the controller twice after its start-up, \
+        "0x0c03 bluetoothd reset the controller 2 times after its start-up, \
          as it does when it rejects the bring-up"
     );
     assert_eq!(bridge.counters().restarts, 2);

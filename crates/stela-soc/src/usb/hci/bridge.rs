@@ -25,10 +25,11 @@
 //!   controller.
 //! - The controller's events reach the guest as they are, but for its
 //!   vendor events, credits alone and answers to commands no longer in
-//!   flight, which are dropped. After a guest bus reset or a new
-//!   configuration, which reach the shadow but never the controller (a USB
-//!   reset would lose its patched firmware), its events stay out until the
-//!   guest's next HCI Reset is answered.
+//!   flight, which are dropped, and a Hardware Error, which falls back. Its
+//!   ACL data is dropped: milestone 1 lends no connection. After a guest
+//!   bus reset or a new configuration, which reach the shadow but never the
+//!   controller (a USB reset would lose its patched firmware), its events
+//!   stay out until the guest's next HCI Reset is answered.
 //! - The owner carries packets to and from the controller through a
 //!   [`Link`] and the [`HostController`] trait.
 use super::model::Model;
@@ -73,6 +74,10 @@ pub enum Cause {
     Malformed,
     /// The host's controller failed.
     HostFailed,
+    /// The host's controller reported a Hardware Error with this code
+    /// (Vol 4 Part E 7.7.16): its firmware has failed, and whatever it was
+    /// running is lost.
+    HardwareError(u8),
     /// bluetoothd reset the controller [`RESTARTS`] times after its
     /// start-up: it restarts so when it rejects the bring-up's answers, and
     /// Setup's first screen waits for it.
@@ -83,16 +88,23 @@ pub enum Cause {
 /// falls back: one restart passes, the second is the model's.
 pub const RESTARTS: u64 = 2;
 
+/// [`DEADLINE`] in milliseconds, as the log says it.
+pub const DEADLINE_MS: u64 = DEADLINE * 1000 / FREQUENCY_HZ;
+
 impl fmt::Display for Cause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Timeout => f.write_str("no answer in 1 s"),
+            Self::Timeout => write!(f, "no answer in {DEADLINE_MS} ms"),
             Self::Refused(status) => write!(f, "status {status:#04x} where the model succeeds"),
             Self::Malformed => f.write_str("an answer of another kind or length than the model's"),
             Self::HostFailed => f.write_str("the host controller failed"),
-            Self::Restarted => f.write_str(
-                "bluetoothd reset the controller twice after its start-up, \
-                 as it does when it rejects the bring-up",
+            Self::HardwareError(code) => {
+                write!(f, "the host controller reported Hardware Error {code:#04x}")
+            }
+            Self::Restarted => write!(
+                f,
+                "bluetoothd reset the controller {RESTARTS} times after its start-up, \
+                 as it does when it rejects the bring-up"
             ),
         }
     }
@@ -194,6 +206,8 @@ enum Running {
 }
 /// A vendor's own event (7.7.65 leaves code 0xFF to vendors).
 const VENDOR_EVENT: u8 = 0xff;
+/// Hardware Error (7.7.16): the controller's firmware failed.
+const HARDWARE_ERROR: u8 = 0x10;
 
 /// The parts of a Command Complete or Command Status event that answers a
 /// command, with its status.
@@ -307,15 +321,13 @@ impl Bridge {
         guest(self.shadow.acl(packet))
     }
 
-    /// Whether ACL data from the controller reaches the guest.
+    /// Whether ACL data from the controller reaches the guest: never in
+    /// milestone 1, which lends no connection. The guest's connections are
+    /// all the shadow's, so the controller's data names none the guest
+    /// knows, and its handle could be one of the shadow's.
     pub fn chip_acl(&mut self) -> bool {
-        let passes = self.fallen.is_none() && !self.resync;
-        if passes {
-            self.counters.passed += 1;
-        } else {
-            self.counters.dropped += 1;
-        }
-        passes
+        self.counters.dropped += 1;
+        false
     }
 
     /// Why the bridge fell back to the model, once it has.
@@ -456,11 +468,18 @@ impl Bridge {
     /// One event from the host's controller. The answer to the command in
     /// flight becomes the guest's; a vendor event, credits alone or a stale
     /// answer is dropped, as is everything while the controller is kept out
-    /// or after the fallback; every other event reaches the guest as it is.
+    /// or after the fallback; a Hardware Error falls back, and the guest,
+    /// whose controller the model now is, never sees it; every other event
+    /// reaches the guest as it is.
     pub fn chip_event(&mut self, event: &[u8], now: u64) -> Vec<Step> {
         if self.fallen.is_some() || event.first() == Some(&VENDOR_EVENT) {
             self.counters.dropped += 1;
             return Vec::new();
+        }
+        if event.first() == Some(&HARDWARE_ERROR) {
+            self.counters.dropped += 1;
+            let code = event.get(2).copied().unwrap_or(0);
+            return self.fall(Cause::HardwareError(code), now);
         }
         if completes(event) {
             // Every completion gives the controller's credits, a stale one

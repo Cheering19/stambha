@@ -104,62 +104,64 @@ impl Merge {
 }
 
 /// The standard commands milestone 1 forwards (opcode, Supported Commands
-/// octet and bit of Bluetooth Core v5.4 Vol 4 Part E 6.27, kind). Each is
-/// one the model implements and lists.
-pub const FORWARDED: &[(u16, u8, u8, Forward)] = &[
+/// octet and bit of Bluetooth Core v5.4 Vol 4 Part E 6.27, parameter length
+/// of 7.1-7.8, kind). Each is one the model implements and lists. A command
+/// of another parameter length is the shadow's: the controller is never
+/// sent what its specification does not describe.
+pub const FORWARDED: &[(u16, u8, u8, u8, Forward)] = &[
     // Link control: inquiry and remote names.
-    (0x0401, 0, 0, Forward::Procedure), // Inquiry
-    (0x0402, 0, 1, Forward::Procedure), // Inquiry Cancel
-    (0x0419, 2, 3, Forward::Procedure), // Remote Name Request
-    (0x041a, 2, 4, Forward::Procedure), // Remote Name Request Cancel
+    (0x0401, 0, 0, 5, Forward::Procedure),  // Inquiry
+    (0x0402, 0, 1, 0, Forward::Procedure),  // Inquiry Cancel
+    (0x0419, 2, 3, 10, Forward::Procedure), // Remote Name Request
+    (0x041a, 2, 4, 6, Forward::Procedure),  // Remote Name Request Cancel
     // Link policy.
-    (0x080e, 5, 3, Forward::Strict), // Read Default Link Policy Settings
-    (0x080f, 5, 4, Forward::Strict), // Write Default Link Policy Settings
+    (0x080e, 5, 3, 0, Forward::Strict), // Read Default Link Policy Settings
+    (0x080f, 5, 4, 2, Forward::Strict), // Write Default Link Policy Settings
     // Controller and baseband.
-    (0x0c01, 5, 6, Forward::Strict),  // Set Event Mask
-    (0x0c03, 5, 7, Forward::Strict),  // Reset
-    (0x0c13, 7, 0, Forward::Strict),  // Write Local Name
-    (0x0c14, 7, 1, Forward::Strict),  // Read Local Name
-    (0x0c15, 7, 2, Forward::Strict),  // Read Connection Accept Timeout
-    (0x0c16, 7, 3, Forward::Strict),  // Write Connection Accept Timeout
-    (0x0c17, 7, 4, Forward::Strict),  // Read Page Timeout
-    (0x0c18, 7, 5, Forward::Strict),  // Write Page Timeout
-    (0x0c1b, 8, 0, Forward::Strict),  // Read Page Scan Activity
-    (0x0c1c, 8, 1, Forward::Strict),  // Write Page Scan Activity
-    (0x0c1d, 8, 2, Forward::Strict),  // Read Inquiry Scan Activity
-    (0x0c1e, 8, 3, Forward::Strict),  // Write Inquiry Scan Activity
-    (0x0c1f, 8, 4, Forward::Strict),  // Read Authentication Enable
-    (0x0c20, 8, 5, Forward::Strict),  // Write Authentication Enable
-    (0x0c23, 9, 0, Forward::Strict),  // Read Class Of Device
-    (0x0c24, 9, 1, Forward::Strict),  // Write Class Of Device
-    (0x0c25, 9, 2, Forward::Strict),  // Read Voice Setting
-    (0x0c26, 9, 3, Forward::Strict),  // Write Voice Setting
-    (0x0c42, 12, 4, Forward::Strict), // Read Inquiry Scan Type
-    (0x0c43, 12, 5, Forward::Strict), // Write Inquiry Scan Type
-    (0x0c44, 12, 6, Forward::Strict), // Read Inquiry Mode
-    (0x0c45, 12, 7, Forward::Strict), // Write Inquiry Mode
-    (0x0c46, 13, 0, Forward::Strict), // Read Page Scan Type
-    (0x0c47, 13, 1, Forward::Strict), // Write Page Scan Type
-    (0x0c51, 17, 0, Forward::Strict), // Read Extended Inquiry Response
-    (0x0c52, 17, 1, Forward::Strict), // Write Extended Inquiry Response
-    (0x0c55, 17, 5, Forward::Strict), // Read Simple Pairing Mode
-    (0x0c56, 17, 6, Forward::Strict), // Write Simple Pairing Mode
-    (0x0c58, 18, 0, Forward::Strict), // Read Inquiry Response Transmit Power Level
-    (0x0c5a, 18, 2, Forward::Strict), // Read Default Erroneous Data Reporting
-    (0x0c5b, 18, 3, Forward::Strict), // Write Default Erroneous Data Reporting
-    (0x0c63, 22, 2, Forward::Strict), // Set Event Mask Page 2
-    (0x0c6c, 24, 5, Forward::Strict), // Read LE Host Support
-    (0x0c6d, 24, 6, Forward::Strict), // Write LE Host Support
+    (0x0c01, 5, 6, 8, Forward::Strict),    // Set Event Mask
+    (0x0c03, 5, 7, 0, Forward::Strict),    // Reset
+    (0x0c13, 7, 0, 248, Forward::Strict),  // Write Local Name
+    (0x0c14, 7, 1, 0, Forward::Strict),    // Read Local Name
+    (0x0c15, 7, 2, 0, Forward::Strict),    // Read Connection Accept Timeout
+    (0x0c16, 7, 3, 2, Forward::Strict),    // Write Connection Accept Timeout
+    (0x0c17, 7, 4, 0, Forward::Strict),    // Read Page Timeout
+    (0x0c18, 7, 5, 2, Forward::Strict),    // Write Page Timeout
+    (0x0c1b, 8, 0, 0, Forward::Strict),    // Read Page Scan Activity
+    (0x0c1c, 8, 1, 4, Forward::Strict),    // Write Page Scan Activity
+    (0x0c1d, 8, 2, 0, Forward::Strict),    // Read Inquiry Scan Activity
+    (0x0c1e, 8, 3, 4, Forward::Strict),    // Write Inquiry Scan Activity
+    (0x0c1f, 8, 4, 0, Forward::Strict),    // Read Authentication Enable
+    (0x0c20, 8, 5, 1, Forward::Strict),    // Write Authentication Enable
+    (0x0c23, 9, 0, 0, Forward::Strict),    // Read Class Of Device
+    (0x0c24, 9, 1, 3, Forward::Strict),    // Write Class Of Device
+    (0x0c25, 9, 2, 0, Forward::Strict),    // Read Voice Setting
+    (0x0c26, 9, 3, 2, Forward::Strict),    // Write Voice Setting
+    (0x0c42, 12, 4, 0, Forward::Strict),   // Read Inquiry Scan Type
+    (0x0c43, 12, 5, 1, Forward::Strict),   // Write Inquiry Scan Type
+    (0x0c44, 12, 6, 0, Forward::Strict),   // Read Inquiry Mode
+    (0x0c45, 12, 7, 1, Forward::Strict),   // Write Inquiry Mode
+    (0x0c46, 13, 0, 0, Forward::Strict),   // Read Page Scan Type
+    (0x0c47, 13, 1, 1, Forward::Strict),   // Write Page Scan Type
+    (0x0c51, 17, 0, 0, Forward::Strict),   // Read Extended Inquiry Response
+    (0x0c52, 17, 1, 241, Forward::Strict), // Write Extended Inquiry Response
+    (0x0c55, 17, 5, 0, Forward::Strict),   // Read Simple Pairing Mode
+    (0x0c56, 17, 6, 1, Forward::Strict),   // Write Simple Pairing Mode
+    (0x0c58, 18, 0, 0, Forward::Strict),   // Read Inquiry Response Transmit Power Level
+    (0x0c5a, 18, 2, 0, Forward::Strict),   // Read Default Erroneous Data Reporting
+    (0x0c5b, 18, 3, 1, Forward::Strict),   // Write Default Erroneous Data Reporting
+    (0x0c63, 22, 2, 8, Forward::Strict),   // Set Event Mask Page 2
+    (0x0c6c, 24, 5, 0, Forward::Strict),   // Read LE Host Support
+    (0x0c6d, 24, 6, 2, Forward::Strict),   // Write LE Host Support
     // Informational: the capabilities, merged, and the controller's own
     // address.
-    (0x1002, 14, 4, Forward::Merge(Merge::Commands)), // Read Local Supported Commands
-    (0x1003, 14, 5, Forward::Merge(Merge::Features)), // Read Local Supported Features
-    (0x1004, 14, 6, Forward::Merge(Merge::ExtendedFeatures)), // Read Local Extended Features
-    (0x1005, 14, 7, Forward::Merge(Merge::Buffers)),  // Read Buffer Size
-    (0x1009, 15, 1, Forward::Strict),                 // Read BD_ADDR
+    (0x1002, 14, 4, 0, Forward::Merge(Merge::Commands)), // Read Local Supported Commands
+    (0x1003, 14, 5, 0, Forward::Merge(Merge::Features)), // Read Local Supported Features
+    (0x1004, 14, 6, 1, Forward::Merge(Merge::ExtendedFeatures)), // Read Local Extended Features
+    (0x1005, 14, 7, 0, Forward::Merge(Merge::Buffers)),  // Read Buffer Size
+    (0x1009, 15, 1, 0, Forward::Strict),                 // Read BD_ADDR
     // LE: the event mask and the features, merged.
-    (0x2001, 25, 0, Forward::Strict), // LE Set Event Mask
-    (0x2003, 25, 2, Forward::Merge(Merge::LeFeatures)), // LE Read Local Supported Features
+    (0x2001, 25, 0, 8, Forward::Strict), // LE Set Event Mask
+    (0x2003, 25, 2, 0, Forward::Merge(Merge::LeFeatures)), // LE Read Local Supported Features
 ];
 
 /// The Supported Commands bits of [`FORWARDED`].
@@ -167,7 +169,7 @@ const FORWARD_MASK: [u8; 64] = {
     let mut mask = [0; 64];
     let mut i = 0;
     while i < FORWARDED.len() {
-        let (_, octet, bit, _) = FORWARDED[i];
+        let (_, octet, bit, _, _) = FORWARDED[i];
         mask[octet as usize] |= 1 << bit;
         i += 1;
     }
@@ -211,13 +213,17 @@ pub fn vendor(opcode: u16) -> bool {
 }
 
 /// `packet`, a whole command, as one for the host's controller, and how its
-/// answer becomes the guest's; `None` for a command the shadow answers.
+/// answer becomes the guest's; `None` for a command the shadow answers,
+/// which a listed command of another parameter length is.
 pub fn forward(packet: &[u8]) -> Option<(ChipCommand, Forward)> {
     let opcode = u16::from_le_bytes([*packet.first()?, *packet.get(1)?]);
     if vendor(opcode) {
         return None;
     }
-    let &(_, _, _, kind) = FORWARDED.iter().find(|entry| entry.0 == opcode)?;
+    let &(_, _, _, length, kind) = FORWARDED.iter().find(|entry| entry.0 == opcode)?;
+    if packet.len() != 3 + usize::from(length) || packet[2] != length {
+        return None;
+    }
     if opcode == READ_EXTENDED_FEATURES && packet.get(3).is_none_or(|&page| page > 1) {
         return None;
     }
