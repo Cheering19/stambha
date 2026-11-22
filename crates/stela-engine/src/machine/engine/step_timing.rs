@@ -3,7 +3,9 @@
 //! The host supplies the clock ([`super::Host::profile_ticks`]); while off,
 //! each phase boundary costs one branch.
 
+pub mod pc_samples;
 mod regions;
+pub use pc_samples::{BlockSample, NO_BLOCK, PcBlock, PcHit, PcSamples};
 pub use regions::{CodeRegion, block_regions, pointer_service_calls};
 
 /// Words of a PE's PAC census (`Statistics` `pac_census`): cipher runs by

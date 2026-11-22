@@ -5332,5 +5332,15 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of the xHCI schedule scan; run on request"
+  },
+  {
+    "package": "xtask",
+    "test": "a_real_cache_names_its_own_functions_back",
+    "source": "xtask/src/symbolize/code.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_SYMBOLIZE_DSC"
+    ],
+    "reason": "requires the guest's own dyld shared cache (its main file or directory, with its subcaches and .symbols) in STELA_SYMBOLIZE_DSC; checks that its page keys and symbols name its functions back"
   }
 ]

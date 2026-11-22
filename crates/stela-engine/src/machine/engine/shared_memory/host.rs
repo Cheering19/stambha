@@ -436,6 +436,12 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     ) {
         self.local.profile_code(code, bytes, regions);
     }
+    fn profile_blocks(
+        &mut self,
+        into: &mut [crate::machine::engine::step_timing::BlockSample],
+    ) -> usize {
+        self.local.profile_blocks(into)
+    }
     fn translations(&mut self) -> Option<&mut dyn crate::machine::Translations> {
         self.local.translations()
     }

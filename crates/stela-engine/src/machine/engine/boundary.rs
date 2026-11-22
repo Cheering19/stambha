@@ -543,6 +543,16 @@ pub trait Host {
         _regions: &[(u32, step_timing::CodeRegion)],
     ) {
     }
+    /// Under `--profile`, after a native run: the samples a host that
+    /// samples where native code runs took in native code since the last
+    /// call, oldest first, as many as `into` holds, and how many it wrote.
+    /// Each is what `ChainControl::block` held then (or
+    /// [`step_timing::NO_BLOCK`]) and the host cycles it stands for
+    /// ([`step_timing::pc_samples`]). The engine names the blocks at once,
+    /// while they are still in their slots; the default takes none.
+    fn profile_blocks(&mut self, _into: &mut [step_timing::BlockSample]) -> usize {
+        0
+    }
     /// Interrupt the host at this counter value, or never.
     fn arm_timer(&mut self, deadline: Option<u64>);
     /// Block until a host interrupt arrives.

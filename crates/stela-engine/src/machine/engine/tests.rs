@@ -180,6 +180,8 @@ pub(super) struct FakeHost {
     pub(super) described: Vec<Described>,
     /// The idle marks of [`Host::profile_idle`], in order.
     pub(super) idle_marks: Vec<bool>,
+    /// The samples [`Host::profile_blocks`] gives next, oldest first.
+    pub(super) block_samples: Vec<step_timing::BlockSample>,
     /// Root sets a native TTBR0 switch loads, for the tests that give the
     /// host some ([`FakeSets`]).
     pub(super) sets: Option<Box<FakeSets>>,
@@ -521,6 +523,13 @@ impl Host for FakeHost {
     fn profile_idle(&mut self, idle: bool) {
         self.idle_marks.push(idle);
     }
+    fn profile_blocks(&mut self, into: &mut [step_timing::BlockSample]) -> usize {
+        let taken = into.len().min(self.block_samples.len());
+        for (into, sample) in into.iter_mut().zip(self.block_samples.drain(..taken)) {
+            *into = sample;
+        }
+        taken
+    }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
         if self.real_counter {
@@ -752,6 +761,7 @@ pub(super) fn board_on<D: Devices>(
         host_work_at: None,
         described: Vec::new(),
         idle_marks: Vec::new(),
+        block_samples: Vec::new(),
         sets: None,
     };
     let profile = CpuProfile {
