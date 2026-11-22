@@ -33,7 +33,7 @@
 use super::{
     bluetooth, host, input, install_progress, network, nor, output, parallel, power, restore, usb,
 };
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -398,13 +398,9 @@ impl Service {
             let (packets, room, status) = devices.with(|devices| bluetooth.queued(devices));
             bluetooth.status(status);
             bluetooth.transmit(packets);
-            let received = if room {
-                bluetooth.receive()
-            } else {
-                Vec::new()
-            };
-            if !received.is_empty() {
-                devices.serve(|devices| bluetooth::HostBluetooth::deliver(devices, received));
+            let received = bluetooth.receive(room);
+            if !received.is_empty() || bluetooth.failure_due() {
+                devices.serve(|devices| bluetooth.deliver(devices, received));
             }
             lap.part(Part::Bluetooth);
         }

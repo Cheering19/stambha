@@ -1730,11 +1730,23 @@ mod iml_tests {
             let actual = ControllerIdentity::Tlv(TlvIdentity::parse(&device, &payload).unwrap());
             script.steps[13].events[0].1 = complete(READ_VERSION, &payload);
             let mut hci = transport(device, script);
+            let error = initialize(&mut hci, &catalog).unwrap_err();
+            // The failure line names the stages, never an identity's
+            // address middle or raw TLV bytes (0x30 and 0x90 here).
+            for text in [format!("{error}"), format!("{error:?}")] {
+                assert!(text.contains("RejectedBoot"), "{text}");
+                for raw in ["1, 2, 3, 4, 5, 6", "165, 90", "06:05:04:03", "03:02:01"] {
+                    assert!(!text.contains(raw), "{raw}: {text}");
+                }
+                if text.contains("address: Some(") {
+                    assert!(text.contains("06:05:04:..:..:01"), "{text}");
+                }
+            }
             let Error::Stages {
                 cause,
                 completed,
                 pending,
-            } = initialize(&mut hci, &catalog).unwrap_err()
+            } = error
             else {
                 panic!("completed IML retained")
             };

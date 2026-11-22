@@ -144,7 +144,11 @@ impl Error {
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "ATH3K USB bootloader {self:?}")
+        write!(
+            f,
+            "ATH3K USB bootloader {}",
+            crate::bluetooth::redacted::Lists(self)
+        )
     }
 }
 impl core::error::Error for Error {}

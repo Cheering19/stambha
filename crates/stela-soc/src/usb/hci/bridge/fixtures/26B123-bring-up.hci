@@ -1,0 +1,66 @@
+# bluetoothd 26B123's start-up on the USB transport, the guest's side only,
+# in the `--bluetooth-trace` capture format (`hci/capture.rs`). Taken from
+# the model's replay (`hci/model/tests.rs`,
+# `bluetoothd_bring_up_completes_in_order`): its HCI bring-up (step table
+# 0x100b38f70), the device configuration after it, the vendor commands of the
+# stack's later start and the first multi-core LE scan, with the parameters
+# bluetoothd sends. Addresses and names are synthetic.
+#
+# [1] Write BD_ADDR (sent when the platform stored an address), [4] Reset
+> cmd 01 fc 06 06 05 04 03 02 42
+> cmd 03 0c 00
+# [5] Read Verbose Config Version Info, [6] version, [7] commands,
+# [8] BD_ADDR, [9] features, [10] extended features page 2, [11] LE features
+> cmd 79 fc 00
+> cmd 01 10 00
+> cmd 02 10 00
+> cmd 09 10 00
+> cmd 03 10 00
+> cmd 04 10 01 02
+> cmd 03 20 00
+# [12] Set Event Mask, [14] LE Set Event Mask, [15] SSP mode, [16] LE host
+> cmd 01 0c 08 ff ff fb ff 07 f8 bf 3d
+> cmd 01 20 08 1f 00 00 00 00 00 00 00
+> cmd 56 0c 01 01
+> cmd 6d 0c 02 01 00
+# [17] LE buffers, [19] LE states, [20] accept list, [21] buffers,
+# [25] Host Buffer Size, [26] flow control, [27] erroneous data reporting
+> cmd 02 20 00
+> cmd 1c 20 00
+> cmd 0f 20 00
+> cmd 05 10 00
+> cmd 33 0c 07 fd 03 00 08 00 00 00
+> cmd 31 0c 01 01
+> cmd 5b 0c 01 01
+# Device configuration: advertising power, class, name, page timeout,
+# page and inquiry scan, Extended Inquiry Result mode, EIR
+> cmd 07 20 00
+> cmd 24 0c 03 0c 01 1c
+> cmd 23 0c 00
+> cmd 13 0c f8 4d 69 6e 69 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+> cmd 14 0c 00
+> cmd 18 0c 02 00 20
+> cmd 1a 0c 01 03
+> cmd 45 0c 01 02
+> cmd 52 0c f1 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+# Vendor commands of the stack's later start, each answered Unknown HCI
+# Command and tolerated
+> cmd 27 fc 04 00 00 00 00
+> cmd 03 fd 04 00 00 00 00
+> cmd 3b fc 04 00 00 00 00
+> cmd 83 fe 04 00 00 00 00
+> cmd 23 fd 04 00 00 00 00
+> cmd f7 fc 04 00 00 00 00
+> cmd 5c fd 04 00 00 00 00
+> cmd e9 fc 05 00 00 00 00 00
+> cmd e2 fc 08 00 00 00 00 00 00 00 00
+> cmd 47 fd 03 00 00 00
+> cmd e9 fc 0e 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+# The first LE scan: multi-core parameters for the main core and the scan
+# core, enable, duplicate list wipe, low-power core statistics, stop
+> cmd 37 fe 0c 00 00 01 02 01 00 e0 01 30 00 1e 00
+> cmd 37 fe 0c 00 00 01 02 02 00 50 00 10 00 1e 00
+> cmd 29 fe 09 03 02 00 00 01 00 00 00 00
+> cmd 2a fe 01 01
+> cmd 3b fe 01 01
+> cmd 29 fe 09 00 02 00 00 03 00 00 00 00

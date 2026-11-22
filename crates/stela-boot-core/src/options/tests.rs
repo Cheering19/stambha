@@ -408,6 +408,31 @@ fn every_option_survives_a_round_trip() {
     assert_eq!(restore.restore_manifest_path.as_deref(), Some("m.plist"));
 }
 
+/// The guest Bluetooth capture is off unless asked for, and survives the
+/// line a setup writes.
+#[test]
+fn the_bluetooth_capture_round_trips_and_is_off_by_default() {
+    assert!(!System::default().bluetooth_trace);
+    assert!(!round_trip("--system --input").bluetooth_trace);
+    let line = format!("--system --storage {DISK} --input {BLUETOOTH_TRACE}");
+    let options = round_trip(&line);
+    assert!(options.input && options.bluetooth_trace);
+    assert_eq!(options.to_string(), line);
+    assert!(!System::default().to_string().contains("bluetooth"));
+}
+
+/// Lending the host's controller is off unless asked for: a line without
+/// the flag gives every boot the model, as before.
+#[test]
+fn the_bluetooth_lend_round_trips_and_is_off_by_default() {
+    assert!(!System::default().bluetooth_lend);
+    assert!(!round_trip("--system --input --bluetooth-trace").bluetooth_lend);
+    let line = format!("--system --storage {DISK} --input {BLUETOOTH_LEND} {BLUETOOTH_TRACE}");
+    let options = round_trip(&line);
+    assert!(options.bluetooth_lend && options.bluetooth_trace);
+    assert_eq!(options.to_string(), line);
+}
+
 #[test]
 fn usb4_approvals_repeat_and_keep_their_canonical_spelling() {
     let first = "446ab8f0-5aff-47c9-8962-5870641e4d61";

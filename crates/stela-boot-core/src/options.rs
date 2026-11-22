@@ -133,6 +133,8 @@ pub const WIFI_COUNTRY: &str = "--wifi-country";
 /// startup menu's Wi-Fi page chose it (`choice::wifi`).
 pub const WIFI_PREFER: &str = "--wifi-prefer";
 pub const USB4_APPROVE: &str = "--usb4-approve";
+pub const BLUETOOTH_TRACE: &str = "--bluetooth-trace";
+pub const BLUETOOTH_LEND: &str = "--bluetooth-lend";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
 /// The saved networks a boot with `--wifi` also joins when its network is
@@ -491,6 +493,16 @@ pub struct System {
     /// pointer, fed whole frames by the host's precision touchpads, which
     /// then no longer move the native mouse ([`TRACKPAD`], with `--input`).
     pub trackpad: Option<GuestTrackpad>,
+    /// Log every packet of the guest's Bluetooth controller, 1024 per
+    /// configuration (`--bluetooth-trace`), masked: addresses keep their
+    /// vendor half and last byte, names, payloads and keys are hidden. A raw
+    /// capture is not offered.
+    pub bluetooth_trace: bool,
+    /// Lend the host's Bluetooth controller to the guest behind the model of
+    /// Apple's module, which answers its vendor commands and takes over
+    /// when the host's fails or stalls (`--bluetooth-lend`). Without it the
+    /// guest gets the model alone.
+    pub bluetooth_lend: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -658,6 +670,8 @@ impl Default for System {
             idle_skip: false,
             input: false,
             trackpad: None,
+            bluetooth_trace: false,
+            bluetooth_lend: false,
             native_cores: None,
             guest_pes: None,
             code_window: None,
@@ -1171,6 +1185,8 @@ impl fmt::Display for System {
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
         line.value(TRACKPAD, self.trackpad.map(GuestTrackpad::name))?;
+        line.flag(BLUETOOTH_LEND, self.bluetooth_lend)?;
+        line.flag(BLUETOOTH_TRACE, self.bluetooth_trace)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

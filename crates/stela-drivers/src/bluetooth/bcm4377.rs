@@ -46,7 +46,7 @@ pub enum Space {
     Bar0,
     Bar2,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Error {
     Unsupported(&'static str),
     Native(native::Error),
@@ -90,9 +90,77 @@ pub enum Error {
     },
 }
 pub type Result<T> = core::result::Result<T, Error>;
+/// The failure line prints no byte a frame or the controller's return held:
+/// their lengths alone (`crate::bluetooth::redacted`).
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Broadcom PCIe Bluetooth {self:?}")
+        let error = crate::bluetooth::redacted::Lists(self);
+        write!(f, "Broadcom PCIe Bluetooth {error}")
+    }
+}
+impl core::fmt::Debug for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::Bytes;
+        match self {
+            Self::Unsupported(what) => f.debug_tuple("Unsupported").field(what).finish(),
+            Self::Native(error) => f.debug_tuple("Native").field(error).finish(),
+            Self::Memory(error) => f.debug_tuple("Memory").field(error).finish(),
+            Self::Dma(error) => f.debug_tuple("Dma").field(error).finish(),
+            Self::Firmware(error) => f.debug_tuple("Firmware").field(error).finish(),
+            Self::Io { space, offset, raw } => f
+                .debug_struct("Io")
+                .field("space", space)
+                .field("offset", offset)
+                .field("raw", raw)
+                .finish(),
+            Self::Readback {
+                space,
+                offset,
+                observed,
+            } => f
+                .debug_struct("Readback")
+                .field("space", space)
+                .field("offset", offset)
+                .field("observed", observed)
+                .finish(),
+            Self::Protocol {
+                requirement,
+                observed,
+            } => f
+                .debug_struct("Protocol")
+                .field("requirement", requirement)
+                .field("observed", observed)
+                .finish(),
+            Self::Packet { kind, bytes } => f
+                .debug_struct("Packet")
+                .field("kind", kind)
+                .field("bytes", &Bytes(bytes))
+                .finish(),
+            Self::Hci { requirement, bytes } => f
+                .debug_struct("Hci")
+                .field("requirement", requirement)
+                .field("bytes", &Bytes(bytes))
+                .finish(),
+            Self::Controller {
+                opcode,
+                status,
+                returned,
+            } => f
+                .debug_struct("Controller")
+                .field("opcode", opcode)
+                .field("status", status)
+                .field("returned", &Bytes(returned))
+                .finish(),
+            Self::State(state) => f.debug_tuple("State").field(state).finish(),
+            Self::Timeout(what) => f.debug_tuple("Timeout").field(what).finish(),
+            Self::QueueFull(ring) => f.debug_tuple("QueueFull").field(ring).finish(),
+            Self::ObservationLimit => f.write_str("ObservationLimit"),
+            Self::Cleanup { cause, cleanup } => f
+                .debug_struct("Cleanup")
+                .field("cause", cause)
+                .field("cleanup", cleanup)
+                .finish(),
+        }
     }
 }
 impl core::error::Error for Error {}
@@ -114,13 +182,25 @@ pub enum State {
     Closed,
     Failed,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Packet {
     pub kind: Kind,
     pub bytes: Vec<u8>,
     pub completion: [u8; 16],
     /// Entire completion footer, including original padding.
     pub footer: Vec<u8>,
+}
+/// A packet prints its kind and lengths, never its bytes.
+impl core::fmt::Debug for Packet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::bluetooth::redacted::Bytes;
+        f.debug_struct("Packet")
+            .field("kind", &self.kind)
+            .field("bytes", &Bytes(&self.bytes))
+            .field("completion", &Bytes(&self.completion))
+            .field("footer", &Bytes(&self.footer))
+            .finish()
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Submission {

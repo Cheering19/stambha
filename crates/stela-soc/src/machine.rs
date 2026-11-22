@@ -33,7 +33,11 @@ use crate::usb::{
 };
 pub use crate::usb::{
     ecm::Counters as UsbNetworkCounters,
-    hci::{Counters as UsbBluetoothCounters, Outbound, Traced as UsbBluetoothTrace},
+    hci::{
+        Counters as UsbBluetoothCounters, Outbound, Traced as UsbBluetoothTrace,
+        bridge::{Counters as UsbBluetoothLendCounters, Fallback as UsbBluetoothFallback},
+        capture::Captured as UsbBluetoothCaptured,
+    },
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
     mux::{
         Backpressure as MuxBackpressure, State as MuxState, StreamId as MuxStream,
@@ -409,6 +413,11 @@ pub enum UsbBluetooth {
     /// Apple's internal USB Bluetooth module, answered by the controller
     /// model: powered, with no radio, finding nothing.
     Model,
+    /// Apple's internal USB Bluetooth module with one of the host's
+    /// controllers lent behind it (`crate::usb::hci::bridge`): the model
+    /// answers its vendor commands, the host's controller the standard ones
+    /// listed, and the model everything once the host's fails or stalls.
+    Bridged,
 }
 
 impl UsbCables {

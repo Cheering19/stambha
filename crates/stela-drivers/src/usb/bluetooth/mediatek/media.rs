@@ -55,7 +55,11 @@ pub enum Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "USB Bluetooth media {self:?}")
+        write!(
+            f,
+            "USB Bluetooth media {}",
+            crate::bluetooth::redacted::Lists(self)
+        )
     }
 }
 impl core::error::Error for Error {}

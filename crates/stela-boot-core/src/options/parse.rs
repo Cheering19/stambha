@@ -199,6 +199,8 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateTrackpad);
                 }
             }
+            BLUETOOTH_TRACE => options.bluetooth_trace = true,
+            BLUETOOTH_LEND => options.bluetooth_lend = true,
             "--usb-storage" => {
                 let serial = value().ok_or(Error::MissingUsbStorage)?;
                 if options.usb_storage.iter().any(|other| other == serial) {
