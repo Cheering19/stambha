@@ -776,6 +776,9 @@ fn emit_selected(
         next_pinned_span = usize::MAX;
         loop_run = true;
     }
+    // The vector use of the instruction after the one being emitted, which
+    // is the next one emitted unless a group takes it.
+    let mut next_class: Option<(usize, VectorUse)> = None;
     for copy in 0..if self_loop.is_some() { 2_usize } else { 1 } {
         if copy == 0
             && self_loop.is_some()
@@ -836,12 +839,17 @@ fn emit_selected(
                         vector_use(&instructions[at].operation, target)
                     }
                 };
-                let class = class_at(cursor);
+                let class = match next_class.take() {
+                    Some((at, class)) if at == cursor => class,
+                    _ => class_at(cursor),
+                };
                 // Where the next instruction stores or forgets the homes
                 // anyway, results go straight to the state.
-                let next_keeps = cursor + 1 < instructions.len()
-                    && !landing[cursor + 1]
-                    && matches!(class_at(cursor + 1), VectorUse::Keep | VectorUse::Access);
+                let next_keeps = cursor + 1 < instructions.len() && !landing[cursor + 1] && {
+                    let next = class_at(cursor + 1);
+                    next_class = Some((cursor + 1, next));
+                    matches!(next, VectorUse::Keep | VectorUse::Access)
+                };
                 code.set_vector_write_through(!next_keeps);
                 match class {
                     VectorUse::Keep | VectorUse::Access => code.set_vector_cache(true),

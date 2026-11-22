@@ -1158,7 +1158,10 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 
 /// Entries of a PE's jump cache, in front of its stamp counts: targets its
 /// table probe entered, by guest PC, which a [`lookup_tail`] takes without
-/// a probe. Bits 2-9 of the PC pick the entry.
+/// a probe. Bits 2-11 of the PC pick the entry. With 256 a lookup site
+/// over 1024 targets (`transfer_path_costs`) missed 75% of its transfers
+/// into the table probe, 14.4 ns a transfer on an i7-12700KF; with 1024 it
+/// misses none, 8.8 ns, and 4096 gains nothing more. 64 KiB a PE.
 ///
 /// An entry holds across native runs, while the target's half has the
 /// context and ITLB drop epoch the entry names, as a stamp holds
@@ -1169,7 +1172,7 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 /// entry's last word again after it, taking the entry back when the word
 /// moved; the table's writer stores the entry, fences and then reads the
 /// caches, so one of the two sees the other.
-pub const JUMP_CACHE_ENTRIES: usize = 256;
+pub const JUMP_CACHE_ENTRIES: usize = 1024;
 /// Bytes of one jump cache entry, a cache line: the PC, the block's code,
 /// its index and the table entry's last word as the probe read it, whose
 /// low byte is the BTYPEs the block accepts ([`LookupEntry`]), then the
@@ -2079,6 +2082,16 @@ impl LookupTable {
     /// and a jump cache entry filled from it would go on entering the block
     /// and BTYPEs it named while the probes take the new entry's.
     pub fn insert(&mut self, slot: usize, entry: LookupEntry) {
+        self.insert_over(slot, entry, &|_| false);
+    }
+
+    /// [`Self::insert`], where an entry whose key `dead` names is a place
+    /// already free: no lookup reaches a context that left, so the
+    /// resident moves over a dead neighbour, and a dead resident is the one
+    /// out, before any live entry is put out at random. An ITLB of a busy
+    /// desktop evicted live pages while dead contexts' entries sat in their
+    /// sets (16% of its misses).
+    pub fn insert_over(&mut self, slot: usize, entry: LookupEntry, dead: &dyn Fn(u64) -> bool) {
         if self.grouping == Grouping::Pc {
             self.note_rekey(slot, &entry);
         }
@@ -2094,8 +2107,13 @@ impl LookupTable {
             self.put(neighbour(slot), LookupEntry::default());
         }
         if other_resident {
-            let keep_resident = if beside.key == 0 || older_beside {
+            // The entry's older self beside it goes before any choice: kept,
+            // it would come back (above). Then a dead neighbour is a free
+            // place, and a dead resident the one out.
+            let keep_resident = if beside.key == 0 || older_beside || dead(beside.key) {
                 true
+            } else if dead(resident.key) {
+                false
             } else {
                 self.victims ^= self.victims << 13;
                 self.victims ^= self.victims >> 7;
@@ -4436,6 +4454,39 @@ mod tests {
 
     fn itlb_salt(context: u64) -> u32 {
         super::itlb_salt(context, ITLB_MASK)
+    }
+
+    /// A full ITLB set gives up a dead context's entry, never a live one, to
+    /// a new page; with none dead it keeps its random choice.
+    #[test]
+    fn a_full_itlb_set_puts_out_a_dead_context_first() {
+        let mut itlb = LookupTable::itlb();
+        let set = |table: &LookupTable, pc: u64, context: u64| table.page_slot(pc, context) & !1;
+        // Three pages, two of context 1 and one of context 2, in one set.
+        let pages = || (0u64..1 << 20).map(|page| page << 14);
+        let a = pages().next().unwrap();
+        let wanted = set(&itlb, a, 1);
+        let b = pages().find(|&pc| set(&itlb, pc, 2) == wanted).unwrap();
+        let c = pages()
+            .find(|&pc| pc != a && set(&itlb, pc, 1) == wanted)
+            .unwrap();
+        let held = |table: &LookupTable, pc: u64, context: u64| {
+            let found = table.find(table.page_slot(pc, context), pc, context);
+            found.pc == pc && found.key == context
+        };
+        for (pc, context) in [(a, 1), (b, 2)] {
+            itlb.insert(
+                itlb.page_slot(pc, context),
+                LookupEntry::page(pc, context, 7),
+            );
+        }
+        assert!(held(&itlb, a, 1) && held(&itlb, b, 2));
+        // Context 2 left: its page gives way, whichever way it is in.
+        itlb.insert_over(itlb.page_slot(c, 1), LookupEntry::page(c, 1, 7), &|key| {
+            key == 2
+        });
+        assert!(held(&itlb, a, 1) && held(&itlb, c, 1));
+        assert!(!held(&itlb, b, 2));
     }
 
     /// Tables grow with the arena, in powers of two within their bounds
