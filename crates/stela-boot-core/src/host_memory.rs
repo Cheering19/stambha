@@ -117,6 +117,41 @@ pub const PACK_FLOOR: u64 = 64 * MIB;
 /// reserving the parts, beyond the pack itself: the pack's placement page,
 /// the storage drivers' rings and the firmware ranges' rounding to 2 MiB.
 const PACK_MARGIN: u64 = 16 * MIB;
+/// The share (a fraction's denominator) of the room a pack read on demand
+/// leaves of its budget ([`sizes_with_room`]) that the loader fills with
+/// the pack's first records before the guest starts, at most
+/// [`PRELOAD_MOST`] and for at most [`PRELOAD_MILLIS`]: the rest of the
+/// room still grows the code window and the guest. A merge lays a pack's
+/// records out in the order a boot first used them, so its first bytes are
+/// what the next boot needs first, while every PE is busy and none reads
+/// the stick for it; the reader goes on in that order on PEs whose guest
+/// waits.
+pub const PRELOAD_SHARE: u64 = 4;
+pub const PRELOAD_MOST: u64 = 256 * MIB;
+/// The longest the loader reads ahead. Reading a whole 498 MB pack would
+/// hold the boot 14 s on a USB 2 stick (35 MB/s) and 5 s on a USB 3 one
+/// (100 MB/s); two seconds reads its first 70 or 200 MB, the boot's start.
+pub const PRELOAD_MILLIS: u64 = 2000;
+/// Below this bound the loader reads nothing ahead.
+pub const PRELOAD_FLOOR: u64 = 4 * MIB;
+
+/// The bytes of a pack read on demand the loader may read ahead into
+/// memory when its indexes leave `room` of its budget: a
+/// 1/[`PRELOAD_SHARE`] of it, at most [`PRELOAD_MOST`], in whole
+/// [`ALIGNMENT`]s; none below [`PRELOAD_FLOOR`].
+pub fn preload_bound(room: u64) -> u64 {
+    let bound = (room / PRELOAD_SHARE).min(PRELOAD_MOST) / ALIGNMENT * ALIGNMENT;
+    if bound < PRELOAD_FLOOR { 0 } else { bound }
+}
+
+/// What a preload within `bound` reads from a medium that reads
+/// `bytes_per_second`, and the milliseconds it holds the boot: the model of
+/// the stick [`PRELOAD_MILLIS`] was chosen with.
+pub fn preload_reads(bound: u64, bytes_per_second: u64) -> (u64, u64) {
+    let in_time = bytes_per_second.saturating_mul(PRELOAD_MILLIS) / 1000;
+    let bytes = bound.min(in_time);
+    (bytes, bytes.saturating_mul(1000) / bytes_per_second.max(1))
+}
 
 /// The engine heap's share (a fraction's denominator) that held compiled
 /// code beside the window before one budget held both: the blocks PEs

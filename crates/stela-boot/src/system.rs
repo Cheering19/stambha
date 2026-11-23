@@ -751,9 +751,16 @@ fn translation_store(
             mb(read),
             mb(held)
         )),
-        PackRead::OnDisk { held, .. } => {
-            crate::status::done(&format!("{} MB, read as macOS asks for it", mb(held)))
-        }
+        PackRead::OnDisk {
+            held, preloaded: 0, ..
+        } => crate::status::done(&format!("{} MB, read as macOS asks for it", mb(held))),
+        PackRead::OnDisk {
+            held, preloaded, ..
+        } => crate::status::done(&format!(
+            "{} MB, its first {} MB read ahead, the rest as macOS asks for it",
+            mb(held),
+            mb(preloaded)
+        )),
         PackRead::Whole(bytes) if store.writable => {
             crate::status::done(&format!("{} MB", mb(bytes)));
         }

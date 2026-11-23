@@ -92,9 +92,11 @@ const SEGMENT: u32 = pack::SEGMENT_BLOB;
 const USED: u32 = pack::USED_BLOB;
 /// The placement record at the start of the handoff file: magic, the bound
 /// the engine writes within, partition GUID, flags, the commit's entry
-/// count and the file's size. The commit's slot ([`SLOT_BYTES`], zeros for
-/// none), the bytes held of each entry and those bytes, each from an 8-byte
-/// boundary, follow.
+/// count, the file's size, the records' bound and the entry read ahead
+/// ([`PRELOAD_AT`]). The commit's slot ([`SLOT_BYTES`], zeros for none),
+/// the bytes held of each entry and those bytes, each from an 8-byte
+/// boundary, follow; then, for an entry read ahead, the length of its
+/// first bytes and those bytes.
 const PLACEMENT_MAGIC: [u8; 8] = *b"STLTSTO2";
 const PLACEMENT_BYTES: usize = 64;
 /// The pack file holds the bound's bytes and its volume's partition is
@@ -205,10 +207,16 @@ pub enum PackRead {
     /// `read` of their `held` bytes: the newest segments, and of the next
     /// the records that end within this PC's budget.
     Part { read: u64, held: u64 },
-    /// Its segments' headers and indexes, `index` bytes of its `held`: the
-    /// records are read when a lookup asks for them, and `room` of the
-    /// budget is left to the window and the guest.
-    OnDisk { index: u64, held: u64, room: u64 },
+    /// Its segments' headers and indexes, `index` bytes of its `held`, and
+    /// the first `preloaded` bytes of its oldest segment ([`Preloaded`]):
+    /// the other records are read when a lookup asks for them, and `room`
+    /// of the budget is left to the window and the guest.
+    OnDisk {
+        index: u64,
+        held: u64,
+        preloaded: u64,
+        room: u64,
+    },
     /// None of it: this PC's budget holds less than the newest segment's
     /// index, or none at all. The pack stays on the volume, unwritten, for
     /// a PC with more RAM.
@@ -304,11 +312,29 @@ pub fn read(budget: u64) -> Option<Opened> {
             PackRead::None | PackRead::Skipped => (0, 0),
             PackRead::Whole(bytes) => (bytes, bytes),
             PackRead::Part { read, held } => (read, held),
-            PackRead::OnDisk { index, held, room } => {
+            PackRead::OnDisk {
+                index, held, room, ..
+            } => {
                 PACK_ROOM.store(room, Ordering::Release);
                 (index, held)
             }
         };
+        if let Some(preload) = &loaded.preload {
+            let mib = |bytes: u64| bytes >> 20;
+            output::arguments(format_args!(
+                "TRANSLATIONS preload read={} MiB in {} ms ({} MB/s), records={}, held={} MiB of \
+                 {} MiB, on-demand past the bound={} records, bound={} MiB stopped={}\n",
+                mib(preload.read),
+                preload.millis,
+                preload.read / 1000 / preload.millis.max(1),
+                preload.records,
+                mib(preload.read),
+                mib(preload.segment),
+                preload.omitted,
+                mib(preload.bound),
+                preload.stopped,
+            ));
+        }
         output::arguments(format_args!(
             "TRANSLATIONS {path} bound={bound} budget={budget} limit={limit} records={records} \
              file={size} segments={} of {} lists={} pack={read} held={held} skipped={} \
@@ -386,14 +412,37 @@ fn claim_spare(root: &mut Directory, translator: &Digest) {
 
 /// What [`read_journal`] read: the handoff region (its placement left
 /// zero), the segments read of those committed, the used-key lists read,
-/// and whether a segment was left out or cut.
+/// whether a segment was left out or cut, and what it read ahead.
 struct Loaded {
     region: Region,
     pack: PackRead,
     segments: (usize, usize),
     lists: usize,
     partial: bool,
+    preload: Option<Preloaded>,
 }
+
+/// The first bytes of a segment of a pack read on demand that the loader
+/// read into memory before the guest starts: how many, in how long, the
+/// records that lie whole in them and those left to be read on demand, the
+/// segment's length, the bound, and why the read stopped.
+struct Preloaded {
+    read: u64,
+    millis: u64,
+    records: usize,
+    omitted: usize,
+    segment: u64,
+    bound: u64,
+    stopped: &'static str,
+}
+
+/// The pack is read ahead in steps of this many bytes, so that the time
+/// bound ([`PRELOAD_MILLIS`]) stops it within a step of USB 2 (0.12 s).
+const PRELOAD_STEP: usize = 4 << 20;
+/// Where the placement record holds the index plus one of the entry whose
+/// first bytes follow the blobs (zero for none): their length, then those
+/// bytes.
+const PRELOAD_AT: usize = 56;
 
 /// A handoff region of a placement and a blank commit slot.
 fn blank() -> Option<Loaded> {
@@ -410,6 +459,7 @@ fn blank() -> Option<Loaded> {
         segments: (0, 0),
         lists: 0,
         partial: false,
+        preload: None,
     })
 }
 
@@ -421,8 +471,10 @@ fn blank() -> Option<Loaded> {
 /// a pack checks its index, and each record its own bytes when first used.
 /// With `demand`, every segment's header and index alone are held: its
 /// records are read from the file as lookups and merges need them, and
-/// the budget they leave goes to the window and the guest. `None` only when
-/// no memory is left for the region.
+/// the budget they leave goes to the window and the guest, less the first
+/// bytes of the oldest segment read ahead after the blobs
+/// ([`preload_segment`], [`PRELOAD_AT`]). `None` only when no memory is
+/// left for the region.
 fn read_journal(
     file: &mut RegularFile,
     translator: &Digest,
@@ -494,12 +546,37 @@ fn read_journal(
             .iter()
             .zip(&held)
             .any(|(entry, &length)| entry.kind == SEGMENT && length == 0);
+    // Read on demand, the oldest segment's first bytes are read ahead too,
+    // within a share of the room its indexes leave: a merge laid its
+    // records out in the order a boot first used them. Only when the store
+    // has a segment to spare, as the segment splits in two there
+    // ([`install`]).
+    let held_segments = held
+        .iter()
+        .zip(entries)
+        .filter(|&(&length, entry)| entry.kind == SEGMENT && length != 0)
+        .count();
+    let preload_bound = stela_boot_core::host_memory::preload_bound(limit.saturating_sub(indexes));
+    let preload = entries
+        .iter()
+        .zip(&held)
+        .position(|(entry, &length)| entry.kind == SEGMENT && length & INDEX_ONLY != 0)
+        .filter(|_| demand && held_segments < pack::MAX_SEGMENTS)
+        .map(|index| {
+            let prefix = held[index] & !INDEX_ONLY;
+            (
+                index,
+                entries[index].length.min(prefix + preload_bound) as usize,
+            )
+        })
+        .filter(|&(index, capacity)| capacity as u64 > held[index] & !INDEX_ONLY);
     let blobs: usize = held
         .iter()
         .map(|&length| ((length & !INDEX_ONLY) as usize).next_multiple_of(8))
         .sum();
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize + 8 * entries.len();
-    let bytes = head + blobs;
+    let tail = head + blobs;
+    let bytes = tail + preload.map_or(0, |(_, capacity)| 8 + capacity);
     let pages = bytes.div_ceil(PAGE);
     let physical = firmware::pages(pages).ok()?;
     // SAFETY: firmware returned this exclusive allocation of `bytes` or
@@ -559,6 +636,35 @@ fn read_journal(
         let at = head - 8 * (entries.len() - index);
         region[at..at + 8].copy_from_slice(&length.to_le_bytes());
     }
+    let preloaded = preload.and_then(|(index, capacity)| {
+        let prefix = &prefixes.iter().find(|(held, _)| *held == index)?.1;
+        let read = preload_segment(
+            file,
+            &entries[index],
+            translator,
+            prefix,
+            &mut region[tail + 8..tail + 8 + capacity],
+            preload_bound,
+        )?;
+        region[tail..tail + 8].copy_from_slice(&read.read.to_le_bytes());
+        region[PRELOAD_AT..PRELOAD_AT + 8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+        Some(read)
+    });
+    // The pages past what was read ahead go back to the firmware, whose
+    // free memory the parts and the guest are sized from.
+    let used = match &preloaded {
+        Some(preloaded) => tail + 8 + preloaded.read as usize,
+        None => tail,
+    };
+    let kept = used.div_ceil(PAGE);
+    if let Some(start) = core::ptr::NonNull::new((physical + kept * PAGE) as *mut u8)
+        && kept < pages
+    {
+        // SAFETY: the end of this LOADER_DATA allocation, which nothing
+        // refers to: the region handed off ends at `used`.
+        let _ = unsafe { boot::free_pages(start, pages - kept) };
+    }
+    let preloaded_bytes = preloaded.as_ref().map_or(0, |preloaded| preloaded.read);
     let segment = |index: usize| entries[index].kind == SEGMENT;
     let (mut read, mut whole, mut segments, mut committed) = (0, 0, 0, 0);
     for (index, &length) in held.iter().enumerate().filter(|(index, _)| segment(*index)) {
@@ -575,7 +681,8 @@ fn read_journal(
         () if demand => PackRead::OnDisk {
             index: read,
             held: whole,
-            room: limit.saturating_sub(read),
+            preloaded: preloaded_bytes,
+            room: limit.saturating_sub(read + preloaded_bytes),
         },
         () if partial => PackRead::Part { read, held: whole },
         () => PackRead::Whole(read),
@@ -583,7 +690,7 @@ fn read_journal(
     Some(Loaded {
         region: Region {
             physical: physical as u64,
-            bytes: bytes as u64,
+            bytes: used as u64,
         },
         pack,
         segments: (segments, committed),
@@ -593,6 +700,63 @@ fn read_journal(
             .filter(|&(index, &length)| !segment(index) && length != 0)
             .count(),
         partial,
+        preload: preloaded,
+    })
+}
+
+/// Read the first bytes of the segment `entry` names into `into`, its
+/// header and index first, in [`PRELOAD_STEP`]s, until `into` is full, the
+/// segment ends, a read fails or [`PRELOAD_MILLIS`] pass: what was read,
+/// when it holds the index `prefix` the loader checked (`segment_index`)
+/// and a record past it. The engine splits it into the records that lie
+/// whole in it and those left to read on demand
+/// (`translation_store::split`), and checks each record as it decodes it.
+fn preload_segment(
+    file: &mut RegularFile,
+    entry: &journal::Entry,
+    translator: &Digest,
+    prefix: &[u8],
+    into: &mut [u8],
+    bound: u64,
+) -> Option<Preloaded> {
+    use stela_boot_core::host_memory::PRELOAD_MILLIS;
+    let started = output::now();
+    let mut read = 0;
+    let mut stopped = if into.len() as u64 == entry.length {
+        "whole"
+    } else {
+        "bound"
+    };
+    for part in into.chunks_mut(PRELOAD_STEP) {
+        if output::millis_since(started) >= PRELOAD_MILLIS {
+            stopped = "time";
+            break;
+        }
+        if read_at(file, entry.offset + read as u64, part).is_none() {
+            stopped = "failed";
+            break;
+        }
+        read += part.len();
+        crate::status::progress(&format!("{} MB read ahead", read >> 20));
+    }
+    let millis = output::millis_since(started);
+    // The bytes read begin with the index the loader holds, and hold more.
+    if read <= prefix.len() || into[..prefix.len()] != prefix[..] {
+        output::arguments(format_args!(
+            "TRANSLATIONS preload read=0 MiB in {millis} ms stopped={stopped}: the segment is \
+             read on demand\n"
+        ));
+        return None;
+    }
+    let within = translation_store::within(prefix, translator, read as u64).ok()?;
+    Some(Preloaded {
+        read: read as u64,
+        millis,
+        records: within.records,
+        omitted: within.omitted,
+        segment: entry.length,
+        bound,
+        stopped,
     })
 }
 
@@ -1150,6 +1314,38 @@ pub fn share(bound: usize) {
     });
 }
 
+/// The bytes the loader read ahead, which follow the blobs ([`PRELOAD_AT`]):
+/// `None` when their length passes the region.
+fn preload_tail(tail: &'static mut [u8]) -> Option<&'static mut [u8]> {
+    let length = usize::try_from(u64::from_le_bytes(tail.get(..8)?.try_into().ok()?)).ok()?;
+    tail.get_mut(8..8usize.checked_add(length)?)
+}
+
+/// The first bytes of a segment the loader read ahead, as the store's two
+/// parts of it: a pack of the records that lie whole in them, and the
+/// index of the others when there are any, their records left in the file
+/// (`translation_store::split`). `None` when the bytes do not split or hold
+/// no whole record: the segment is read on demand from its index as before.
+fn split_preload(
+    bytes: &'static mut [u8],
+    translator: &Digest,
+) -> Option<(Pack<'static>, Option<Pack<'static>>)> {
+    let split = translation_store::split(bytes, translator).ok()?;
+    if split.resident == 0 {
+        return None;
+    }
+    let bytes: &'static [u8] = bytes;
+    let resident = Pack::parse(bytes, translator).ok()?;
+    let remainder = match split.omitted {
+        0 => None,
+        _ => {
+            let index: &'static [u8] = Box::leak(split.remainder.into_boxed_slice());
+            Some(Pack::index_only(index, translator).ok()?)
+        }
+    };
+    Some((resident, remainder))
+}
+
 /// Make the store of the handoff file `region` the engine's: the GPT
 /// partition to open for writing it, when it can be written.
 pub fn install(region: &'static mut [u8]) -> Option<Guid> {
@@ -1174,21 +1370,45 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             )
         })?
         .min(region.len());
-    let contents: &'static [u8] = &region[..blobs];
+    let read_ahead = u64::from_le_bytes(
+        region[PRELOAD_AT..PRELOAD_AT + 8]
+            .try_into()
+            .expect("a field"),
+    );
+    let (contents, tail) = region.split_at_mut(blobs);
+    let contents: &'static [u8] = contents;
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let word = |at: usize| u32::from_le_bytes(contents[at..at + 4].try_into().expect("a word"));
     let (limit, flags, size, records) = (field(8), word(32), field(40), field(48));
     let translator = translations::translator_id();
     let slot = &contents[PLACEMENT_BYTES..head];
     let committed = (0..2).find_map(|index| Commit::decode(slot, index, DOMAIN, size));
+    // The store's segments: those read, with the one read ahead split in
+    // two. The writer's: one for each segment the file commits.
     let mut segments = Vec::new();
     let mut offsets = Vec::new();
+    let mut filed = Vec::new();
     let mut used = Vec::new();
     let mut discarded = 0;
+    let mut preloaded = (0, 0);
     if let Some(commit) = committed
         .as_ref()
         .filter(|commit| commit.key == translator.0 && commit.entries.len() == count)
     {
+        let held = |index: usize| field(head + 8 * index) & !INDEX_ONLY != 0;
+        let read_segments = commit
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|&(index, entry)| entry.kind == SEGMENT && held(index))
+            .count();
+        // The bytes read ahead and their entry, while the store has a
+        // segment to spare for the split.
+        let mut ahead = read_ahead
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|_| read_segments < pack::MAX_SEGMENTS)
+            .and_then(|index| Some((index, preload_tail(tail)?)));
         let mut at = head + 8 * count;
         for (index, entry) in commit.entries.iter().enumerate() {
             let word = field(head + 8 * index);
@@ -1202,8 +1422,25 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             match entry.kind {
                 SEGMENT if length != 0 => match parsed {
                     Ok(pack) => {
-                        segments.push(pack);
-                        offsets.push(entry.offset);
+                        filed.push(pack::Segment::at(pack, entry.offset));
+                        let split = ahead
+                            .take_if(|(ahead, _)| *ahead == index)
+                            .and_then(|(_, bytes)| split_preload(bytes, &translator));
+                        match split {
+                            Some((resident, remainder)) => {
+                                preloaded = (resident.records(), resident.bytes());
+                                segments.push(resident);
+                                offsets.push(entry.offset);
+                                if let Some(remainder) = remainder {
+                                    segments.push(remainder);
+                                    offsets.push(entry.offset);
+                                }
+                            }
+                            None => {
+                                segments.push(pack);
+                                offsets.push(entry.offset);
+                            }
+                        }
                     }
                     Err(error) => {
                         output::arguments(format_args!(
@@ -1223,11 +1460,13 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
     let partial = flags & PARTIAL != 0;
     output::arguments(format_args!(
         "TRANSLATIONS pack segments={} records={} bytes={} lists={} discarded={discarded} \
-         partial={partial}\n",
-        segments.len(),
-        segments.iter().map(Pack::records).sum::<usize>(),
-        segments.iter().map(Pack::bytes).sum::<usize>(),
+         partial={partial} preloaded={} preloaded_bytes={}\n",
+        filed.len(),
+        filed.iter().map(pack::Segment::records).sum::<usize>(),
+        filed.iter().map(pack::Segment::bytes).sum::<u64>(),
         used.len(),
+        preloaded.0,
+        preloaded.1,
     ));
     let readable = if segments.is_empty() { 0 } else { READ_PACK };
     let file = writer::File {
@@ -1236,11 +1475,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
         records,
         file_bytes: size,
         committed,
-        segments: segments
-            .iter()
-            .zip(&offsets)
-            .map(|(&pack, &offset)| pack::Segment::at(pack, offset))
-            .collect(),
+        segments: filed,
         used,
         partial,
     };
