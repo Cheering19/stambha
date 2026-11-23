@@ -10539,6 +10539,7 @@ mod stage2_syndrome;
 mod table_base;
 mod tagged;
 mod thread_switch;
+mod tier1_golden;
 mod timer_native;
 
 #[test]
