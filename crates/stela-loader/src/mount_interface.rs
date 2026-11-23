@@ -60,6 +60,8 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So do the fork's `--tlbi-keep on|off` and `--tlbi-verify-check`,
 /// hand-written opt-ins that keep the ITLB's contexts across a TLBI of
 /// everything and check what they keep: no line setup writes holds them.
+/// So does the fork's `--gpu-aspm off|firmware`, a hand-written opt-in that
+/// turns the GPU links' ASPM off at the claim: no line setup writes holds it.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

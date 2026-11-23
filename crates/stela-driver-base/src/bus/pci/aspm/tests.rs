@@ -410,3 +410,75 @@ fn extended_headers_cannot_alias_l1ss_bodies_in_either_traversal_direction() {
         }
     }
 }
+
+#[test]
+fn link_power_goes_off_substates_first_then_aspm_device_before_port() {
+    let writes = Writes::default();
+    let mut endpoint = device(address(0, 1, 0), None, &writes);
+    let mut port = device(address(0, 0, 1), Some((1, 1)), &writes);
+    add_l1ss(&mut endpoint, 0x180, 0x5abca50f);
+    add_l1ss(&mut port, 0x240, 0xabcdff0a);
+    let (endpoint_address, port_address) = (endpoint.address, port.address);
+    let found = disable_link_power(&mut endpoint.config, Some(&mut port.config)).unwrap();
+    assert_eq!(
+        found,
+        LinkPowerOff {
+            device: EndPower {
+                aspm: 3,
+                substates: Some(0xf)
+            },
+            port: Some(EndPower {
+                aspm: 3,
+                substates: Some(0xa)
+            }),
+        }
+    );
+    assert_eq!(
+        *writes.borrow(),
+        [
+            (endpoint_address, 0x188, 0x5abca500),
+            (port_address, 0x248, 0xabcdff00),
+            (endpoint_address, 0x50, 0xa5a0),
+            (port_address, 0x50, 0xa5a0),
+        ]
+    );
+    assert_eq!(endpoint.config.words[20], 0xc000_a5a0);
+    assert_eq!(port.config.words[20], 0xc000_a5a0);
+    assert_eq!(
+        alloc::format!("{}; {}", found.device, found.port.unwrap()),
+        "L0s+L1 with L1SS enables f; L0s+L1 with L1SS enables a"
+    );
+    writes.borrow_mut().clear();
+    // Already off: read back, nothing written.
+    let again = disable_link_power(&mut endpoint.config, Some(&mut port.config)).unwrap();
+    assert!(writes.borrow().is_empty());
+    assert_eq!(alloc::format!("{}", again.device), "off with L1SS none");
+}
+
+#[test]
+fn link_power_without_a_port_turns_only_the_device_end_off() {
+    let writes = Writes::default();
+    let mut endpoint = device(address(0, 1, 0), None, &writes);
+    let found = disable_link_power::<Config, _>(&mut endpoint.config, None).unwrap();
+    assert_eq!(found.port, None);
+    assert_eq!(alloc::format!("{}", found.device), "L0s+L1 with no L1SS");
+    assert_eq!(*writes.borrow(), [(endpoint.address, 0x50, 0xa5a0)]);
+}
+
+#[test]
+fn link_power_checks_both_ends_before_writing_and_reports_a_refusal() {
+    let writes = Writes::default();
+    let mut endpoint = device(address(0, 1, 0), None, &writes);
+    let mut port = device(address(0, 0, 1), Some((1, 1)), &writes);
+    port.config.words[16] = 0; // no PCIe capability
+    assert!(disable_link_power(&mut endpoint.config, Some(&mut port.config)).is_err());
+    assert!(writes.borrow().is_empty());
+    let mut port = device(address(0, 0, 1), Some((1, 1)), &writes);
+    port.config.refuses_aspm = true;
+    assert!(matches!(
+        disable_link_power(&mut endpoint.config, Some(&mut port.config)),
+        Err(BlockError::Device { .. })
+    ));
+    // The device's end went off before the port refused.
+    assert_eq!(endpoint.config.words[20], 0xc000_a5a0);
+}

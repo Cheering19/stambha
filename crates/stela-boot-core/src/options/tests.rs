@@ -150,6 +150,33 @@ fn the_tlbi_keep_is_off_unless_asked_for_and_its_check_needs_it() {
 }
 
 #[test]
+fn a_gpu_link_keeps_the_firmwares_aspm_unless_gpu_aspm_turns_it_off() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.gpu_aspm(), GpuAspm::Firmware);
+    assert_eq!(plain.gpu_aspm, None);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, aspm) in [
+        ("--system --gpu-aspm off", GpuAspm::Off),
+        ("--system --gpu-aspm firmware", GpuAspm::Firmware),
+        ("--system --acpi-hardware --gpu-aspm off", GpuAspm::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.gpu_aspm(), aspm);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --gpu-aspm", Error::GpuAspm),
+        ("--system --gpu-aspm on", Error::GpuAspm),
+        (
+            "--system --gpu-aspm off --gpu-aspm off",
+            Error::DuplicateGpuAspm,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),

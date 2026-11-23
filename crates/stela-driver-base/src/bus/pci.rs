@@ -34,8 +34,8 @@ pub mod regs;
 pub mod requester;
 pub mod substates;
 pub use aspm::{
-    aspm_control, disable_aspm_l1_2_link, disable_aspm_link, link_control_word, link_speed,
-    native as native_aspm,
+    EndPower, LinkPowerOff, aspm_control, disable_aspm_l1_2_link, disable_aspm_link,
+    disable_link_power, link_control_word, link_speed, native as native_aspm,
 };
 pub use capability::{
     Capabilities, Capability, CapabilityError, ExtendedCapabilities, ExtendedCapability, Layout,

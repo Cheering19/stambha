@@ -8,6 +8,13 @@
 //! P-state, so the line shows whether the link follows load too. Clocks are
 //! not read: GSP-RM 570.144's headers define no clock control, and RM refused
 //! the 615.78.08 one.
+//!
+//! `GPU THERMAL`: each round also reads the GPU's internal temperature
+//! sensor, and every beat with a reading says the last and the highest
+//! since the beat before, so a GPU that runs hot before it is lost shows it.
+//! A sensor that gives no reading is said once, with its register, and
+//! again when that changes. Power is not read: GSP-RM 570.144's headers hold
+//! no power monitor control.
 use alloc::{format, string::String};
 use core::{
     fmt,
@@ -27,6 +34,9 @@ pub struct Report {
     link_control: AtomicU32,
     link_speeds: AtomicU32,
     link_cap: AtomicU32,
+    tsensor: AtomicU32,
+    temp: AtomicI32,
+    temp_max: AtomicU32,
 }
 
 impl Report {
@@ -42,6 +52,9 @@ impl Report {
             link_control: AtomicU32::new(0),
             link_speeds: AtomicU32::new(0),
             link_cap: AtomicU32::new(0),
+            tsensor: AtomicU32::new(0),
+            temp: AtomicI32::new(-1),
+            temp_max: AtomicU32::new(0),
         }
     }
 
@@ -54,6 +67,7 @@ impl Report {
         let rounds = self.rounds.swap(0, Ordering::Relaxed);
         let pstates = self.pstates.swap(0, Ordering::Relaxed);
         let link_speeds = self.link_speeds.swap(0, Ordering::Relaxed);
+        let temp_max = self.temp_max.swap(0, Ordering::Relaxed);
         (rounds != 0).then(|| Taken {
             rounds,
             pstate: self.pstate.load(Ordering::Relaxed),
@@ -64,6 +78,11 @@ impl Report {
                 control: self.link_control.load(Ordering::Relaxed) as u16,
                 speeds: link_speeds,
                 cap: self.link_cap.load(Ordering::Relaxed) as u16,
+            },
+            thermal: Thermal {
+                sensor: self.tsensor.load(Ordering::Relaxed),
+                temp: self.temp.load(Ordering::Relaxed),
+                max: temp_max,
             },
         })
     }
@@ -89,6 +108,43 @@ pub struct Taken {
     pub status: i32,
     /// The GPU's PCIe link.
     pub link: Link,
+    /// The GPU's temperature sensor.
+    pub thermal: Thermal,
+}
+
+/// The GPU's internal temperature sensor as the beat's rounds read it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Thermal {
+    /// NV_THERM_I2CS_SENSOR_00 as last read, zero before any read.
+    pub sensor: u32,
+    /// The last reading in degrees C, negative for none.
+    pub temp: i32,
+    /// The highest reading of the beat in degrees C, zero for none.
+    pub max: u32,
+}
+
+impl Thermal {
+    fn read(&self) -> bool {
+        self.temp >= 0
+    }
+}
+
+/// `temp=52C max=55C power=unread`, or `temp=unread sensor=badf1100
+/// power=unread` for a sensor that gave no reading.
+impl fmt::Display for Thermal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.read() {
+            write!(
+                f,
+                "temp={}C max={}C",
+                self.temp,
+                self.max.max(self.temp as u32)
+            )?;
+        } else {
+            write!(f, "temp=unread sensor={:08x}", self.sensor)?;
+        }
+        f.write_str(" power=unread")
+    }
 }
 
 impl Taken {
@@ -219,13 +275,26 @@ impl fmt::Display for Taken {
 /// The state the last line reported.
 pub struct Reported {
     last: spin_cell::Cell,
+    sensor: spin_cell::Cell,
 }
 
 impl Reported {
     pub const fn new() -> Self {
         Self {
             last: spin_cell::Cell::new(),
+            sensor: spin_cell::Cell::new(),
         }
+    }
+
+    /// `GPU THERMAL …` for `taken`: every beat with a reading, else when
+    /// the sensor's register is new, so a sensor that gives none is said
+    /// once.
+    pub fn thermal_line(&self, taken: &Taken) -> Option<String> {
+        let thermal = &taken.thermal;
+        let state = [u64::from(thermal.read()), u64::from(thermal.sensor)];
+        let last = self.sensor.replace(state);
+        (thermal.read() || last.is_none_or(|last| last != state))
+            .then(|| format!("GPU THERMAL {thermal}"))
     }
 
     /// `GPU PERF …` for `taken` when it is the first or its state changed

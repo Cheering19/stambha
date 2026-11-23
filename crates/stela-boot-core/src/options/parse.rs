@@ -82,6 +82,12 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateAsusMode);
                 }
             }
+            GPU_ASPM => {
+                let aspm = GpuAspm::parse(value().ok_or(Error::GpuAspm)?)?;
+                if options.gpu_aspm.replace(aspm).is_some() {
+                    return Err(Error::DuplicateGpuAspm);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {
