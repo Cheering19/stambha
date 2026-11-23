@@ -233,14 +233,16 @@ mod tests {
             "CHOICE Wi-Fi hidden: no PCI function is a Wi-Fi chip the driver starts; not \
              started yet: 0000:02:00.0 (8086:9df0), 0000:03:00.0 (14c3:7920)\n"
         );
-        // An MT7921, an MT7922, an MT7925 and an RTL8822CE start, their
-        // claims quiesced by a reset.
+        // An MT7921, an MT7922, an MT7925, an RTL8822CE and an RTL8821CE
+        // start, their claims quiesced by a reset.
         for chip in [
             function(3, 0x14c3, 0x7961, WIFI),
             function(3, 0x14c3, 0x0616, WIFI),
             function(3, 0x0b48, 0x7922, WIFI),
             function(3, 0x14c3, 0x7925, WIFI),
             function(6, 0x10ec, 0xc822, WIFI),
+            function(6, 0x10ec, 0xc821, WIFI),
+            function(6, 0x10ec, 0xb821, WIFI),
         ] {
             let mut functions = others();
             functions.push(chip);

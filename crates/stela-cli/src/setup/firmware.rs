@@ -1039,9 +1039,9 @@ mod tests {
         assert!(parsed.missing().is_empty());
         // A stick for an image with the AMD port also holds its firmware.
         let (objects, summary) = if cfg!(feature = "amdgpu-port") {
-            (125, "for every supported device (187.6 MiB)")
+            (126, "for every supported device (187.8 MiB)")
         } else {
-            (92, "for every supported device (179.7 MiB)")
+            (93, "for every supported device (179.9 MiB)")
         };
         assert_eq!(parsed.objects.len(), objects);
         assert_eq!(bundle_summary(), summary);
@@ -1330,9 +1330,9 @@ mod tests {
         assert_eq!(
             status,
             if cfg!(feature = "amdgpu-port") {
-                "the firmware on the stick is incomplete: 3 of 125 files are there"
+                "the firmware on the stick is incomplete: 3 of 126 files are there"
             } else {
-                "the firmware on the stick is incomplete: 3 of 92 files are there"
+                "the firmware on the stick is incomplete: 3 of 93 files are there"
             }
         );
     }
@@ -1356,9 +1356,9 @@ mod tests {
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
         let lacks = if cfg!(feature = "amdgpu-port") {
-            "lacks 124 of 125 files"
+            "lacks 125 of 126 files"
         } else {
-            "lacks 91 of 92 files"
+            "lacks 92 of 93 files"
         };
         assert!(status.contains(lacks), "{status}");
         assert!(!status.contains("nvidia/"), "{status}");

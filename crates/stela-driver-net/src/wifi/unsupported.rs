@@ -35,10 +35,9 @@ pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
         (0x14c3, 0x7603 | 0x7602 | 0x7612 | 0x7662 | 0x7610 | 0x7630 | 0x7650) => {
             "MediaTek MT76x0, MT76x2 or MT7603 (Linux mt76): no driver here"
         }
-        // rtw88 and rtw89. Only RTL8822C runs a station here; RTL8852CE
-        // (10ec:c852) is brought up to running firmware.
+        // rtw88 and rtw89. RTL8822CE, RTL8821CE and RTL8852CE run a station
+        // here.
         (0x10ec, 0xb822) => "Realtek RTL8822BE (Linux rtw88_8822be): no driver here",
-        (0x10ec, 0xb821 | 0xc821) => "Realtek RTL8821CE (Linux rtw88_8821ce): no driver here",
         (0x10ec, 0xd723) => "Realtek RTL8723DE (Linux rtw88_8723de): no driver here",
         (0x10ec, 0x8813) => "Realtek RTL8814AE (Linux rtw88_8814ae): no driver here",
         (0x10ec, 0x8852 | 0xa85a) => "Realtek RTL8852AE (Linux rtw89_8852ae): no driver here",
@@ -150,8 +149,9 @@ mod tests {
 
     #[test]
     fn chips_a_driver_here_runs_have_no_reason_and_others_name_the_linux_driver() {
-        // MT7921, MT7922, MT7925, RTL8822CE, RTL8852CE, and an Intel device
-        // the Intel driver lists, which reports its own radio and step.
+        // MT7921, MT7922, MT7925, RTL8822CE, RTL8821CE, RTL8852CE, and an
+        // Intel device the Intel driver lists, which reports its own radio
+        // and step.
         for (vendor, device) in [
             (0x14c3, 0x7961),
             (0x14c3, 0x0608),
@@ -162,6 +162,8 @@ mod tests {
             (0x14c3, 0x0717),
             (0x10ec, 0xc822),
             (0x10ec, 0xc82f),
+            (0x10ec, 0xb821),
+            (0x10ec, 0xc821),
             (0x10ec, 0xc852),
             (0x8086, 0x2725),
             (0x8086, 0x51f0),
@@ -180,7 +182,7 @@ mod tests {
             (0x14c3, 0x7920, "mt7921e"),
             (0x14c3, 0x7990, "mt7996e"),
             (0x10ec, 0xb852, "rtw89_8852be"),
-            (0x10ec, 0xc821, "rtw88_8821ce"),
+            (0x10ec, 0xb822, "rtw88_8822be"),
             (0x17cb, 0x1103, "ath11k_pci"),
             (0x17cb, 0x1109, "ath12k"),
             (0x168c, 0x003e, "ath10k_pci"),

@@ -24,13 +24,13 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // of Navi 21.
     if Ports::BUILT == Ports::ALL {
         assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 125 files, 187.6 MiB.
-        assert_eq!((count, bytes), (125, 196_758_077), "{count} {bytes}");
+        // The recipes' recorded lengths: 126 files, 187.8 MiB.
+        assert_eq!((count, bytes), (126, 196_897_549), "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
-        // Without the AMD port: 92 files, 179.7 MiB.
-        assert_eq!((count, bytes), (92, 188_455_525), "{count} {bytes}");
+        // Without the AMD port: 93 files, 179.9 MiB.
+        assert_eq!((count, bytes), (93, 188_594_997), "{count} {bytes}");
     }
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);

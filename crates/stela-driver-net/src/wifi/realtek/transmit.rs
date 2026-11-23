@@ -5,7 +5,7 @@
 use super::{
     beacon::{self, Allocation},
     fifo::Geometry,
-    identity::{Chip, Profile},
+    identity::Profile,
     io::Bar,
     registers::*,
 };
@@ -216,7 +216,7 @@ impl<R: Registers> Rings<R> {
         source: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
     ) -> Result<Self, Error> {
-        if io.profile().chip() != Chip::Rtl8822C {
+        if io.profile().rtw88().is_none() {
             return Err(Error::UnsupportedChip);
         }
         io.verify_identity()?;
@@ -343,25 +343,28 @@ impl<R: Registers> Rings<R> {
     pub unsafe fn phydm_info(
         &mut self,
         source: &dyn PageSource,
-        phy: &super::phy::PhyInitialized,
+        phy: &super::phy::Initialized,
         report: &super::features::Report,
     ) -> Result<(), Error> {
         if self.poisoned || !self.configured {
             return Err(Error::Quarantined);
         }
         let profile = self.io.as_ref().ok_or(Error::Quarantined)?.profile();
-        if phy.factory_power().profile() != profile || report.profile() != profile {
+        if phy.profile() != profile || report.profile() != profile {
             return Err(Error::IdentityChanged);
         }
         let cap = report.capabilities();
-        if cap.rf_paths != 2 || cap.rf_phys != 2 || cap.antenna_tx != 3 || cap.antenna_rx != 3 {
-            return Err(Error::UnsupportedLayout);
-        }
+        let rf_type = match (cap.rf_paths, cap.rf_phys, cap.antenna_tx, cap.antenna_rx) {
+            (2, 2, 3, 3) => FW_RF_2T2R,
+            (1, 1, 1, 1) => FW_RF_1T1R,
+            _ => return Err(Error::UnsupportedLayout),
+        };
         if self.pending() == H2C_COUNT - 1 {
             return Err(Error::Full);
         }
         let payload = phydm_info(
-            phy.factory_power().rfe(),
+            phy.rfe(),
+            rf_type,
             profile.cut(),
             cap.antenna_tx,
             cap.antenna_rx,
@@ -381,13 +384,26 @@ impl<R: Registers> Rings<R> {
         &mut self,
         source: &dyn PageSource,
     ) -> Result<(), Error> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.iqk_command(source, true, false) }
+    }
+    /// `rtw_fw_do_iqk` with `clear` and `segment_iqk`.
+    ///
+    /// # Safety
+    /// As [`Self::initial_iqk_command`], for the command's own parameters.
+    pub unsafe fn iqk_command(
+        &mut self,
+        source: &dyn PageSource,
+        clear: bool,
+        segment: bool,
+    ) -> Result<(), Error> {
         if self.poisoned || !self.configured {
             return Err(Error::Quarantined);
         }
         if self.pending() == H2C_COUNT - 1 {
             return Err(Error::Full);
         }
-        self.command(source, iqk(self.sequence))
+        self.command(source, iqk(self.sequence, clear, segment))
     }
     /// `rtw_pci_tx_write_data`: give `queue` one frame, which `packet` describes.
     /// [`Error::Full`] only asks to try again once the queue drains.
@@ -700,21 +716,32 @@ fn general_info(geometry: Geometry, sequence: u16) -> [u8; 32] {
     p[10] = (geometry.firmware_tx_page() - geometry.boundary()) as u8;
     p
 }
-fn phydm_info(rfe: u8, cut: u8, antenna_tx: u8, antenna_rx: u8, sequence: u16) -> [u8; 32] {
+/// `FW_RF_2T2R` and `FW_RF_1T1R`.
+const FW_RF_2T2R: u8 = 2;
+const FW_RF_1T1R: u8 = 4;
+fn phydm_info(
+    rfe: u8,
+    rf_type: u8,
+    cut: u8,
+    antenna_tx: u8,
+    antenna_rx: u8,
+    sequence: u16,
+) -> [u8; 32] {
     let mut p = [0; 32];
     p[..4].copy_from_slice(&0x0011ff01u32.to_le_bytes());
     p[4..8].copy_from_slice(&(16u32 | (u32::from(sequence) << 16)).to_le_bytes());
     p[8] = rfe;
-    p[9] = 2;
+    p[9] = rf_type;
     p[10] = cut;
     p[11] = (antenna_tx & 15) | ((antenna_rx & 15) << 4);
     p
 }
-fn iqk(sequence: u16) -> [u8; 32] {
+/// `H2C_PKT_IQK`: `IQK_SET_CLEAR` and `IQK_SET_SEGMENT_IQK`.
+fn iqk(sequence: u16, clear: bool, segment: bool) -> [u8; 32] {
     let mut p = [0; 32];
     p[..4].copy_from_slice(&0x000eff01u32.to_le_bytes());
     p[4..8].copy_from_slice(&(9u32 | (u32::from(sequence) << 16)).to_le_bytes());
-    p[8] = 1;
+    p[8] = u8::from(clear) | (u8::from(segment) << 1);
     p
 }
 /// `rtw_pci_tx_write_data`'s two buffer descriptors: the packet descriptor at

@@ -145,7 +145,10 @@ impl Kind {
             Some(Self::MediatekWifi)
         } else if function.vendor == 0x10ec
             && function.class[..2] == [2, 0x80]
-            && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+            && (realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+                || realtek_wifi::chip::RTL8821C
+                    .devices
+                    .contains(&function.device))
         {
             Some(Self::RealtekWifi)
         } else if super::rtl8852ce(function) {
@@ -182,7 +185,7 @@ impl Kind {
             Self::Ish => "Intel sensor hub",
             Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
             Self::MediatekWifi => "MT7921/MT7922/MT7925 Wi-Fi (with --wifi)",
-            Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
+            Self::RealtekWifi => "rtw88 RTL8822CE/RTL8821CE Wi-Fi (with --wifi)",
             Self::Rtw89Wifi => "rtw89 Wi-Fi (with --wifi)",
             Self::IntelBluetooth => "Intel PCIe Bluetooth",
             Self::Bcm4377 => "bcm4377 Bluetooth",
@@ -710,7 +713,18 @@ pub(super) unsafe fn realtek_wifi(
         attachment,
         bars,
         quiesced,
-    } = claim_quiesced(services, address, |_| Ok(wifi_claim::Chip::Rtl8822c))?;
+    } = claim_quiesced(services, address, |function| {
+        Ok(
+            if realtek_wifi::chip::RTL8821C
+                .devices
+                .contains(&function.device)
+            {
+                wifi_claim::Chip::Rtl8821c
+            } else {
+                wifi_claim::Chip::Rtl8822c
+            },
+        )
+    })?;
     let registers = match map(services, address, &bars, 2) {
         Ok(registers) => registers,
         Err(error) => {
@@ -734,6 +748,15 @@ pub(super) unsafe fn realtek_wifi(
     };
     let configured = (|| -> Result<_, Error> {
         let link_control = crate::bus::pci::link_control_word(&function)?;
+        // rtw_pci_phy_cfg: a chip whose requests must not time out. One
+        // without device control 2 goes on, as Linux does.
+        let spec = realtek_wifi::chip::for_device(function.device);
+        if spec
+            .and_then(|spec| spec.rtw88.as_ref())
+            .is_some_and(|spec| spec.pcie_completion_timeout_off)
+        {
+            function.disable_completion_timeout()?;
+        }
         let config = function.config();
         let identity = (
             config.read16(0x2c)?,
@@ -3629,8 +3652,11 @@ mod tests {
         ] {
             started.push((vendor, device, Kind::MediatekWifi));
         }
-        for device in realtek_wifi::identity::RTL8822C_DEVICES {
-            started.push((0x10ec, device, Kind::RealtekWifi));
+        for device in realtek_wifi::identity::RTL8822C_DEVICES
+            .iter()
+            .chain(realtek_wifi::chip::RTL8821C.devices)
+        {
+            started.push((0x10ec, *device, Kind::RealtekWifi));
         }
         for (vendor, device, kind) in started {
             let function = identity(vendor, device, [2, 0x80, 0]);

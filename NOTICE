@@ -730,6 +730,23 @@ crates/stela-driver-net/src/wifi/realtek/: Realtek RTL8822C native firmware
 crates/stela-driver-net/src/wifi/realtek/: Realtek RTL8822C station
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     net/mac80211/scan.c, net/mac80211/wpa.c, net/wireless/reg.c
+crates/stela-driver-net/src/wifi/realtek/: Realtek RTL8821C (rtw88)
+  station and the shared rtw_chip_info table, with the RTL8822C's chip-reset
+  recovery, PCIe ASPM quirks and stepped calibration
+    Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/realtek/rtw88/coex.c,
+    drivers/net/wireless/realtek/rtw88/fw.c,
+    drivers/net/wireless/realtek/rtw88/main.c,
+    drivers/net/wireless/realtek/rtw88/main.h,
+    drivers/net/wireless/realtek/rtw88/pci.c,
+    drivers/net/wireless/realtek/rtw88/phy.c,
+    drivers/net/wireless/realtek/rtw88/reg.h,
+    drivers/net/wireless/realtek/rtw88/rtw8821c.c,
+    drivers/net/wireless/realtek/rtw88/rtw8821c.h,
+    drivers/net/wireless/realtek/rtw88/rtw8821c_table.c,
+    drivers/net/wireless/realtek/rtw88/rtw8821c_table.h,
+    drivers/net/wireless/realtek/rtw88/rtw8821ce.c,
+    drivers/net/wireless/realtek/rtw88/rtw8822c.c
 crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
   PCIe power, efuse, DMA, firmware download, MAC init, H2C/C2H command channel,
   BB/RF table, RF register page, coex Wi-Fi grant, calibration, channel, TX

@@ -1,6 +1,6 @@
 //! The cold claim of a Wi-Fi function whose driver sets Bus Master before it
 //! resets its engines: an Intel radio (iwlwifi), a MediaTek MT7921 or MT7922
-//! (mt7921e) or MT7925 (mt7925e), or a Realtek RTL8822CE (rtw88). Their claim used to keep the
+//! (mt7921e) or MT7925 (mt7925e), or a Realtek RTL8822CE or RTL8821CE (rtw88). Their claim used to keep the
 //! preparation's seal for good, so the Bus Master each driver sets was
 //! refused and none became a station (issues #224 and #18).
 //!
@@ -56,6 +56,8 @@ pub enum Chip {
     Mt7925,
     /// A Realtek RTL8822CE (`realtek::identity::RTL8822C_DEVICES`).
     Rtl8822c,
+    /// A Realtek RTL8821CE (`realtek::chip::RTL8821C`).
+    Rtl8821c,
 }
 
 impl Chip {
@@ -77,6 +79,7 @@ impl Chip {
             Self::Mt7922 => "MT7922",
             Self::Mt7925 => "MT7925",
             Self::Rtl8822c => "RTL8822CE",
+            Self::Rtl8821c => "RTL8821CE",
         }
     }
 }

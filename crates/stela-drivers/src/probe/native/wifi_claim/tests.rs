@@ -179,12 +179,16 @@ fn plan_takes_flr_first_then_the_bus_and_otherwise_nothing() {
     }
 }
 
-/// An Intel radio or an RTL8822CE that advertises FLR gets one, and no bus
+/// An Intel radio, an RTL8822CE or an RTL8821CE that advertises FLR gets one, and no bus
 /// reset even when one is offered; it answers again as the same stopped
 /// function, and Bus Master is never written.
 #[test]
 fn a_radio_with_flr_is_reset_function_level() {
-    for ((vendor, device), chip) in [(AX210, Chip::Intel), (RTL8822CE, Chip::Rtl8822c)] {
+    for ((vendor, device), chip) in [
+        (AX210, Chip::Intel),
+        (RTL8822CE, Chip::Rtl8822c),
+        ((0x10ec, 0xc821), Chip::Rtl8821c),
+    ] {
         let (mut peer, state) = model(vendor, device, FLR);
         state.borrow_mut().bus_reset = true;
         let quiesced = run(&mut peer, chip).unwrap();
@@ -199,7 +203,11 @@ fn a_radio_with_flr_is_reset_function_level() {
 /// offers.
 #[test]
 fn a_radio_without_flr_gets_the_bus_reset() {
-    for ((vendor, device), chip) in [(AX210, Chip::Intel), (RTL8822CE, Chip::Rtl8822c)] {
+    for ((vendor, device), chip) in [
+        (AX210, Chip::Intel),
+        (RTL8822CE, Chip::Rtl8822c),
+        ((0x10ec, 0xc821), Chip::Rtl8821c),
+    ] {
         let (mut peer, state) = model(vendor, device, 0);
         state.borrow_mut().bus_reset = true;
         let quiesced = run(&mut peer, chip).unwrap();

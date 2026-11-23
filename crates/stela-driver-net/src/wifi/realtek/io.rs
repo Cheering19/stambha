@@ -4,10 +4,24 @@
 //! rtw88/{hci,pci}.h. `Io` carries the reserved-page beacon submission the
 //! firmware download needs; `Bar` is the plain BAR shared by the beacon, RX
 //! and TX register blocks.
-use super::identity::{Chip, Profile};
-use crate::{Clock, bus::mmio::Mmio};
+use super::identity::Profile;
+use crate::{Clock, Deadline, bus::mmio::Mmio};
 use alloc::sync::Arc;
 use core::ptr::NonNull;
+use stela_driver_base::stepped::{until, yield_now};
+
+/// A wait of `microseconds` in stepped work: the step ends, and the work goes
+/// on once the wait has passed on `io`'s clock. Registers without a clock
+/// delay in place and end the step after.
+pub async fn sleep<I: Io + ?Sized>(io: &mut I, microseconds: u64) {
+    match io.deadline(microseconds) {
+        Some(deadline) => until(deadline).await,
+        None => {
+            io.delay_us(microseconds);
+            yield_now().await;
+        }
+    }
+}
 
 /// Bytes of the BAR every RTL8822C register block reaches.
 pub const BAR_BYTES: usize = 0x170c;
@@ -78,6 +92,11 @@ pub unsafe trait Io {
     fn now_us(&mut self) -> Result<u64, Error> {
         Err(Error::InvalidClock)
     }
+    /// When a wait of `microseconds` from now ends, on the clock the delays
+    /// keep; `None` where [`Self::delay_us`] stands in for one.
+    fn deadline(&mut self, _microseconds: u64) -> Option<Deadline> {
+        None
+    }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error>;
     /// # Safety
     /// Same new BCN_VALID completion proof as BeaconQueue::consumed.
@@ -114,6 +133,9 @@ unsafe impl<I: Io> Io for &mut I {
     fn now_us(&mut self) -> Result<u64, Error> {
         (**self).now_us()
     }
+    fn deadline(&mut self, microseconds: u64) -> Option<Deadline> {
+        (**self).deadline(microseconds)
+    }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error> {
         (**self).submit_beacon(data)
     }
@@ -130,7 +152,7 @@ unsafe impl<I: Io> Io for &mut I {
 /// with the queue on any uncertain download; dropping this adapter cannot
 /// unmap memory still accessible to a quarantined device.
 pub struct NativeIo<Q: BeaconQueue> {
-    registers: Mmio,
+    registers: Window,
     clock: Clock,
     profile: Profile,
     bytes: usize,
@@ -164,33 +186,31 @@ impl<Q: BeaconQueue> NativeIo<Q> {
         // this entry additionally requires completed prior MAC power setup.
         unsafe { Self::mapped(window, bytes, queue, owner, clock, profile) }
     }
-    /// Construct the real native interface and execute the source MAC power
-    /// sequence before firmware download. No FIFO/HCI/radio readiness implied.
+    /// Construct the real native interface for the source MAC power sequence
+    /// ([`super::power::on`]) before firmware download. No MAC power, FIFO,
+    /// HCI or radio readiness is implied.
     ///
     /// # Safety
     /// Same real UC BAR/requester/profile/clock ownership as `new`, except MAC
     /// power may be off or left on by prior firmware. All old DMA/IRQ workers
     /// are acknowledged stopped and drained; the native beacon queue is
     /// fresh/idle, its isolated domain owns all mappings and no competing
-    /// power/reset path exists. Caller keeps validated FIFO geometry for
-    /// the later source MAC configuration and download restore boundary.
-    /// After this sequence, HCI/beacon-base reconfiguration/readback
-    /// is required before Download or queue submission. The software queue's
-    /// configured flag is not evidence that its base survived a power cycle.
-    pub unsafe fn power_on_new(
+    /// power/reset path exists. Caller runs the power sequence first and
+    /// keeps validated FIFO geometry for the later source MAC configuration
+    /// and download restore boundary. After that sequence, HCI/beacon-base
+    /// reconfiguration/readback is required before Download or queue
+    /// submission. The software queue's configured flag is not evidence that
+    /// its base survived a power cycle.
+    pub unsafe fn unpowered(
         window: NonNull<u8>,
         bytes: usize,
         queue: Q,
         owner: Arc<dyn core::any::Any>,
         clock: Clock,
         profile: Profile,
-    ) -> Result<Self, super::power::Error> {
+    ) -> Result<Self, Error> {
         // SAFETY: caller supplies the exclusive mapped requester.
-        let mut io = unsafe { Self::mapped(window, bytes, queue, owner, clock, profile)? };
-        // SAFETY: entry contract requires independent stop/drain and fresh
-        // idle queue, not a manufactured reset/firmware completion proof.
-        unsafe { super::power::on(&mut io)? };
-        Ok(io)
+        unsafe { Self::mapped(window, bytes, queue, owner, clock, profile) }
     }
     /// # Safety
     /// Exclusive UC BAR, owned requester, calibrated clock and exact
@@ -209,12 +229,12 @@ impl<Q: BeaconQueue> NativeIo<Q> {
         if clock.ticks_per_microsecond == 0 {
             return Err(Error::InvalidClock);
         }
-        if profile.chip() != Chip::Rtl8822C {
+        if profile.rtw88().is_none() {
             return Err(Error::WrongChip);
         }
         Ok(Self {
             // SAFETY: the constructor's UC BAR/ownership contract.
-            registers: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            registers: unsafe { Window::new(window, bytes) },
             clock,
             profile,
             bytes,
@@ -273,6 +293,9 @@ unsafe impl<Q: BeaconQueue> Io for NativeIo<Q> {
         self.owned.as_ref().ok_or(Error::InvalidState)?;
         Ok(self.clock.now_us())
     }
+    fn deadline(&mut self, microseconds: u64) -> Option<Deadline> {
+        Some(self.clock.deadline(microseconds))
+    }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error> {
         self.owned
             .as_mut()
@@ -295,10 +318,118 @@ unsafe impl<Q: BeaconQueue> Io for NativeIo<Q> {
     }
 }
 
+/// The registers a [`NativeIo`] or [`Bar`] reaches: the BAR, or in tests a
+/// modeled chip attached at the BAR's address ([`model::attach`]).
+#[derive(Clone)]
+struct Window {
+    mmio: Mmio,
+    #[cfg(test)]
+    model: Option<alloc::rc::Rc<dyn model::Chip>>,
+}
+impl Window {
+    /// # Safety
+    /// [`Mmio::new`]'s contract for `window` and `bytes`.
+    unsafe fn new(window: NonNull<u8>, bytes: usize) -> Self {
+        Self {
+            // SAFETY: forwarded from the caller.
+            mmio: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            #[cfg(test)]
+            model: model::find(window),
+        }
+    }
+    fn read8(&self, offset: usize) -> u8 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 1) as u8;
+        }
+        self.mmio.read8(offset)
+    }
+    fn read16(&self, offset: usize) -> u16 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 2) as u16;
+        }
+        self.mmio.read16(offset)
+    }
+    fn read32(&self, offset: usize) -> u32 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 4);
+        }
+        self.mmio.read32(offset)
+    }
+    fn write8(&self, offset: usize, value: u8) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 1, value.into());
+        }
+        self.mmio.write8(offset, value);
+    }
+    fn write16(&self, offset: usize, value: u16) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 2, value.into());
+        }
+        self.mmio.write16(offset, value);
+    }
+    fn write32(&self, offset: usize, value: u32) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 4, value);
+        }
+        self.mmio.write32(offset, value);
+    }
+}
+
+/// Modeled chips that answer a test's BAR in place of memory, so the native
+/// register path, rings and [`super::hardware::Hardware`] run on them.
+#[cfg(test)]
+pub(super) mod model {
+    extern crate std;
+    use alloc::{rc::Rc, vec::Vec};
+    use core::{cell::RefCell, ptr::NonNull};
+
+    /// A chip's registers, by offset and access width in bytes.
+    pub(in crate::wifi::realtek) trait Chip {
+        fn read(&self, register: u32, width: usize) -> u32;
+        fn write(&self, register: u32, width: usize, value: u32);
+    }
+
+    type Attached = Vec<(usize, Rc<dyn Chip>)>;
+
+    std::thread_local! {
+        static CHIPS: RefCell<Attached> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Answer each BAR this thread maps at `window` from `chip`.
+    pub(in crate::wifi::realtek) fn attach(window: NonNull<u8>, chip: Rc<dyn Chip>) {
+        CHIPS.with(|chips| chips.borrow_mut().push((window.as_ptr().addr(), chip)));
+    }
+
+    /// Stop answering `window` from a chip; BARs mapped before keep theirs.
+    pub(in crate::wifi::realtek) fn detach(window: NonNull<u8>) {
+        CHIPS.with(|chips| {
+            chips
+                .borrow_mut()
+                .retain(|(at, _)| *at != window.as_ptr().addr())
+        });
+    }
+
+    pub(super) fn find(window: NonNull<u8>) -> Option<Rc<dyn Chip>> {
+        CHIPS.with(|chips| {
+            chips
+                .borrow()
+                .iter()
+                .find(|(at, _)| *at == window.as_ptr().addr())
+                .map(|(_, chip)| chip.clone())
+        })
+    }
+}
+
 /// The exclusive BAR of one RTL8822C requester, shared by its beacon, RX and
 /// TX register blocks. The owner keeps the PCI claim and mapping alive.
 pub struct Bar {
-    mmio: Mmio,
+    mmio: Window,
     profile: Profile,
     _owner: Arc<dyn core::any::Any>,
 }
@@ -317,12 +448,12 @@ impl Bar {
         if bytes < BAR_BYTES || window.as_ptr().addr() & 3 != 0 {
             return Err(Error::Register);
         }
-        if profile.chip() != Chip::Rtl8822C {
+        if profile.rtw88().is_none() {
             return Err(Error::WrongChip);
         }
         Ok(Self {
             // SAFETY: the constructor's exclusive mapped-BAR contract.
-            mmio: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            mmio: unsafe { Window::new(window, bytes) },
             profile,
             _owner: owner,
         })
@@ -361,6 +492,38 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
+    fn a_chip_attached_at_the_window_answers_the_bars_mapped_there() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        type Stores = RefCell<Vec<(u32, usize, u32)>>;
+        struct Echo(Stores);
+        impl model::Chip for Echo {
+            fn read(&self, register: u32, width: usize) -> u32 {
+                register ^ width as u32
+            }
+            fn write(&self, register: u32, width: usize, value: u32) {
+                self.0.borrow_mut().push((register, width, value));
+            }
+        }
+        let memory: Arc<Vec<u32>> = Arc::new(alloc::vec![0; BAR_BYTES / 4]);
+        let window = NonNull::new(memory.as_ptr().cast_mut().cast::<u8>()).unwrap();
+        let chip = Rc::new(Echo(RefCell::new(Vec::new())));
+        model::attach(window, chip.clone());
+        // SAFETY: the window is this test's own memory, which the chip
+        // answers in its place; nothing else maps it.
+        let bar = unsafe { Bar::new(window, BAR_BYTES, profile(), memory.clone()) }.unwrap();
+        model::detach(window);
+        assert_eq!(bar.read32(0x80), 0x84);
+        assert_eq!(bar.read8(0x10), 0x11);
+        bar.write16(0x100, 7);
+        assert_eq!(*chip.0.borrow(), [(0x100, 2, 7)]);
+        assert!(memory.iter().all(|word| *word == 0));
+        // SAFETY: as above, read only.
+        let plain = unsafe { Bar::new(window, BAR_BYTES, profile(), memory.clone()) }.unwrap();
+        assert_eq!(plain.read32(0x80), 0);
+    }
+
+    #[test]
     fn native_register_adapter_bounds_alignment_and_quarantine_prevent_invalid_access() {
         use core::sync::atomic::AtomicU32;
         struct NoDma;
@@ -385,7 +548,7 @@ mod tests {
         let mut io = NativeIo {
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            registers: unsafe { Mmio::new(address, BAR_BYTES) },
+            registers: unsafe { Window::new(NonNull::new(address as *mut u8).unwrap(), BAR_BYTES) },
             clock: Clock {
                 ticks_per_microsecond: 1,
             },

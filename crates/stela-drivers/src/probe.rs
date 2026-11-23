@@ -65,7 +65,7 @@ pub fn rtl8852ce(function: &crate::bus::pci::Identity) -> bool {
 /// - an RTL8852CE ([`rtl8852ce`]), quiesced through its own registers;
 /// - an Intel radio `iwl_pci_probe` identifies (with `native-acpi`, which
 ///   its platform configuration needs), an MT7921, MT7922 or MT7925, or an
-///   RTL8822CE, each quiesced by a reset (`native::wifi_claim`, experimental: no such chip
+///   RTL8822CE or RTL8821CE, each quiesced by a reset (`native::wifi_claim`, experimental: no such chip
 ///   has run here yet). On a PC where no reset reaches the chip, its claim
 ///   keeps it sealed and the boot log says why.
 ///
@@ -87,9 +87,12 @@ pub fn wifi_starts(function: &crate::bus::pci::Identity) -> bool {
     }
     .chip()
     .is_some();
-    let rtl8822c = function.vendor == 0x10ec
-        && crate::net::wifi::realtek::identity::RTL8822C_DEVICES.contains(&function.device);
-    rtl8852ce(function) || (wireless && (intel || mt792x || rtl8822c))
+    let rtw88 = function.vendor == 0x10ec
+        && (crate::net::wifi::realtek::identity::RTL8822C_DEVICES.contains(&function.device)
+            || crate::net::wifi::realtek::chip::RTL8821C
+                .devices
+                .contains(&function.device));
+    rtl8852ce(function) || (wireless && (intel || mt792x || rtw88))
 }
 
 /// A controller refusal keeps its original typed details for boot diagnostics.

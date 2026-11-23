@@ -3,6 +3,7 @@ use super::*;
 use crate::wifi::realtek::identity::tests::profile;
 use alloc::{sync::Arc, vec::Vec};
 use std::sync::Mutex;
+use stela_driver_base::stepped::block_on;
 struct Model {
     physical: [u8; PHYSICAL],
     control: u32,
@@ -62,6 +63,15 @@ impl Model {
     }
 }
 struct Registers(Arc<Mutex<Model>>);
+/// [`read`] run to completion on `model`.
+///
+/// # Safety
+/// [`read`]'s contract, for the model alone.
+unsafe fn read_model(model: Arc<Mutex<Model>>) -> Result<Physical, Error> {
+    let mut registers = Registers(model);
+    // SAFETY: forwarded from the caller.
+    block_on(unsafe { read(&mut registers) })
+}
 // SAFETY: serialized OTP/register/timer effects model, no physical OTP or
 // calibrated timer claim. Source bytes and events stay independent.
 unsafe impl Io for Registers {
@@ -172,7 +182,7 @@ fn real_read_trigger_polling_preserves_raw_otp_ldo_bank_and_exact_identity() {
         let model = Arc::new(Mutex::new(Model::new(case)));
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        let physical = unsafe { read(&mut Registers(model.clone())) }.unwrap();
+        let physical = unsafe { read_model(model.clone()) }.unwrap();
         let m = model.lock().unwrap();
         assert_eq!(physical.bytes(), &m.physical);
         assert_eq!(physical.profile(), profile());
@@ -195,7 +205,7 @@ fn completed_address_echo_rejects_wrong_or_all_ones_control_with_valid_identity(
             assert!(matches!(
                 // SAFETY: the model device, its pages and its domain belong to this test alone;
                 // no other driver, worker or DMA touches them.
-                unsafe { read(&mut Registers(model.clone())) },
+                unsafe { read_model(model.clone()) },
                 Err(Error::CompletionAddress { requested, observed })
                     if requested == address as u16 && observed == ((value >> 8) & 1023) as u16
             ));
@@ -209,7 +219,7 @@ fn completed_address_echo_rejects_wrong_or_all_ones_control_with_valid_identity(
     model.lock().unwrap().physical = [0xff; PHYSICAL];
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let physical = unsafe { read(&mut Registers(model.clone())) }.unwrap();
+    let physical = unsafe { read_model(model.clone()) }.unwrap();
     assert_eq!(physical.bytes(), &[0xff; PHYSICAL]);
     let m = model.lock().unwrap();
     assert!(!m.quarantined);
@@ -222,7 +232,7 @@ fn uncertain_reads_are_quarantined() {
     let normal = Arc::new(Mutex::new(Model::new(0)));
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { read(&mut Registers(normal.clone())) }.unwrap();
+    unsafe { read_model(normal.clone()) }.unwrap();
     let calls = normal.lock().unwrap().calls;
     for call in 1..=calls {
         let model = Arc::new(Mutex::new(Model::new(0)));
@@ -234,7 +244,7 @@ fn uncertain_reads_are_quarantined() {
         assert!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { read(&mut Registers(model.clone())) }.is_err(),
+            unsafe { read_model(model.clone()) }.is_err(),
             "operation {call}"
         );
         assert!(model.lock().unwrap().quarantined);
@@ -245,7 +255,7 @@ fn uncertain_reads_are_quarantined() {
         assert!(matches!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { read(&mut Registers(model.clone())) },
+            unsafe { read_model(model.clone()) },
             Err(Error::IdentityChanged)
         ));
         assert!(model.lock().unwrap().quarantined);
@@ -255,7 +265,7 @@ fn uncertain_reads_are_quarantined() {
         model.lock().unwrap().ready = ready;
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        assert!(unsafe { read(&mut Registers(model.clone())) }.is_err());
+        assert!(unsafe { read_model(model.clone()) }.is_err());
         assert!(model.lock().unwrap().quarantined);
         assert!(model.lock().unwrap().events.is_empty());
     }
@@ -269,7 +279,7 @@ fn uncertain_reads_are_quarantined() {
         assert!(matches!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { read(&mut Registers(model.clone())) },
+            unsafe { read_model(model.clone()) },
             Err(Error::Timeout { address: 0 })
         ));
         assert_eq!(model.lock().unwrap().delays, POLLS);
@@ -280,7 +290,7 @@ fn uncertain_reads_are_quarantined() {
     assert!(matches!(
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { read(&mut Registers(model.clone())) },
+        unsafe { read_model(model.clone()) },
         Err(Error::Removed)
     ));
     assert!(model.lock().unwrap().quarantined);
@@ -329,6 +339,68 @@ fn immutable_board_provenance_keeps_raw_values_without_fallback_or_policy() {
     for mac in [[0; 6], [255; 6], [1, 0, 0, 0, 0, 0]] {
         log.bytes[0x120..0x126].copy_from_slice(&mac);
         assert_eq!(log.board().valid_mac(), Err(Error::InvalidMac));
+    }
+}
+#[test]
+fn an_rtl8821c_reads_its_own_map() {
+    let rtl8821c = crate::wifi::realtek::chip::rtl8821c::tests::profile(1);
+    // Its logical map ends at 512 bytes and 96 physical bytes are protected.
+    let mut p = [255; PHYSICAL];
+    p[..4].copy_from_slice(&[0x0f, 0x8e, 1, 2]);
+    let physical = Physical {
+        profile: rtl8821c,
+        bytes: p,
+    };
+    assert_eq!(
+        physical.logical().err(),
+        Some(Error::Logical { offset: 64 * 8 })
+    );
+    let mut p = [0x1f; PHYSICAL];
+    p[PHYSICAL - 96 - 1] = 0x0f;
+    let physical = Physical {
+        profile: rtl8821c,
+        bytes: p,
+    };
+    assert_eq!(
+        physical.logical().err(),
+        Some(Error::Header {
+            offset: PHYSICAL - 96 - 1
+        })
+    );
+    let mut log = Logical {
+        profile: rtl8821c,
+        bytes: core::array::from_fn(|i| i as u8),
+    };
+    log.bytes[0xd0..0xd6].copy_from_slice(&[2, 3, 4, 5, 6, 7]);
+    for (rfe, btg, known) in [
+        (0x00, false, true),
+        (0x22, true, true),
+        (0x04, true, true),
+        (0x06, false, true),
+        (0x01, false, false),
+        (0x0a, true, false),
+    ] {
+        log.bytes[0xca] = rfe;
+        let b = log.board();
+        assert_eq!(b.valid_mac().unwrap(), [2, 3, 4, 5, 6, 7]);
+        let raw = b.raw();
+        assert_eq!(raw.rfe_raw, rfe & 0x1f);
+        assert_eq!(raw.package, (rfe >> 5) & 1);
+        assert_eq!(raw.rfe_btg, btg);
+        assert_eq!(b.source_rfe().is_ok(), known);
+        assert_eq!(raw.thermal_raw, [0xba, 0xff]);
+        assert_eq!(raw.thermal_average, 0xba);
+        assert_eq!(raw.crystal_cap_raw, 0xb9);
+        assert_eq!(raw.tx_bb_swing, [0xc6, 0xc7]);
+        assert_eq!(raw.power_track_raw, 0);
+        // RFE 2 and 4 take path A's 2.4 GHz indices from path B's.
+        let a = &raw.power_tables[..18];
+        if matches!(rfe & 0x1f, 2 | 4) {
+            assert_eq!(a, &log.bytes[0x10 + 42..0x10 + 42 + 18]);
+        } else {
+            assert_eq!(a, &log.bytes[0x10..0x10 + 18]);
+        }
+        assert_eq!(raw.power_tables[18..], log.bytes[0x10 + 18..0xb8]);
     }
 }
 #[test]
@@ -387,7 +459,7 @@ fn physical_transport_logical_maps_and_all_board_fields_match_unchanged_c() {
         let model = Arc::new(Mutex::new(Model::new(case)));
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        let native = unsafe { read(&mut Registers(model.clone())) }.unwrap();
+        let native = unsafe { read_model(model.clone()) }.unwrap();
         assert_eq!(native.bytes(), &trace[offset..offset + 512]);
         offset += 512;
         let size = u32::from_le_bytes(trace[offset..offset + 4].try_into().unwrap()) as usize;
@@ -412,7 +484,7 @@ fn physical_transport_logical_maps_and_all_board_fields_match_unchanged_c() {
         assert!(matches!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { read(&mut Registers(model.clone())) },
+            unsafe { read_model(model.clone()) },
             Err(Error::Timeout { address: 0 })
         ));
         let mut words = [0; 5];
