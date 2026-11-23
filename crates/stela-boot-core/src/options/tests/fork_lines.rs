@@ -262,7 +262,7 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert!(!options.hle && options.hle_off.is_empty());
         assert!(!options.core_trial);
         assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());
-        assert!(options.pack_preload.is_none() && options.pack_preload());
+        assert!(options.pack_preload.is_none() && !options.pack_preload());
     }
 }
 
