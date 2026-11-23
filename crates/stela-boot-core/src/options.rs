@@ -671,6 +671,11 @@ pub struct System {
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
+    /// Replace the guest functions HLE has signatures for with native
+    /// routines (`--hle`); off by default.
+    pub hle: bool,
+    /// The routines `--hle` leaves translated (`--hle-off ID[,ID...]`).
+    pub hle_off: Vec<stela_engine::hle::Id>,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -799,6 +804,8 @@ impl Default for System {
             laptop: None,
             asus_mode: None,
             amx_native: None,
+            hle: false,
+            hle_off: Vec::new(),
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -942,6 +949,34 @@ impl fmt::Display for Ssid<'_> {
             } else {
                 write!(f, "{character}")?;
             }
+        }
+        Ok(())
+    }
+}
+
+/// A `--hle-off` word: distinct routine names separated by commas.
+fn hle_routines(word: &str) -> Result<Vec<stela_engine::hle::Id>, Error> {
+    let mut routines = Vec::new();
+    for name in word.split(',') {
+        let routine = stela_engine::hle::Id::from_name(name).ok_or(Error::HleId)?;
+        if routines.contains(&routine) {
+            return Err(Error::HleId);
+        }
+        routines.push(routine);
+    }
+    Ok(routines)
+}
+
+/// Routines as one `--hle-off` word.
+struct Routines<'a>(&'a [stela_engine::hle::Id]);
+
+impl fmt::Display for Routines<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, routine) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(",")?;
+            }
+            f.write_str(routine.name())?;
         }
         Ok(())
     }
@@ -1338,6 +1373,11 @@ impl fmt::Display for System {
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
+        line.flag("--hle", self.hle)?;
+        line.value(
+            "--hle-off",
+            (!self.hle_off.is_empty()).then(|| Routines(&self.hle_off)),
+        )?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

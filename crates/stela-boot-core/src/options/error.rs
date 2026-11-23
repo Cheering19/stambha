@@ -119,6 +119,8 @@ pub enum Error {
     DuplicateNativeBootstrap,
     AmxNative,
     DuplicateAmxNative,
+    DuplicateHle,
+    HleId,
     Constraint(Constraint),
     Target {
         argument: TargetArgument,
@@ -272,6 +274,10 @@ impl Error {
                 "--amx-native takes on, off, or off: and AMX register operations such as fma32,vecfp"
             }
             Self::DuplicateAmxNative => "duplicate --amx-native",
+            Self::DuplicateHle => "--hle and --hle-off each occur once",
+            Self::HleId => {
+                "--hle-off needs distinct routines separated by commas: memmove, bzero, memset, memcmp or strlen"
+            }
             Self::Constraint(rule) => rule.message(),
             Self::Target { source, .. } | Self::Guid { source, .. } => source,
             Self::BootCommandOrigin { source, .. } => source,

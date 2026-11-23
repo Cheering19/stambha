@@ -442,7 +442,7 @@ fn every_option_survives_a_round_trip() {
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
          --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
-         --acpi-hardware --amx-native off \
+         --acpi-hardware --amx-native off --hle --hle-off bzero \
          --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
@@ -463,6 +463,8 @@ fn every_option_survives_a_round_trip() {
     assert!(!System::default().acpi_hardware);
     assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
+    assert!(options.hle);
+    assert_eq!(options.hle_off, [stela_engine::hle::Id::Bzero]);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(
         "--system --bundle b --storage {DISK} --restore-study --restore-source {DISK} \
@@ -494,6 +496,40 @@ fn the_bluetooth_lend_round_trips_and_is_off_by_default() {
     let options = round_trip(&line);
     assert!(options.bluetooth_lend && options.bluetooth_trace);
     assert_eq!(options.to_string(), line);
+}
+
+#[test]
+fn hle_flags_round_trip_and_refuse_unknown_ids() {
+    use stela_engine::hle::Id;
+    let off = round_trip("--system");
+    assert!(!off.hle);
+    assert!(off.hle_off.is_empty());
+    assert!(round_trip("--system --hle").hle);
+    let some = round_trip("--system --hle --hle-off memmove,strlen");
+    assert!(some.hle);
+    assert_eq!(some.hle_off, [Id::Memmove, Id::Strlen]);
+    assert_eq!(some.to_string(), "--system --hle --hle-off memmove,strlen");
+    // Without --hle the list is kept, and turns nothing off.
+    let alone = round_trip("--system --hle-off bzero,memset,memcmp");
+    assert!(!alone.hle);
+    assert_eq!(alone.hle_off, [Id::Bzero, Id::Memset, Id::Memcmp]);
+    for text in [
+        "--system --hle-off nosuch",
+        "--system --hle-off",
+        "--system --hle-off memmove,",
+        "--system --hle-off ,memmove",
+        "--system --hle-off memmove,memmove",
+        "--system --hle-off bail",
+        "--system --hle-off Memmove",
+    ] {
+        assert_eq!(System::parse(text), Err(Error::HleId), "{text}");
+    }
+    for text in [
+        "--system --hle --hle",
+        "--system --hle-off memmove --hle-off strlen",
+    ] {
+        assert_eq!(System::parse(text), Err(Error::DuplicateHle), "{text}");
+    }
 }
 
 #[test]

@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 default = ["std"]
-test-support = []
+test-support = ["stela-compiler/test-support"]
 native-profile = ["stela-contracts/native-profile"]
 std = ["serde/std", "serde_json/std", "stela-compiler/std", "stela-contracts/std", "stela-formats/std", "dep:tempfile", "dep:libc"]
 

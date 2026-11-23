@@ -103,6 +103,7 @@ pub mod flag_word;
 mod flags;
 mod fp_register;
 mod guest_range;
+pub mod hle;
 mod integer_math;
 mod integer_minmax;
 mod integer_unary;

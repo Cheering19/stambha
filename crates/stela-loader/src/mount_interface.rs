@@ -55,6 +55,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So does the fork's `--asus-mode performance|turbo|silent|off`, as
 /// hand-written: an ASUS laptop's firmware thermal policy is set to
 /// performance unasked, and no line setup writes holds the option.
+/// So do the fork's `--hle` and `--hle-off ID[,ID...]`, hand-written
+/// opt-ins that replace signed guest functions with native routines: no
+/// line setup writes holds them.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

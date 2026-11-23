@@ -233,7 +233,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.cpu.step_advance = mode.step;
         // PSTATE.PACM applies to the one instruction after PACM.
         let pacm = self.cpu.pstate.pacm;
-        let single = mode.breakpoints || mode.step || pacm;
+        let bypass = self.take_hle_bypass(pc);
+        let single = bypass || mode.breakpoints || mode.step || pacm;
         let fetching = self.timing_start();
         let fetched = self.fetch_block(pc, single);
         let fetched_at = self.timing_charge(step_timing::Phase::Fetch, fetching);
