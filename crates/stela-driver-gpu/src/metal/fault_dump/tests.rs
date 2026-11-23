@@ -167,6 +167,29 @@ fn hex_lines_stop_at_the_budget_and_count_the_rest() {
     assert_eq!(whole.end(1, HEX_BUDGET), None);
 }
 
+/// The boot log's burst for one family of lines
+/// (`stela_boot_core::log_budget::BURST_BYTES`), which `GPU FAULT` lines share.
+const LOG_BURST_BYTES: usize = 64 << 10;
+
+#[test]
+fn the_first_faults_hex_leaves_the_log_room_for_every_fault() {
+    let image = ShaderImage {
+        stage: "fragment".into(),
+        code: alloc::vec![0xa5; 4 * HEX_BUDGET],
+        ..vertex()
+    };
+    let mut budget = HexBudget::new(HEX_BUDGET);
+    let text: usize = budget
+        .code(1, "render 1234", 3, &image)
+        .iter()
+        .map(|line| "GPU FAULT ".len() + line.len() + 1)
+        .sum();
+    // At most 3/8 of the burst: the rest holds the pipeline and stage lines
+    // of the first fault and of the two after it.
+    assert!(text <= LOG_BURST_BYTES * 3 / 8, "{text} bytes of hex text");
+    assert!(budget.end(1, HEX_BUDGET).is_some());
+}
+
 #[test]
 fn every_line_starts_with_the_prefix_the_platform_logs_whole() {
     let image = vertex();

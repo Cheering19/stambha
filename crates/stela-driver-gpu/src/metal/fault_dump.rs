@@ -31,8 +31,11 @@ pub const MAX_PIPELINES: usize = 8;
 /// The Vulkan pipelines of one Metal pipeline a dump names: its first, then
 /// its bicubic and mesh variants or a compute pipeline's threadgroup shapes.
 pub const MAX_VARIANTS: usize = 4;
-/// The bytes of machine code the first fault's dump gives in hex.
-pub const HEX_BUDGET: usize = 32 << 10;
+/// The bytes of machine code the first fault's dump gives in hex: about
+/// 19 KB of `GPU FAULT` text, so the boot log's 64 KiB burst for the family
+/// (`stela_boot_core::log_budget::BURST_BYTES`) still holds the pipeline and
+/// stage lines of all [`REPORTED_FAULTS`] faults.
+pub const HEX_BUDGET: usize = 6 << 10;
 /// The bytes of code on each hex line.
 pub const HEX_LINE_BYTES: usize = 64;
 
