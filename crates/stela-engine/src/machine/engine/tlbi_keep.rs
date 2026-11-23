@@ -54,6 +54,15 @@
 //! `--tlbi-verify-check` walks every entry verification keeps in full as
 //! well, and drops it, counted as a mismatch with a sample, where the walk
 //! gives anything else: a check of the argument above on a real boot.
+//!
+//! **Cost.** A TLBI of everything marks the contexts (one store each) and
+//! bumps two epochs. A verification reads each of the context's records
+//! where it lies (`TlbiKeep::store`, indexed by context and page): a kept
+//! entry moves nothing, and a dropped one leaves its own slot
+//! (`LookupTable::set`), not every set its 16 KiB granule lists across all
+//! contexts: with a thousand contexts sharing each VA and boot 27's drop
+//! rate, that search was most of the cost in `tests/tlbi_keep_cost.rs`,
+//! which times the keep against forgetting.
 
 use super::*;
 
@@ -167,12 +176,36 @@ impl<H: Host> mmu::TableMemory for RecordingTables<'_, H> {
     }
 }
 
-/// A verification's cache of descriptors it read, by address.
-struct Confirmed([(u64, Option<u64>); CONFIRMED]);
+/// Variants a verification's cache keeps the numbers of.
+const VARIANTS_SEEN: usize = 4;
+
+/// A verification's cache of descriptors it read, by address, and of the
+/// numbers of the variants its entries' frames took (`known_variant`
+/// searches every variant; a context's pages take one or two).
+struct Confirmed(
+    [(u64, Option<u64>); CONFIRMED],
+    [Option<(Variant, Option<VariantId>)>; VARIANTS_SEEN],
+    usize,
+);
 
 impl Confirmed {
     fn new() -> Self {
-        Self([(u64::MAX, None); CONFIRMED])
+        Self([(u64::MAX, None); CONFIRMED], [None; VARIANTS_SEEN], 0)
+    }
+
+    /// The number of `variant`, through the cache.
+    fn variant<H: Host, D: Devices>(
+        &mut self,
+        machine: &Machine<H, D>,
+        variant: Variant,
+    ) -> Option<VariantId> {
+        if let Some((_, id)) = self.1.iter().flatten().find(|(held, _)| *held == variant) {
+            return *id;
+        }
+        let id = machine.known_variant(variant);
+        self.1[self.2 % VARIANTS_SEEN] = Some((variant, id));
+        self.2 += 1;
+        id
     }
 
     fn slot(address: u64) -> usize {
@@ -188,10 +221,15 @@ pub(super) struct TlbiKeep {
     /// `--tlbi-verify-check`: every entry verification keeps is walked in
     /// full as well.
     pub(super) check: bool,
-    /// The walk each ITLB entry was filled from, by context and page. An
-    /// entry the ITLB evicted leaves its record until a verification or a
-    /// prune finds it gone.
-    records: BTreeMap<(u64, u64), WalkRecord>,
+    /// The walk each ITLB entry was filled from, by context and page, as
+    /// its place in `store`. An entry the ITLB evicted leaves its record
+    /// until a verification or a prune finds it gone. The index holds
+    /// places, not records: a verification reads a context's records where
+    /// they are and moves none it keeps.
+    records: BTreeMap<(u64, u64), u32>,
+    /// The records by place, and the places of records that went.
+    store: Vec<WalkRecord>,
+    free: Vec<u32>,
     /// Contexts with an ITLB entry no record covers, which no verification
     /// can keep.
     incomplete: BTreeSet<u64>,
@@ -202,6 +240,42 @@ pub(super) struct TlbiKeep {
     /// the acceptance tests must catch.
     #[cfg(test)]
     pub(super) unverified: bool,
+}
+
+impl TlbiKeep {
+    /// Record the walk of `context`'s entry of `page`, over the one before.
+    fn put(&mut self, context: u64, page: u64, record: WalkRecord) {
+        if let Some(&at) = self.records.get(&(context, page)) {
+            self.store[at as usize] = record;
+            return;
+        }
+        let at = match self.free.pop() {
+            Some(at) => {
+                self.store[at as usize] = record;
+                at
+            }
+            None => {
+                self.store.push(record);
+                (self.store.len() - 1) as u32
+            }
+        };
+        self.records.insert((context, page), at);
+    }
+
+    /// Drop the record of `context`'s entry of `page`, if it has one.
+    fn take(&mut self, context: u64, page: u64) {
+        if let Some(at) = self.records.remove(&(context, page)) {
+            self.free.push(at);
+        }
+    }
+
+    /// The pages `context` has records of, with their places.
+    fn pages(&self, context: u64) -> Vec<(u64, u32)> {
+        self.records
+            .range((context, 0)..=(context, u64::MAX))
+            .map(|(&(_, page), &at)| (page, at))
+            .collect()
+    }
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
@@ -270,11 +344,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let keep = &mut self.tlbi_keep;
         match record.filter(|record| record.covers(page)) {
-            Some(record) if keep.records.len() < limit => {
-                keep.records.insert((context, page), record);
-            }
+            Some(record) if keep.records.len() < limit => keep.put(context, page, record),
             _ => {
-                keep.records.remove(&(context, page));
+                keep.take(context, page);
                 keep.incomplete.insert(context);
             }
         }
@@ -285,9 +357,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn prune_kept_records(&mut self) {
         let (itlb, spaces) = (&self.itlb, &self.spaces);
         let live = |number: u64| spaces.iter().any(|spaces| spaces.live(number).is_some());
-        self.tlbi_keep.records.retain(|&(context, page), _| {
+        let TlbiKeep { records, free, .. } = &mut self.tlbi_keep;
+        records.retain(|&(context, page), &mut at| {
             let held = itlb.find(itlb.page_slot(page, context), page, context);
-            held.pc == page && held.key == context && live(context)
+            let stays = held.pc == page && held.key == context && live(context);
+            if !stays {
+                free.push(at);
+            }
+            stays
         });
         self.tlbi_keep.incomplete.retain(|&number| live(number));
     }
@@ -304,17 +381,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Take the records of `context`'s entries out.
-    fn take_kept_records(&mut self, context: u64) -> Vec<(u64, WalkRecord)> {
-        let records = &mut self.tlbi_keep.records;
-        let taken: Vec<(u64, WalkRecord)> = records
-            .range((context, 0)..=(context, u64::MAX))
-            .map(|(&(_, page), &record)| (page, record))
-            .collect();
-        for (page, _) in &taken {
-            records.remove(&(context, *page));
+    /// Take the records of `context`'s entries out: their pages.
+    fn take_kept_records(&mut self, context: u64) -> Vec<u64> {
+        let pages = self.tlbi_keep.pages(context);
+        for &(page, _) in &pages {
+            self.tlbi_keep.take(context, page);
         }
-        taken
+        pages.into_iter().map(|(page, _)| page).collect()
     }
 
     /// A TLBI of everything with `--tlbi-keep on`: every context stays,
@@ -361,16 +434,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         number: u64,
     ) -> bool {
         let started = self.host.counter();
-        let records = self.take_kept_records(number);
         let current = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let incomplete = self.tlbi_keep.incomplete.remove(&number);
         let verified = if el != current || incomplete {
-            self.refills.extend(records.iter().map(|&(page, _)| page));
+            let pages = self.take_kept_records(number);
+            self.refills.extend(pages);
             self.spaces[half].remove_number(number);
             self.statistics.tlbi_keep.forgotten += 1;
             false
         } else {
-            self.verify_records(number, variant, records);
+            self.verify_records(number, variant);
             self.spaces[half].confirm(number);
             self.statistics.tlbi_keep.verified += 1;
             true
@@ -379,23 +452,32 @@ impl<H: Host, D: Devices> Machine<H, D> {
         verified
     }
 
-    /// [`Self::verify_kept`]'s check of each of `records`, the context
-    /// `number`'s.
-    fn verify_records(&mut self, number: u64, variant: Variant, records: Vec<(u64, WalkRecord)>) {
+    /// [`Self::verify_kept`]'s check of each record of the context `number`.
+    /// A kept entry's record stays where it is. A dropped entry leaves its
+    /// slot, which grows its half's drop epoch as `forget_range_where`
+    /// would (`LookupTable::set`), and its record goes: a drop costs one
+    /// slot, not a search of every set its granule lists.
+    fn verify_records(&mut self, number: u64, variant: Variant) {
         let controls = self.cpu.controls(self.cpu.regime());
         let requester = self.cpu.requester();
         let mut confirmed = Confirmed::new();
-        for (page, record) in records {
-            let held = self
-                .itlb
-                .find(self.itlb.page_slot(page, number), page, number);
+        for (page, at) in self.tlbi_keep.pages(number) {
+            let record = self.tlbi_keep.store[at as usize];
+            // The slot the entry is in: its own or its neighbour
+            // (`LookupTable::find`).
+            let slot = self.itlb.page_slot(page, number);
+            let held_at = [slot, slot ^ 1].into_iter().find(|&at| {
+                let held = self.itlb.entry(at);
+                held.pc == page && held.key == number
+            });
             // An entry the ITLB evicted: nothing to keep.
-            if held.pc != page || held.key != number {
+            let Some(held_at) = held_at else {
+                self.tlbi_keep.take(number, page);
                 continue;
-            }
+            };
+            let held = self.itlb.entry(held_at);
             #[cfg(test)]
             if self.tlbi_keep.unverified {
-                self.tlbi_keep.records.insert((number, page), record);
                 continue;
             }
             let mut kept =
@@ -404,11 +486,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 kept = self.check_kept(page, held, &record, &controls, requester, variant);
             }
             if kept {
-                self.tlbi_keep.records.insert((number, page), record);
                 self.statistics.tlbi_keep.kept += 1;
             } else {
-                self.itlb
-                    .forget_range_where(page..=page, |entry| entry.key == number);
+                self.itlb.set(held_at, chain::LookupEntry::default());
+                self.tlbi_keep.take(number, page);
                 self.statistics.tlbi_keep.dropped += 1;
                 self.refills.push(page);
             }
@@ -444,6 +525,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             record.guarded,
             record.global,
             variant,
+            confirmed,
         ) != Some(held)
         {
             return false;
@@ -487,6 +569,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The ITLB entry a fill in `context` would make of the page `page`
     /// translating to the frame of `physical`, `guarded` and `global`, for a
     /// fetch in `variant`: what [`Self::take_page`] holds of such a walk.
+    /// `confirmed` caches the variants' numbers.
+    #[allow(clippy::too_many_arguments)]
     fn kept_entry(
         &self,
         page: u64,
@@ -495,13 +579,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         guarded: bool,
         global: bool,
         variant: Variant,
+        confirmed: &mut Confirmed,
     ) -> Option<chain::LookupEntry> {
         let current = Variant {
             guarded_page: guarded,
             ..variant
         };
         let frame = physical & !(FETCH_PAGE - 1);
-        let id = self.known_variant(self.page_variant(current, frame))?;
+        let id = confirmed.variant(self, self.page_variant(current, frame))?;
         let key = self.block_key(frame, id);
         Some(match global {
             true => chain::LookupEntry::global_page(page, context, key),
@@ -543,6 +628,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     walked.guarded,
                     walked.global,
                     variant,
+                    // Its own cache: the check shares nothing with what it
+                    // checks.
+                    &mut Confirmed::new(),
                 ) == Some(held)
         });
         if !matches {
