@@ -70,8 +70,16 @@ fn request(routine: Routine, exit: u64) -> Request {
         pc: GuestAddress(PC),
         exit: GuestAddress(PC + exit),
         max_bytes: 65_536,
+        target: crate::TargetCpu::Baseline,
     }
 }
+
+/// The three vector sets a fast path picks from.
+const TARGETS: [crate::TargetCpu; 3] = [
+    crate::TargetCpu::Baseline,
+    crate::TargetCpu::Avx2,
+    crate::TargetCpu::Avx512f,
+];
 
 /// The target of the `jmp rel32` or `jcc rel32` whose displacement ends at
 /// `end` in `code`.
@@ -261,12 +269,49 @@ fn compose_refuses_a_bail_of_two_instructions_and_an_exit_off_the_page() {
             Refusal::MaxBytes
         );
     }
-    // The production routines' fast paths are not built yet.
+}
+
+/// Every production routine lays out on each vector set: a fast path of
+/// whole alignment units within a mark's bound, one direct success exit to
+/// the `ret`, ready to link, and every bail jump at the bail's code.
+#[test]
+fn every_production_routine_composes_on_each_vector_set() {
     for routine in Routine::PRODUCTION {
-        assert_eq!(
-            compose(request(routine, 12), synthetic()).unwrap_err(),
-            Refusal::NoNative,
-            "{routine:?}"
-        );
+        for target in TARGETS {
+            let request = Request {
+                target,
+                ..request(routine, 60)
+            };
+            let composite = compose(request, synthetic()).unwrap();
+            let end = composite.prefix_end as usize;
+            let block = &composite.block;
+            let code = &block.native.x86_64_code;
+            assert!(end.is_multiple_of(PREFIX_ALIGN as usize) && end <= MAX_PREFIX_BYTES as usize);
+            let exit = GuestAddress(PC + 60);
+            let successes: Vec<_> = block
+                .direct_exits
+                .iter()
+                .filter(|candidate| candidate.offset < end)
+                .collect();
+            assert_eq!(successes.len(), 1, "{routine:?} {target:?}");
+            let success = successes[0];
+            assert_eq!(
+                (success.target, success.kind, success.skipped),
+                (exit, ExitKind::Direct, 0)
+            );
+            let slot = chain::link_slot(Some(PC), exit, ExitKind::Direct);
+            assert!(chain::exit_ready(code, success.offset, 0, slot));
+            assert_eq!(code[end..], synthetic().native.x86_64_code[..]);
+            // AVX code ends in vzeroupper before its success exit; SSE2
+            // code holds no VEX or EVEX prefix at all.
+            let vex = code[..end]
+                .windows(3)
+                .any(|bytes| bytes == [0xc5, 0xf8, 0x77]);
+            assert_eq!(
+                vex,
+                target != crate::TargetCpu::Baseline,
+                "{routine:?} {target:?}"
+            );
+        }
     }
 }

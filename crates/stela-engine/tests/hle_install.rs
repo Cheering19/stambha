@@ -65,28 +65,30 @@ fn hle_off_compiles_the_same_blocks_as_without_it() -> Result<()> {
 }
 
 #[test]
-fn a_match_whose_routine_has_no_native_is_refused_and_translated() -> Result<()> {
-    // memmove's fast path is not built yet: its composite is refused.
-    let stand_in = stand_in(Id::Memmove);
-    let memmove = || Config::with_table(table(&stand_in, Id::Memmove), &[Id::Memmove]);
-    let case = returning(Id::Memmove, 5);
-    let (on, statistics) = run(&stand_in, &case, Some(memmove()))?;
-    let (off, _) = run(&stand_in, &case, None)?;
-    assert_eq!(agree(&stand_in, &case, &off, &on), Ok(()));
-    assert_eq!(on, off);
-    assert!(statistics.matched >= 1, "{statistics:?}");
-    assert_eq!(statistics.matched_signatures, 1);
-    assert_eq!(statistics.installed, 0);
-    assert_eq!(statistics.refusals(Refusal::Compose), statistics.matched);
-    // Over many calls: the same outcomes and the same blocks as off.
-    let mut on = Session::new(&stand_in, Some(memmove()))?;
-    let mut off = Session::new(&stand_in, None)?;
-    for case in cases(Id::Memmove, 6, 40) {
-        assert_eq!(on.run(&case)?, off.run(&case)?);
+fn a_matched_production_routine_installs_its_native_once_and_runs_it() -> Result<()> {
+    // Each production routine's stand-in under its own native: one match
+    // and one install for the whole session, and a call that returns runs
+    // the fast path (the composite and the `ret`, two instructions).
+    for id in [Id::Memmove, Id::Bzero, Id::Memset, Id::Memcmp, Id::Strlen] {
+        let stand_in = stand_in(id);
+        let config = Config::with_table(table(&stand_in, id), &[id]).with_max_bytes(CASE_MAX_BYTES);
+        let mut on = Session::new(&stand_in, Some(config))?;
+        let mut off = Session::new(&stand_in, None)?;
+        let mut native = 0;
+        for case in cases(id, 6, 40) {
+            let (a, b) = (off.run(&case)?, on.run(&case)?);
+            assert_eq!(agree(&stand_in, &case, &a, &b), Ok(()), "{id:?}");
+            native += usize::from(b.retired == 2);
+        }
+        let statistics = on.hle();
+        assert_eq!(
+            (statistics.matched, statistics.installed),
+            (1, 1),
+            "{id:?} {statistics:?}"
+        );
+        assert_eq!(statistics.matched_signatures, 1);
+        assert!(native > 0, "{id:?}");
     }
-    assert_eq!(compiled(&mut on), compiled(&mut off));
-    assert!(on.hle().matched >= 1);
-    assert_eq!(on.hle().installed, 0);
     Ok(())
 }
 
@@ -111,7 +113,7 @@ fn a_bail_only_native_agrees_with_the_original_for_every_stand_in() -> Result<()
         let mut on = Session::new(stand_in, Some(bail(stand_in)))?;
         let mut off = Session::new(stand_in, None)?;
         let (mut returned, mut aborted) = (0, 0);
-        for case in cases(id, 0xba11 + id.bit() as u64, count) {
+        for case in case_stream(id, 0xba11 + id.bit() as u64, count) {
             let (expected, got) = (off.run(&case)?, on.run(&case)?);
             assert_eq!(agree(stand_in, &case, &expected, &got), Ok(()), "{id:?}");
             // The original runs in both: they end alike in full.
@@ -352,7 +354,7 @@ fn a_touch_native_agrees_with_the_original_on_random_cases() -> Result<()> {
     let mut on = Session::new(&stand_in, Some(touch()))?;
     let mut off = Session::new(&stand_in, None)?;
     let (mut bypassed, mut aborted) = (0, 0);
-    for case in cases(Id::Touch, 0x70c4, case_count(4000)) {
+    for case in case_stream(Id::Touch, 0x70c4, case_count(4000)) {
         let before = on.hle().bypassed;
         let (expected, got) = (off.run(&case)?, on.run(&case)?);
         assert_eq!(
@@ -459,6 +461,7 @@ fn a_function_longer_than_the_first_window_is_matched_once_per_compile() -> Resu
         exit: 156,
         returns: false,
         caller: None,
+        driven: false,
     };
     let case = &cases(Id::Memmove, 17, 1)[0];
     let (on, statistics) = run(&long, case, Some(bail(&long)))?;

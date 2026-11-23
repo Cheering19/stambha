@@ -67,6 +67,10 @@ pub struct StandIn {
     pub exit: u16,
     pub returns: bool,
     pub caller: Option<usize>,
+    /// Calls start at the page's first word, a driver program ahead of the
+    /// function that calls it (or runs into it) and ends with a branch to
+    /// [`Self::end`].
+    pub driven: bool,
 }
 
 impl StandIn {
@@ -107,9 +111,22 @@ impl StandIn {
         code_base() + 4 * self.entry as u64
     }
 
-    /// Where a call of it starts: its caller's `blr`, or its entry.
+    /// Where a call of it starts: its driver, its caller's `blr`, or its
+    /// entry.
     pub fn start(&self) -> u64 {
-        code_base() + 4 * self.caller.unwrap_or(self.entry) as u64
+        match self.driven {
+            true => code_base(),
+            false => code_base() + 4 * self.caller.unwrap_or(self.entry) as u64,
+        }
+    }
+
+    /// The function after `driver`'s words, which calls start at: the
+    /// driver's last word must branch to [`Self::end`].
+    pub fn driven_by(&self, driver: &[u32]) -> StandIn {
+        let mut driven = self.at(driver.len());
+        driven.words[..driver.len()].copy_from_slice(driver);
+        driven.driven = true;
+        driven
     }
 
     /// The address its caller returns to: the word after its last, where
@@ -228,6 +245,7 @@ pub fn stand_in(id: Id) -> StandIn {
         exit,
         returns,
         caller: None,
+        driven: false,
     }
 }
 
@@ -294,8 +312,14 @@ impl Rng {
 
 /// `count` cases for `id` from `seed`, sizes up to [`CASE_MAX_BYTES`].
 pub fn cases(id: Id, seed: u64, count: usize) -> Vec<Case> {
+    case_stream(id, seed, count).collect()
+}
+
+/// [`cases`], made one at a time: a case holds the whole data mapping, so
+/// the acceptance run's million would not fit in memory at once.
+pub fn case_stream(id: Id, seed: u64, count: usize) -> impl Iterator<Item = Case> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-    (0..count).map(|_| case(id, &mut rng)).collect()
+    (0..count).map(move |_| case(id, &mut rng))
 }
 
 fn case(id: Id, rng: &mut Rng) -> Case {
@@ -486,10 +510,16 @@ impl Session {
     /// A machine for `stand_in`, with HLE configured as `hle` says, or
     /// never configured (`None`).
     pub fn new(stand_in: &StandIn, hle: Option<Config>) -> Result<Self> {
+        Self::with_target(stand_in, hle, TargetCpu::detect())
+    }
+
+    /// [`Self::new`], compiling for `target` (one of [`targets`]), whose
+    /// vectors a native's fast path uses.
+    pub fn with_target(stand_in: &StandIn, hle: Option<Config>, target: TargetCpu) -> Result<Self> {
         let machine = with_mappings(|code, data| {
             // The page holds this function alone.
             ensure!(code.write(code.0, &[0; BYTES]), "clear the code");
-            let mut machine = machine(code, data, &stand_in.words, TargetCpu::detect())?;
+            let mut machine = machine(code, data, &stand_in.words, target)?;
             machine.set_regions(false);
             if stand_in.caller.is_some() {
                 machine.host.guard(code.0, BYTES);
@@ -765,5 +795,163 @@ pub fn agree(stand_in: &StandIn, case: &Case, off: &Outcome, on: &Outcome) -> Re
             Err("x0 differs from the reference model".into())
         }
         Some(_) => Ok(()),
+    }
+}
+
+/// The vector sets this host runs a fast path with: SSE2 always, AVX2 and
+/// AVX-512F where it has them, each a target a session compiles for.
+pub fn targets() -> Vec<TargetCpu> {
+    let host = TargetCpu::detect();
+    let mut targets = vec![TargetCpu::Baseline];
+    if host.supports(TargetCpu::Avx2) {
+        targets.push(TargetCpu::Avx2);
+    }
+    if host.supports(TargetCpu::Avx512f) {
+        targets.push(host);
+    }
+    targets
+}
+
+/// Whether a run is the acceptance run (`STELA_HLE_CASES` of 100000 or
+/// more), which also runs the exhaustive suites in full.
+pub fn exhaustive() -> bool {
+    case_count(0) >= 100_000
+}
+
+/// A case of `id` with arguments `x` (pointers as data offsets) over random
+/// `contents` from `seed`, a page unreadable or read-only, bounded at
+/// [`CASE_MAX_BYTES`].
+pub fn case_of(
+    x: [u64; 3],
+    seed: u64,
+    unreadable: Option<usize>,
+    read_only: Option<usize>,
+) -> Case {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    Case {
+        x,
+        contents: (0..BYTES).map(|_| rng.next() as u8).collect(),
+        unreadable,
+        read_only,
+        max_bytes: CASE_MAX_BYTES,
+    }
+}
+
+/// What [`Differential::check`] saw of one case: the original's run, the
+/// native's on each target, and whether every one of those ran the fast
+/// path to its exit (two instructions retired, the composite and the
+/// `ret`, and no bypass).
+pub struct Checked {
+    pub off: Outcome,
+    pub on: Vec<Outcome>,
+    pub native: bool,
+    pub bypassed: bool,
+}
+
+/// One routine's differential: its stand-in run with HLE off on one
+/// machine, and with its native on a machine per target ([`targets`]),
+/// all reused across cases as a hot function's composite is.
+pub struct Differential {
+    pub stand_in: StandIn,
+    off: Session,
+    on: Vec<(TargetCpu, Session)>,
+}
+
+impl Differential {
+    /// `id`'s stand-in under its own native, bounded at `max_bytes`.
+    pub fn new(id: Id, max_bytes: u32) -> Result<Self> {
+        Self::of(stand_in(id), id, max_bytes)
+    }
+
+    /// `stand_in`'s function under `routine`.
+    pub fn of(stand_in: StandIn, routine: Id, max_bytes: u32) -> Result<Self> {
+        let config =
+            Config::with_table(table(&stand_in, routine), &[routine]).with_max_bytes(max_bytes);
+        let on = targets()
+            .into_iter()
+            .map(|target| {
+                Ok((
+                    target,
+                    Session::with_target(&stand_in, Some(config.clone()), target)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            off: Session::new(&stand_in, None)?,
+            on,
+            stand_in,
+        })
+    }
+
+    /// Every machine of the differential, the original's first: for a
+    /// suite to set the System registers its function needs.
+    pub fn machines(&mut self) -> impl Iterator<Item = &mut Machine<NativeHost, NoDevices>> {
+        std::iter::once(&mut self.off)
+            .chain(self.on.iter_mut().map(|(_, session)| session))
+            .map(Session::machine)
+    }
+
+    /// The HLE counts of each target's machine.
+    pub fn statistics(&self) -> Vec<(TargetCpu, Statistics)> {
+        self.on
+            .iter()
+            .map(|(target, session)| (*target, session.hle()))
+            .collect()
+    }
+
+    /// Run `case` off and on every target: each must [`agree`] with the
+    /// original, an error naming the target and the case otherwise.
+    pub fn check(&mut self, case: &Case) -> Result<Checked> {
+        self.check_with(case, false)
+    }
+
+    /// [`Self::check`] of a call the native must bail on: each target's
+    /// run must equal the original's in full, as the original runs in
+    /// both, whatever the reference model says of it.
+    pub fn check_bailed(&mut self, case: &Case) -> Result<Checked> {
+        self.check_with(case, true)
+    }
+
+    fn check_with(&mut self, case: &Case, bailed: bool) -> Result<Checked> {
+        let off = self.off.run(case)?;
+        let mut on = Vec::new();
+        let (mut native, mut bypassed) = (true, false);
+        for (target, session) in &mut self.on {
+            let before = session.hle().bypassed;
+            let outcome = session.run(case)?;
+            let agreed = match bailed {
+                true if outcome == off => Ok(()),
+                true => Err("differs from the original in full".into()),
+                false => agree(&self.stand_in, case, &off, &outcome),
+            };
+            if let Err(why) = agreed {
+                anyhow::bail!(
+                    "{:?} on {}: {why}: x {:x?} unreadable {:?} read-only {:?}; off {:?} retired {} abort {:x?}, on {:?} retired {} abort {:x?}",
+                    self.stand_in.id,
+                    target.id(),
+                    case.x,
+                    case.unreadable,
+                    case.read_only,
+                    off.stop,
+                    off.retired,
+                    off.abort,
+                    outcome.stop,
+                    outcome.retired,
+                    outcome.abort,
+                );
+            }
+            let faulted = session.hle().bypassed != before;
+            bypassed |= faulted;
+            native &= !faulted
+                && outcome.retired == 2
+                && outcome.stop == Stop::Breakpoint(self.stand_in.end());
+            on.push(outcome);
+        }
+        Ok(Checked {
+            off,
+            on,
+            native,
+            bypassed,
+        })
     }
 }

@@ -110,6 +110,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.hle.statistics
     }
 
+    /// Whether HLE may replace any function: a routine with a signature is
+    /// enabled.
+    pub fn hle_enabled(&self) -> bool {
+        self.hle.config.enabled != 0
+    }
+
+    /// The signatures HLE matches against.
+    pub fn hle_signatures(&self) -> usize {
+        self.hle.config.table.len()
+    }
+
     /// At the compile of the block at `pc` (`physical`) from the raw bytes
     /// `source`, its window's first: whether an enabled signature's
     /// function starts there and may be replaced, and its composite
@@ -243,6 +254,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             pc: GuestAddress(pc),
             exit: GuestAddress(pc + site.exit),
             max_bytes: self.hle.config.max_bytes,
+            // The fast path's vectors are the widest the PE compiles for.
+            target: preparation.description().target,
         };
         let Ok(composite) = composite::compose(request, bail) else {
             self.hle.statistics.refuse(Refusal::Compose);

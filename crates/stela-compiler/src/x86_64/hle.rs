@@ -22,20 +22,17 @@
 //! names it once, at the fast path, and its source bytes are that word's. A
 //! fault in the fast path leaves the entry's guest state, for the engine to
 //! run the original once and take it (`stela_engine`'s `hle_fault`).
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    allow(
-        dead_code,
-        reason = "only the test routines' fast paths use the emitters until the production ones land"
-    )
-)]
+mod compare;
+mod copy;
 mod emit;
+mod fill;
+mod scan;
 
 use super::asm::{Code, Gpr};
 use super::chain::DirectExit;
 use super::pinned::PINNED;
 use crate::aarch64::Register;
-use crate::{GuestAddress, NativeBlock, block::CompiledBlock};
+use crate::{GuestAddress, NativeBlock, TargetCpu, block::CompiledBlock};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -130,6 +127,11 @@ const fn pins(guest: u8, host: Gpr) -> bool {
 const _: () = assert!(pins(0, Gpr::R15) && pins(1, Gpr::Rbp));
 const _: () = assert!(core::mem::offset_of!(crate::GuestState, x) == 0);
 
+/// X2's frame slot, where a fast path reads its third argument.
+fn x2() -> super::asm::Mem {
+    super::frame(2 * 8)
+}
+
 /// The composite [`compose`] lays out: which routine, at which function
 /// entry, with its exit `ret`, and the most bytes one call may work on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +143,9 @@ pub struct Request {
     pub exit: GuestAddress,
     /// A call on more bytes bails ([`MAX_BYTES`] bounds it).
     pub max_bytes: u32,
+    /// The host the composite runs on, whose widest vectors (SSE2, AVX2 or
+    /// AVX-512F) the fast path moves, fills and compares with.
+    pub target: TargetCpu,
 }
 
 /// A composite block and where its fast path ends, the bail's code starts.
@@ -163,8 +168,6 @@ pub enum Refusal {
     ExitIsEntry,
     /// `max_bytes` is outside [`MAX_BYTES`].
     MaxBytes,
-    /// No fast path of the routine is built in.
-    NoNative,
     /// The fast path is longer than [`MAX_PREFIX_BYTES`].
     PrefixTooLong,
 }
@@ -268,10 +271,11 @@ fn fast_path(
             // Never reached: a success exit's layout, for its tests.
             Ok(vec![emit::success(code, request.exit)])
         }
-        Routine::Memmove | Routine::Bzero | Routine::Memset | Routine::Memcmp | Routine::Strlen => {
-            let _ = (code, bails);
-            Err(Refusal::NoNative)
-        }
+        Routine::Memmove => Ok(copy::memmove(code, request, bails)),
+        Routine::Bzero => Ok(fill::fill(code, request, fill::Fill::Bzero, bails)),
+        Routine::Memset => Ok(fill::fill(code, request, fill::Fill::Memset, bails)),
+        Routine::Memcmp => Ok(compare::memcmp(code, request, bails)),
+        Routine::Strlen => Ok(scan::strlen(code, request, bails)),
     }
 }
 
