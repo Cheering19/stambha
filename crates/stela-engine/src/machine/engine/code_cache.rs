@@ -605,11 +605,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some((started, live)) = whole {
             let done = self.whole_tlbi_clock();
             self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
+            self.note_whole_tlbi_trigger();
             let times = &mut self.statistics.whole_tlbi_times;
             times[0] += u64::from(live);
             times[1] += forgot.wrapping_sub(started);
             times[2] += done.wrapping_sub(forgot);
         }
+    }
+
+    /// What came before this PE's own TLBI of everything: whether TTBR0_EL1
+    /// changed since its previous one and, under step timing, one in
+    /// [`WHOLE_TLBI_SAMPLE_EVERY`] sampled ([`WholeTlbiTrigger`]). Reads
+    /// registers only.
+    fn note_whole_tlbi_trigger(&mut self) {
+        let ttbr0 = self.cpu.read(SystemRegister::TTBR0_EL1);
+        let switched = self.whole_tlbis != 0 && ttbr0 != self.whole_tlbi_ttbr0;
+        let sample = (self.step_timing.is_some()
+            && self.whole_tlbis.is_multiple_of(WHOLE_TLBI_SAMPLE_EVERY))
+        .then(|| {
+            [
+                self.cpu.pc,
+                self.cpu.state.x[16],
+                self.cpu.state.x[30],
+                self.whole_tlbi_ttbr0,
+                ttbr0,
+            ]
+        });
+        self.statistics.whole_tlbi_trigger.note(switched, sample);
+        self.whole_tlbi_ttbr0 = ttbr0;
+        self.whole_tlbis += 1;
     }
 
     /// The counter, for the times of a TLBI of everything, while step

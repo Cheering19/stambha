@@ -626,6 +626,8 @@ pub struct Statistics {
     /// the counter ticks of all of them in the engine's forgetting and in
     /// the host's shadow, those two under step timing only.
     pub whole_tlbi_times: [u64; 3],
+    /// What came before those TLBIs ([`WholeTlbiTrigger`]).
+    pub whole_tlbi_trigger: WholeTlbiTrigger,
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
@@ -827,6 +829,58 @@ impl WholeTlbiSites {
     }
 }
 
+/// The samples a [`WholeTlbiTrigger`] keeps.
+pub const WHOLE_TLBI_SAMPLES: usize = 4;
+/// One TLBI of everything in this many is sampled, under step timing.
+pub const WHOLE_TLBI_SAMPLE_EVERY: u64 = 4096;
+
+/// What came before a PE's own TLBIs of everything, to find what makes a
+/// guest flush everything at context-switch rate: whether TTBR0_EL1
+/// changed since the PE's previous one (an address-space switch between
+/// the two, natively or not), and, under step timing (`--profile`), a
+/// rate-limited sample of where it was called from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(feature = "std", feature = "native-profile"),
+    derive(serde::Serialize)
+)]
+pub struct WholeTlbiTrigger {
+    /// Those that found TTBR0_EL1 as the PE's previous one left it, and
+    /// those that found it changed.
+    pub switched: [u64; 2],
+    /// One in [`WHOLE_TLBI_SAMPLE_EVERY`] under step timing: its PC, X16,
+    /// X30, and TTBR0_EL1 at the PE's previous one and now; the latest
+    /// first, `[0; 5]` none.
+    pub samples: [[u64; 5]; WHOLE_TLBI_SAMPLES],
+}
+
+impl WholeTlbiTrigger {
+    /// Count one with TTBR0_EL1 `switched` or not, and keep `sample`.
+    pub fn note(&mut self, switched: bool, sample: Option<[u64; 5]>) {
+        self.switched[usize::from(switched)] += 1;
+        if let Some(sample) = sample {
+            self.samples.copy_within(..WHOLE_TLBI_SAMPLES - 1, 1);
+            self.samples[0] = sample;
+        }
+    }
+
+    /// Add `other`'s counts; its samples go first.
+    pub fn add(&mut self, other: &Self) {
+        self.switched[0] += other.switched[0];
+        self.switched[1] += other.switched[1];
+        let mut samples = [[0; 5]; WHOLE_TLBI_SAMPLES];
+        let kept = other
+            .samples
+            .iter()
+            .chain(&self.samples)
+            .filter(|sample| **sample != [0; 5]);
+        for (into, sample) in samples.iter_mut().zip(kept) {
+            *into = *sample;
+        }
+        self.samples = samples;
+    }
+}
+
 /// [`MailWait`]'s parts.
 pub const MAIL_WAITS: usize = MailWait::LongestNative as usize + 1;
 
@@ -861,6 +915,7 @@ impl core::ops::AddAssign for Statistics {
             itlb_sources,
             whole_tlbi_sites,
             whole_tlbi_times,
+            whole_tlbi_trigger,
             compiled,
             self_loops,
             regions,
@@ -1019,6 +1074,7 @@ impl core::ops::AddAssign for Statistics {
         for (total, count) in self.whole_tlbi_times.iter_mut().zip(whole_tlbi_times) {
             *total += count;
         }
+        self.whole_tlbi_trigger.add(&whole_tlbi_trigger);
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
         }

@@ -10604,6 +10604,66 @@ fn whole_tlbi_benchmark() {
 /// The census of TLBIs of everything keeps the most frequent PCs, merges a
 /// PC it holds and orders them most first; a new PC takes the least
 /// frequent's place and count.
+/// A PE's own TLBIs of everything count by whether TTBR0_EL1 changed since
+/// its previous one, natively written or not, and only under step timing
+/// is one in [`WHOLE_TLBI_SAMPLE_EVERY`] sampled with its PC, X16, X30 and
+/// both TTBR0 values; mail's TLBIs of everything count in neither.
+#[test]
+fn whole_tlbis_count_the_address_space_switches_before_them() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = machine(&[RET]);
+    let all = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.tlb_maintained(Reach::All, Everywhere::All, None)
+    };
+    let trigger = |machine: &Machine<FakeHost, NoDevices>| machine.statistics.whole_tlbi_trigger;
+    all(&mut machine);
+    all(&mut machine);
+    assert_eq!(trigger(&machine).switched, [2, 0]);
+    // TTBR0 as a native switch leaves it, the engine not told.
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::TTBR0_EL1, 0, 0x1234_0000);
+    all(&mut machine);
+    all(&mut machine);
+    assert_eq!(trigger(&machine).switched, [3, 1]);
+    assert_eq!(trigger(&machine).samples, [[0; 5]; WHOLE_TLBI_SAMPLES]);
+    // Mail's TLBI of everything is another PE's.
+    machine.applying_mail = true;
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::TTBR0_EL1, 0, 0x5678_0000);
+    all(&mut machine);
+    machine.applying_mail = false;
+    assert_eq!(trigger(&machine).switched, [3, 1]);
+    // Under step timing: the next one taken is the 5th, not sampled, until
+    // WHOLE_TLBI_SAMPLE_EVERY of them.
+    machine.set_step_timing(true);
+    machine.cpu.state.x[16] = 0x16;
+    machine.cpu.state.x[30] = 0x30;
+    let pc = machine.cpu.pc;
+    for _ in 4..WHOLE_TLBI_SAMPLE_EVERY + 1 {
+        all(&mut machine);
+    }
+    let seen = trigger(&machine);
+    assert_eq!(
+        seen.switched[0] + seen.switched[1],
+        WHOLE_TLBI_SAMPLE_EVERY + 1
+    );
+    assert_eq!(seen.samples[0], [pc, 0x16, 0x30, 0x5678_0000, 0x5678_0000]);
+    assert_eq!(seen.samples[1], [0; 5]);
+    // Merged over PEs: counts add, samples of both are kept.
+    let mut merged = seen;
+    merged.add(&seen);
+    assert_eq!(
+        merged.switched,
+        [seen.switched[0] * 2, seen.switched[1] * 2]
+    );
+    assert_eq!(merged.samples[..2], [seen.samples[0]; 2]);
+}
+
 #[test]
 fn whole_tlbi_sites_keep_the_most_frequent_pcs() {
     let mut sites = WholeTlbiSites::default();

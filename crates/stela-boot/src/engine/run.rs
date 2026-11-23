@@ -2782,6 +2782,25 @@ impl Heartbeat {
                 line.push_str(&format!(" {pc:#x}={count}"));
             }
             output::arguments(format_args!("{line}\n"));
+            // What came before them: an address-space switch since the PE's
+            // previous one or none, and under --profile a sample of where
+            // they were called from.
+            let mut line = String::from("PES WHOLE TLBI TRIGGER same_ttbr0/new_ttbr0");
+            let mut sampled = String::new();
+            for (pe, counts) in per_pe.iter().enumerate() {
+                let trigger = &counts.whole_tlbi_trigger;
+                let [same, new] = trigger.switched;
+                line.push_str(&format!(" {pe}:{same}/{new}"));
+                for [pc, x16, x30, from, to] in trigger.samples {
+                    if pc != 0 {
+                        sampled.push_str(&format!(
+                            "PES WHOLE TLBI SAMPLE pe={pe} pc={pc:#x} x16={x16:#x} x30={x30:#x} \
+                             ttbr0={from:#x}->{to:#x}\n"
+                        ));
+                    }
+                }
+            }
+            output::arguments(format_args!("{line}\n{sampled}"));
             output::arguments(format_args!("{transitions}\n"));
             let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
                 transition_misses[kind * 9..kind * 9 + 9]
