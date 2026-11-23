@@ -319,7 +319,7 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
 }
 
 /// The census's functions as the firmware bundle reads them.
-fn census_pci(functions: &[crate::pci_io::FunctionObservation]) -> Vec<Pci> {
+pub(crate) fn census_pci(functions: &[crate::pci_io::FunctionObservation]) -> Vec<Pci> {
     functions
         .iter()
         .filter_map(|function| {

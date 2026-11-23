@@ -18,6 +18,11 @@ pub struct Census<'a> {
     pub functions: &'a [Identity],
     /// The functions the firmware has a handle for that could not be read.
     pub unread: usize,
+    /// The PCI ports that show nothing below them
+    /// (`stela_loader::host_firmware::bundle::empty_ports`): a Wi-Fi card
+    /// the firmware left powered off there answers only after the engine
+    /// powers the port on, after the firmware's exit.
+    pub empty_ports: usize,
 }
 
 /// What the census says of the PC's Wi-Fi.
@@ -55,6 +60,13 @@ pub fn decide(census: Result<Census<'_>, &str>) -> Hardware {
     }
     if census.functions.is_empty() {
         return Hardware::Unknown("the firmware's PCI census lists no function".into());
+    }
+    if census.empty_ports != 0 {
+        return Hardware::Unknown(format!(
+            "{} PCI port(s) show nothing below them, where a Wi-Fi card the firmware left \
+             powered off answers only after the firmware's exit",
+            census.empty_ports
+        ));
     }
     Hardware::Absent(
         census
@@ -130,7 +142,28 @@ mod tests {
         ])
     }
     fn census(functions: &[Identity], unread: usize) -> Result<Census<'_>, &'static str> {
-        Ok(Census { functions, unread })
+        Ok(Census {
+            functions,
+            unread,
+            empty_ports: 0,
+        })
+    }
+
+    #[test]
+    fn a_port_with_nothing_below_it_keeps_wifi_offered() {
+        // A laptop whose firmware left its M.2 Wi-Fi slot powered off: no
+        // Wi-Fi function yet, and one port shows nothing below it.
+        let functions = others();
+        let powered_off = Census {
+            functions: &functions,
+            unread: 0,
+            empty_ports: 1,
+        };
+        let hardware = decide(Ok(powered_off));
+        assert!(matches!(hardware, Hardware::Unknown(_)), "{hardware:?}");
+        assert!(hardware.offered());
+        // Every port answered and still no Wi-Fi function: none offered.
+        assert!(!decide(census(&functions, 0)).offered());
     }
 
     #[test]

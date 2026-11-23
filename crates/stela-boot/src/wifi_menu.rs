@@ -38,9 +38,11 @@ pub(crate) fn offered() -> bool {
                 .iter()
                 .map(crate::pci_io::FunctionObservation::identity)
                 .collect();
+            let pci = crate::storage::census_pci(&census.functions);
             wifi_hardware::decide(Ok(wifi_hardware::Census {
                 functions: &functions,
                 unread: census.failures.len(),
+                empty_ports: stela_loader::host_firmware::bundle::empty_ports(&pci).count(),
             }))
         }
         Err(error) => wifi_hardware::decide(Err(&alloc::format!("{error}"))),
