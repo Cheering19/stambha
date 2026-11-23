@@ -8,10 +8,10 @@
 //! their own ([`FILE`]); the arena the boot writes its own segments to
 //! gives up as much, so the boot holds no more than its budget. The engine
 //! takes the records hottest first on PEs whose guest waits, in bounded
-//! steps after the blocks prepared ahead, while the board's kept forms
+//! steps beside the blocks prepared ahead, while the board's kept forms
 //! have room and the heap is not short; then it ends. The pack's pages,
 //! outside the heap, stay the boot's, within the budget as said.
-use super::{AHEAD, AHEAD_MICROS, DIRECTORY, DOMAIN, Lock, PACK_EXTENSION, SEGMENT};
+use super::{AHEAD_MICROS, DIRECTORY, DOMAIN, Lock, PACK_EXTENSION, SEGMENT};
 use super::{open, pack_name, read_at, read_exact};
 use crate::{firmware, handoff::Region, output, paging::PAGE};
 use alloc::{format, string::String, vec, vec::Vec};
@@ -198,21 +198,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A step of the refill on a PE whose guest waits, after the blocks
-/// prepared ahead: records hottest first, each compiled by `compile`
-/// (`Machine::refill`), for at most [`AHEAD_MICROS`] or until `stop` says
-/// the guest has work. Without `room` (the board's kept forms half full,
-/// or the heap short) the refill ends; so it does when no record is left.
-/// One PE takes a step at a time; the others go on.
+/// A step of the refill on a PE whose guest waits, after a step of the
+/// blocks prepared ahead (each with its own bound): records hottest first,
+/// each compiled by `compile` (`Machine::refill`), for at most
+/// [`AHEAD_MICROS`] or until `stop` says the guest has work. It no longer
+/// waits for the ahead queue to empty: a desktop boot never emptied it
+/// (24.0 M of 37.3 M jobs dropped, 2026-11-23), so the previous
+/// translator's records, blocks a boot ran, waited behind guesses of which
+/// 14 % ran. Without `room` (the board's kept forms half full, or the heap
+/// short) the refill ends; so it does when no record is left. One PE takes
+/// a step at a time; the others go on.
 pub fn step(
     room: bool,
     compile: &mut dyn FnMut(&Digest, &Record, &mut RefillCounts),
     stop: &dyn Fn() -> bool,
 ) {
-    if REFILL.with(|held| held.is_none())
-        || AHEAD.with(|queue| queue.as_ref().is_some_and(|queue| !queue.is_empty()))
-        || STEPPING.swap(true, Ordering::Acquire)
-    {
+    if REFILL.with(|held| held.is_none()) || STEPPING.swap(true, Ordering::Acquire) {
         return;
     }
     if !room {
