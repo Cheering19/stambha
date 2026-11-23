@@ -1,5 +1,6 @@
 //! The part of a pack segment a boot reads when its RAM holds less than
 //! all of it.
+use alloc::vec::Vec;
 use sha2::{Digest as _, Sha256};
 use stela_engine::translations::{
     Digest,
@@ -88,6 +89,58 @@ pub fn trim(pack: &mut [u8]) -> usize {
     pack[index_end..index_end + CHECKSUM_BYTES].copy_from_slice(&checksum);
     pack[index_end + CHECKSUM_BYTES..old_end].fill(0);
     kept
+}
+
+/// What [`split`] made of a segment's first bytes: the records that lie
+/// whole in them, now a pack of their own, and the header, index and
+/// checksum of the others, whose records stay in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split {
+    pub resident: usize,
+    pub remainder: Vec<u8>,
+    pub omitted: usize,
+}
+
+/// Split `pack`, the first bytes of a pack segment read into memory ahead
+/// of any lookup (its header, its whole index and the records that follow
+/// up to where the read stopped), into two packs that name disjoint keys:
+/// `pack` itself, trimmed in place to name only the records that lie whole
+/// inside it ([`trim`]), and [`Split::remainder`], the header, index and
+/// checksum of every other record, whose bytes stay in the file
+/// (`Pack::index_only`). Each record keeps its offset from the segment's
+/// start, its age and its uses in both, so a reader reads a remainder
+/// record where the segment holds it. `Err`, with `pack` unchanged, when
+/// the index is not whole in `pack` or fails the checks `Pack::parse`
+/// makes of it: the caller keeps reading the segment on demand.
+pub fn split(pack: &mut [u8], translator: &Digest) -> Result<Split, PackError> {
+    let start = pack::prefix_bytes(pack, translator)?;
+    if pack.len() < start {
+        return Err(PackError::Truncated);
+    }
+    Pack::length(&pack[..start], translator)?;
+    let count = (start - HEADER_BYTES - CHECKSUM_BYTES) / INDEX_ENTRY_BYTES;
+    let held = pack.len() as u64;
+    let mut remainder = Vec::with_capacity(start);
+    remainder.extend_from_slice(&pack[..HEADER_BYTES]);
+    let mut omitted = 0;
+    for index in 0..count {
+        let (offset, bytes) = entry(pack, index);
+        // `Pack::length` checked that the sum does not overflow.
+        if offset + bytes > held {
+            let from = HEADER_BYTES + index * INDEX_ENTRY_BYTES;
+            remainder.extend_from_slice(&pack[from..from + INDEX_ENTRY_BYTES]);
+            omitted += 1;
+        }
+    }
+    remainder[COUNT_AT..COUNT_AT + 4].copy_from_slice(&(omitted as u32).to_le_bytes());
+    let checksum = Sha256::digest(&remainder);
+    remainder.extend_from_slice(&checksum);
+    let resident = trim(pack);
+    Ok(Split {
+        resident,
+        remainder,
+        omitted,
+    })
 }
 
 /// Index entry `index`'s record offset and length (the length field less
@@ -185,5 +238,126 @@ mod tests {
     fn at_least_past(record: &[u8], pack: &[u8], length: u64) -> bool {
         let start = record.as_ptr() as usize - pack.as_ptr() as usize;
         (start + record.len()) as u64 > length
+    }
+
+    /// The store a boot makes of a segment preloaded and split into
+    /// `parts`: the resident part, `read`, and, when records are left, the
+    /// remainder read on demand, as `translations::install` makes them.
+    fn preloaded<'a>(
+        translator: Digest,
+        read: &'a [u8],
+        parts: &'a Split,
+    ) -> stela_engine::translations::pack::Store<'a> {
+        use stela_engine::translations::pack::Store;
+        let mut segments = vec![Pack::parse(read, &translator).unwrap()];
+        if parts.omitted != 0 {
+            segments.push(Pack::index_only(&parts.remainder, &translator).unwrap());
+        }
+        Store::over(translator, segments)
+    }
+
+    #[test]
+    fn a_segment_preloaded_whole_serves_every_lookup_from_memory() {
+        use stela_engine::machine::Looked;
+        let translator = Digest::of(b"translator");
+        let bytes = sample(translator);
+        let full = Pack::parse(&bytes, &translator).unwrap();
+        let mut read = bytes.clone();
+        let parts = split(&mut read, &translator).unwrap();
+        assert_eq!((parts.resident, parts.omitted), (40, 0));
+        let mut store = preloaded(translator, &read, &parts);
+        for (key, _) in full.iter() {
+            assert!(matches!(store.lookup(&key), Looked::Found(_)), "{key:?}");
+        }
+        // Nothing was asked of the file.
+        assert_eq!(store.counters.awaited, 0);
+        assert!(store.take_wanted().is_none());
+        assert_eq!(store.counters.loaded, 40);
+    }
+
+    #[test]
+    fn a_preload_cut_by_its_bound_leaves_the_other_records_to_be_read_on_demand() {
+        use stela_engine::machine::Looked;
+        let translator = Digest::of(b"translator");
+        let bytes = sample(translator);
+        let full = Pack::parse(&bytes, &translator).unwrap();
+        let prefix = pack::prefix_bytes(&bytes[..HEADER_BYTES], &translator).unwrap();
+        let cut = prefix + (bytes.len() - prefix) / 3;
+        let mut read = bytes[..cut].to_vec();
+        let parts = split(&mut read, &translator).unwrap();
+        assert!(parts.resident > 0 && parts.omitted > 0);
+        assert_eq!(parts.resident + parts.omitted, 40);
+        let mut store = preloaded(translator, &read, &parts);
+        let resident = Pack::parse(&read, &translator).unwrap();
+        let rest = Pack::index_only(&parts.remainder, &translator).unwrap();
+        assert!(!rest.resident());
+        let (mut found, mut awaited) = (0, 0);
+        for (key, record) in full.iter() {
+            // Each key is in one part only, where the segment holds it.
+            assert_ne!(resident.get(&key).is_some(), rest.locate(&key).is_some());
+            match store.lookup(&key) {
+                Looked::Found(_) => {
+                    assert_eq!(resident.get(&key), Some(record));
+                    found += 1;
+                }
+                Looked::Awaited => {
+                    assert_eq!(rest.locate(&key), full.locate(&key));
+                    awaited += 1;
+                }
+                Looked::Absent => panic!("a record the segment holds was lost: {key:?}"),
+            }
+        }
+        assert_eq!((found, awaited), (parts.resident, parts.omitted));
+        // Every record left in the file is asked of the reader, at the
+        // offset the segment holds it.
+        let mut wanted = 0;
+        while let Some(want) = store.take_wanted() {
+            let at = want.pieces.iter().flatten().next().copied();
+            assert_eq!(at, full.locate(&want.key));
+            wanted += 1;
+        }
+        assert_eq!(wanted, parts.omitted);
+    }
+
+    #[test]
+    fn a_damaged_or_short_preload_is_never_trusted() {
+        use stela_engine::machine::Looked;
+        let translator = Digest::of(b"translator");
+        let bytes = sample(translator);
+        let full = Pack::parse(&bytes, &translator).unwrap();
+        let prefix = pack::prefix_bytes(&bytes[..HEADER_BYTES], &translator).unwrap();
+        // A read that stopped inside the index splits nothing and leaves
+        // the bytes as they were: the segment stays read on demand.
+        let mut short = bytes[..prefix - 1].to_vec();
+        assert_eq!(split(&mut short, &translator), Err(PackError::Truncated));
+        assert_eq!(short, bytes[..prefix - 1]);
+        // A damaged index is refused as the engine refuses it.
+        let mut damaged = bytes.clone();
+        damaged[HEADER_BYTES + 3] ^= 1;
+        let before = damaged.clone();
+        assert_eq!(split(&mut damaged, &translator), Err(PackError::Checksum));
+        assert_eq!(damaged, before);
+        // A record damaged in memory fails its own check at its lookup and
+        // is never decoded into a block, nor asked again; the others serve.
+        let (bad, _) = full.iter().nth(5).unwrap();
+        let (offset, _) = full.locate(&bad).unwrap();
+        let mut read = bytes.clone();
+        read[offset as usize + 40] ^= 0x80;
+        let parts = split(&mut read, &translator).unwrap();
+        let mut store = preloaded(translator, &read, &parts);
+        for (key, _) in full.iter() {
+            let looked = store.lookup(&key);
+            if key == bad {
+                assert!(
+                    matches!(looked, Looked::Absent),
+                    "a damaged record was used"
+                );
+            } else {
+                assert!(matches!(looked, Looked::Found(_)), "{key:?}");
+            }
+        }
+        assert_eq!(store.counters.invalid, 1);
+        assert!(!store.want(&bad));
+        assert!(matches!(store.lookup(&bad), Looked::Absent));
     }
 }

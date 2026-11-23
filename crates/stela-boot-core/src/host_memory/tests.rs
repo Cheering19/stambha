@@ -473,6 +473,52 @@ fn a_16_gb_pc_keeps_about_a_gigabyte_for_the_pack() {
     assert_eq!(pack_budget(free(16), 8, 8), 992 * MIB);
 }
 
+/// The bytes a second of a USB 2 stick and of a USB 3 one read under the
+/// firmware.
+const USB_2: u64 = 35_000_000;
+const USB_3: u64 = 100_000_000;
+/// The pack of boot 23 (`Opening the translation cache (498 MB, ...)`).
+const PACK_23: u64 = 498_000_000;
+
+#[test]
+fn a_16_gb_pc_reads_the_first_quarter_gigabyte_of_its_pack_ahead() {
+    // The budget less a 498 MB pack's indexes (about 6 MiB).
+    let room = pack_budget(free(16), 8, 8) - 6 * MIB;
+    let bound = preload_bound(room);
+    assert_eq!(bound, 246 * MIB);
+    // Three quarters of the room still grows the window and the guest.
+    assert!(room - bound >= 3 * room / 4 - ALIGNMENT);
+    // An 8 GB PC reads ahead a fourth of its smaller room.
+    assert_eq!(
+        preload_bound(pack_budget(free(8), 8, 8) - 6 * MIB),
+        122 * MIB
+    );
+    // A larger PC reads no more than the most.
+    assert_eq!(preload_bound(pack_budget(free(128), 16, 16)), PRELOAD_MOST);
+    // A room that holds little reads nothing ahead.
+    assert_eq!(preload_bound(PRELOAD_FLOOR * PRELOAD_SHARE - 1), 0);
+    assert_eq!(preload_bound(0), 0);
+}
+
+#[test]
+fn a_preload_holds_the_boot_two_seconds_at_most_whatever_the_stick() {
+    let bound = 246 * MIB;
+    // Reading the whole pack before the guest would cost 14 s on USB 2 and
+    // 5 s on USB 3: the reason the read stops at a time bound.
+    assert_eq!(PACK_23 * 1000 / USB_2, 14_228);
+    assert_eq!(PACK_23 * 1000 / USB_3, 4_980);
+    // USB 2: the first 70 MB, in the two seconds.
+    assert_eq!(preload_reads(bound, USB_2), (70_000_000, PRELOAD_MILLIS));
+    // USB 3: 200 MB in two seconds, within the bound.
+    assert_eq!(preload_reads(bound, USB_3), (200_000_000, PRELOAD_MILLIS));
+    // A fast stick or an NVMe reads the bound and stops early.
+    let (bytes, millis) = preload_reads(bound, 400_000_000);
+    assert_eq!(bytes, bound);
+    assert!(millis < 700, "{millis}");
+    // A reader that reads nothing holds the boot no time.
+    assert_eq!(preload_reads(0, USB_2), (0, 0));
+}
+
 #[test]
 fn a_128_gb_pc_keeps_more_for_the_pack() {
     let budget = pack_budget(free(128), 16, 16);

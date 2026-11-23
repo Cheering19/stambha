@@ -213,6 +213,32 @@ fn a_queue_hands_out_the_newest_job_skips_repeats_and_drops_the_oldest() {
 }
 
 #[test]
+fn a_launch_burst_leaves_the_waits_after_it_its_last_sixteen_thousand_jobs() {
+    let offer = fetched_offer(BASE);
+    let template = offer.ahead_jobs().next().expect("a job");
+    let mut queue = Queue::new();
+    // A launch offers jobs while no PE waits: three times what the queue
+    // holds, as 37.3 M jobs offered against 24.0 M dropped with 4096.
+    let burst = 3 * CAPACITY as u64;
+    for index in 0..burst {
+        queue.push(Job {
+            pc: BASE + 0x10_0000 + index * 4,
+            ..template.clone()
+        });
+    }
+    assert_eq!(queue.counts().dropped, burst - CAPACITY as u64);
+    // The PEs that wait after it take the newest first, the burst's end,
+    // four times as many as a queue of 4096 kept.
+    let served: Vec<u64> = core::iter::from_fn(|| queue.pop().map(|job| job.pc())).collect();
+    assert_eq!(served.len(), 4 * 4096);
+    assert_eq!(served[0], BASE + 0x10_0000 + (burst - 1) * 4);
+    assert!(served.is_sorted_by(|newer, older| newer > older));
+    // Both lanes full take about 2.5 MB.
+    let bytes = core::mem::size_of::<Job>() * (CAPACITY + ELSEWHERE_CAPACITY);
+    assert!(bytes <= 3 << 20, "{bytes}");
+}
+
+#[test]
 fn a_fetched_block_names_its_targets_in_other_pages_whose_walk_its_pe_holds() {
     let words = two_pages();
     let elsewhere = BASE + 0x1000;
