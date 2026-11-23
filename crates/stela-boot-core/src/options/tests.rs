@@ -999,6 +999,7 @@ fn amx_native_is_on_unless_turned_off() {
 }
 
 mod constraints;
+mod fork_lines;
 mod grammar;
 
 #[test]
