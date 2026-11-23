@@ -203,7 +203,8 @@ impl fmt::Display for TestBattery {
 /// What the host does with its lid (`--lid`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Lid {
-    /// Nothing, the default: Linux's kernel only reports the lid, its
+    /// Nothing, the default, though a laptop takes [`Self::Method`]
+    /// unasked ([`crate::laptop`]): Linux's kernel only reports the lid, its
     /// userspace decides, and a wrong `_LID` reading is common enough that
     /// Linux keeps DMI quirks for it.
     #[default]
@@ -234,10 +235,48 @@ impl Lid {
     }
 }
 
+/// Whether a boot on a laptop takes its laptop features unasked
+/// (`--laptop auto|off`, [`crate::laptop`]): a hand-written opt-out setup
+/// never writes, so the options revision stays 13.
+pub const LAPTOP: &str = "--laptop";
+
+/// `--laptop`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Laptop {
+    /// The default: on a laptop, behave as if `--battery`, `--lid method`,
+    /// `--brightness-keys` and, with `--input` and a precision touchpad,
+    /// `--trackpad mt2` were given, where the line does not give them.
+    #[default]
+    Auto,
+    /// Take none of them: each is the opt-in its option is.
+    Off,
+}
+
+impl Laptop {
+    const NAMES: [(&'static str, Self); 2] = [("auto", Self::Auto), ("off", Self::Off)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, laptop)| *laptop)
+            .ok_or(Error::Laptop)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, laptop)| *laptop == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
-/// revision stays 13).
+/// revision stays 13). A laptop with a precision touchpad takes `mt2`
+/// unasked ([`crate::laptop`]).
 pub const TRACKPAD: &str = "--trackpad";
 
 /// The trackpad `--trackpad` cables: a Magic Trackpad 2 (05AC:0265), or
@@ -558,8 +597,12 @@ pub struct System {
     /// Step a display output with `_BCL` and `_BCM` in the firmware's
     /// `_DOD` at its brightness notifications (`--brightness-keys`): Linux
     /// does only where ACPI video owns the backlight, which Stela cannot
-    /// tell.
+    /// tell. A laptop takes it unasked, as it takes `--battery` and
+    /// `--lid method` ([`crate::laptop`]).
     pub brightness_keys: bool,
+    /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
+    /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
+    pub laptop: Option<Laptop>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -687,6 +730,7 @@ impl Default for System {
             lid: None,
             lid_sleep: false,
             brightness_keys: false,
+            laptop: None,
             amx_native: None,
             ecid: None,
             network_check: None,
@@ -847,6 +891,12 @@ impl System {
     /// What the host does with its lid: `--lid`, else nothing.
     pub fn lid(&self) -> Lid {
         self.lid.unwrap_or_default()
+    }
+
+    /// Whether a laptop takes its laptop features unasked: `--laptop`,
+    /// else [`Laptop::Auto`].
+    pub fn laptop(&self) -> Laptop {
+        self.laptop.unwrap_or_default()
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1211,6 +1261,7 @@ impl fmt::Display for System {
         line.value("--lid", self.lid.map(Lid::name))?;
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
+        line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
