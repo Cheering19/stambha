@@ -171,6 +171,23 @@ fn one_command_is_in_flight_and_the_next_waits_its_turn() {
 }
 
 #[test]
+fn a_reconfiguration_with_a_command_in_flight_gives_its_credit_back() {
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0c14, &[]), 0));
+    // bluetoothd configures the function again; the command's answer, which
+    // would give the credit back, never reaches the bridge.
+    bridge.resync();
+    let reset = packet(0x0c03, &[]);
+    assert_eq!(chip(bridge.command(&reset, 1)), reset);
+    assert_eq!(bridge.fallen(), None);
+    // A bus reset does the same.
+    let mut bridge = Bridge::new(ADDRESS);
+    chip(bridge.command(&packet(0x0c14, &[]), 0));
+    bridge.reset();
+    assert_eq!(chip(bridge.command(&reset, 1)), reset);
+}
+
+#[test]
 fn credits_alone_and_stale_answers_are_dropped() {
     let mut bridge = Bridge::new(ADDRESS);
     // Credits alone (opcode 0, no status), before and during a command.

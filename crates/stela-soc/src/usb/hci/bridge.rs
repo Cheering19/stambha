@@ -307,11 +307,15 @@ impl Bridge {
 
     /// The guest configured the function again, which drops its queues: the
     /// command in flight and those waiting are gone, and the controller is
-    /// kept out until the next HCI Reset.
+    /// kept out until the next HCI Reset. The controller's credit comes back
+    /// with them, as Linux's `hci_dev_do_reset` sets `cmd_cnt` to one: the
+    /// answer that would give it back is dropped while the function is not
+    /// configured, and the next HCI Reset would wait for it for good.
     pub fn resync(&mut self) {
         self.pending = None;
         self.backlog.clear();
         self.running.clear();
+        self.credits = 1;
         self.resync = true;
     }
 
