@@ -537,6 +537,7 @@ pub(super) fn choose_wifi(environment: &Environment<'_>, command: &mut Request) 
         )?,
         index => networks[index].clone(),
     };
+    ui.warning(wifi::CHIP_NOTE)?;
     ui.warning("The passphrase is stored in plaintext on the stick.")?;
     command.wifi_passphrase = Some(wifi::ask_passphrase(ui, &ssid)?);
     command.wifi = Some(ssid);

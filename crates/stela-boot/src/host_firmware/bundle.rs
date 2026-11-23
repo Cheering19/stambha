@@ -156,11 +156,8 @@ fn load_from(
             room.bytes
         ));
     }
-    for why in &selection.unknown {
-        output::arguments(format_args!(
-            "HOST FIRMWARE BUNDLE NO RECIPE for the NVIDIA display device at {why}: its \
-             firmware is not in Stela's catalog\n"
-        ));
+    for line in selection.unknown_lines() {
+        output::arguments(format_args!("{line}"));
     }
     let mut bundled = Bundled {
         selected: Vec::new(),

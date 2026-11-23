@@ -38,6 +38,7 @@ use stela_boot_core::heap;
 mod host_check;
 mod host_firmware;
 mod host_inventory;
+mod install_caution;
 mod installer;
 mod la57;
 mod layout;
