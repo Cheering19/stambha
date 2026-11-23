@@ -7,6 +7,7 @@ mod frames;
 mod minimum;
 mod ownership;
 mod polled;
+mod reset;
 
 // A complete vendor-page HID collection: ID17, two eight-bit input fields.
 const REPORT_DESCRIPTOR: [u8; 23] = [
@@ -56,6 +57,12 @@ struct Hardware {
     fail_after_opcode: Option<u8>,
     /// No pin: an empty input register reads as a zero length.
     idle_zero: bool,
+    /// Feature reports by ID, as a touchpad keeps its Input Mode apart
+    /// from its switches; an ID never set reads as zero, mouse mode.
+    keyed: bool,
+    features: Vec<(u8, Vec<u8>)>,
+    /// Feature SET_REPORTs the device answers by resetting itself.
+    reset_on_feature: usize,
 }
 fn descriptor(vendor: u16, product: u16) -> [u8; 30] {
     let mut bytes = [0; 30];
@@ -107,7 +114,16 @@ impl Hardware {
             reads: 0,
             fail_after_opcode: None,
             idle_zero: false,
+            keyed: false,
+            features: Vec::new(),
+            reset_on_feature: 0,
         }
+    }
+    /// The device resets on its own: back to its power-on feature values,
+    /// with a reset response no command waits for.
+    fn device_reset(&mut self) {
+        self.features.clear();
+        self.input.push_back(vec![0, 0]);
     }
     fn frame(body: &[u8]) -> Vec<u8> {
         let mut out = (body.len() as u16 + 2).to_le_bytes().to_vec();
@@ -133,6 +149,7 @@ impl Hardware {
                 assert!(self.power_on);
                 assert_eq!(id, 0);
                 self.reset_count += 1;
+                self.features.clear();
                 if !self.no_reset_ack {
                     self.input.push_back(vec![0, 0]);
                 }
@@ -149,7 +166,12 @@ impl Hardware {
                         id
                     });
                 }
-                body.extend_from_slice(&self.feature);
+                if self.keyed {
+                    let stored = self.features.iter().find(|(stored, _)| *stored == id);
+                    body.extend_from_slice(stored.map_or(&[0][..], |(_, bytes)| bytes));
+                } else {
+                    body.extend_from_slice(&self.feature);
+                }
                 let mut frame = Self::frame(&body);
                 if let Some(length) = self.truncate_get {
                     frame[..2].copy_from_slice(&length.to_le_bytes());
@@ -171,6 +193,14 @@ impl Hardware {
                     index += 1;
                 }
                 self.feature = bytes[index..].to_vec();
+                if kind == 3 {
+                    self.features.retain(|(stored, _)| *stored != id);
+                    self.features.push((id, self.feature.clone()));
+                    if self.reset_on_feature != 0 {
+                        self.reset_on_feature -= 1;
+                        self.device_reset();
+                    }
+                }
             }
             _ => panic!("unknown HID command"),
         }
@@ -380,9 +410,11 @@ fn raw_input_keeps_report_ids_payload_and_empty_interrupt_distinct() {
     );
     h.borrow_mut().input.push_back(vec![2, 0]);
     assert_eq!(d.poll().unwrap(), Some(InputReport::Empty));
+    // A reset response no command waits for is visible and never fatal,
+    // as Linux i2c_hid_get_input drops it.
     h.borrow_mut().input.push_back(vec![0, 0]);
-    assert_eq!(d.poll().unwrap_err().kind, ErrorKind::UnexpectedReset);
-    assert!(d.needs_reset());
+    assert_eq!(d.poll().unwrap(), Some(InputReport::Reset));
+    assert!(d.is_ready());
 }
 #[test]
 fn command_report_ids_zero_short_and_extended_preserve_exact_wire_layout() {
@@ -788,7 +820,8 @@ fn exact_bad_input_size_profiles_expose_original_header_and_all_bytes() {
             );
             assert!(d.is_ready());
             h.borrow_mut().input.push_back(vec![0, 0]);
-            assert_eq!(d.poll().unwrap_err().kind, ErrorKind::UnexpectedReset);
+            assert_eq!(d.poll().unwrap(), Some(InputReport::Reset));
+            assert!(d.is_ready());
         }
     }
     let (mut d, h) = device(0x048d, 0x837b);

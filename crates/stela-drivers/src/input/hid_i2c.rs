@@ -109,7 +109,6 @@ pub enum ErrorKind {
     NoOutputRegister,
     ResetTimeout,
     InputDrainTimeout,
-    UnexpectedReset,
     IdentityChanged,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +152,12 @@ pub enum InputReport {
     Data(Vec<u8>),
     Empty,
     SpuriousInterrupt,
+    /// A zero-length input on the asserted pin with no reset pending: a reset
+    /// completed, the device's own or a late response to the host's. Linux
+    /// `i2c_hid_get_input` drops it; the device stays ready, and a device
+    /// that reset itself is back in its power-on state, as a touchpad in its
+    /// firmware's mouse mode.
+    Reset,
     /// Exact upstream BAD_INPUT_SIZE devices return the complete read buffer
     /// when their header is invalid. Preserve every byte and expose the
     /// original wire length; a consumer never mistakes this for a valid header.
@@ -539,36 +544,92 @@ impl<B: Bus, I: Interrupt, T: Timer> Device<B, I, T> {
         if !matches!(self.state, State::Fresh | State::Stopped) {
             return Err(ErrorKind::NeedsReset.into());
         }
+        self.act(State::Ready, Self::start)
+    }
+    /// Read the descriptor, reset as `i2c_hid_hwreset` does (power on,
+    /// RESET, then wait for the reset response on the pin) and read the
+    /// report descriptor. A device started before keeps both descriptors.
+    fn start(&mut self) -> Result<(), ErrorKind> {
+        self.interrupt
+            .mask_and_drain()
+            .map_err(ErrorKind::Interrupt)?;
+        let mut bytes = [0; DESCRIPTOR_BYTES];
+        if let Err(error) = self.register(self.descriptor_register, &mut bytes) {
+            if !Self::address_nack(error) {
+                return Err(error);
+            }
+            self.delay(ADDRESS_WAKE_DELAY_US)?;
+            self.register(self.descriptor_register, &mut bytes)?;
+        }
+        let descriptor = Descriptor::parse(&bytes)?;
+        if self.descriptor.is_some_and(|old| old != descriptor) {
+            return Err(ErrorKind::IdentityChanged);
+        }
+        self.quirks = Quirks::for_device(descriptor);
+        self.input = Self::buffer(usize::from(descriptor.max_input_length))?;
+        self.descriptor = Some(descriptor);
+        self.reset()?;
+        let mut report = Self::buffer(usize::from(descriptor.report_descriptor_length))?;
+        self.register(descriptor.report_descriptor_register, &mut report)?;
+        if !self.report_descriptor.is_empty() && self.report_descriptor != report {
+            return Err(ErrorKind::IdentityChanged);
+        }
+        self.report_descriptor = report;
+        if self.quirks.repower {
+            self.power(true)?;
+        }
+        Ok(())
+    }
+    /// Start a started device again, ready or failed: power it on, reset it
+    /// and wait for the reset response, and read both descriptors again,
+    /// which must be unchanged. This puts a device that reset itself, or
+    /// whose command failed, back in its power-on state. A failure of the
+    /// timing source, or a callback that never returned, authorizes nothing.
+    pub fn reinitialize(&mut self) -> Result<(), Error> {
+        if self.descriptor.is_none() {
+            return Err(ErrorKind::NotReady.into());
+        }
+        match self.state {
+            State::Ready => {}
+            State::Faulted
+                if !matches!(
+                    self.failure.map(|failure| failure.kind),
+                    None | Some(ErrorKind::Minimum(_) | ErrorKind::Interrupted)
+                ) => {}
+            State::Faulted => return Err(ErrorKind::NeedsReset.into()),
+            _ => return Err(ErrorKind::NotReady.into()),
+        }
+        self.act(State::Ready, Self::start)
+    }
+    /// Watch the pin for `us` after a command that can make the device
+    /// reset, as a touchpad's mode switch: whether a reset response (a
+    /// zero-length input) came, which ends the watch. Reports in the window
+    /// are discarded and counted with those before start. A polled device
+    /// cannot tell a reset from its empty register: it waits the window out
+    /// and drains its register.
+    pub fn settle(&mut self, us: u64) -> Result<bool, Error> {
+        self.ready()?;
         self.act(State::Ready, |this| {
-            this.interrupt
-                .mask_and_drain()
-                .map_err(ErrorKind::Interrupt)?;
-            let mut bytes = [0; DESCRIPTOR_BYTES];
-            if let Err(error) = this.register(this.descriptor_register, &mut bytes) {
-                if !Self::address_nack(error) {
-                    return Err(error);
+            if this.interrupt.polled() {
+                this.delay(us)?;
+                this.drain_before_reset()?;
+                return Ok(false);
+            }
+            let start = this.timer.start();
+            while this.timer.elapsed_us(start) < us {
+                if this.interrupt.asserted().map_err(ErrorKind::Interrupt)? {
+                    let length = this.read_input()?;
+                    if length == 0 {
+                        return Ok(true);
+                    }
+                    if !(this.quirks.elan && length == u16::MAX) {
+                        this.input_length(length)?;
+                    }
+                    this.discarded_before_start = this.discarded_before_start.saturating_add(1);
                 }
-                this.delay(ADDRESS_WAKE_DELAY_US)?;
-                this.register(this.descriptor_register, &mut bytes)?;
+                this.timer.relax();
             }
-            let descriptor = Descriptor::parse(&bytes)?;
-            if this.descriptor.is_some_and(|old| old != descriptor) {
-                return Err(ErrorKind::IdentityChanged);
-            }
-            this.quirks = Quirks::for_device(descriptor);
-            this.input = Self::buffer(usize::from(descriptor.max_input_length))?;
-            this.descriptor = Some(descriptor);
-            this.reset()?;
-            let mut report = Self::buffer(usize::from(descriptor.report_descriptor_length))?;
-            this.register(descriptor.report_descriptor_register, &mut report)?;
-            if !this.report_descriptor.is_empty() && this.report_descriptor != report {
-                return Err(ErrorKind::IdentityChanged);
-            }
-            this.report_descriptor = report;
-            if this.quirks.repower {
-                this.power(true)?;
-            }
-            Ok(())
+            Ok(false)
         })
     }
     /// Read only when the device IRQ pin is asserted, or a polled device is
@@ -583,11 +644,13 @@ impl<B: Bus, I: Interrupt, T: Timer> Device<B, I, T> {
             let length = this.read_input()?;
             if length == 0 {
                 // A polled device answers an empty register with no length;
-                // only an asserted pin makes it a reset.
+                // only an asserted pin makes it a reset. Linux
+                // `i2c_hid_get_input` takes it as a host or device initiated
+                // reset completing and drops it: never a failure.
                 if this.interrupt.polled() {
                     return Ok(None);
                 }
-                return Err(ErrorKind::UnexpectedReset);
+                return Ok(Some(InputReport::Reset));
             }
             if this.quirks.elan && length == u16::MAX {
                 return Ok(Some(InputReport::SpuriousInterrupt));
@@ -777,6 +840,76 @@ impl<B: Bus, I: Interrupt, T: Timer> Device<B, I, T> {
 
 /// Input reports one poll reads at most, as USB HID bounds its pass.
 const POLL_REPORTS: usize = 16;
+/// How long a touchpad's mode switch is watched for the reset it can cause:
+/// Linux's no-reset-interrupt delay.
+const MODE_SETTLE_US: u64 = QUIRK_RESET_DELAY_US;
+/// Mode losses a touchpad is set back to touchpad mode for within
+/// [`RESTORE_WINDOW_US`]; one more reads it as a mouse.
+const MAX_RESTORES: u32 = 3;
+const RESTORE_WINDOW_US: u64 = 10_000_000;
+
+/// Why a precision touchpad is read in its firmware's mouse mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallback {
+    /// A mode report, or the watch after it, failed.
+    Switch(Error),
+    /// Starting the pad again after it lost the mode failed.
+    Restart(Error),
+    /// The pad reset and lost the mode again after it was switched back.
+    ResetAfterSwitch,
+    /// The pad lost the mode this many times within the restore window.
+    Resets(u32),
+}
+
+impl core::fmt::Display for Fallback {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Switch(error) => write!(f, "the switch failed: {error}"),
+            Self::Restart(error) => write!(f, "starting it again failed: {error}"),
+            Self::ResetAfterSwitch => f.write_str("it reset and lost the mode again once switched"),
+            Self::Resets(count) => write!(
+                f,
+                "it reset and lost the mode {count} times in {} s",
+                RESTORE_WINDOW_US / 1_000_000
+            ),
+        }
+    }
+}
+
+/// What an I²C-HID device did on its own, for the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// A reset response no command waited for, dropped as Linux drops it;
+    /// a precision touchpad still read back touchpad mode. Said once.
+    ResetDropped,
+    /// The touchpad reset itself and lost touchpad mode; it was started
+    /// again and switched back, the `count`th time in the restore window.
+    ModeRestored { count: u32 },
+    /// Touchpad mode was not kept: the pad is read in its firmware's mouse
+    /// mode from now on, so it still moves the pointer.
+    MouseMode(Fallback),
+}
+
+impl core::fmt::Display for Notice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ResetDropped => f.write_str(
+                "a reset response no command waited for (zero-length input), dropped as Linux \
+                 i2c_hid_get_input drops it",
+            ),
+            Self::ModeRestored { count } => write!(
+                f,
+                "the touchpad reset itself and lost touchpad mode: started again and switched \
+                 back (restore {count})"
+            ),
+            Self::MouseMode(cause) => write!(
+                f,
+                "precision touchpad mode not kept ({cause}): read as a mouse in its firmware's \
+                 mouse mode"
+            ),
+        }
+    }
+}
 
 /// An I²C-HID keyboard or pointer: the initialized device and the HID
 /// report translator its input reports pass through.
@@ -787,6 +920,11 @@ pub struct HidInput<B, I, T> {
     /// A precision touchpad switched to report its fingers.
     ptp: Option<ptp::Ptp>,
     pub name: String,
+    notices: Vec<Notice>,
+    reset_dropped: bool,
+    /// Mode restores in the window that started at `restored_at`.
+    restores: u32,
+    restored_at: u64,
 }
 
 impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
@@ -801,18 +939,21 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
         match Translator::describe(device.report_descriptor()) {
             Ok(translator) => {
                 // A precision touchpad goes to touchpad mode, as Linux
-                // hid-multitouch's `mt_set_modes` sets it; a failed switch
-                // leaves it in its firmware's mouse mode, read as a mouse,
-                // and the failure is the device's, reported by its poll.
-                let ptp = translator
-                    .descriptor()
-                    .and_then(ptp::Profile::select)
-                    .filter(|profile| {
-                        profile.mode_reports().iter().all(|(id, payload)| {
-                            device.set_report(ReportType::Feature, *id, payload).is_ok()
-                        })
-                    })
-                    .map(ptp::Ptp::new);
+                // hid-multitouch's `mt_set_modes` sets it. A switch that
+                // fails, or that the pad answers by resetting out of the
+                // mode, starts the pad again in its firmware's mouse mode
+                // and reads it as a mouse: it always moves the pointer.
+                let mut notices = Vec::new();
+                let ptp = match translator.descriptor().and_then(ptp::Profile::select) {
+                    Some(profile) => match Self::switch(&mut device, &profile) {
+                        Ok(()) => Some(ptp::Ptp::new(profile)),
+                        Err(cause) => {
+                            notices.push(Self::mouse_mode(&mut device, cause));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 let mut name = name;
                 if ptp.is_some() {
                     name.push_str(" precision touchpad");
@@ -822,10 +963,110 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
                     translator,
                     ptp,
                     name,
+                    notices,
+                    reset_dropped: false,
+                    restores: 0,
+                    restored_at: 0,
                 })
             }
             Err(error) => Err(Refusal::descriptor(device, error)),
         }
+    }
+
+    /// Set touchpad mode, then watch for the reset the switch can cause, as
+    /// `i2c_hid_hwreset` waits for a reset response. A pad that reset and
+    /// no longer reads back touchpad mode is started again and switched once
+    /// more.
+    fn switch(device: &mut Device<B, I, T>, profile: &ptp::Profile) -> Result<(), Fallback> {
+        for attempt in 0..2 {
+            if attempt != 0 {
+                device.reinitialize().map_err(Fallback::Restart)?;
+            }
+            for (id, payload) in profile.mode_reports() {
+                device
+                    .set_report(ReportType::Feature, id, &payload)
+                    .map_err(Fallback::Switch)?;
+            }
+            match device.settle(MODE_SETTLE_US) {
+                Ok(false) => return Ok(()),
+                Ok(true) if Self::holds_mode(device, profile) => return Ok(()),
+                Ok(true) => {}
+                Err(error) => return Err(Fallback::Switch(error)),
+            }
+        }
+        Err(Fallback::ResetAfterSwitch)
+    }
+
+    /// Whether the pad reads back touchpad mode. A failed read leaves the
+    /// device to be started again, as a lost mode does.
+    fn holds_mode(device: &mut Device<B, I, T>, profile: &ptp::Profile) -> bool {
+        let Some((id, bytes)) = profile.input_mode_report() else {
+            return false;
+        };
+        let skip = usize::from(id != 0);
+        device
+            .get_report(ReportType::Feature, id, bytes + skip)
+            .is_ok_and(|report| profile.holds_touchpad_mode(report.data.get(skip..).unwrap_or(&[])))
+    }
+
+    /// Start the pad again, which leaves it in its firmware's mouse mode, to
+    /// be read as a mouse. A device that does not start again stays failed
+    /// and is removed with its own error.
+    fn mouse_mode(device: &mut Device<B, I, T>, cause: Fallback) -> Notice {
+        let _ = device.reinitialize();
+        Notice::MouseMode(cause)
+    }
+
+    /// A reset response no command waited for. A precision touchpad that
+    /// lost touchpad mode with it is started again and switched back, within
+    /// [`MAX_RESTORES`] in [`RESTORE_WINDOW_US`], else read as a mouse;
+    /// any other device is left in its power-on state, as Linux leaves it.
+    fn reset(&mut self, inputs: &mut Vec<Input>) {
+        let Self {
+            device,
+            ptp,
+            notices,
+            reset_dropped,
+            restores,
+            restored_at,
+            ..
+        } = self;
+        let Some(pad) = ptp
+            .as_mut()
+            .filter(|pad| !Self::holds_mode(device, pad.profile()))
+        else {
+            if !core::mem::replace(reset_dropped, true) {
+                notices.push(Notice::ResetDropped);
+            }
+            return;
+        };
+        pad.release(inputs);
+        let now = device.now_us();
+        if *restores == 0 || now.wrapping_sub(*restored_at) >= RESTORE_WINDOW_US {
+            *restores = 0;
+            *restored_at = now;
+        }
+        *restores += 1;
+        let restored = if *restores > MAX_RESTORES {
+            Err(Fallback::Resets(*restores))
+        } else {
+            device
+                .reinitialize()
+                .map_err(Fallback::Restart)
+                .and_then(|()| Self::switch(device, pad.profile()))
+        };
+        match restored {
+            Ok(()) => notices.push(Notice::ModeRestored { count: *restores }),
+            Err(cause) => {
+                notices.push(Self::mouse_mode(device, cause));
+                *ptp = None;
+            }
+        }
+    }
+
+    /// What the device did on its own since the last call, for the log.
+    pub fn take_notices(&mut self) -> Vec<Notice> {
+        core::mem::take(&mut self.notices)
     }
 
     /// Whether the device is a precision touchpad reporting its fingers.
@@ -873,6 +1114,16 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
                     }
                 }
                 Some(InputReport::Empty | InputReport::SpuriousInterrupt) => {}
+                Some(InputReport::Reset) => {
+                    self.reset(inputs);
+                    if self.device.needs_reset() {
+                        return Err(self
+                            .device
+                            .first_error()
+                            .unwrap_or_else(|| ErrorKind::NeedsReset.into()));
+                    }
+                    break;
+                }
             }
         }
         Ok(())
