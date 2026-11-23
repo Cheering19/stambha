@@ -160,6 +160,42 @@ fn enter_joins_the_selected_network_first_and_escape_leaves() {
 }
 
 #[test]
+fn a_network_whose_key_a_boot_cannot_use_is_not_joined() {
+    let broken = Network {
+        usable: false,
+        ..saved("cafe")
+    };
+    let mut page = Page::new(vec![configured("home"), broken], true, None);
+    page.press(Key::Down);
+    assert_eq!(page.press(Key::Enter), Action::Stay);
+    assert!(
+        page.notice()
+            .is_some_and(|notice| notice.starts_with("cafe's saved key"))
+    );
+}
+
+#[test]
+fn the_menus_preference_names_only_a_usable_saved_network_after_the_page() {
+    let networks = vec![
+        configured("home"),
+        saved("cafe"),
+        Network {
+            usable: false,
+            ..saved("lab")
+        },
+    ];
+    let keep = |name: &str| kept_preference(Some(name.to_string()), &networks);
+    assert_eq!(keep("cafe").as_deref(), Some("cafe"));
+    // Forgotten on the page, so no longer listed.
+    assert_eq!(keep("attic"), None);
+    // Listed, but its key is not one a boot can use.
+    assert_eq!(keep("lab"), None);
+    // `--wifi`'s own network is the default, never a preference.
+    assert_eq!(keep("home"), None);
+    assert_eq!(kept_preference(None, &networks), None);
+}
+
+#[test]
 fn the_page_opens_on_the_network_chosen_before() {
     let page = Page::new(vec![configured("home"), saved("cafe")], true, Some("cafe"));
     assert_eq!(page.selected(), Row::Network(1));

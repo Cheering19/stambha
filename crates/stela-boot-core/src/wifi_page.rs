@@ -52,6 +52,18 @@ pub struct Network {
     pub usable: bool,
 }
 
+/// The menu's `--wifi-prefer` once the page closed, as `networks` now lists
+/// them: kept only while it names a saved network with a key a boot can use,
+/// so a network forgotten on the page, or one whose key is not usable, is
+/// not still named as joined first.
+pub fn kept_preference(prefer: Option<String>, networks: &[Network]) -> Option<String> {
+    prefer.filter(|name| {
+        networks
+            .iter()
+            .any(|network| !network.configured && network.usable && network.name == *name)
+    })
+}
+
 /// The networks to list: `configured` first, then each of the saved file's
 /// (`wifi_saved::listing`) once. A name that is not UTF-8 cannot be chosen
 /// by name (`--wifi-prefer`), so it is left out.
@@ -392,6 +404,12 @@ impl Page {
             Key::Enter => match self.selected() {
                 Row::JoinOther => self.mode = Mode::Add(Form::new()),
                 Row::Network(_) if !self.joins => self.notice = Some(String::from(NO_WIFI)),
+                Row::Network(index) if !self.networks[index].usable => {
+                    self.notice = Some(format!(
+                        "{}'s saved key is not one a boot can use: forget it and join it again.",
+                        self.networks[index].name
+                    ));
+                }
                 Row::Network(index) => return Action::Join(self.networks[index].name.clone()),
             },
             Key::Delete | Key::Backspace => match self.selected() {

@@ -651,9 +651,15 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                     menu.wifi_prefer.as_deref(),
                 );
                 // Only a boot that joins `--wifi` takes a preference.
-                if let (Some(configured), Some(name)) = (configured, chosen) {
+                if let (Some(configured), Some(name)) = (configured.as_deref(), chosen) {
                     menu.wifi_prefer = (name != configured).then_some(name);
                 }
+                // A preference the page forgot, or one whose key no boot can
+                // use, is no longer named as joined first.
+                menu.wifi_prefer = stela_boot_core::wifi_page::kept_preference(
+                    menu.wifi_prefer.take(),
+                    &crate::wifi_menu::listed(volume, configured.as_deref()),
+                );
                 menu.wifi_saved = crate::wifi_menu::saved(volume);
                 continue;
             }

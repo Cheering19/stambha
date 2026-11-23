@@ -114,6 +114,12 @@ fn translate(press: Press) -> Key {
     }
 }
 
+/// The networks the page lists, for the menu to check its preference
+/// against once the page closed (`wifi_page::kept_preference`).
+pub(crate) fn listed(volume: &mut FileSystem, configured: Option<&str>) -> Vec<Network> {
+    networks(volume, configured)
+}
+
 /// The networks to list: `configured`, then the saved file's; the file's
 /// bytes are wiped once read.
 fn networks(volume: &mut FileSystem, configured: Option<&str>) -> Vec<Network> {
