@@ -65,6 +65,7 @@ pub mod handoff_records;
 pub mod heap;
 #[cfg(target_arch = "x86_64")]
 pub mod host_clock;
+pub mod host_core;
 pub mod host_identity;
 pub mod host_memory;
 #[cfg(target_arch = "x86_64")]

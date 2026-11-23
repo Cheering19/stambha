@@ -28,6 +28,7 @@ pub(crate) mod fdr;
 mod firmware_requests;
 mod gpu;
 pub(crate) mod host;
+mod host_core;
 mod ident;
 mod input;
 pub(crate) mod install;
@@ -1425,6 +1426,8 @@ fn run_machine<H: Host>(
     {
         profile_lifetime_maxima(timing, handoff.tsc_hz, "guest-stop");
     }
+    // The host core serves nothing from here on (`--host-core on`).
+    host_core::stop(handoff.tsc_hz);
     let mut service = service::take().expect("the run's service");
     if options.profile {
         service.power().disks().report_callbacks(handoff.tsc_hz);

@@ -284,6 +284,14 @@ impl Laptop {
 /// laptop does not take it unasked until it is proven on hardware.
 pub const ACPI_HARDWARE: &str = "--acpi-hardware";
 
+/// One host processor beyond the guest's PEs for the host's own work
+/// (`--host-core on|off`, [`crate::host_core`]): the service turns and the
+/// GPUs' pump leave PE 0's core. A hand-written opt-in, in a startup
+/// choice of its own, that setup never writes, so the options revision
+/// stays 13; off unless given. Any step that cannot be checked boots as
+/// without it.
+pub const HOST_CORE: &str = "--host-core";
+
 /// Lets a guest whose kernel panicked run on (`--keep-running-on-panic`):
 /// without it the run stops `guest_watch::PANIC_HOLD_MILLIS` after the
 /// panic's first line when no reset follows (`crate::guest_watch`). A
@@ -621,6 +629,9 @@ pub struct System {
     pub brightness_keys: bool,
     /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
     pub acpi_hardware: bool,
+    /// [`HOST_CORE`]'s value, unset where the line has none
+    /// ([`Self::host_core`]).
+    pub host_core: Option<bool>,
     /// Run on after a guest kernel panic ([`KEEP_RUNNING_ON_PANIC`]).
     pub keep_running_on_panic: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
@@ -754,6 +765,7 @@ impl Default for System {
             lid_sleep: false,
             brightness_keys: false,
             acpi_hardware: false,
+            host_core: None,
             keep_running_on_panic: false,
             laptop: None,
             amx_native: None,
@@ -999,6 +1011,12 @@ impl System {
         } else {
             None
         }
+    }
+
+    /// Whether the line asks for a host core ([`HOST_CORE`] `on`); off
+    /// unless given.
+    pub fn host_core(&self) -> bool {
+        self.host_core == Some(true)
     }
 
     /// Select the exact number of host processors the loader reserves.
@@ -1287,6 +1305,10 @@ impl fmt::Display for System {
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
+        line.value(
+            HOST_CORE,
+            self.host_core.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.flag(KEEP_RUNNING_ON_PANIC, self.keep_running_on_panic)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;

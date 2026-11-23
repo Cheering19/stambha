@@ -835,7 +835,27 @@ fn load(
     };
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
-    let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
+    let pes = system.assigned_native_cores(available_cores, bundle_pes)?;
+    // `--host-core on`: one more processor, the last, for the host's own
+    // work. Anything that rules it out boots exactly as without it.
+    let host_core = stela_boot_core::host_core::plan(
+        system.host_core(),
+        system.parallel,
+        pes,
+        available_cores.min(crate::native_smp::topology::MAX_CORES),
+    );
+    match host_core {
+        stela_boot_core::host_core::Plan::Off => {}
+        stela_boot_core::host_core::Plan::Refused(why) => output::arguments(format_args!(
+            "HOST CORE off: {why}; {pes} PEs, as without --host-core\n"
+        )),
+        stela_boot_core::host_core::Plan::Reserve { executors } => {
+            output::arguments(format_args!(
+                "HOST CORE plan: {executors} processors reserved, {pes} PEs and the host core last\n"
+            ))
+        }
+    }
+    let cores = host_core.executors(pes);
     // The translation cache takes only what the parts and the guest leave,
     // so it is read last before they are reserved: only the engine image's
     // copy comes between.
@@ -844,6 +864,15 @@ fn load(
     crate::status::begin("Setting up Stambha's memory");
     let image = memory::prepare_image(&snapshot)?;
     let mut memory = memory::reserve(cores, &image.ram, system.code_window)?;
+    if let stela_boot_core::host_core::Plan::Reserve { executors } = host_core {
+        let reserved = memory.native_resources.cores as usize;
+        match stela_boot_core::host_core::confirm(executors, reserved, reserved) {
+            Ok(()) => memory.native_resources.host_core = 1,
+            Err(why) => output::arguments(format_args!(
+                "HOST CORE off: {why} ({reserved} of {executors}); the PEs run as reserved\n"
+            )),
+        }
+    }
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(

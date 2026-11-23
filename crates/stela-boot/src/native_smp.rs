@@ -34,8 +34,11 @@ pub(crate) unsafe fn validate(
     }
     let resources = &handoff.native_resources;
     // The loader reserves fewer than requested only when firmware left no
-    // AP startup page.
-    if requested.is_some_and(|requested| cores > requested)
+    // AP startup page. A host core (`--host-core on`) is one beyond the PEs
+    // `--native-cores` counts.
+    if resources.host_core > 1
+        || (resources.host_core == 1 && cores < 2)
+        || requested.is_some_and(|requested| resources.pe_cores() > requested)
         || resources.stacks.bytes != resources::STACK_BYTES * cores as u64
         || resources.stacks.physical == 0
     {

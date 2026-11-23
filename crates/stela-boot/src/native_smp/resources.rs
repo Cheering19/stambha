@@ -24,6 +24,17 @@ pub(crate) struct Resources {
     pub tasks: Region,
     /// Private bounce leaf physical addresses, indexed by fixed worker slot.
     pub bounce: [[u64; 2]; MAX_CORES],
+    /// 1 when the last of `cores` is a host core (`--host-core on`,
+    /// `stela_boot_core::host_core`) that runs no PE, else 0.
+    pub host_core: u32,
+}
+
+impl Resources {
+    /// The processors reserved for the guest's PEs: all of them but a
+    /// host core.
+    pub(crate) fn pe_cores(&self) -> usize {
+        (self.cores as usize).saturating_sub(self.host_core as usize)
+    }
 }
 
 impl Default for Resources {
@@ -36,6 +47,7 @@ impl Default for Resources {
             invocations: Region::default(),
             tasks: Region::default(),
             bounce: [[0; 2]; MAX_CORES],
+            host_core: 0,
         }
     }
 }

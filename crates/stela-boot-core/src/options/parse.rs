@@ -39,6 +39,16 @@ impl ParseState<'_> {
             "--lid-sleep" => options.lid_sleep = true,
             "--brightness-keys" => options.brightness_keys = true,
             ACPI_HARDWARE => options.acpi_hardware = true,
+            HOST_CORE => {
+                let on = match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::HostCore),
+                };
+                if options.host_core.replace(on).is_some() {
+                    return Err(Error::DuplicateHostCore);
+                }
+            }
             KEEP_RUNNING_ON_PANIC => options.keep_running_on_panic = true,
             "--lid" => {
                 if options.lid.is_some() {

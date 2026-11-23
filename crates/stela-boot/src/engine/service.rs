@@ -39,6 +39,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_boot_core::{
+    host_core::Taker,
     service_watch::{Budget, Late, LongSteps, SlowParts, Split, Turn, blame},
     shutdown::{Mode as Shutdown, Requests as ShutdownRequests},
 };
@@ -890,12 +891,24 @@ pub(super) fn serve(boot: bool, step: bool, watch: &GuestWatch) {
     if !boot {
         host::clear_interrupted();
     }
+    let started = host::rdtsc();
     let served = hold(|slot| {
         let Some(service) = slot else {
             return false;
         };
         service.serve(boot, step, watch)
     });
+    // Who served, for each one's share in the beat's line (`report`).
+    if served.is_some() {
+        let taker = if boot {
+            Taker::Boot
+        } else if super::host_core::here() {
+            Taker::HostCore
+        } else {
+            Taker::Waiting
+        };
+        super::host_core::SHARES.add(taker, host::rdtsc().wrapping_sub(started));
+    }
     // A step that left parts for the next keeps the host starved, so the
     // next step follows at the next slice.
     if served == Some(true) {
@@ -964,6 +977,9 @@ pub(super) fn report(tsc_hz: u64) -> String {
             u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1))
         ));
     }
+    // Each taker's share of the time served, PE 0's among them, and the
+    // host core's state and passes (`host_core`).
+    line.push_str(&super::host_core::report(tsc_hz));
     // An in-flight service keeps its sample for the next report. Reporting
     // never waits for the owner or holds it while formatting.
     #[cfg(feature = "diagnostics")]

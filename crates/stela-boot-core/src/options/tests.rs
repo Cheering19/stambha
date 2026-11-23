@@ -56,6 +56,27 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
     ] {
         assert_eq!(System::parse(text).err(), Some(error), "{text}");
     }
+    // `--host-core`: off unless given, each value kept as written.
+    assert!(!plain.host_core());
+    assert_eq!(plain.host_core, None);
+    for (text, on) in [
+        ("--system --host-core on", true),
+        ("--system --host-core off", false),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.host_core(), on);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --host-core", Error::HostCore),
+        ("--system --host-core yes", Error::HostCore),
+        (
+            "--system --host-core on --host-core off",
+            Error::DuplicateHostCore,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
     // `off` beside the opt-ins it leaves: each still parses as before.
     let given =
         System::parse("--system --laptop off --battery --lid method --brightness-keys").unwrap();
