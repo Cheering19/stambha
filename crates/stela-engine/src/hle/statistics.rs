@@ -1,6 +1,7 @@
 //! What a machine's HLE did: the compiles whose entry matched a signature,
 //! the composites installed, the calls whose native prefix faulted and ran
 //! the original, and the matches it refused, by reason.
+use alloc::{format, string::String};
 
 /// Why HLE left a function translated after finding it in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,5 +70,26 @@ impl Statistics {
 
     pub(crate) fn refuse(&mut self, refusal: Refusal) {
         self.refused[refusal as usize] += 1;
+    }
+
+    /// PE `pe`'s report line, of a table of `signatures`: `PES HLE pe=0
+    /// matched=1/5 installed=3 bypassed=0 refused=breakpoint:0,...`, where
+    /// `matched` counts the signatures that matched at least once.
+    pub fn line(&self, pe: usize, signatures: usize) -> String {
+        let mut line = format!(
+            "PES HLE pe={pe} matched={}/{signatures} installed={} bypassed={} refused=",
+            self.matched_signatures.count_ones(),
+            self.installed,
+            self.bypassed,
+        );
+        for (index, refusal) in Refusal::ALL.into_iter().enumerate() {
+            let separator = if index == 0 { "" } else { "," };
+            line.push_str(&format!(
+                "{separator}{}:{}",
+                refusal.name(),
+                self.refusals(refusal)
+            ));
+        }
+        line
     }
 }

@@ -1766,6 +1766,9 @@ impl Heartbeat {
         let next = Beat::at(machine, now);
         let elapsed = now - self.beat.at;
         beat_report(machine, &self.beat, &next, elapsed);
+        if machine.step_timing().is_some() && machine.hle_enabled() {
+            hle_report(machine);
+        }
         mark(&mut cost, "position");
         service.report(tsc_hz);
         mark(&mut cost, "service");
@@ -3195,6 +3198,18 @@ pub(super) fn beat_report<H: Host>(
         cpu.state.x[23],
         cpu.state.x[30],
     ));
+}
+
+/// `PES HLE pe=N matched=K/T installed= bypassed= refused=...`: what this
+/// PE's HLE matched, installed, bypassed and refused since it started
+/// (`stela_engine::hle::Statistics::line`), once a beat under `--profile`
+/// when `--hle` enabled a routine.
+pub(super) fn hle_report<H: Host, D: stela_engine::machine::Devices>(machine: &Machine<H, D>) {
+    let line = machine
+        .hle_statistics()
+        .line(machine.processor(), machine.hle_signatures());
+    output::arguments(format_args!("{line}
+"));
 }
 
 /// `BEAT SHORT …`: the fields of the `BEAT` line that say the guest runs,

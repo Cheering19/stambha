@@ -2,7 +2,7 @@
 //! that are on, and the most bytes one native call may move, fill, compare
 //! or scan.
 use super::{Id, Signature, signatures::SIGNATURES};
-use alloc::sync::Arc;
+use alloc::{format, string::String, sync::Arc, vec::Vec};
 
 /// The signatures a table may hold, so a 64-bit set names those that
 /// matched.
@@ -67,6 +67,31 @@ impl Config {
 
     pub fn enables(&self, id: Id) -> bool {
         self.enabled & id.bit() != 0
+    }
+
+    /// The boot's line after `HLE `, for a configuration `--hle` turned on
+    /// with `off` named by `--hle-off`: `on signatures=K ids=memmove,bzero
+    /// off=strlen max=65536`, `-` for an empty list. With no signatures, it
+    /// says that nothing can match.
+    pub fn describe(&self, off: &[Id]) -> String {
+        let names = |ids: &mut dyn Iterator<Item = Id>| {
+            let names: Vec<&str> = ids.map(Id::name).collect();
+            match names.is_empty() {
+                true => String::from("-"),
+                false => names.join(","),
+            }
+        };
+        let ids = names(&mut Id::PRODUCTION.into_iter().filter(|id| self.enables(*id)));
+        let off = names(&mut off.iter().copied());
+        let mut line = format!(
+            "on signatures={} ids={ids} off={off} max={}",
+            self.table.len(),
+            self.max_bytes
+        );
+        if self.enabled == 0 {
+            line.push_str(": no signature is enabled, so no function is replaced");
+        }
+        line
     }
 
     fn of(ids: u32, table: Arc<[Signature]>) -> Self {

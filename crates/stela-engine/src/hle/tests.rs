@@ -406,3 +406,43 @@ fn a_table_of_more_than_64_signatures_panics() {
     let signature = Signature::of(Id::Memmove, &leaf(), EXIT).unwrap();
     Config::with_table(alloc::sync::Arc::from(vec![signature; 65]), &[Id::Memmove]);
 }
+
+#[test]
+fn statistics_line_names_every_counter() {
+    let mut statistics = Statistics {
+        matched: 9,
+        matched_signatures: 0b101,
+        installed: 3,
+        bypassed: 2,
+        ..Statistics::default()
+    };
+    statistics.refuse(Refusal::CrossesPage);
+    statistics.refuse(Refusal::Compose);
+    statistics.refuse(Refusal::Compose);
+    assert_eq!(
+        statistics.line(4, 5),
+        "PES HLE pe=4 matched=2/5 installed=3 bypassed=2 refused=breakpoint:0,crosses-page:1,\
+         device-site:0,admitted:0,bail:0,compose:2"
+    );
+}
+
+#[test]
+fn a_boot_config_describes_its_routines() {
+    let signature = Signature::of(Id::Memmove, &leaf(), EXIT).unwrap();
+    let table: alloc::sync::Arc<[Signature]> = alloc::sync::Arc::from([signature]);
+    let on = Config::with_table(table.clone(), &[Id::Memmove]);
+    assert_eq!(
+        on.describe(&[Id::Strlen]),
+        "on signatures=1 ids=memmove off=strlen max=65536"
+    );
+    let none = Config::with_table(table, &[]);
+    assert_eq!(
+        none.describe(&[Id::Memmove]),
+        "on signatures=1 ids=- off=memmove max=65536: no signature is enabled, so no function is replaced"
+    );
+    assert!(
+        Config::boot(true, &[])
+            .describe(&[])
+            .starts_with("on signatures=0 ids=- off=- ")
+    );
+}

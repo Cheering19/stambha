@@ -1214,6 +1214,12 @@ fn run_machine<H: Host>(
         }
     }
     machine.set_step_timing(options.profile);
+    let hle = stela_engine::hle::Config::boot(options.hle, &options.hle_off);
+    if options.hle {
+        output::arguments(format_args!("HLE {}
+", hle.describe(&options.hle_off)));
+    }
+    machine.set_hle(hle);
     let amx_model = options.amx_model();
     machine.set_amx_model(amx_model.0);
     if amx_model == stela_boot_core::options::AmxModel::ALL {
