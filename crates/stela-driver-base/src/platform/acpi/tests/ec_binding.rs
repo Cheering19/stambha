@@ -784,6 +784,13 @@ mod ec_binding_tests {
         sci: Option<(Interrupt, usize)>,
         refuse_sci: bool,
         install_attempts: usize,
+        /// GPE0's one status and one enable register (ports 0x1010 and
+        /// 0x1011), where the FADT names the block ([`fixture_ec_events`]).
+        gpe_status: u8,
+        gpe_enable: u8,
+        /// The values written to SMI_CMD (port 0xb2); ACPI_ENABLE (0xa0)
+        /// sets SCI_EN, as a chipset's firmware does.
+        smi: Vec<u8>,
     }
     static LEGACY: Mutex<Option<Legacy>> = Mutex::new(None);
     unsafe extern "C" fn legacy_map(p: *mut c_void, address: u64, length: u64) -> *mut c_void {
@@ -836,6 +843,9 @@ mod ec_binding_tests {
         0
     }
     fn legacy_port(port: u64, width: u32, write: Option<u32>) -> Option<u32> {
+        if let Some(value) = events_port(port, width, write) {
+            return Some(value);
+        }
         if !matches!(width, 8 | 16 | 32) || port < 0x1000 || port + u64::from(width / 8) > 0x1006 {
             return None;
         }
@@ -864,6 +874,36 @@ mod ec_binding_tests {
             legacy.control = u16::from_le_bytes(bytes[4..].try_into().unwrap());
         }
         Some(u32::from_le_bytes(result))
+    }
+    /// GPE0 (status 0x1010, enable 0x1011, status write-one-to-clear) and
+    /// SMI_CMD (0xb2), byte wide, for the hardware-mode fixture.
+    fn events_port(port: u64, width: u32, write: Option<u32>) -> Option<u32> {
+        if width != 8 || !matches!(port, 0x1010 | 0x1011 | 0xb2) {
+            return None;
+        }
+        let mut legacy = LEGACY.lock().unwrap();
+        let legacy = legacy.as_mut()?;
+        let value = write.map(|value| value as u8);
+        Some(u32::from(match (port, value) {
+            (0x1010, None) => legacy.gpe_status,
+            (0x1010, Some(clear)) => {
+                legacy.gpe_status &= !clear;
+                0
+            }
+            (0x1011, None) => legacy.gpe_enable,
+            (0x1011, Some(enable)) => {
+                legacy.gpe_enable = enable;
+                0
+            }
+            (_, None) => 0,
+            (_, Some(command)) => {
+                legacy.smi.push(command);
+                if command == 0xa0 {
+                    legacy.control |= 1;
+                }
+                0
+            }
+        }))
     }
     unsafe extern "C" fn ec_timer(_: *mut c_void) -> u64 {
         RAW_TIME.fetch_add(1, Ordering::AcqRel)
@@ -1192,6 +1232,9 @@ mod ec_binding_tests {
             sci: None,
             refuse_sci: false,
             install_attempts: 0,
+            gpe_status: 0,
+            gpe_enable: 0,
+            smi: Vec::new(),
         });
         EC.lock().unwrap().as_mut().unwrap().require_facs = global_lock;
         provider.map = legacy_map;
@@ -1464,5 +1507,181 @@ mod ec_binding_tests {
             .args(["--exact", "platform::acpi::tests::ec_binding_tests::native_installed_ec_retirement_failure_quarantines_provider_after_termination"])
             .env("STELA_EC_RETIREMENT_FAILURE_CHILD", "1").status().unwrap();
         assert!(result.success());
+    }
+
+    /// The hardware-mode fixture: the legacy fixture's FADT with GPE0 (one
+    /// register pair at 0x1010), SMI_CMD 0xb2 and ACPI_ENABLE 0xa0 with
+    /// SCI_EN clear, and a DSDT as the FA608PP's: an EC whose `_GPE` is 3,
+    /// whose `_REG` sets ECOK and notifies the lid, whose `_INI` counts, and
+    /// whose `_Q2F` notifies the lid as the FA608PP's does; a lid `LID0`.
+    fn fixture_ec_events() -> (Services, Arc<Counts>) {
+        let (provider, counts) = fixture_ec_legacy(false);
+        let resources = [
+            0x47, 1, 0x72, 0, 0x72, 0, 1, 1, 0x47, 1, 0x76, 0, 0x76, 0, 1, 1, 0x79, 0,
+        ];
+        let mut buffer = vec![0x0a, resources.len() as u8];
+        buffer.extend(resources);
+        let mut ec = b"EC00".to_vec();
+        ec.extend(name(b"_HID", b"\x0dPNP0C09\0"));
+        ec.extend(name(b"_CRS", &pkg(&[0x11], &buffer)));
+        ec.extend(name(b"_GPE", &[0x0a, 3]));
+        ec.extend(name(b"ECOK", &[0]));
+        ec.extend(name(b"INI0", &[0]));
+        ec.extend(name(b"Q2F0", &[0]));
+        ec.extend(b"\x5b\x80ECRG\x03\x00\x01");
+        ec.extend(pkg(b"\x5b\x81", b"ECRG\x01BYTE\x08"));
+        // _REG: If (Arg0 == 3) { ECOK = Arg1 }, Notify (\LID0, 0x80).
+        ec.extend(method(
+            b"_REG",
+            2,
+            b"\xa0\x0b\x93\x68\x0a\x03\x70\x69ECOK\x86\\LID0\x0a\x80",
+        ));
+        ec.extend(method(b"_INI", 0, b"\x75INI0"));
+        ec.extend(method(b"_Q2F", 0, b"\x75Q2F0\x86\\LID0\x0a\x80"));
+        let mut aml = pkg(b"\x5b\x82", &ec);
+        let mut lid = b"LID0".to_vec();
+        lid.extend(name(b"_HID", b"\x0dPNP0C0D\0"));
+        aml.extend(pkg(b"\x5b\x82", &lid));
+        let mut dsdt = table(b"DSDT", 36 + aml.len(), 2);
+        dsdt[36..].copy_from_slice(&aml);
+        checksum(&mut dsdt, 9);
+        // SAFETY: the test exclusively owns unpublished provider/table storage.
+        let platform = unsafe { &mut *provider.context.cast::<TestPlatform>() };
+        for (address, table) in &mut platform.tables {
+            if *address == 0x4000 {
+                *table = dsdt.clone();
+            }
+            if *address == 0x3000 {
+                table[48..52].copy_from_slice(&0xb2u32.to_le_bytes());
+                table[52] = 0xa0;
+                table[53] = 0xa1;
+                table[80..84].copy_from_slice(&0x1010u32.to_le_bytes());
+                table[92] = 2;
+                checksum(table, 9);
+            }
+        }
+        LEGACY.lock().unwrap().as_mut().unwrap().control = 0;
+        (provider, counts)
+    }
+
+    /// The `--acpi-hardware` path as `stela-boot`'s `engine::aml` runs it, on
+    /// the real ACPICA: `_INI` before the census, the EC's region and
+    /// `_REG`, hardware activation entering ACPI mode through SMI_CMD and
+    /// installing the SCI, the EC's GPE taken by its raw handler from the
+    /// SCI handler, the query read and its `_Q2F` run, and the lid's
+    /// notification delivered as deferred work.
+    #[test]
+    fn hardware_mode_enters_acpi_mode_takes_the_ec_gpe_and_delivers_its_query() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        static EC_EVENT: AtomicBool = AtomicBool::new(false);
+        EC_EVENT.store(false, Ordering::SeqCst);
+        let (provider, counts) = fixture_ec_events();
+        // SAFETY: the fixture provider's tables and callbacks are valid, and the serial lock keeps
+        // this the only interpreter.
+        let session = unsafe { Session::start(provider, Mode::InterpreterOnly) }.unwrap();
+        let ec_device = session.handle("\\EC00").unwrap();
+        let integer = |name: &str| match ec_device.evaluate(Some(name), &[]) {
+            Ok(Some(Value::Integer(value))) => value,
+            other => panic!("{name}: {other:?}"),
+        };
+        // `_INI` before the census, as the boot runs it with or without the
+        // option; nothing of hardware mode yet.
+        session.initialize_devices().unwrap();
+        assert_eq!(integer("INI0"), 1);
+        assert_eq!(integer("ECOK"), 0);
+        assert!(LEGACY.lock().unwrap().as_ref().unwrap().smi.is_empty());
+        let device = Device::discover(session.devices("PNP0C09").unwrap()[0]).unwrap();
+        assert_eq!(device.gpe, Some(3));
+        let config = ec::Config {
+            polling_guard_us: 0,
+            ..ec::Config::default()
+        };
+        // SAFETY: the fixture's simulated EC owns these ports alone, and this test runs in
+        // process context.
+        let binding = unsafe { Binding::install(device, config, Scope::FirstController) }.unwrap();
+        assert_eq!(
+            integer("ECOK"),
+            1,
+            "_REG(3, 1) ran when the EC's region handler did"
+        );
+        let lid = Arc::new(AtomicU32::new(0));
+        let counted = lid.clone();
+        let notification = session
+            .handle("\\LID0")
+            .unwrap()
+            .notify(move |value| {
+                if value == 0x80 {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .unwrap();
+
+        session.enable_hardware().unwrap();
+        assert!(session.hardware_enabled());
+        {
+            let legacy = LEGACY.lock().unwrap();
+            let legacy = legacy.as_ref().unwrap();
+            assert_eq!(legacy.smi, [0xa0], "ACPI_ENABLE written to SMI_CMD once");
+            assert_eq!(legacy.control & 1, 1, "SCI_EN set");
+            assert!(
+                legacy.sci.is_some(),
+                "the SCI handler installed on SCI_INT 9"
+            );
+            assert_eq!(
+                legacy.gpe_enable, 0,
+                "no GPE enabled before its owner takes it"
+            );
+        }
+        assert_eq!(integer("INI0"), 1, "hardware activation runs no _INI again");
+        session.flag_gpe(3, true, &EC_EVENT).unwrap();
+        session.update_all_gpes().unwrap();
+        assert_eq!(LEGACY.lock().unwrap().as_ref().unwrap().gpe_enable, 1 << 3);
+
+        let sci = || {
+            let (handler, context) = LEGACY.lock().unwrap().as_ref().unwrap().sci.unwrap();
+            // SAFETY: ACPICA's installed SCI handler and its context, called in
+            // process context as the boot's deferred dispatch does.
+            unsafe { handler(context as *mut c_void) }
+        };
+        // No status set: the handler finds nothing.
+        assert_eq!(sci(), 0);
+        assert!(!EC_EVENT.load(Ordering::SeqCst));
+        // The EC raises SCI_EVT with query 0x2f, and its GPE's status.
+        EC.lock().unwrap().as_mut().unwrap().queries.push_back(0x2f);
+        LEGACY.lock().unwrap().as_mut().unwrap().gpe_status |= 1 << 3;
+        assert_ne!(sci(), 0, "the SCI handler handled the EC's GPE");
+        assert!(EC_EVENT.swap(false, Ordering::SeqCst));
+        {
+            let legacy = LEGACY.lock().unwrap();
+            let legacy = legacy.as_ref().unwrap();
+            assert_eq!(legacy.gpe_status & (1 << 3), 0, "its status cleared");
+            assert_eq!(
+                legacy.gpe_enable & (1 << 3),
+                0,
+                "disabled until its queries drain"
+            );
+        }
+        let event = binding.poll_query().unwrap().unwrap();
+        assert_eq!(event.value(), 0x2f);
+        event.dispatch().unwrap();
+        assert_eq!(integer("Q2F0"), 1, "_Q2F ran");
+        assert!(binding.poll_query().unwrap().is_none());
+        session
+            .enable_gpe(Gpe {
+                block: None,
+                number: 3,
+            })
+            .unwrap();
+        assert_eq!(LEGACY.lock().unwrap().as_ref().unwrap().gpe_enable, 1 << 3);
+        // SAFETY: test process context; drains the provider's work queue.
+        unsafe { acpi_os_wait_events_complete() };
+        assert!(
+            lid.load(Ordering::SeqCst) >= 1,
+            "the lid's notification from _Q2F delivered as deferred work"
+        );
+        notification.remove().unwrap();
+        drop(binding);
+        session.shutdown().unwrap();
+        assert!(counts.destroyed.load(Ordering::SeqCst));
     }
 }
