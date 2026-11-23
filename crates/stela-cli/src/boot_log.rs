@@ -982,7 +982,12 @@ pub(crate) mod tests {
     /// A 4 MiB log region as this tree's writer leaves it, with one boot per
     /// entry of `boots`, each printing it and storing every 64 KiB.
     pub(crate) fn written(boots: &[Vec<u8>]) -> Vec<u8> {
-        let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
+        written_in(boot_log::LOG_BYTES, boots)
+    }
+
+    /// [`written`] in a `length`-byte region, as a longer log file is.
+    pub(crate) fn written_in(length: u64, boots: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = vec![0u8; length as usize];
         let mut region = Bytes {
             bytes: &mut bytes,
             identity: Identity {
@@ -990,7 +995,7 @@ pub(crate) mod tests {
                 location: "test".into(),
                 model: "RAM".into(),
                 serial: String::new(),
-                blocks: boot_log::LOG_BYTES / 512,
+                blocks: length / 512,
                 block_size: 512,
                 read_only: false,
                 features: Default::default(),

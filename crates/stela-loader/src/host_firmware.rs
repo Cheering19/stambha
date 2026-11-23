@@ -92,7 +92,10 @@ impl MountLimits {
 
 pub const MANIFEST_PATH: &str = "EFI/stela/firmware/manifest.json";
 pub const DIRECTORY: &str = "EFI/stela/firmware";
-pub const MAX_MANIFEST_BYTES: usize = 128 * 1024;
+/// Room for the complete bundle's manifest: an image with the AMD and Intel
+/// ports writes 468 files (194 KiB), which an NVIDIA image must still read
+/// to find its GSP-RM firmware on a stick that image set up.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_IMAGES: usize = 64;
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Room for a GSP-RM image per GPU family, beside every other driver's firmware.
@@ -182,7 +185,7 @@ fn fail(message: &str) -> Error {
 impl<'a> Manifest<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(fail("host firmware manifest exceeds 128 KiB"));
+            return Err(fail("host firmware manifest exceeds 1 MiB"));
         }
         let manifest: Self = serde_json::from_slice(bytes)
             .map_err(|e| Error(format!("host firmware manifest: {e}")))?;

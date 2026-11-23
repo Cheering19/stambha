@@ -789,3 +789,88 @@ fn a_gpu_lacking_files_is_told_why_in_the_order_a_user_can_act_on() {
     assert_eq!(Absent::of([Unread, NoRoom]), Absent::AnsweredLate);
     assert_eq!(Absent::of([Unread]), Absent::AnsweredLate);
 }
+
+/// A stick set up by an image with the AMD and Intel ports holds their files
+/// too: its manifest lists 468 files in 194 KiB (198,909 bytes from that
+/// build's `stela`), past the 128 KiB and 256 files an NVIDIA image once
+/// read. This build's own files, the GSP-RM images among them, are found by
+/// their digests beside the others.
+#[test]
+fn a_stick_with_another_ports_files_still_gives_this_build_its_own() {
+    const FILES: usize = 468;
+    let own = complete();
+    let object =
+        |sha256: &str, length: usize, source: &str, revision: &str, member: &str, license: &str| {
+            serde_json::json!({"path":object_path(sha256),"sha256":sha256,"length":length,
+            "source":source,"revision":revision,"member":member,"license":notice_path(license)})
+        };
+    let mut objects: Vec<_> = own
+        .iter()
+        .map(|(file, notice)| {
+            object(
+                file.sha256,
+                file.length,
+                file.source,
+                file.revision,
+                file.member,
+                notice.sha256,
+            )
+        })
+        .collect();
+    // The ports' files, named as amdgpu's are, under the first notice.
+    let notice = own[0].1;
+    for index in 0..FILES - own.len() {
+        let sha256 = format!("{:032x}{:032x}", 0xa11d_0000_u64 + index as u64, index);
+        let member = format!(
+            "amdgpu/gc_11_0_{}_imu_kicker_firmware_{index:03}.bin",
+            index % 10
+        );
+        objects.push(object(
+            &sha256,
+            300_000,
+            "linux-firmware",
+            "1987bb20",
+            &member,
+            notice.sha256,
+        ));
+    }
+    let mut notices: Vec<&Artifact> = Vec::new();
+    for (_, notice) in &own {
+        if !notices.iter().any(|seen| seen.sha256 == notice.sha256) {
+            notices.push(notice);
+        }
+    }
+    let notices: Vec<_> = notices
+        .iter()
+        .map(|notice| {
+            serde_json::json!({"path":notice_path(notice.sha256),"sha256":notice.sha256,
+                "length":notice.length,"source":notice.source,"revision":notice.revision,
+                "member":notice.member})
+        })
+        .collect();
+    let bytes = serde_json::to_vec_pretty(
+        &serde_json::json!({"schema":1,"objects":objects,"notices":notices}),
+    )
+    .unwrap();
+    assert!(bytes.len() > 128 * 1024, "{}", bytes.len());
+    let bundle = Bundle::parse(&bytes).unwrap();
+    assert_eq!(bundle.objects.len(), FILES);
+    for (file, _) in &own {
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.sha256 == file.sha256),
+            "{}",
+            file.member
+        );
+    }
+    assert!(recipes::GSP.iter().all(|recipe| {
+        bundle
+            .objects
+            .iter()
+            .any(|object| object.sha256 == recipe.image.sha256)
+    }));
+    // A manifest past the limit is still refused.
+    assert!(Bundle::parse(&vec![b' '; MAX_MANIFEST_BYTES + 1]).is_err());
+}
