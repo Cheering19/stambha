@@ -420,6 +420,15 @@ pub const TIER2: &str = "--tier2";
 /// standing. A debug mode, hand-written as [`TIER2`] is.
 pub const TIER2_CHECK: &str = "--tier2-check";
 
+/// Reads the rest of a translation pack read on demand into memory in the
+/// background once the guest runs (`--pack-preload on|off`, on unless
+/// given): large sequential reads of the USB on idle time, never ahead of a
+/// lookup's own read, within the memory the pack's budget leaves
+/// (`host_memory::bulk_bound`). `off` leaves the records to be read as
+/// lookups ask for them, as before. A hand-written opt-out setup never
+/// writes, so the options revision stays 13.
+pub const PACK_PRELOAD: &str = "--pack-preload";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -768,6 +777,9 @@ pub struct System {
     pub tier2: Option<bool>,
     /// Check tier 2 ([`TIER2_CHECK`]), which runs it.
     pub tier2_check: bool,
+    /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
+    /// `None` unless given, which preloads ([`Self::pack_preload`]).
+    pub pack_preload: Option<bool>,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -917,6 +929,7 @@ impl Default for System {
             core_trial: false,
             tier2: None,
             tier2_check: false,
+            pack_preload: None,
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
@@ -1137,6 +1150,12 @@ impl System {
     /// [`GpuAspm::Firmware`].
     pub fn gpu_aspm(&self) -> GpuAspm {
         self.gpu_aspm.unwrap_or_default()
+    }
+
+    /// Whether the translation pack is preloaded in the background:
+    /// unless `--pack-preload off`.
+    pub fn pack_preload(&self) -> bool {
+        self.pack_preload != Some(false)
     }
 
     /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
@@ -1526,6 +1545,10 @@ impl fmt::Display for System {
         line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
         line.flag(TIER2_CHECK, self.tier2_check)?;
+        line.value(
+            PACK_PRELOAD,
+            self.pack_preload.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;

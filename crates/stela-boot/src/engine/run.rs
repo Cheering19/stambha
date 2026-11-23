@@ -1122,6 +1122,10 @@ pub(super) fn run<H: Host>(
                 // this PE's guest waits.
                 if idle {
                     super::translations::step();
+                } else if quiet && !super::host_core::takes_pump() {
+                    // Its background preload goes on from EL0, where this
+                    // PE holds no kernel lock, unless a host core serves.
+                    super::translations::background();
                 }
                 service.parts.lap(ServiceParts::DISK, host::rdtsc());
             });

@@ -107,6 +107,9 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
                 if now.wrapping_sub(served) >= micros * SERVICE_MICROS {
                     served = now;
                     service::serve(false, false, &watch);
+                    // The translation pack's background preload, a
+                    // bounded step: here PE 0 leaves it to this core.
+                    super::translations::background();
                     TURNS.fetch_add(1, Ordering::Relaxed);
                 }
                 if gpu::pump_host_core() {

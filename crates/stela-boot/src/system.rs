@@ -724,12 +724,15 @@ pub(crate) fn boot(
 /// left, within what this PC's free RAM leaves after Stela's parts and the
 /// guest's floor (`host_memory::pack_budget`), less `pending` bytes the
 /// loader allocates before it reserves the parts: a cache, it never stops
-/// the boot. Rewriting its pack needs the storage drivers.
+/// the boot. Rewriting its pack needs the storage drivers. With
+/// `background` (`--pack-preload`, on unless `off`) a pack read on demand
+/// also gets the memory its budget leaves, to be read into once macOS runs.
 fn translation_store(
     mut files: BundleFiles,
     mut storage: Option<stela_drivers::Handoff>,
     cores: usize,
     pending: u64,
+    background: bool,
 ) -> (BundleFiles, Option<stela_drivers::Handoff>) {
     use crate::engine::translations::PackRead;
     crate::status::begin("Opening the translation cache");
@@ -737,7 +740,7 @@ fn translation_store(
     // reports the map's absence.
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
     let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
-    let Some(store) = crate::engine::translations::read(budget) else {
+    let Some(store) = crate::engine::translations::read(budget, background) else {
         crate::status::done("none on this USB");
         return (files, storage);
     };
@@ -751,6 +754,25 @@ fn translation_store(
             "{} of {} MB, as much as this PC's memory holds",
             mb(read),
             mb(held)
+        )),
+        PackRead::OnDisk {
+            held,
+            preloaded: 0,
+            background: 1..,
+            ..
+        } => crate::status::done(&format!(
+            "{} MB, read into memory once macOS runs",
+            mb(held)
+        )),
+        PackRead::OnDisk {
+            held,
+            preloaded,
+            background: 1..,
+            ..
+        } => crate::status::done(&format!(
+            "{} MB, its first {} MB read ahead, the rest read into memory once macOS runs",
+            mb(held),
+            mb(preloaded)
         )),
         PackRead::OnDisk {
             held, preloaded: 0, ..
@@ -883,7 +905,7 @@ fn load(
         ));
         (bundle, storage)
     } else {
-        translation_store(bundle, storage, cores, image_bytes)
+        translation_store(bundle, storage, cores, image_bytes, system.pack_preload())
     };
     crate::status::begin("Setting up Stambha's memory");
     let image = memory::prepare_image(&snapshot)?;
