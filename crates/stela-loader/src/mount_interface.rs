@@ -52,6 +52,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// unasked from what it reads of the PC, which the line does not hold.
 /// So does the fork's `--acpi-hardware`, a hand-written opt-in that turns
 /// on the host's ACPI hardware mode: no line setup writes holds it.
+/// So does the fork's `--asus-mode performance|turbo|silent|off`, as
+/// hand-written: an ASUS laptop's firmware thermal policy is set to
+/// performance unasked, and no line setup writes holds the option.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

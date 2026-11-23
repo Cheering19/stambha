@@ -65,6 +65,35 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
 }
 
 #[test]
+fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
+    // The default is performance, and writes nothing.
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.asus_mode(), AsusMode::Performance);
+    assert_eq!(plain.asus_mode, None);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, mode) in [
+        ("--system --asus-mode performance", AsusMode::Performance),
+        ("--system --asus-mode turbo", AsusMode::Turbo),
+        ("--system --asus-mode silent", AsusMode::Silent),
+        ("--system --asus-mode off", AsusMode::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.asus_mode(), mode);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --asus-mode", Error::AsusMode),
+        ("--system --asus-mode balanced", Error::AsusMode),
+        (
+            "--system --asus-mode off --asus-mode turbo",
+            Error::DuplicateAsusMode,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),

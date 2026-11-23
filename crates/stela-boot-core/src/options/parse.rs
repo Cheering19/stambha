@@ -51,6 +51,12 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateLaptop);
                 }
             }
+            ASUS_MODE => {
+                let mode = AsusMode::parse(value().ok_or(Error::AsusMode)?)?;
+                if options.asus_mode.replace(mode).is_some() {
+                    return Err(Error::DuplicateAsusMode);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {

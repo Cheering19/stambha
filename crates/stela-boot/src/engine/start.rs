@@ -3020,6 +3020,9 @@ fn start_platform(
     };
     if let Some(acpi) = host_acpi {
         acpi.activate(prepared_sci);
+        // After hardware mode, where it runs, so an EC whose RAM is reached
+        // through its operation region is installed; it needs none.
+        acpi.set_asus_thermal_policy(options.asus_mode());
     }
     super::step_watchdog::clear_stage();
     super::step_watchdog::leave();

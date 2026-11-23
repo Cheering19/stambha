@@ -2058,6 +2058,124 @@ impl HostAcpi {
         *self.asus.borrow_mut() = Some((wmi, notification));
     }
 
+    /// Set an ASUS laptop's firmware thermal policy to `mode` before macOS
+    /// starts, as Linux's asus-wmi sets `throttle_thermal_policy` at probe,
+    /// so macOS runs in it whatever Windows last chose, in its own bounded
+    /// firmware call, with or without hardware mode: DSTS finds the policy
+    /// device, DEVS sets it. One line saying what it was, what was set and
+    /// what the firmware then reads, or why it was skipped; nothing on a PC
+    /// without an ASUS notebook's WMI device. The package power limits the
+    /// device names are read alongside, and only read. A failure is
+    /// reported and the boot goes on.
+    pub(super) fn set_asus_thermal_policy(&'static self, mode: stela_boot_core::options::AsusMode) {
+        use stela_boot_core::options::AsusMode;
+        use stela_drivers::platform::asus_wmi::ThermalMode;
+        let wanted = match mode {
+            AsusMode::Off => {
+                output::arguments(format_args!(
+                    "ASUS thermal policy: skipped, --asus-mode off leaves it as the firmware has it\n"
+                ));
+                return;
+            }
+            AsusMode::Performance => ThermalMode::Default,
+            AsusMode::Turbo => ThermalMode::Overboost,
+            AsusMode::Silent => ThermalMode::Silent,
+        };
+        self.firmware(
+            "ASUS thermal policy",
+            "the policy is left as the firmware has it",
+            false,
+            move |session| Self::asus_thermal_policy_entered(session, wanted),
+        );
+    }
+    /// [`Self::set_asus_thermal_policy`]'s firmware call.
+    fn asus_thermal_policy_entered(
+        session: &'static Session,
+        wanted: stela_drivers::platform::asus_wmi::ThermalMode,
+    ) {
+        use stela_drivers::platform::asus_wmi::{AsusWmi, ThermalMode, mode_in_effect};
+        let wmi = match AsusWmi::find(session) {
+            Ok(Some(wmi)) => wmi,
+            // Not an ASUS notebook: nothing to say.
+            Ok(None) => return,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "ASUS thermal policy: skipped, the WMI device search was refused ({error:?})\n"
+                ));
+                return;
+            }
+        };
+        let policy = match wmi.thermal_policy() {
+            Ok(Some(policy)) => policy,
+            Ok(None) => {
+                output::arguments(format_args!(
+                    "ASUS thermal policy: skipped, {} has no thermal policy device\n",
+                    wmi.path
+                ));
+                return;
+            }
+            Err(error) => {
+                output::arguments(format_args!(
+                    "ASUS thermal policy: skipped, {} DSTS refused ({error:?})\n",
+                    wmi.path
+                ));
+                return;
+            }
+        };
+        // DSTS of the policy answers no mode on the FA608PP (a constant
+        // 0x00010003), and asus-wmi reads none; its firmware keeps the mode
+        // in effect in its EC's FTBL, which DEVS of 0x00120075 writes. Read
+        // where that field exists and reads, as AML reads it.
+        let mode = || -> String {
+            match mode_in_effect(session, &policy) {
+                Some(value) => match u32::try_from(value)
+                    .ok()
+                    .and_then(|value| ThermalMode::from_value(value, policy.device))
+                {
+                    Some(mode) => String::from(mode.name()),
+                    None => alloc::format!("FTBL {value:#x}"),
+                },
+                None => String::from("unknown"),
+            }
+        };
+        let was = mode();
+        let line = match wmi.set_thermal_policy(&policy, wanted) {
+            Ok(value) => alloc::format!(
+                "ASUS thermal policy: was {was}, set {} ({:#x} = {value} by DEVS, DSTS {:#x}), \
+                 the firmware reads {}\n",
+                wanted.name(),
+                policy.device,
+                policy.status,
+                mode()
+            ),
+            Err(error) => alloc::format!(
+                "ASUS thermal policy: was {was}, set {} refused ({:#x} by DEVS: {error:?}), the \
+                 boot goes on\n",
+                wanted.name(),
+                policy.device
+            ),
+        };
+        output::arguments(format_args!("{line}"));
+        let limits = wmi.power_limits();
+        let limits: Vec<String> = limits
+            .into_iter()
+            .map(|(name, status)| match status {
+                Ok(status) => alloc::format!("{name}={:#x}", status & 0xffff),
+                Err(error) => alloc::format!("{name}=refused({error:?})"),
+            })
+            .collect();
+        output::arguments(format_args!(
+            "HOST POWER LIMITS asus-wmi {}: {} (DSTS's value bits, read only; 0 is a limit the \
+             firmware does not report)\n",
+            wmi.path,
+            if limits.is_empty() {
+                String::from("none present")
+            } else {
+                limits.join(" ")
+            }
+        ));
+    }
+
     /// The ASUS WMI events since the last poll: at any notification, the
     /// firmware's whole queue read through `_WED` until it is empty
     /// ([`stela_drivers::platform::asus_wmi::AsusWmi::drain`]), past a read

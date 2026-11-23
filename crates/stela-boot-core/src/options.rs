@@ -277,6 +277,54 @@ impl Laptop {
     }
 }
 
+/// The thermal policy an ASUS laptop's firmware is set to before macOS
+/// starts (`--asus-mode performance|turbo|silent|off`), as Linux's
+/// asus-wmi sets `throttle_thermal_policy`: a hand-written option setup
+/// never writes, so the options revision stays 13. Without it an ASUS
+/// laptop runs in performance (asus-wmi's default), whatever Windows last
+/// chose; any other PC is left alone.
+pub const ASUS_MODE: &str = "--asus-mode";
+
+/// `--asus-mode`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AsusMode {
+    /// The default: the firmware's performance (balanced) policy, Linux's
+    /// `ASUS_THROTTLE_THERMAL_POLICY_DEFAULT`.
+    #[default]
+    Performance,
+    /// The firmware's turbo (overboost) policy: the loudest fans.
+    Turbo,
+    /// The firmware's silent policy.
+    Silent,
+    /// Leave the policy as the firmware has it.
+    Off,
+}
+
+impl AsusMode {
+    const NAMES: [(&'static str, Self); 4] = [
+        ("performance", Self::Performance),
+        ("turbo", Self::Turbo),
+        ("silent", Self::Silent),
+        ("off", Self::Off),
+    ];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, mode)| *mode)
+            .ok_or(Error::AsusMode)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, mode)| *mode == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// Runs the host's ACPI in hardware mode (`--acpi-hardware`): the SCI,
 /// fixed events and GPEs, the embedded controller's queries and the
 /// notifications they send ([`crate::acpi_hardware`]). A hand-written
@@ -617,6 +665,9 @@ pub struct System {
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
+    /// The ASUS thermal policy set before macOS starts ([`ASUS_MODE`]);
+    /// [`AsusMode::Performance`] unless given ([`Self::asus_mode`]).
+    pub asus_mode: Option<AsusMode>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -746,6 +797,7 @@ impl Default for System {
             brightness_keys: false,
             acpi_hardware: false,
             laptop: None,
+            asus_mode: None,
             amx_native: None,
             ecid: None,
             network_check: None,
@@ -912,6 +964,12 @@ impl System {
     /// else [`Laptop::Auto`].
     pub fn laptop(&self) -> Laptop {
         self.laptop.unwrap_or_default()
+    }
+
+    /// The ASUS thermal policy set before macOS starts: `--asus-mode`,
+    /// else [`AsusMode::Performance`].
+    pub fn asus_mode(&self) -> AsusMode {
+        self.asus_mode.unwrap_or_default()
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1278,6 +1336,7 @@ impl fmt::Display for System {
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
+        line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
