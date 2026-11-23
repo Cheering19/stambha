@@ -277,6 +277,13 @@ impl Laptop {
     }
 }
 
+/// Runs the host's ACPI in hardware mode (`--acpi-hardware`): the SCI,
+/// fixed events and GPEs, the embedded controller's queries and the
+/// notifications they send ([`crate::acpi_hardware`]). A hand-written
+/// opt-in setup never writes, so the options revision stays 13, and a
+/// laptop does not take it unasked until it is proven on hardware.
+pub const ACPI_HARDWARE: &str = "--acpi-hardware";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -605,6 +612,8 @@ pub struct System {
     /// tell. A laptop takes it unasked, as it takes `--battery` and
     /// `--lid method` ([`crate::laptop`]).
     pub brightness_keys: bool,
+    /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
+    pub acpi_hardware: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -735,6 +744,7 @@ impl Default for System {
             lid: None,
             lid_sleep: false,
             brightness_keys: false,
+            acpi_hardware: false,
             laptop: None,
             amx_native: None,
             ecid: None,
@@ -1266,6 +1276,7 @@ impl fmt::Display for System {
         line.value("--lid", self.lid.map(Lid::name))?;
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
+        line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;

@@ -413,7 +413,7 @@ fn every_option_survives_a_round_trip() {
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
          --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
-         --amx-native off \
+         --acpi-hardware --amx-native off \
          --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
@@ -430,6 +430,8 @@ fn every_option_survives_a_round_trip() {
     assert_eq!(options.lid(), Lid::Method);
     assert!(options.brightness_keys);
     assert!(!System::default().brightness_keys);
+    assert!(options.acpi_hardware);
+    assert!(!System::default().acpi_hardware);
     assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));

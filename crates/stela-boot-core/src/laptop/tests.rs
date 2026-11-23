@@ -121,6 +121,10 @@ fn a_laptop_takes_every_feature_but_lid_sleep() {
     assert!(options.brightness_keys);
     assert_eq!(options.guest_trackpad(), Some(GuestTrackpad::Mt2));
     assert!(!options.lid_sleep);
+    assert!(
+        !options.acpi_hardware,
+        "ACPI hardware mode stays the line's to ask for"
+    );
     // The record stays one the parser accepts.
     assert_eq!(options.check(), Ok(()));
     assert_eq!(
