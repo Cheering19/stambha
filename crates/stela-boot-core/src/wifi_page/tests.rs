@@ -330,7 +330,10 @@ fn the_configured_network_is_never_forgotten_here() {
     let mut page = page();
     assert_eq!(page.press(Key::Delete), Action::Stay);
     assert!(matches!(page.mode(), Mode::List));
-    assert!(page.notice().is_some_and(|n| n.contains("stela.cfg")));
+    assert!(
+        page.notice()
+            .is_some_and(|n| n.contains("stambha settings"))
+    );
     assert!(!has_text(&page.scene(SCREEN), "Delete: forget"));
 }
 
