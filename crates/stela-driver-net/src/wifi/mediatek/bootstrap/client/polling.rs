@@ -32,14 +32,37 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         s.rings_empty && s.pending_rx.is_empty()
     }
 
+    /// One pass over the rings. The events of the frames taken before a
+    /// frame that fails stay for the next pass, as mac80211 has already
+    /// handed them on when it drops a frame, so a refused frame never takes
+    /// the good ones before it with it.
     pub(super) fn poll_inner(
+        &mut self,
+        now: u64,
+        source: &dyn PageSource,
+        policy: &mut (impl station::RegulatoryPolicy + scan::Policy),
+        guard: Option<&mut wifi::regulatory::PmfAuthenticationGuard<'_>>,
+        six: Option<&mut wifi::regulatory::SixGhzAuthenticationGuard<'_>>,
+    ) -> Result<Vec<Event>, Error> {
+        let mut events = core::mem::take(&mut self.state_mut().carried_events);
+        match self.poll_frames(now, source, policy, guard, six, &mut events) {
+            Ok(()) => Ok(events),
+            Err(error) => {
+                self.state_mut().carried_events = events;
+                Err(error)
+            }
+        }
+    }
+
+    fn poll_frames(
         &mut self,
         now: u64,
         source: &dyn PageSource,
         policy: &mut (impl station::RegulatoryPolicy + scan::Policy),
         mut guard: Option<&mut wifi::regulatory::PmfAuthenticationGuard<'_>>,
         mut six: Option<&mut wifi::regulatory::SixGhzAuthenticationGuard<'_>>,
-    ) -> Result<Vec<Event>, Error> {
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
         // A live 6 GHz transport is serviced only under its held providers;
         // cleanup after removal needs none.
         if self.state().six_ghz.is_some() && six.is_none() && self.phase() == Phase::Joining {
@@ -87,13 +110,16 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // TX-free stamps each release on the controller's clock, as mt76
         // times status out in jiffies.
         s.txs.expire(s.controller.state().control.clock.now_us());
-        let mut events: Vec<_> = s.txs.ready.drain(..).map(Event::TxStatus).collect();
+        events.extend(s.txs.ready.drain(..).map(Event::TxStatus));
         events.append(&mut s.cqm.ready);
         while let Some(received) = s.pending_rx.pop_front() {
             let receive::ReceivedFrame { queue, frame: f } = received;
+            // mt76_dma_rx_process frees a frame the hardware or the ring
+            // dropped and goes on with the next; a split A-MSDU it belonged
+            // to cannot complete.
             if f.drop {
                 s.receive_groups.discard(queue);
-                return Err(Error::WrongProfile);
+                continue;
             }
             let kind = f
                 .bytes
@@ -119,12 +145,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 s.asynchronous.push(f);
                 continue;
             }
-            if let Ok(event) = crate::wifi::mediatek::mcu::Event::parse(Chip::Mt7925, &f.bytes) {
-                if event.event_id == 14
-                    && event.is_unsolicited()
+            let chip = s.controller.state().identity.chip;
+            if let Ok(event) = crate::wifi::mediatek::mcu::Event::parse(chip, &f.bytes) {
+                // mt7921_mcu_scan_event ends the scan on either CE scan-done
+                // event; the MT7925's UNI event carries a done TLV.
+                let scan_done = event.is_unsolicited()
                     && s.phase == Phase::Scanning
-                    && wire::scan_done(event.payload).map_err(Error::Codec)?
-                {
+                    && if chip == Chip::Mt7925 {
+                        event.event_id == 14
+                            && wire::scan_done(event.payload).map_err(Error::Codec)?
+                    } else {
+                        wire::connac2::scan_done(event.event_id)
+                    };
+                if scan_done {
                     s.scanner
                         .completed(s.scan_ticket.unwrap(), scan::Outcome::Completed)
                         .map_err(Error::Scan)?;
@@ -132,7 +165,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 }
                 // mt7925_mcu_rssi_monitor_event: each INFO TLV reports
                 // the first TLV's RSSI against the threshold.
-                if event.event_id == 0x41
+                if chip == Chip::Mt7925
+                    && event.event_id == 0x41
                     && event.is_unsolicited()
                     && s.phase == Phase::Associated
                     && let Some(monitor) = s.cqm.monitor.filter(|m| m.firmware)
@@ -140,10 +174,46 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     events.extend(rssi_events(event.payload, monitor.threshold));
                     continue;
                 }
-                if event.event_id == 12
+                // mt7921_mcu_rssi_monitor_event: the RSSI of each BSS.
+                if chip != Chip::Mt7925
+                    && event.event_id == wire::connac2::RSSI_NOTIFY_EVENT
                     && event.is_unsolicited()
                     && s.phase == Phase::Associated
-                    && event.payload.len() >= 12
+                    && let Some(monitor) = s.cqm.monitor.filter(|m| m.firmware)
+                {
+                    let bss = s.profile.unwrap().interface.bss_index;
+                    if let Some(rssi) = wire::connac2::rssi(event.payload, bss) {
+                        events.push(Event::Rssi {
+                            rssi,
+                            high: rssi > monitor.threshold,
+                        });
+                    }
+                    continue;
+                }
+                // mt7921_mcu_tx_done_event: one TXS record by event.
+                if chip != Chip::Mt7925
+                    && event.event_id == wire::connac2::TX_DONE_EVENT
+                    && event.is_unsolicited()
+                    && let Some(p) = s.profile
+                    && let Some(packet) = wire::connac2::tx_done_status(event.payload)
+                {
+                    let reports = s
+                        .txs
+                        .receive(&packet, &Self::peer_wcids(s, p), p.channel.band);
+                    events.extend(reports.into_iter().map(Event::TxStatus));
+                    continue;
+                }
+                // mt7921_mcu_connection_loss_event takes the CE beacon-loss
+                // event's bss_idx; the MT7925's UNI event leads its TLV with it.
+                let (lost, length) = if chip == Chip::Mt7925 {
+                    (12, 12)
+                } else {
+                    (wire::connac2::BEACON_LOSS_EVENT, 4)
+                };
+                if event.event_id == lost
+                    && event.is_unsolicited()
+                    && s.phase == Phase::Associated
+                    && event.payload.len() >= length
                     && event.payload[0] == s.profile.unwrap().interface.bss_index
                 {
                     let action = s.station.disconnect().map_err(Error::Station)?;
@@ -197,7 +267,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 && matches!(frame.header().control & 0x00fc, 0x0080 | 0x0050)
                 && Self::other_link(s, &frame.radio).is_some()
             {
-                Self::beacon_of_other_link(s, frame, &mut events)?;
+                Self::beacon_of_other_link(s, frame, events)?;
                 events.push(Event::Raw(f));
                 continue;
             }
@@ -208,6 +278,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .map_err(Error::Scan)?;
                 let nontransmitted = scan::multiple_bssid::nontransmitted(&bss);
                 for bss in core::iter::once(bss).chain(nontransmitted) {
+                    s.pmf_observations.retain(|(_, old)| {
+                        old.bss.bssid != bss.bssid || old.bss.channel != bss.channel
+                    });
                     s.pmf_observations
                         .try_reserve(1)
                         .map_err(|_| Error::NoMemory)?;
@@ -215,7 +288,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                         s.pmf_observations.remove(0);
                     }
                     s.pmf_observations
-                        .push(Arc::new(PmfBssObservation { bss: bss.clone() }));
+                        .push((now, Arc::new(PmfBssObservation { bss: bss.clone() })));
                     events.push(Event::Bss(bss));
                 }
                 continue;
@@ -420,7 +493,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         if let Some((session, failure)) = s.authentication_end.take() {
             events.push(Event::ExternalAuthenticationEnded { session, failure });
         }
-        for event in &events {
+        for event in events.iter() {
             if let Event::TxStatus(status) = event
                 && Some(status.receipt) == s.mlme_receipt
             {
@@ -430,7 +503,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .map_err(Error::Station)?;
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     /// `ieee80211_drop_unencrypted_mgmt` for a robust frame on a PMF

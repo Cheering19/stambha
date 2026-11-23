@@ -29,6 +29,7 @@ use crate::{
 };
 use alloc::{alloc::alloc, boxed::Box, sync::Arc, vec::Vec};
 use core::{alloc::Layout, ptr::NonNull};
+use stela_driver_base::stepped::yield_now;
 
 pub mod client;
 
@@ -53,12 +54,8 @@ pub enum Error {
     RequiredRfkill,
     ChannelNotInDomain,
     UnsupportedBand,
-    /// Only MT7925's regulatory programming is ported.
-    UnsupportedChip(Chip),
     FirmwareStatus(u32),
-    UnvalidatedHeaderFormat {
-        wcid: u16,
-    },
+    UnvalidatedHeaderFormat { wcid: u16 },
     Interface(mailbox::device::Error),
     WrongFirmware,
     Register(registers::Error),
@@ -89,7 +86,7 @@ impl core::error::Error for Error {}
 /// # Safety
 /// As for [`Controller::new`], before its firmware epoch: the mapping is
 /// this function's exclusively claimed, uncached BAR0, kept by `owner`.
-pub unsafe fn identify(
+pub async unsafe fn identify(
     pci: PciIdentity,
     base: NonNull<u8>,
     bytes: usize,
@@ -108,8 +105,8 @@ pub unsafe fn identify(
     // SAFETY: `identify` requires `Controller::new`'s contract: `clock` is
     // calibrated on this CPU and these are the exclusive requester's registers.
     let mut control = unsafe { Control::new(registers, clock) }.map_err(Error::Control)?;
-    control.firmware_own().map_err(Error::Control)?;
-    control.driver_own(aspm).map_err(Error::Control)?;
+    control.firmware_own().await.map_err(Error::Control)?;
+    control.driver_own(aspm).await.map_err(Error::Control)?;
     let (raw_chip, raw_revision, raw_bound) =
         control.identity_registers().map_err(Error::Control)?;
     Identity::observed(pci, raw_chip, raw_revision, raw_bound).map_err(Error::Identity)
@@ -144,6 +141,14 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     mac: Option<MacInitialized>,
     counters: Option<[u32; 11]>,
     counter_reset_ticks: Option<u64>,
+    /// Rings outside the layout another owner left counted, emptied at install.
+    cleared_rings: u8,
+    /// The MCU did not report power-on for download in time; Linux warns
+    /// and downloads anyway, and so does this controller.
+    firmware_power_late: bool,
+    /// Every command waits at most the runtime bound, from the first: the
+    /// bring-up runs from station polls, as a recovery does.
+    runtime_commands: bool,
 }
 /// Drop after the first mutation keeps the entire real context,
 /// including fully completed facts. Independent quiescence is required
@@ -216,7 +221,7 @@ impl<C: 'static> Controller<MmioBar, MmioQueue, C> {
     /// They must not belong to another function or synthetic physical aliases.
     /// `aspm` is the requester ASPM-supported state; its source
     /// wake-delay selection remains bound through the subsequent MCU setup.
-    pub unsafe fn install(
+    pub async unsafe fn install(
         &mut self,
         source: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
@@ -240,6 +245,7 @@ impl<C: 'static> Controller<MmioBar, MmioQueue, C> {
                     NonNull::new_unchecked(base.as_ptr().add(offset as usize).cast::<[u32; 4]>());
                 Ok(MmioQueue::from_window(p, owner.clone()))
             })
+            .await
         }
     }
 }
@@ -256,7 +262,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             return Err(Error::WrongPhase);
         }
         let mut facts = Vec::new();
-        facts.try_reserve_exact(12).map_err(|_| Error::NoMemory)?;
+        facts.try_reserve_exact(14).map_err(|_| Error::NoMemory)?;
         // SAFETY: `Owned` is not zero-sized.
         let p = unsafe { alloc(Layout::new::<Owned<I, Q, C>>()) }.cast::<Owned<I, Q, C>>();
         if p.is_null() {
@@ -287,6 +293,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
                 mac: None,
                 counters: None,
                 counter_reset_ticks: None,
+                cleared_rings: 0,
+                firmware_power_late: false,
+                runtime_commands: false,
             });
             Ok(Self {
                 owned: Some(Box::from_raw(p)),
@@ -314,6 +323,21 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     pub fn policy(&self) -> Option<&Execution<Arc<C>>> {
         self.state().policy.as_ref()
     }
+    /// How many rings outside this chip's layout install found counted and
+    /// emptied.
+    pub fn cleared_rings(&self) -> u8 {
+        self.state().cleared_rings
+    }
+    /// Whether boot downloaded firmware after the MCU's power-on report
+    /// timed out, as Linux does after its warning.
+    pub fn firmware_power_late(&self) -> bool {
+        self.state().firmware_power_late
+    }
+    /// Bound every command of this controller by the runtime bound, as a
+    /// bring-up that runs from station polls needs; set before the install.
+    pub(in crate::wifi::mediatek) fn bound_commands(&mut self) {
+        self.state_mut().runtime_commands = true;
+    }
     fn require(&self, phase: Phase) -> Result<(), Error> {
         if self.phase() == phase {
             Ok(())
@@ -326,7 +350,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// and meet `TxRing::install`'s coherent-WB, 32-bit, NoSnoop- and ATS-off
     /// conditions. Each queue `queue` returns is this requester's own ring
     /// register window.
-    pub(in crate::wifi::mediatek) unsafe fn install_with(
+    pub(in crate::wifi::mediatek) async unsafe fn install_with(
         &mut self,
         source: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
@@ -337,15 +361,20 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         let s = self.state_mut();
         s.phase = Phase::Quarantined;
         s.aspm = Some(aspm);
-        s.control.driver_own(aspm).map_err(Error::Control)?;
+        s.control.driver_own(aspm).await.map_err(Error::Control)?;
         if s.identity.chip == Chip::Mt7925 {
+            s.control
+                .enable_sleep_protection()
+                .map_err(Error::Control)?;
             // SAFETY: mt7925_pci_probe: driver-own, WFSYS reset, then DMA init.
             // No ring is allocated/published or engine enabled before its ACK.
-            unsafe { s.control.initial_wfsys_reset() }.map_err(Error::Control)?;
+            unsafe { s.control.initial_wfsys_reset() }
+                .await
+                .map_err(Error::Control)?;
         }
-        s.control.stop_dma(true).map_err(Error::Control)?;
+        s.control.stop_dma(true).await.map_err(Error::Control)?;
         s.control.mask_interrupts().map_err(Error::Control)?;
-        s.control.verify_unused_queues().map_err(Error::Control)?;
+        s.cleared_rings = s.control.clear_unused_queues().map_err(Error::Control)?;
         s.control
             .disable_global_translation()
             .map_err(Error::Control)?;
@@ -431,6 +460,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             }
             .map_err(Error::Mailbox)?,
         );
+        if s.runtime_commands {
+            s.mailbox.as_mut().unwrap().enter_runtime();
+        }
         s.phase = Phase::Queues;
         Ok(())
     }
@@ -441,7 +473,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// path issues no Bluetooth WMT or CONNV3 subsystem reset. Failure keeps
     /// this function's uncertain resources and cannot be retried in this owner;
     /// it does not grant a caller shared power/reset or sibling recovery.
-    pub fn boot(&mut self, prepared: &Prepared<'_>) -> Result<(), Error> {
+    /// A step per register poll and per command.
+    pub async fn boot(&mut self, prepared: &Prepared<'_>) -> Result<(), Error> {
         self.require(Phase::Queues)?;
         if *prepared.requests() != super::firmware::Requests::new(&self.state().identity) {
             return Err(Error::WrongFirmware);
@@ -450,18 +483,30 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         s.phase = Phase::Quarantined;
         s.control
             .prepare_firmware(s.aspm.expect("qualified actual PCI ASPM state"))
+            .await
             .map_err(Error::Control)?;
         let m = s.mailbox.as_mut().unwrap();
-        let fact = m
-            .initial(&Request::restart(s.identity.chip))
-            .map_err(Error::Transport)?;
-        s.facts.push(fact);
-        s.control.poll_firmware_power_on().map_err(Error::Control)?;
+        let fact = m.initial(&Request::restart(s.identity.chip));
+        yield_now().await;
+        s.facts.push(fact.map_err(Error::Transport)?);
+        // mt792x_load_firmware warns "MCU is not ready for firmware
+        // download" and goes on; the download's own replies then decide.
+        s.firmware_power_late = s
+            .control
+            .poll_firmware_power_on()
+            .await
+            .map_err(Error::Control)?
+            .is_none();
         m.download_after_source_restart(prepared)
+            .await
             .map_err(Error::Download)?;
-        s.control.poll_n9_ready().map_err(Error::Control)?;
-        s.capabilities = Some(m.query_capabilities().map_err(Error::Capabilities)?);
-        s.eeprom = Some(m.query_encapsulation().map_err(Error::Eeprom)?);
+        s.control.poll_n9_ready().await.map_err(Error::Control)?;
+        let capabilities = m.query_capabilities();
+        yield_now().await;
+        s.capabilities = Some(capabilities.map_err(Error::Capabilities)?);
+        let eeprom = m.query_encapsulation();
+        yield_now().await;
+        s.eeprom = Some(eeprom.map_err(Error::Eeprom)?);
         s.auxiliary = Some(prepared.retain_auxiliary());
         s.phase = Phase::Firmware;
         Ok(())
@@ -477,7 +522,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// stopped-radio permission required by Execution::prepare for these
     /// inputs and this exact downloaded image; none is inferred from raw NIC
     /// flags. The guard remains owned throughout partial/completed execution.
-    pub unsafe fn execute_clc(&mut self, inputs: ClcInputs) -> Result<(), Error> {
+    pub async unsafe fn execute_clc(&mut self, inputs: ClcInputs) -> Result<(), Error> {
         self.require(Phase::Firmware)?;
         let s = self.state_mut();
         s.phase = Phase::Quarantined;
@@ -500,18 +545,17 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             .as_mut()
             .unwrap()
             .execute(s.mailbox.as_mut().unwrap())
+            .await
             .map_err(Error::Clc)?;
         s.phase = Phase::Clc;
         Ok(())
     }
-    /// The channel domain and rate power `mt7925_mcu_regd_update` programs
-    /// for `country` after the completed CLC, under the platform's `sar`.
+    /// The channel domain and rate power `mt7925_mcu_regd_update` or
+    /// `__mt7921_mcu_regd_update` programs for `country` after the completed
+    /// CLC, under the platform's `sar`.
     pub fn regulatory_plan(&self, country: &Country, sar: &Sar) -> Result<regd::Plan, Error> {
         self.require(Phase::Clc)?;
         let s = self.state();
-        if s.identity.chip != Chip::Mt7925 {
-            return Err(Error::UnsupportedChip(s.identity.chip));
-        }
         let policy = s.policy.as_ref().ok_or(Error::MissingPolicy)?;
         let observed = policy.capabilities().observed();
         let phy = observed.phy().ok_or(Error::MissingCapabilities)?;
@@ -520,6 +564,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             .select_clc(policy.eeprom().observed().byte())
             .map_err(|error| Error::Clc(mailbox::clc::Error::Selection(error)))?;
         regd::Plan::new(regd::Inputs {
+            chip: s.identity.chip,
             country,
             bands: [
                 phy.has_2ghz(),
@@ -550,7 +595,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// consume real CLC reply restrictions first, resolve all board/
     /// OS/SAR/per-rate limits, and keep/serialize their revocation. No defaults
     /// or policy provider are synthesized by this wire execution.
-    pub unsafe fn execute_remaining(&mut self, inputs: remaining::Inputs<'_>) -> Result<(), Error> {
+    pub async unsafe fn execute_remaining(
+        &mut self,
+        inputs: remaining::Inputs<'_>,
+    ) -> Result<(), Error> {
         self.require(Phase::Clc)?;
         let s = self.state_mut();
         // SAFETY: `execute_remaining`'s contract gives `prepare_remaining` the
@@ -567,6 +615,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             .as_mut()
             .unwrap()
             .execute_all(s.mailbox.as_mut().unwrap())
+            .await
             .map_err(Error::Remaining)?;
         s.phase = Phase::Policy;
         Ok(())
@@ -575,7 +624,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// The source EEPROM/board override is resolved and kept in C
     /// before EFUSE mode. This initial profile excludes override images needing
     /// a different buffer mode. No live peer/WTBL/key users may exist.
-    pub unsafe fn initialize_mac(&mut self) -> Result<(), Error> {
+    pub async unsafe fn initialize_mac(&mut self) -> Result<(), Error> {
         self.require(Phase::Policy)?;
         let s = self.state_mut();
         s.phase = Phase::Quarantined;
@@ -583,25 +632,34 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             Request::firmware_log(s.identity.chip),
             Request::efuse_mode(s.identity.chip),
         ] {
-            let fact = s
-                .mailbox
-                .as_mut()
-                .unwrap()
-                .initial(&request)
-                .map_err(Error::Transport)?;
-            s.facts.push(fact);
+            let fact = s.mailbox.as_mut().unwrap().initial(&request);
+            yield_now().await;
+            s.facts.push(fact.map_err(Error::Transport)?);
         }
         // SAFETY: `initialize_mac`'s contract: the EEPROM override is resolved
         // and no peer, WTBL or key user exists on the freshly booted firmware.
-        s.mac = Some(unsafe { s.control.initialize_mac_raw() }.map_err(Error::Control)?);
+        s.mac = Some(
+            unsafe { s.control.initialize_mac_raw() }
+                .await
+                .map_err(Error::Control)?,
+        );
+        // mt7925_init_work: thermal protection once the MAC is up.
+        for request in Request::thermal_protection(s.identity.chip)
+            .into_iter()
+            .flatten()
+        {
+            let fact = s.mailbox.as_mut().unwrap().initial(&request);
+            yield_now().await;
+            s.facts.push(fact.map_err(Error::Transport)?);
+        }
         if s.identity.chip != Chip::Mt7925 {
             let fact = s
                 .mailbox
                 .as_mut()
                 .unwrap()
-                .initial(&Request::rts(s.identity.chip))
-                .map_err(Error::Transport)?;
-            s.facts.push(fact);
+                .initial(&Request::rts(s.identity.chip));
+            yield_now().await;
+            s.facts.push(fact.map_err(Error::Transport)?);
         }
         s.phase = Phase::Mac;
         Ok(())
@@ -613,7 +671,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// Raw policy command completion alone cannot satisfy this precondition.
     /// StartFacts remains separate from association, RF-kill/watchdog/event
     /// service, secure data admission and a guest Ethernet Link.
-    pub unsafe fn start(
+    pub async unsafe fn start(
         &mut self,
         band: Band,
         channel: u8,
@@ -652,30 +710,29 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         s.phase = Phase::Quarantined;
         let m = s.mailbox.as_mut().unwrap();
         if !c3 {
-            let f = m
-                .initial(&Request::mac_enable(s.identity.chip, true).map_err(Error::Codec)?)
-                .map_err(Error::Transport)?;
-            s.facts.push(f);
+            let f = m.initial(&Request::mac_enable(s.identity.chip, true).map_err(Error::Codec)?);
+            yield_now().await;
+            s.facts.push(f.map_err(Error::Transport)?);
         }
-        p.start_domain(m).map_err(Error::Remaining)?;
+        p.start_domain(m).await.map_err(Error::Remaining)?;
         if let Some(r) = rxpath {
-            let f = m.initial(&r).map_err(Error::Transport)?;
-            s.facts.push(f);
-            p.start_power(m).map_err(Error::Remaining)?;
+            let f = m.initial(&r);
+            yield_now().await;
+            s.facts.push(f.map_err(Error::Transport)?);
+            p.start_power(m).await.map_err(Error::Remaining)?;
         } else {
-            let f = m
-                .initial(&Request::rts(s.identity.chip))
-                .map_err(Error::Transport)?;
-            s.facts.push(f);
+            let f = m.initial(&Request::rts(s.identity.chip));
+            yield_now().await;
+            s.facts.push(f.map_err(Error::Transport)?);
         }
         s.counters = Some(s.control.reset_mac_counters().map_err(Error::Control)?);
         s.counter_reset_ticks = Some(s.control.clock.now_us());
         if !c3 {
             for value in [1, 2] {
-                let f = m
-                    .initial(&Request::radio_led(s.identity.chip, value).map_err(Error::Codec)?)
-                    .map_err(Error::Transport)?;
-                s.facts.push(f);
+                let f =
+                    m.initial(&Request::radio_led(s.identity.chip, value).map_err(Error::Codec)?);
+                yield_now().await;
+                s.facts.push(f.map_err(Error::Transport)?);
             }
         }
         s.phase = Phase::StartFacts;
@@ -687,7 +744,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// source selector documented by Interface::claim. No live prior owner or
     /// concurrent resource allocator exists. This helper implements the
     /// two-command registration; no peer/associated state is inferred.
-    pub unsafe fn register_interface(
+    pub async unsafe fn register_interface(
         &mut self,
         context: Context,
     ) -> Result<mailbox::device::Interface<Arc<C>>, Error> {
@@ -707,7 +764,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         .map_err(Error::Interface)?;
         let old = s.phase;
         s.phase = Phase::Quarantined;
-        match interface.activate(s.mailbox.as_mut().unwrap()) {
+        match interface.activate(s.mailbox.as_mut().unwrap()).await {
             Ok(()) => {
                 s.phase = old;
                 Ok(interface)

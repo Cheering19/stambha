@@ -28,6 +28,31 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+std::thread_local! {
+    static LONGEST: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Run `future` to completion a step at a time, as the attach does,
+/// keeping its longest step in counter ticks, which the model's virtual
+/// clock counts in microseconds.
+pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    loop {
+        let start = crate::Clock::ticks();
+        let poll = stela_driver_base::stepped::poll_once(future.as_mut());
+        let ticks = crate::Clock::ticks().wrapping_sub(start);
+        LONGEST.with(|longest| longest.set(longest.get().max(ticks)));
+        if let core::task::Poll::Ready(output) = poll {
+            return output;
+        }
+    }
+}
+
+/// The longest step [`block_on`] ran on this thread since the last call.
+fn longest_step() -> u64 {
+    LONGEST.with(|longest| longest.replace(0))
+}
+
 #[derive(Default)]
 pub(crate) struct DeviceBar {
     pub(crate) values: BTreeMap<u32, u32>,
@@ -241,6 +266,28 @@ impl NativeFixture {
         }
     }
     pub(crate) fn install(&mut self) -> Result<(), BootError> {
+        block_on(self.install_stepped())
+    }
+    /// A new owner of the same device, as the next bring-up attempt takes
+    /// it; the abandoned controller keeps its memory, as its Drop does.
+    pub(crate) fn reclaim(&mut self) {
+        let chip = self.chip;
+        // SAFETY: the model device belongs to this test alone.
+        let control =
+            unsafe { Control::new(Registers::new(chip, self.bar.clone()), model_clock()) }.unwrap();
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "private local-custody model exercises the real owner retention paths"
+        )]
+        let guard = Arc::new(NativeGuard {
+            _local: core::marker::PhantomData,
+            model: self.model.clone(),
+            bar: self.bar.clone(),
+            drops: self.drops.clone(),
+        });
+        self.controller = Controller::claim(identity(chip), control, guard, None).unwrap();
+    }
+    pub(crate) async fn install_stepped(&mut self) -> Result<(), BootError> {
         let domain: Arc<dyn crate::bus::dma::mapping::DmaDomain> =
             Arc::new(Domain(self.memory.clone()));
         let bar = self.bar.clone();
@@ -279,13 +326,17 @@ impl NativeFixture {
                         response: response.clone(),
                     })
                 })
+                .await
         }
     }
     pub(crate) fn boot(&mut self, chip: Chip) {
+        block_on(self.boot_stepped(chip));
+    }
+    pub(crate) async fn boot_stepped(&mut self, chip: Chip) {
         let requests = Requests::new(&identity(chip));
         let provider = catalog(&requests, patch_bytes(), ram(&clc_bytes(chip)));
         let prepared = requests.load(&provider).unwrap();
-        self.controller.boot(&prepared).unwrap();
+        self.controller.boot(&prepared).await.unwrap();
     }
     pub(crate) fn policy(&mut self, chip: Chip) {
         self.policy_bands(chip, [true, true, false]);
@@ -323,7 +374,7 @@ impl NativeFixture {
             .chip_flags();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { self.controller.execute_clc(inputs(flags)) }.unwrap();
+        unsafe { block_on(self.controller.execute_clc(inputs(flags))) }.unwrap();
         let bands: [Vec<power::Channel>; 3] = core::array::from_fn(|i| {
             if enabled[i] {
                 let band = [Band::Ghz2, Band::Ghz5, Band::Ghz6][i];
@@ -365,7 +416,7 @@ impl NativeFixture {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         unsafe {
-            self.controller.execute_remaining(
+            block_on(self.controller.execute_remaining(
                 crate::wifi::mediatek::mailbox::clc::remaining::Inputs {
                     channel_configuration,
                     domain: domain::Inputs {
@@ -381,7 +432,7 @@ impl NativeFixture {
                         ghz6: enabled[2].then_some(&bands[2]),
                     },
                 },
-            )
+            ))
         }
         .unwrap();
     }
@@ -429,6 +480,19 @@ fn initial_mt7925_wfsys_ack_precedes_dma_stop_and_every_queue_publication() {
             .position(|v| v.0 == 1 && v.1 == 0xd4208)
             .unwrap();
         let queue = b.log.iter().position(|v| v.0 == 2).unwrap();
+        // MT_HW_EMI_CTL through the L1 window: 0x18010000 selected, then
+        // SLPPROT_EN set at 0x130000 + 0x1100, before the reset.
+        let select = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0x155024 && v.2 >> 16 == 0x1801)
+            .unwrap();
+        let protect = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0x131100 && v.2 & 2 != 0)
+            .unwrap();
+        assert!(own < select && select < protect && protect < clear);
         assert!(own < clear && clear < set && set < ack && ack < dma && dma < queue);
         assert_eq!(
             b.log.iter().filter(|v| v.0 == 1 && v.1 == 0xf0140).count(),
@@ -531,7 +595,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         assert_eq!(f.controller.phase(), Phase::Policy);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let mac = f.controller.mac_observations().unwrap();
         assert_eq!(mac.wtbl.len(), 20);
         assert_eq!(mac.global_format.value & (1 << 19), 0);
@@ -542,7 +606,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         let n = f.model.lock().unwrap().clc_commands.len();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         assert_eq!(f.controller.phase(), Phase::StartFacts);
         assert_eq!(f.model.lock().unwrap().clc_commands.len(), n);
         assert_eq!(
@@ -611,7 +675,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         }
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        assert!(unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.is_err());
+        assert!(unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.is_err());
         f.retire();
         let drops = f.drops.clone();
         drop(f);
@@ -637,7 +701,7 @@ fn publication_failures_keep_guard_and_context() {
             }
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            assert!(unsafe { f.controller.initialize_mac() }.is_err());
+            assert!(unsafe { block_on(f.controller.initialize_mac()) }.is_err());
             assert_eq!(f.controller.phase(), Phase::Quarantined);
             let drops = f.drops.clone();
             drop(f);
@@ -646,25 +710,36 @@ fn publication_failures_keep_guard_and_context() {
     }
 }
 #[test]
-fn dormant_foreign_queue_is_refused_before_any_dma_publication() {
+fn rings_another_owner_left_counted_are_emptied_before_dma_starts() {
     if crate::test_process::isolate_model() {
         return;
     }
     let mut f = NativeFixture::new(Chip::Mt7925);
-    f.bar.0.lock().unwrap().values.insert(0xd4514, 17);
-    assert!(matches!(
-        f.install(),
-        Err(BootError::Control(
-            crate::wifi::mediatek::control::Error::Readback {
-                address: 0xd4514,
-                ..
-            }
-        ))
-    ));
-    assert!(f.memory.lock().unwrap().mappings.is_empty());
-    let drops = f.drops.clone();
-    drop(f);
-    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    // RX ring 1 and TX ring 2: outside MT7925's layout, left by another OS.
+    {
+        let mut b = f.bar.0.lock().unwrap();
+        for (register, value) in [(0xd4510, 0x1234_5000), (0xd4514, 17), (0xd4518, 3)] {
+            b.values.insert(register, value);
+        }
+        b.values.insert(0xd4324, 64);
+    }
+    f.install().unwrap();
+    assert_eq!(f.controller.cleared_rings(), 2);
+    {
+        let b = f.bar.0.lock().unwrap();
+        for register in [0xd4510, 0xd4514, 0xd4518, 0xd4324] {
+            assert_eq!(b.values[&register], 0, "{register:x}");
+        }
+        // Emptied before the engine was enabled.
+        let cleared = b.log.iter().position(|v| *v == (1, 0xd4514, 0)).unwrap();
+        let enabled = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0xd4208 && v.2 & 5 == 5)
+            .unwrap();
+        assert!(cleared < enabled);
+    }
+    f.retire();
 }
 
 #[test]
@@ -680,7 +755,7 @@ fn global_and_source_per_wcid_controls_match_receive_format() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let context = Context {
             bss_index: 0,
             omac_index: 0,
@@ -699,7 +774,7 @@ fn global_and_source_per_wcid_controls_match_receive_format() {
         }
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        let interface = unsafe { f.controller.register_interface(context) }.unwrap();
+        let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         let disabled = unsafe { f.controller.disable_peer_translation(&interface, 1, true) };
@@ -817,7 +892,7 @@ fn composed_bootstrap_matches_source_mac_effects_and_all_initial_packet_bytes() 
             }
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.initialize_mac() }.unwrap();
+            unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
             let mut native = f.bar.0.lock().unwrap().log.clone();
             let global = if chip == Chip::Mt7925 { 0xe800 } else { 0xf000 };
             let with_deagg = initial(global) | (1 << 15);
@@ -840,7 +915,7 @@ fn composed_bootstrap_matches_source_mac_effects_and_all_initial_packet_bytes() 
             f.bar.0.lock().unwrap().log.clear();
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+            unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
             assert_eq!(f.bar.0.lock().unwrap().log, counters);
             let trace = std::fs::read(root.join(alloc::format!("{id}-commands.trace"))).unwrap();
             let mut at = 0;
@@ -885,7 +960,7 @@ fn all_images_boot_the_full_native_layout_before_source_initialization() {
             std::fs::read(images.join(chip.ram_name())).unwrap(),
         );
         let prepared = requests.load(&provider).unwrap();
-        f.controller.boot(&prepared).unwrap();
+        block_on(f.controller.boot(&prepared)).unwrap();
         drop(prepared);
         drop(provider);
         assert!(
@@ -900,10 +975,10 @@ fn all_images_boot_the_full_native_layout_before_source_initialization() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         f.retire();
     }
 }
@@ -943,13 +1018,13 @@ fn missing_live_rfkill_service_refuses_start_before_any_radio_command() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let count = f.model.lock().unwrap().initial_commands.len();
         let reg = f.model.lock().unwrap().regulatory_commands.len();
         assert!(matches!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.start(Band::Ghz5, 36, 5180) },
+            unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) },
             Err(BootError::RequiredRfkill)
         ));
         assert_eq!(f.controller.phase(), Phase::Mac);
@@ -969,10 +1044,88 @@ fn wrong_prepared_input_refuses_before_restart_or_firmware_mutation() {
     let provider = catalog(&r, patch_bytes(), ram(&clc_bytes(Chip::Mt7925)));
     let p = r.load(&provider).unwrap();
     assert!(matches!(
-        f.controller.boot(&p),
+        block_on(f.controller.boot(&p)),
         Err(BootError::WrongFirmware)
     ));
     assert_eq!(f.controller.phase(), Phase::Queues);
     assert!(f.model.lock().unwrap().initial_commands.is_empty());
+    f.retire();
+}
+
+#[test]
+fn a_late_power_on_report_still_downloads_as_linux_does() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let mut f = NativeFixture::new(Chip::Mt7925);
+    // The MCU never reports FW_PWR_ON: mt792x_load_firmware warns, then
+    // downloads, and the download's own replies decide.
+    f.bar.0.lock().unwrap().values.insert(0xe00f0, 0);
+    f.install().unwrap();
+    f.boot(Chip::Mt7925);
+    assert!(f.controller.firmware_power_late());
+    assert_eq!(f.controller.phase(), Phase::Firmware);
+    f.retire();
+}
+
+/// The whole bring-up, firmware download included, runs in steps of one
+/// register read or one command, each within a recovery step's bound on
+/// the model's clock.
+#[test]
+fn every_bring_up_step_fits_a_recovery_step() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for chip in [Chip::Mt7921, Chip::Mt7922, Chip::Mt7925] {
+        let mut f = NativeFixture::new(chip);
+        longest_step();
+        f.install().unwrap();
+        f.boot(chip);
+        f.policy(chip);
+        // SAFETY: the model device, its pages and its domain belong to this test alone; no
+        // other driver, worker or DMA touches them.
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
+        // SAFETY: as above.
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
+        let context = crate::wifi::mediatek::bootstrap::client::tests::profile().interface;
+        // SAFETY: as above.
+        let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
+        let longest = longest_step();
+        assert!(longest > 0);
+        assert!(
+            longest <= crate::wifi::connection::keeper::RECOVERY_STEP_US,
+            "{chip:?}: {longest} us"
+        );
+        drop(interface);
+        f.retire();
+    }
+}
+
+/// A bring-up abandoned in the middle of its firmware download, as a lost
+/// station's recovery is when the radio is lost for good, leaves the device
+/// to the next owner: its WLAN subsystem reset, download and start succeed.
+#[test]
+fn a_bring_up_dropped_mid_download_leaves_the_device_to_the_next_reset() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let mut f = NativeFixture::new(Chip::Mt7925);
+    let firmware_queue = f.queues[&0xd4400].clone();
+    {
+        let mut stepped = stela_driver_base::stepped::Stepped::new(async {
+            f.install_stepped().await.unwrap();
+            f.boot_stepped(Chip::Mt7925).await;
+        });
+        while firmware_queue.lock().unwrap().head < 2 {
+            assert!(stepped.step().is_pending());
+        }
+        // Dropped mid-download: its state goes at the await it stopped at.
+    }
+    assert_eq!(f.controller.phase(), Phase::Quarantined);
+    f.reclaim();
+    f.install().unwrap();
+    f.boot(Chip::Mt7925);
+    f.policy(Chip::Mt7925);
+    assert_eq!(f.controller.phase(), Phase::Policy);
     f.retire();
 }

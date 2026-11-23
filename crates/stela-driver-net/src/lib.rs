@@ -127,9 +127,9 @@ pub trait Link {
     }
     /// How long after its start the link may take to report carrier before
     /// a missing one means no cable or no network. The default is a wired
-    /// PHY's, and every link here keeps it but the RTL8852CE station, whose
-    /// radio waits [`wifi::realtek::ax::WIFI_CARRIER_WAIT_US`] for a scan,
-    /// an SAE exchange and the 4-way handshake, through its keeper.
+    /// PHY's; a Wi-Fi station's keeper waits for its scan, join and
+    /// handshake, and the RTL8852CE station's radio names its own wait,
+    /// [`wifi::realtek::ax::WIFI_CARRIER_WAIT_US`], which its keeper keeps.
     fn carrier_wait_us(&self) -> u64 {
         WIRED_CARRIER_WAIT_US
     }
@@ -174,6 +174,13 @@ pub trait Link {
     /// interrupt, ring and receive counts), with no address in it; None
     /// where the driver keeps no such state.
     fn diagnostic(&mut self) -> Option<String> {
+        None
+    }
+    /// The next one-time diagnostic the adapter wants logged while it runs,
+    /// such as an operation it declines or a connection attempt that
+    /// failed; each is given once, and none is an error. Problems found
+    /// while attaching stay with the probe's warnings.
+    fn take_diagnostic(&mut self) -> Option<String> {
         None
     }
 }

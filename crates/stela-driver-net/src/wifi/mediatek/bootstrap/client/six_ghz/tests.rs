@@ -13,6 +13,7 @@ use crate::wifi::station::wire::{AssociationRequest, six_ghz::tests::selected};
 use crate::wifi::{Band, Channel};
 use alloc::rc::Rc;
 use core::cell::Cell;
+use stela_driver_base::stepped::block_on;
 
 pub(crate) const SIX: Channel = Channel {
     band: Band::Ghz6,
@@ -116,11 +117,12 @@ fn six_setup() -> (Client<Bar, Q, NativeGuard>, Model) {
     f.boot(Chip::Mt7925);
     f.policy_bands(Chip::Mt7925, [true; 3]);
     // SAFETY: this fixture owns the modeled controller, policy and firmware.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: modeled initial radio ownership, as the 6 GHz scan test uses.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: exact fixture-owned interface and controller resource.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     let NativeFixture {
         controller,
@@ -139,6 +141,7 @@ fn six_setup() -> (Client<Bar, Q, NativeGuard>, Model) {
         queues,
         memory,
         drops,
+        chip: Chip::Mt7925,
     };
     (driver, model)
 }

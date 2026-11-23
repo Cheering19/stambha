@@ -115,9 +115,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let generation = s.peer_generation.checked_add(1).ok_or(Error::Busy)?;
         // Prepare all source bodies before beginning physical mutation.
-        let bss = profile.bss_request(false).map_err(Error::Codec)?;
-        let peer = profile.peer_request(true, false).map_err(Error::Codec)?;
-        let broadcast = profile.broadcast_request().map_err(Error::Codec)?;
+        let codec = Self::codec(s);
+        let bss = codec.bss(profile, None, false).map_err(Error::Codec)?;
+        let peer = codec
+            .peer(profile, None, true, false)
+            .map_err(Error::Codec)?;
+        let broadcast = codec.broadcast(profile, None).map_err(Error::Codec)?;
         let ciphers = join.request.key_ciphers();
         let management_cipher = join.request.pmf().map(|pmf| pmf.management());
         let action = match beacon {
@@ -167,10 +170,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(profile.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        Self::command(s, Command::BssInfo, &bss)?;
-        Self::command(s, Command::StationRecord, &peer)?;
-        s.format_generation = Some(generation);
-        Self::command(s, Command::StationRecord, &broadcast)?;
+        let connac2 = s.controller.state().identity.chip != Chip::Mt7925;
+        Self::add_peer(s, connac2, &bss, &peer, &broadcast, generation)?;
         Self::claim_keys(s, profile)?;
         s.phase = Phase::Joining;
         let result = Self::action_guarded(s, action, now, source, policy, guard);
@@ -178,6 +179,33 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             s.phase = Phase::Quarantined;
         }
         result
+    }
+
+    /// The peer's records before its authentication. The MT7925 updates the
+    /// disabled BSS first and then the peer's and the broadcast entry's
+    /// records (`mt7925_mac_link_sta_add`); `mt7921_mac_sta_add` sends only
+    /// the peer's STATE_NONE record, the BSS staying as the interface or the
+    /// last removal left it and the broadcast entry following the
+    /// association.
+    pub(super) fn add_peer(
+        s: &mut Owned<I, Q, C>,
+        connac2: bool,
+        bss: &[Vec<u8>],
+        peer: &[u8],
+        broadcast: &[u8],
+        generation: u64,
+    ) -> Result<(), Error> {
+        if !connac2 {
+            for body in bss {
+                Self::command(s, Command::BssInfo, body)?;
+            }
+        }
+        Self::command(s, Command::StationRecord, peer)?;
+        s.format_generation = Some(generation);
+        if !connac2 {
+            Self::command(s, Command::StationRecord, broadcast)?;
+        }
+        Ok(())
     }
 
     /// Claim, or rebind from the last association, the PTK and GTK slots of
@@ -265,8 +293,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let mut p = s.profile.ok_or(Error::WrongProfile)?;
         if p.cipher == 0 {
             p.cipher = 4;
-            let b = Self::bss_request(s, p, true)?;
-            Self::command(s, Command::BssInfo, &b)?;
+            for body in Self::bss_request(s, p, true)? {
+                Self::command(s, Command::BssInfo, &body)?;
+            }
             s.profile = Some(p);
         }
         let key = if pairwise {
