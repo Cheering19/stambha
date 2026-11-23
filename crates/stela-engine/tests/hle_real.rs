@@ -129,7 +129,7 @@ fn system_registers(differential: &mut Differential) {
 }
 
 #[test]
-#[ignore = "manual: opt-in"]
+#[ignore = "oracle: STELA_HLE_FUNCTIONS"]
 fn real_platform_functions_match_their_natives() -> Result<()> {
     let mut failures = Vec::new();
     for real in functions()? {
@@ -202,7 +202,7 @@ fn driven(function: &StandIn, calls: u32) -> Result<StandIn> {
 }
 
 #[test]
-#[ignore = "manual: opt-in"]
+#[ignore = "manual: STELA_HLE_FUNCTIONS"]
 fn real_platform_functions_time_by_size() -> Result<()> {
     for real in functions()?.into_iter().filter(|real| real.eligible) {
         let function = standing(&real);
