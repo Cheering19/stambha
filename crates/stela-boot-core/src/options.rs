@@ -325,6 +325,46 @@ impl AsusMode {
     }
 }
 
+/// The power management of each GPU's PCI Express link
+/// (`--gpu-aspm off|firmware`): `off` turns ASPM L0s and L1 and every L1 PM
+/// Substate off at both ends of the link at the GPU's claim, as Linux's
+/// `pcie_aspm.policy=performance` does, a test for GPUs that drop off the
+/// bus while the firmware left L1 on. A hand-written opt-in setup never
+/// writes, so the options revision stays 13; without it the link keeps
+/// what the firmware set.
+pub const GPU_ASPM: &str = "--gpu-aspm";
+
+/// `--gpu-aspm`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuAspm {
+    /// The default: the link's ASPM as the firmware left it, its L1 PM
+    /// Substates set as Linux leaves them.
+    #[default]
+    Firmware,
+    /// ASPM and the L1 PM Substates off at both ends.
+    Off,
+}
+
+impl GpuAspm {
+    const NAMES: [(&'static str, Self); 2] = [("firmware", Self::Firmware), ("off", Self::Off)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, aspm)| *aspm)
+            .ok_or(Error::GpuAspm)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, aspm)| *aspm == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// Runs the host's ACPI in hardware mode (`--acpi-hardware`): the SCI,
 /// fixed events and GPEs, the embedded controller's queries and the
 /// notifications they send ([`crate::acpi_hardware`]). A hand-written
@@ -668,6 +708,9 @@ pub struct System {
     /// The ASUS thermal policy set before macOS starts ([`ASUS_MODE`]);
     /// [`AsusMode::Performance`] unless given ([`Self::asus_mode`]).
     pub asus_mode: Option<AsusMode>,
+    /// The GPU links' power management ([`GPU_ASPM`]);
+    /// [`GpuAspm::Firmware`] unless given ([`Self::gpu_aspm`]).
+    pub gpu_aspm: Option<GpuAspm>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -798,6 +841,7 @@ impl Default for System {
             acpi_hardware: false,
             laptop: None,
             asus_mode: None,
+            gpu_aspm: None,
             amx_native: None,
             ecid: None,
             network_check: None,
@@ -970,6 +1014,12 @@ impl System {
     /// else [`AsusMode::Performance`].
     pub fn asus_mode(&self) -> AsusMode {
         self.asus_mode.unwrap_or_default()
+    }
+
+    /// The GPU links' power management: `--gpu-aspm`, else
+    /// [`GpuAspm::Firmware`].
+    pub fn gpu_aspm(&self) -> GpuAspm {
+        self.gpu_aspm.unwrap_or_default()
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1337,6 +1387,7 @@ impl fmt::Display for System {
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
+        line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;

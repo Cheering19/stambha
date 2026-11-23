@@ -1255,7 +1255,7 @@ fn claim(
     // SAFETY: the cold owner of `address` its fabric promoted, in D0 since
     // `enable_decode`, Bus Master sealed by its preparation; the fabric
     // keeps every other configuration writer out.
-    unsafe { link::set_substates(address, function, port.as_ref()) };
+    unsafe { link::set_link_power(address, function, port.as_ref()) };
     let config = function
         .config()
         .retain_epoch()

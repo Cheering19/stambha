@@ -3472,6 +3472,7 @@ fn start_devices(
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
                 }
             });
+            gpu::link::choose(options.gpu_aspm());
             if options.boots_macos()
                 && let Ok(work) = work
                 && open_gpus(
