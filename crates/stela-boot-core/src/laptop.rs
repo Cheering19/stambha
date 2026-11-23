@@ -8,9 +8,11 @@
 //! attached, and the precision touchpads among the host's inputs. A laptop
 //! is a mobile-class profile ([`mobile_class`]), or a battery and a lid
 //! together, which a laptop whose firmware leaves the profile unspecified
-//! or says desktop still has. On a laptop the boot behaves as if `--battery`,
-//! `--lid method` and `--brightness-keys` were given, and `--trackpad mt2`
-//! too where a precision touchpad and `--input` are there ([`plan`]).
+//! or says desktop still has. On a laptop the boot behaves as if
+//! `--trackpad mt2` were given where a precision touchpad and `--input` are
+//! there, and, only with `--acpi-hardware`, `--battery`, `--lid method` and
+//! `--brightness-keys` too ([`plan`]): without hardware mode the battery
+//! would freeze at its first reading and the lid and keys would do nothing.
 //!
 //! What the line gives wins: a `--test-battery`, `--lid ignore`,
 //! `--trackpad builtin`. `--laptop off` takes nothing, so each feature stays
@@ -128,6 +130,10 @@ pub struct Plan {
     pub trackpad: Choice,
 }
 
+/// Why a laptop's battery, lid and brightness keys are skipped on a boot
+/// without `--acpi-hardware`.
+pub const NEEDS_HARDWARE: &str = "needs --acpi-hardware";
+
 /// The laptop features `options` and `facts` give this boot. Off a laptop,
 /// or with `--laptop off`, each is what the line gives or skipped.
 pub fn plan(options: &System, facts: Facts) -> Plan {
@@ -141,6 +147,12 @@ pub fn plan(options: &System, facts: Facts) -> Plan {
         None if !auto => Choice::Skipped(not_laptop),
         None => skip.unwrap_or(Choice::Taken),
     };
+    // The battery, the lid and the brightness keys follow the host only
+    // through ACPI hardware mode's events and polls: without it the battery
+    // would show its first reading for the whole boot, and the lid and the
+    // keys would do nothing. So a boot without `--acpi-hardware` takes none
+    // of them unasked; the options given still stand.
+    let without_hardware = (!options.acpi_hardware).then_some(Choice::Skipped(NEEDS_HARDWARE));
     let battery = choose(
         options.battery.map(|battery| match battery {
             Battery::Host => "--battery",
@@ -149,7 +161,9 @@ pub fn plan(options: &System, facts: Facts) -> Plan {
         // A boot that withholds the battery says so first: an install's.
         match options.battery_withheld(false) {
             Some(boot) => Some(Choice::Withheld(boot)),
-            None => (!facts.battery).then_some(Choice::Skipped("no ACPI battery")),
+            None => (!facts.battery)
+                .then_some(Choice::Skipped("no ACPI battery"))
+                .or(without_hardware),
         },
     );
     let lid = choose(
@@ -157,9 +171,14 @@ pub fn plan(options: &System, facts: Facts) -> Plan {
             Lid::Ignore => "--lid ignore",
             Lid::Method => "--lid method",
         }),
-        (!facts.lid).then_some(Choice::Skipped("no ACPI lid")),
+        (!facts.lid)
+            .then_some(Choice::Skipped("no ACPI lid"))
+            .or(without_hardware),
     );
-    let brightness_keys = choose(options.brightness_keys.then_some("--brightness-keys"), None);
+    let brightness_keys = choose(
+        options.brightness_keys.then_some("--brightness-keys"),
+        without_hardware,
+    );
     let trackpad = choose(
         options.trackpad.map(|kind| match kind {
             GuestTrackpad::Mt2 => "--trackpad mt2",

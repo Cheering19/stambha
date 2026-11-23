@@ -108,7 +108,7 @@ fn a_laptop_is_a_mobile_class_profile_or_a_battery_and_a_lid() {
 
 #[test]
 fn a_laptop_takes_every_feature_but_lid_sleep() {
-    let mut options = installed("");
+    let mut options = installed(" --acpi-hardware");
     let plan = plan(&options, laptop());
     assert_eq!(
         [plan.battery, plan.lid, plan.brightness_keys, plan.trackpad],
@@ -121,10 +121,6 @@ fn a_laptop_takes_every_feature_but_lid_sleep() {
     assert!(options.brightness_keys);
     assert_eq!(options.guest_trackpad(), Some(GuestTrackpad::Mt2));
     assert!(!options.lid_sleep);
-    assert!(
-        !options.acpi_hardware,
-        "ACPI hardware mode stays the line's to ask for"
-    );
     // The record stays one the parser accepts.
     assert_eq!(options.check(), Ok(()));
     assert_eq!(
@@ -133,6 +129,42 @@ fn a_laptop_takes_every_feature_but_lid_sleep() {
          trackpad mt2\n"
     );
 }
+
+#[test]
+fn without_acpi_hardware_a_laptop_takes_only_the_trackpad() {
+    // The battery would freeze at its first reading, and the lid and the
+    // brightness keys would do nothing, without hardware mode's events.
+    let mut options = installed("");
+    let plan = plan(&options, laptop());
+    assert_eq!(
+        [plan.battery, plan.lid, plan.brightness_keys],
+        [Choice::Skipped(NEEDS_HARDWARE); 3]
+    );
+    assert_eq!(plan.trackpad, Choice::Taken);
+    assert!(!plan.takes_brightness_keys());
+    plan.apply(&mut options);
+    assert_eq!(options.battery, None);
+    assert_eq!(options.lid, None);
+    assert!(!options.brightness_keys);
+    assert_eq!(options.guest_trackpad(), Some(GuestTrackpad::Mt2));
+    assert!(
+        !options.acpi_hardware,
+        "ACPI hardware mode stays the line's to ask for"
+    );
+    assert_eq!(options.check(), Ok(()));
+    assert_eq!(plan.line(), TESTER_LINE);
+    // The options given still stand.
+    let given = installed(" --battery --lid method --brightness-keys");
+    let plan = super::plan(&given, laptop());
+    assert_eq!(plan.battery, Choice::Given("--battery"));
+    assert_eq!(plan.lid, Choice::Given("--lid method"));
+    assert_eq!(plan.brightness_keys, Choice::Given("--brightness-keys"));
+}
+
+/// A laptop's line without `--acpi-hardware`: the touchpad alone.
+const TESTER_LINE: &str = "LAPTOP detected (FADT mobile, battery, lid): trackpad mt2; skipped: \
+     battery (needs --acpi-hardware), lid (needs --acpi-hardware), brightness keys (needs \
+     --acpi-hardware)\n";
 
 #[test]
 fn a_desktop_takes_nothing_and_keeps_what_is_given() {
@@ -210,7 +242,8 @@ fn explicit_options_win() {
         assert!(check(&options), "{extra}");
         assert_eq!(options.check(), Ok(()), "{extra}");
     }
-    let options = installed(" --lid ignore --test-battery 50,charging --trackpad builtin");
+    let options =
+        installed(" --acpi-hardware --lid ignore --test-battery 50,charging --trackpad builtin");
     assert_eq!(
         plan(&options, laptop()).line(),
         "LAPTOP detected (FADT mobile, battery, lid): --test-battery as given, --lid ignore as \
@@ -225,7 +258,7 @@ fn each_feature_without_its_device_is_skipped_with_its_reason() {
         pm_profile: Some(2),
         ..Facts::default()
     };
-    let mut options = installed("");
+    let mut options = installed(" --acpi-hardware");
     let plan = plan(&options, bare);
     assert_eq!(plan.battery, Choice::Skipped("no ACPI battery"));
     assert_eq!(plan.lid, Choice::Skipped("no ACPI lid"));
@@ -266,20 +299,21 @@ fn a_boot_that_withholds_the_battery_does_not_take_it() {
     for (line, boot) in [
         (
             alloc::format!(
-                "--system --input --storage {DISK} --nor {DISK} --bundle b --install p.json"
+                "--system --input --acpi-hardware --storage {DISK} --nor {DISK} --bundle b \
+                 --install p.json"
             ),
             "the macOS installer",
         ),
         (
-            alloc::format!("--system --input --preboot {DISK} --upgrade"),
+            alloc::format!("--system --input --acpi-hardware --preboot {DISK} --upgrade"),
             "a staged macOS update",
         ),
         (
-            alloc::format!("--system --input --preboot {DISK} --paired-recovery"),
+            alloc::format!("--system --input --acpi-hardware --preboot {DISK} --paired-recovery"),
             "recoveryOS",
         ),
         (
-            alloc::format!("--system --input --preboot {DISK} --bundle-repair"),
+            alloc::format!("--system --input --acpi-hardware --preboot {DISK} --bundle-repair"),
             "the Metal plugin repair",
         ),
     ] {
@@ -299,8 +333,10 @@ fn a_boot_that_withholds_the_battery_does_not_take_it() {
     }
     // The installed macOS takes it, in single-user and safe mode too.
     for flag in ["", " --single-user", " --safe-boot"] {
-        let options =
-            System::parse(&alloc::format!("--system --input --preboot {DISK}{flag}")).unwrap();
+        let options = System::parse(&alloc::format!(
+            "--system --input --acpi-hardware --preboot {DISK}{flag}"
+        ))
+        .unwrap();
         assert_eq!(plan(&options, laptop()).battery, Choice::Taken, "{flag}");
     }
 }
@@ -312,10 +348,14 @@ fn the_tuf_a16_is_a_laptop_with_every_feature() {
         ..laptop()
     };
     assert_eq!(
-        plan(&installed(""), facts).line().to_string(),
+        plan(&installed(" --acpi-hardware"), facts)
+            .line()
+            .to_string(),
         "LAPTOP detected (FADT mobile, battery, lid): battery on, lid method, brightness keys, \
          trackpad mt2\n"
     );
+    // A tester's boot, without hardware mode: the touchpad alone.
+    assert_eq!(plan(&installed(""), facts).line(), TESTER_LINE);
 }
 
 /// The engine's AML host and boot, whose laptop path these tests follow
