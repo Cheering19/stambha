@@ -60,15 +60,26 @@ pub fn rtl8852ce(function: &crate::bus::pci::Identity) -> bool {
 }
 
 /// Whether the scan can start a Wi-Fi station on `function` today, given a
-/// `--wifi` network: only an RTL8852CE ([`rtl8852ce`]), whose claim goes
-/// through cold preparation and so may set Bus Master. The Intel, MediaTek
-/// and RTL8822C functions the scan also routes (`native::Kind::IntelWifi`,
-/// `MediatekWifi`, `RealtekWifi`) are claimed unmastered, and the seal
-/// refuses the Bus Master their drivers set before resetting their engines,
-/// so none of them becomes a station yet. The startup menu offers Wi-Fi
-/// only on a PC that has such a function (`stela_boot_core::wifi_hardware`).
+/// `--wifi` network. Each claim goes through the mount's cold preparation
+/// and so may set Bus Master once its chip is proven quiescent:
+/// - an RTL8852CE ([`rtl8852ce`]), quiesced through its own registers;
+/// - an Intel radio `iwl_pci_probe` identifies (with `native-acpi`, which
+///   its platform configuration needs), an MT7925, or an RTL8822CE, each
+///   quiesced by a reset (`native::wifi_claim`, experimental: no such chip
+///   has run here yet). On a PC where no reset reaches the chip, its claim
+///   keeps it sealed and the boot log says why.
+///
+/// The startup menu offers Wi-Fi only on a PC that has such a function
+/// (`stela_boot_core::wifi_hardware`).
 pub fn wifi_starts(function: &crate::bus::pci::Identity) -> bool {
-    rtl8852ce(function)
+    let wireless = function.class[..2] == [2, 0x80];
+    let intel = cfg!(feature = "native-acpi")
+        && function.vendor == 0x8086
+        && crate::net::wifi::intel::identity::device(function.device).is_some();
+    let mt7925 = function.vendor == 0x14c3 && matches!(function.device, 0x7925 | 0x0717);
+    let rtl8822c = function.vendor == 0x10ec
+        && crate::net::wifi::realtek::identity::RTL8822C_DEVICES.contains(&function.device);
+    rtl8852ce(function) || (wireless && (intel || mt7925 || rtl8822c))
 }
 
 /// A controller refusal keeps its original typed details for boot diagnostics.
@@ -105,6 +116,13 @@ pub enum Error {
     /// An RTL8852CE whose Bus Master could not be cleared again after its
     /// attach failed, and why.
     Rtw89BusMaster(Box<Error>),
+    /// An Intel, MT7925 or RTL8822CE Wi-Fi function its claim kept sealed,
+    /// with Bus Master off, because no reset proved it quiescent
+    /// (`native::wifi_claim`).
+    WifiClaim(native::wifi_claim::Chip, native::wifi_claim::Error),
+    /// A Wi-Fi function whose attach failed (the first error) and whose Bus
+    /// Master could not be cleared again after it (the second).
+    WifiBusMaster(Box<Error>, Box<Error>),
     IntelBluetooth(crate::bluetooth::intel_pcie::Error),
     Bcm4377(crate::bluetooth::bcm4377::Error),
     Ehci(usb::ehci::Error),
@@ -141,6 +159,13 @@ impl fmt::Display for Error {
             Self::Rtw89Wifi(error) => write!(f, "rtw89: {error}"),
             Self::Rtw89Station(error) => write!(f, "rtw89: {error}"),
             Self::Rtw89BusMaster(error) => write!(f, "rtw89: {RTW89_BUS_MASTER}: {error}"),
+            Self::WifiClaim(chip, error) => write!(f, "Wi-Fi claim: {}: {error}", chip.name()),
+            Self::WifiBusMaster(error, cleared) => {
+                write!(
+                    f,
+                    "{error}; then Bus Master could not be cleared: {cleared}"
+                )
+            }
             Self::IntelBluetooth(error) => write!(f, "btintel_pcie: {error}"),
             Self::Bcm4377(error) => write!(f, "hci_bcm4377: {error}"),
             Self::Ehci(error) => write!(f, "EHCI: {error}"),
@@ -996,6 +1021,15 @@ const RTW89_BUS_MASTER: &str = "RTL8852CE: Bus Master could not be cleared after
 /// Record an RTL8852CE whose station runs (M3 spec S16.2): it joins the
 /// links as a Wi-Fi adapter, its running firmware is reported, and its
 /// requester and domain stay kept.
+/// The warning of an Intel, MT7925 or RTL8822CE Wi-Fi function whose claim
+/// went through: the reset that quiesced it before Bus Master, and how
+/// firmware had left it.
+fn wifi_quiesced(devices: &mut Devices, address: Address, quiesced: native::wifi_claim::Quiesced) {
+    devices
+        .warnings
+        .push((address, Warning::Text(alloc::format!("{quiesced}"))));
+}
+
 fn rtw89_started(devices: &mut Devices, address: Address, up: native::Rtw89Up) {
     let native::Rtw89Up {
         station,
@@ -1200,7 +1234,9 @@ impl Devices {
             | Error::RealtekWifi(_)
             | Error::Rtw89Wifi(_)
             | Error::Rtw89Station(_)
-            | Error::Rtw89BusMaster(_) => "Wi-Fi",
+            | Error::Rtw89BusMaster(_)
+            | Error::WifiClaim(..)
+            | Error::WifiBusMaster(..) => "Wi-Fi",
             Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
             Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
             Error::Ehci(_) => "USB",
@@ -1491,7 +1527,7 @@ unsafe fn intel_wifi(
         >,
     >,
     bridges: &[native::Bridge],
-) -> Result<Adapter, native::Failure> {
+) -> Result<(Adapter, native::wifi_claim::Quiesced), native::Failure> {
     use net::wifi::intel::attach::AttachError;
     let Some(Ok(database)) = regulatory else {
         return Err((Error::IntelWifi(AttachError::NoRegulatoryDatabase), None));
@@ -1530,7 +1566,7 @@ unsafe fn intel_wifi(
         };
         // SAFETY: forwarded from the caller.
         unsafe { native::intel_wifi(services, address, completion, inputs) }
-            .map(|link| Adapter::IntelWifi(Box::new(link)))
+            .map(|(link, quiesced)| (Adapter::IntelWifi(Box::new(link)), quiesced))
     }
     #[cfg(not(feature = "native-acpi"))]
     {
@@ -1573,7 +1609,10 @@ unsafe fn mediatek_wifi(
     bridges: &[native::Bridge],
     aspm: bool,
 ) -> Result<
-    native::Located<net::wifi::mediatek::attach::Attached<native::MediatekOwner>>,
+    (
+        native::Located<net::wifi::mediatek::attach::Attached<native::MediatekOwner>>,
+        native::wifi_claim::Quiesced,
+    ),
     native::Failure,
 > {
     use net::wifi::mediatek::attach::AttachError;
@@ -1629,7 +1668,13 @@ unsafe fn realtek_wifi(
             crate::net::wifi::regulatory::database::LoadError,
         >,
     >,
-) -> Result<native::Located<native::RealtekWifi>, native::Failure> {
+) -> Result<
+    (
+        native::Located<native::RealtekWifi>,
+        native::wifi_claim::Quiesced,
+    ),
+    native::Failure,
+> {
     use net::wifi::realtek::attach::{AttachError, Inputs};
     let Some(Ok(database)) = regulatory else {
         return Err((Error::RealtekWifi(AttachError::NoRegulatoryDatabase), None));
@@ -2839,7 +2884,10 @@ unsafe fn attach_native(
                     inputs.bridges,
                 )
             } {
-                Ok(link) => devices.nics.push(link),
+                Ok((link, quiesced)) => {
+                    wifi_quiesced(devices, address, quiesced);
+                    devices.nics.push(link);
+                }
                 Err((error, kept)) => {
                     devices.failures.push((address, error));
                     devices.owners.extend(kept);
@@ -2875,7 +2923,8 @@ unsafe fn attach_native(
                     aspm,
                 )
             } {
-                Ok(native::Located { location, link }) => {
+                Ok((native::Located { location, link }, quiesced)) => {
+                    wifi_quiesced(devices, address, quiesced);
                     if link.firmware_domain_unused {
                         devices.warnings.push((
                                 address,
@@ -2915,7 +2964,8 @@ unsafe fn attach_native(
                     &devices.regulatory,
                 )
             } {
-                Ok(link) => {
+                Ok((link, quiesced)) => {
+                    wifi_quiesced(devices, address, quiesced);
                     devices.nics.push(Adapter::RealtekWifi(Box::new(link)));
                 }
                 Err((error, kept)) => {
