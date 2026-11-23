@@ -21,7 +21,10 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
-use stela_boot_core::gpu_loss::{self, SilentLines};
+use stela_boot_core::{
+    gpu_fault::{self, FaultLines},
+    gpu_loss::{self, SilentLines},
+};
 use stela_contracts::gate::{BundleReport, GateService, MemoryRange, window};
 pub(in crate::engine) use stela_drivers::gpu::metal::deferred::Taker;
 use stela_drivers::gpu::metal::{
@@ -29,6 +32,7 @@ use stela_drivers::gpu::metal::{
     deferred::{busy_pause_after_slice, busy_pause_millis},
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
+    fault_dump,
     native::{self, ExportedMemory, Loader, MemoryExporter, NativeBackend, pipeline_store},
     open::{Attachment, FIRST_SUBMISSION_NS, Gpu, OpenError, PcieLink, open, reopen},
     service::{
@@ -388,9 +392,21 @@ unsafe fn with_interrupts<R>(body: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Logs why the service refused a guest's call, once for each reason.
+/// Logs why the service refused a guest's call, once for each reason. A
+/// lost device's fault dump is logged as it comes, as `GPU FAULT` lines:
+/// the service bounds it, and each of its lines says something new; its
+/// opening is followed by the kernel's lines of the fault.
 fn report(reason: &str) {
     static SEEN: Seen<512> = Seen::new();
+    if let Some(dump) = reason.strip_prefix(fault_dump::PREFIX) {
+        output::arguments(format_args!("GPU FAULT {dump}\n"));
+        if let Some(fault) = fault_dump::opening_fault(reason) {
+            for line in gpu_fault::kernel_lines(fault, &FAULTS.kept(), FAULTS.seen()) {
+                output::arguments(format_args!("GPU FAULT {line}\n"));
+            }
+        }
+        return;
+    }
     if let Some(unheld) = SEEN.first_time(reason) {
         output::arguments(format_args!("GPU REFUSED {reason}{unheld}\n"));
     }
@@ -408,10 +424,15 @@ static LOSS_DUE: AtomicBool = AtomicBool::new(false);
 /// first, for the reason of a stop that follows.
 static SILENT: SilentLines<4, 320> = SilentLines::new();
 
+/// The kernel drivers' first lines of GPU faults (Xid, rc and the channel
+/// disabled), which follow a lost device's fault dump ([`report`]).
+static FAULTS: FaultLines<12, 320> = FaultLines::new();
+
 /// A line a kernel driver printed: one that says its GPU stopped answering
-/// is kept for [`watch_losses`].
+/// is kept for [`watch_losses`], one of a GPU fault for the fault dump.
 pub(in crate::engine) fn driver_line(line: &str) {
     SILENT.observe(line);
+    FAULTS.observe(line);
     // What the port above reads when its GPU went silent or came back.
     if let Some(event) = gpu_loss::link_event(line)
         && let Some(gpu) = installed()

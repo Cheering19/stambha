@@ -590,6 +590,14 @@ impl GpuStack {
         }
         Err(refusal.unwrap_or_else(|| adapter.unavailable_reason()))
     }
+
+    /// The stack that draws for `adapter`: [`Self::select`]'s, when it
+    /// [`draws`](Self::draws). A device of a vendor whose kernel driver does
+    /// not take it (an amdgpu-era Radeon left to radeon, an Intel GPU outside
+    /// xe's table) has none, though its vendor's stack draws for others.
+    pub fn drawing(adapter: &Adapter) -> Option<&'static GpuStack> {
+        Self::select(adapter).ok().filter(|stack| stack.draws())
+    }
 }
 
 /// [`GpuStack::claim_order`] of a GPU that draws or not and is integrated,
@@ -834,6 +842,30 @@ mod tests {
             GpuStack::select(&audio).err(),
             Some("amdgpu's PCI ID table does not hold this device")
         );
+    }
+
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn a_device_its_vendors_kernel_driver_refuses_has_no_drawing_stack() {
+        // A Southern Islands or older Radeon, which amdgpu leaves to radeon.
+        let mut radeon = adapter(0x1002);
+        radeon.device = crate::amdgpu::LEFT_TO_RADEON[0];
+        assert!(GpuStack::select(&radeon).is_err());
+        assert!(GpuStack::drawing(&radeon).is_none());
+    }
+
+    #[test]
+    fn a_stack_draws_for_an_adapter_only_where_it_is_selected_and_draws() {
+        for stack in STACKS {
+            let adapter = adapter(stack.vendor.pci_id());
+            let expected = GpuStack::select(&adapter)
+                .ok()
+                .filter(|selected| selected.draws());
+            assert_eq!(
+                GpuStack::drawing(&adapter).map(|stack| stack as *const GpuStack),
+                expected.map(|stack| stack as *const GpuStack)
+            );
+        }
     }
 
     #[cfg(feature = "xe-port")]

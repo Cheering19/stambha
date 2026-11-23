@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:42:46 +0000
+Subject: [PATCH] nvk: report each shader's program header and machine code as
+ executable representations, with the header's address and whether the upload
+ queue wrote it
+
+A GPU that rejects a shader program header (nouveau's Xid 13, "Shader
+Program Header N Error") names no shader, and a release build has no
+NV50_PROG_DEBUG dump. Each executable now lists, beside the NIR and NAK
+assembly a capturing pipeline keeps, the bytes the GPU runs whether or not
+the pipeline asked to capture them: "NAK program header" (the 128-byte SPH
+from Turing on; none for compute), "NAK geometry program header" for a mesh
+shader that has one, and "NAK binary", the machine code nvk_shader_upload()
+copies after the header. Both are binary (isText false) and follow the
+count-then-fill protocol of the text representations.
+
+Its statistics add "Program header address", the header's GPU address, and
+"Uploaded by queue", 1 when the shader heap has no CPU mapping (a BAR
+smaller than VRAM) and the upload queue wrote the shader, which is the path
+a laptop without Resizable BAR takes.
+---
+ src/nouveau/vulkan/nvk_shader.c | 83 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 0dc4ed7cc5b728e72294f9d2a2fefe62daa417f1..ee498bbcbdacd209bbc0e27829573c8f6ff01c2d 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -1438,12 +1438,13 @@ nvk_shader_get_executable_properties(
+ 
+ static VkResult
+ nvk_shader_get_executable_statistics(
+-   UNUSED struct vk_device *device,
++   struct vk_device *device,
+    const struct vk_shader *vk_shader,
+    uint32_t executable_index,
+    uint32_t *statistic_count,
+    VkPipelineExecutableStatisticKHR *statistics)
+ {
++   struct nvk_device *dev = container_of(device, struct nvk_device, vk);
+    struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
+    VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableStatisticKHR, out,
+                           statistics, statistic_count);
+@@ -1526,6 +1527,29 @@ nvk_shader_get_executable_statistics(
+       stat->value.u64 = shader->info.slm_size;
+    }
+ 
++   /* Where the GPU reads the shader program header, and how it got there:
++    * a shader heap the CPU cannot map (a BAR smaller than VRAM) is written
++    * by the upload queue, which runs before the client's next work.
++    */
++   if (nvk_shader_get_hdr_size(dev, shader) > 0) {
++      vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
++         WRITE_STR(stat->name, "Program header address");
++         WRITE_STR(stat->description,
++                   "GPU address of the shader program header");
++         stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
++         stat->value.u64 = shader->hdr_addr;
++      }
++   }
++
++   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
++      WRITE_STR(stat->name, "Uploaded by queue");
++      WRITE_STR(stat->description,
++                "1 when the upload queue wrote the shader, 0 when the CPU "
++                "wrote it through a mapping of the shader heap");
++      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
++      stat->value.u64 = !nvk_mem_arena_is_mapped(&dev->shader_heap.arena);
++   }
++
+    return vk_outarray_status(&out);
+ }
+ 
+@@ -1550,15 +1574,36 @@ write_ir_text(VkPipelineExecutableInternalRepresentationKHR* ir,
+    return true;
+ }
+ 
++static bool
++write_ir_bytes(VkPipelineExecutableInternalRepresentationKHR *ir,
++               const void *data, size_t data_len)
++{
++   ir->isText = VK_FALSE;
++
++   if (ir->pData == NULL) {
++      ir->dataSize = data_len;
++      return true;
++   }
++
++   memcpy(ir->pData, data, MIN2(ir->dataSize, data_len));
++   if (ir->dataSize < data_len)
++      return false;
++
++   ir->dataSize = data_len;
++   return true;
++}
++
+ static VkResult
+ nvk_shader_get_executable_internal_representations(
+-   UNUSED struct vk_device *device,
++   struct vk_device *device,
+    const struct vk_shader *vk_shader,
+    uint32_t executable_index,
+    uint32_t *internal_representation_count,
+    VkPipelineExecutableInternalRepresentationKHR *internal_representations)
+ {
++   struct nvk_device *dev = container_of(device, struct nvk_device, vk);
+    struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
++   const uint32_t hdr_size = nvk_shader_get_hdr_size(dev, shader);
+    VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableInternalRepresentationKHR, out,
+                           internal_representations,
+                           internal_representation_count);
+@@ -1584,6 +1629,40 @@ nvk_shader_get_executable_internal_representations(
+       }
+    }
+ 
++   /* The bytes the GPU runs, kept whether or not the pipeline asked to
++    * capture its representations: the shader program header NAK wrote and
++    * the machine code after it, as nvk_shader_upload() copies them.
++    */
++   if (hdr_size > 0) {
++      vk_outarray_append_typed(VkPipelineExecutableInternalRepresentationKHR, &out, ir) {
++         WRITE_STR(ir->name, "NAK program header");
++         WRITE_STR(ir->description,
++                   "The shader program header, as the GPU reads it");
++         if (!write_ir_bytes(ir, shader->info.hdr, hdr_size))
++            incomplete_text = true;
++      }
++   }
++
++   if (hdr_size > 0 && shader->info.stage == MESA_SHADER_MESH &&
++       shader->info.mesh.has_gs_sph) {
++      vk_outarray_append_typed(VkPipelineExecutableInternalRepresentationKHR, &out, ir) {
++         WRITE_STR(ir->name, "NAK geometry program header");
++         WRITE_STR(ir->description,
++                   "The geometry shader program header of a mesh shader");
++         if (!write_ir_bytes(ir, shader->info.mesh.gs_hdr, hdr_size))
++            incomplete_text = true;
++      }
++   }
++
++   if (shader->code_size > 0) {
++      vk_outarray_append_typed(VkPipelineExecutableInternalRepresentationKHR, &out, ir) {
++         WRITE_STR(ir->name, "NAK binary");
++         WRITE_STR(ir->description, "The shader's machine code");
++         if (!write_ir_bytes(ir, shader->code_ptr, shader->code_size))
++            incomplete_text = true;
++      }
++   }
++
+    return incomplete_text ? VK_INCOMPLETE : vk_outarray_status(&out);
+ }
+ 

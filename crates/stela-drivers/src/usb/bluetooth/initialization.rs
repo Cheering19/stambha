@@ -52,7 +52,11 @@ impl fmt::Display for InitializationError {
                 }
                 f.write_str(": no vendor setup here takes it, so it stays off")
             }
-            _ => write!(f, "native USB Bluetooth initialization {self:?}"),
+            _ => write!(
+                f,
+                "native USB Bluetooth initialization {}",
+                crate::bluetooth::redacted::Lists(self)
+            ),
         }
     }
 }

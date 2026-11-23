@@ -24,9 +24,9 @@ pub(crate) enum Command {
                       erasing needs --confirm-disk."
     )]
     Create(Box<Create>),
-    /// Bring a stick to this version of Stela
+    /// Bring a stick to this version of Stambha
     #[command(
-        long_about = "Replace the stick's Stela with this version and prepare its boot\n\
+        long_about = "Replace the stick's Stambha with this version and prepare its boot\n\
                       files again when needed. Downloads only the boot files it needs."
     )]
     Update(Update),
@@ -54,7 +54,7 @@ pub(crate) enum Command {
                       file to attach to a report; otherwise they are printed."
     )]
     Log(Log),
-    /// Remove everything Stela wrote to a stick.
+    /// Remove everything Stambha wrote to a stick.
     #[command(hide = true)]
     Uninstall(Stick),
     /// Change an install's NVRAM on its machine-state partition, which is
@@ -346,7 +346,7 @@ impl Machine {
 #[derive(Args)]
 pub(crate) struct Create {
     /// The stick's whole disk (/dev/sdb, disk5 or PhysicalDrive2), which
-    /// is erased, or one of its mounted volumes. Without it, stela asks.
+    /// is erased, or one of its mounted volumes. Without it, stambha asks.
     #[arg(
         value_name = "STICK",
         value_parser = path(),
@@ -383,7 +383,7 @@ pub(crate) struct Create {
         verbatim_doc_comment
     )]
     confirm_disk: Option<String>,
-    /// Where downloaded images are kept: Stela's per-user cache by default.
+    /// Where downloaded images are kept: Stambha's per-user cache by default.
     #[arg(long, hide = true)]
     download_dir: Option<PathBuf>,
     /// Give this USB4 device a PCIe tunnel on PCs without an IOMMU that
@@ -392,14 +392,14 @@ pub(crate) struct Create {
     usb4_allow: Vec<String>,
     #[command(flatten)]
     addressing: HiddenAddressing,
-    /// The `stela.efi` to install instead of the one built into `stela`.
+    /// The `stela.efi` to install instead of the one built into `stambha`.
     #[arg(long, hide = true)]
     efi: Option<PathBuf>,
-    /// The Mac model Stela presents: Mac14,3 (Mac mini M2), the one
+    /// The Mac model Stambha presents: Mac14,3 (Mac mini M2), the one
     /// supported now.
     #[arg(long, hide = true)]
     model: Option<String>,
-    /// The PC's partition that becomes the Mac's internal SSD, when stela
+    /// The PC's partition that becomes the Mac's internal SSD, when stambha
     /// runs on the PC itself; on an existing setup it adds another install.
     #[arg(long, value_parser = partition_name, hide = true)]
     target: Option<String>,
@@ -415,7 +415,7 @@ pub(crate) struct Create {
     #[arg(long, requires = "target", hide = true)]
     erase_target: bool,
     /// Write fresh machine state over bytes that are neither blank nor
-    /// Stela's machine state.
+    /// Stambha's machine state.
     #[arg(long, requires = "target", hide = true)]
     initialize_nor: bool,
     /// The new install's name (macOS by default).
@@ -499,10 +499,10 @@ pub(crate) struct Update {
     /// Use this IPSW instead of downloading
     #[arg(long, value_name = "FILE")]
     ipsw: Option<PathBuf>,
-    /// Where downloaded images are kept: Stela's per-user cache by default.
+    /// Where downloaded images are kept: Stambha's per-user cache by default.
     #[arg(long, hide = true)]
     download_dir: Option<PathBuf>,
-    /// The `stela.efi` to install instead of the one built into `stela`.
+    /// The `stela.efi` to install instead of the one built into `stambha`.
     #[arg(long, hide = true)]
     efi: Option<PathBuf>,
 }
@@ -544,7 +544,7 @@ pub(crate) struct Repair {
         verbatim_doc_comment
     )]
     wifi_passphrase_file: Option<PathBuf>,
-    /// Where downloaded images are kept: Stela's per-user cache by default.
+    /// Where downloaded images are kept: Stambha's per-user cache by default.
     #[arg(long, hide = true)]
     download_dir: Option<PathBuf>,
     /// Erase the other file system an install's SSD partition holds.

@@ -864,7 +864,7 @@ fn a_plan_that_writes_what_no_plan_writes_writes_nothing() {
             },
             refused(
                 2,
-                "the entry the plan adds is not the planned Stela partition",
+                "the entry the plan adds is not the planned Stambha partition",
             ),
         ),
         // The primary entries elsewhere.
@@ -940,7 +940,7 @@ fn a_plan_that_writes_what_no_plan_writes_writes_nothing() {
             },
             refused(
                 40 * gib,
-                "the partition to reuse is not that Stela partition on the disk",
+                "the partition to reuse is not that Stambha partition on the disk",
             ),
         ),
         // Windows reused: smaller than macOS, and no Stela partition.

@@ -261,12 +261,12 @@ pub(crate) fn panic(info: &PanicInfo<'_>) -> ! {
         let failed = Failed(crate::ALLOCATOR.first_failure());
         match info.location() {
             Some(at) => super::fatal(format_args!(
-                "Stela failed at {}:{}: {message}{failed} stack={callers}",
+                "Stambha failed at {}:{}: {message}{failed} stack={callers}",
                 at.file(),
                 at.line()
             )),
             None => super::fatal(format_args!(
-                "Stela failed: {message}{failed} stack={callers}"
+                "Stambha failed: {message}{failed} stack={callers}"
             )),
         }
     }

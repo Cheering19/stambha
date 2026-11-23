@@ -48,10 +48,10 @@ impl Usb {
             .disks()?
             .into_iter()
             .find(|d| d.identifier == self.id)
-            .context("the chosen stick was disconnected; run stela again")?;
+            .context("the chosen stick was disconnected; run stambha again")?;
         ensure!(
             disk.erasable() && *self == Self::from_disk(&disk, host),
-            "the chosen stick changed; run stela again and choose it again"
+            "the chosen stick changed; run stambha again and choose it again"
         );
         Ok(())
     }
@@ -218,7 +218,7 @@ pub(super) fn configure(
     let ui = environment.ui;
     ensure!(
         ui.interactive(),
-        "making an installer step by step needs a terminal; scripts run `stela create STICK \
+        "making an installer step by step needs a terminal; scripts run `stambha create STICK \
          --confirm-disk SIZE`"
     );
     match ask(environment, command, stick) {
@@ -337,20 +337,20 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
                 None => "choose Quit".into(),
             };
             ui.warning(&format!(
-                "This stick holds Stela with macOS {}: a new installer replaces it. To keep it, \
+                "This stick holds Stambha with macOS {}: a new installer replaces it. To keep it, \
                  {keep}.",
                 super::home::macos_name(&record.build)
             ))?;
         }
         match &stick.state {
             super::home::State::Unreadable(reason) => ui.warning(&format!(
-                "This stick may hold Stela, but stela cannot read it: {} A new installer \
+                "This stick may hold Stambha, but stambha cannot read it: {} A new installer \
                  replaces whatever it holds. To keep it, choose Quit.",
                 super::home::sentence(reason)
             ))?,
             super::home::State::Newer(version) if stick.record.is_none() => {
                 ui.warning(&format!(
-                    "This stick holds Stela {version}: a new installer replaces it. To keep it, \
+                    "This stick holds Stambha {version}: a new installer replaces it. To keep it, \
                  choose Quit."
                 ))?
             }
@@ -537,6 +537,7 @@ pub(super) fn choose_wifi(environment: &Environment<'_>, command: &mut Request) 
         )?,
         index => networks[index].clone(),
     };
+    ui.warning(wifi::CHIP_NOTE)?;
     ui.warning("The passphrase is stored in plaintext on the stick.")?;
     command.wifi_passphrase = Some(wifi::ask_passphrase(ui, &ssid)?);
     command.wifi = Some(ssid);

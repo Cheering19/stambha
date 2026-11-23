@@ -182,7 +182,7 @@ pub(super) enum Role {
 }
 
 /// Where a command that changes the PC's own disk works.
-const ON_THE_PC: &str = "run stela on the PC itself, for example from a Linux live USB, with \
+const ON_THE_PC: &str = "run stambha on the PC itself, for example from a Linux live USB, with \
     that disk connected";
 
 /// The partition identifier that is still `disk`'s partition in `role`:
@@ -206,7 +206,7 @@ pub(super) fn confirm(
     ensure!(
         !disk.is_chosen(),
         "this install's disk is chosen in stela.efi on the PC, so the stick does not record \
-         where it is and stela cannot reach it from any computer"
+         where it is and stambha cannot reach it from any computer"
     );
     let (recorded, serial, guid, what) = match role {
         Role::AppleRegion => (
@@ -260,7 +260,7 @@ pub(super) fn confirm(
     }
     ensure!(
         info.mount.is_none(),
-        "{identifier} is mounted; this install's {what} is a raw partition Stela owns"
+        "{identifier} is mounted; this install's {what} is a raw partition Stambha owns"
     );
     Ok(identifier)
 }
@@ -440,14 +440,14 @@ fn usable(
     );
     ensure!(
         usb_disk != Some(info.disk.as_str()),
-        "{identifier} is on the Stela stick; the {role} belongs on the PC's own disk"
+        "{identifier} is on the Stambha stick; the {role} belongs on the PC's own disk"
     );
     if erasing {
         return Ok(info);
     }
     if let Some(mount) = &info.mount {
         bail!(
-            "{identifier} is mounted at {}: the {role} is a raw partition Stela owns. Move \
+            "{identifier} is mounted at {}: the {role} is a raw partition Stambha owns. Move \
              anything you keep elsewhere, then pass --erase-target, which unmounts and erases it.",
             mount.display()
         );
@@ -455,7 +455,7 @@ fn usable(
     if let Some(container) = &info.container {
         bail!(
             "{identifier} backs APFS container {container}, whose volumes are mounted: the {role} \
-             is a raw partition Stela owns. Move anything you keep elsewhere, then pass \
+             is a raw partition Stambha owns. Move anything you keep elsewhere, then pass \
              --erase-target, which unmounts and erases it; the container of the running system \
              cannot be used."
         );
@@ -551,12 +551,12 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
         // A partition of the stick itself: `--target` names the PC's disks
         // only, so `--erase-target` cannot reach it.
         Contents::Other(what) if request.external_disks => bail!(
-            "{} on the stick holds {what}, not a Stela macOS disk; installing macOS onto it \
+            "{} on the stick holds {what}, not a Stambha macOS disk; installing macOS onto it \
              would erase it. Copy off what you keep, then delete or wipe that partition.",
             region.identifier
         ),
         Contents::Other(what) => bail!(
-            "{} holds {what}, not a Stela macOS disk; installing macOS onto it would erase it. \
+            "{} holds {what}, not a Stambha macOS disk; installing macOS onto it would erase it. \
              Pass --erase-target to use it anyway.",
             region.identifier
         ),

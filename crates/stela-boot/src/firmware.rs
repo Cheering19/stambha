@@ -55,7 +55,7 @@ pub struct Handoff {
 pub(crate) fn pages(count: usize) -> Result<usize> {
     any_pages(count)
         .map(|page| page.as_ptr() as usize)
-        .map_err(|_| refuse!("firmware has no memory for Stela"))
+        .map_err(|_| refuse!("firmware has no memory for Stambha"))
 }
 
 /// `count` pages of `LOADER_DATA` at any address. Where the firmware refuses

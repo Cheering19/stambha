@@ -234,7 +234,7 @@ pub(super) fn describe_install(plan: &InstallPlan, prepared: u64, text: &mut Str
         if medium.expected.sha1.is_none() {
             writeln!(
                 text,
-                "  note           this IPSW was not downloaded by stela, so it is checked against \
+                "  note           this IPSW was not downloaded by stambha, so it is checked against \
                  its own contents only"
             )?;
         }
@@ -443,7 +443,7 @@ impl Resume {
         if !differences.is_empty() {
             bail!(
                 "this stick holds a create that stopped and differs from this one: {}. Finish it \
-                 with {}, or start over with `stela create` on the stick's whole disk, which \
+                 with {}, or start over with `stambha create` on the stick's whole disk, which \
                  erases it",
                 differences.join(", "),
                 super::fix(&command.usb, "repair")
@@ -501,6 +501,12 @@ pub(super) const OFFLINE_SIGNING_NOTE: &str =
 /// An Online installer.
 pub(super) const ONLINE_NOTE: &str = "Online: the install downloads macOS, so the PC needs \
     internet (Ethernet, or the Wi-Fi set here).";
+/// Said before the PC boots the stick: its firmware starts Stela only with
+/// Secure Boot off (the README's requirements), and turning it off can make
+/// Windows ask for its BitLocker recovery key at its next start.
+pub(super) const SECURE_BOOT_STEP: &str = "Turn Secure Boot off in the PC's firmware setup \
+    first, or the PC will not start the stick. If Windows uses BitLocker, have its recovery key \
+    ready: Windows may ask for it after the change.";
 /// What is not known yet about the installed system without a network.
 pub(super) const FIRST_START_NOTE: &str =
     "macOS may ask for internet the first time it starts; this is not tested yet.";
@@ -592,7 +598,7 @@ pub(super) fn plan(
         true => match super::record::interrupted(host, &esp, &command.usb) {
             Some(previous) => Some(previous),
             None => bail!(
-                "{} already holds Stela. Update it with {} or {}, or {}",
+                "{} already holds Stambha. Update it with {} or {}, or {}",
                 command.usb.display(),
                 super::fix(&command.usb, "update"),
                 super::fix(&command.usb, "update --macos VERSION"),
@@ -745,7 +751,7 @@ pub(super) fn plan(
             notes.push(previous.resume_summary());
             if !resume.stale.is_empty() {
                 notes.push(
-                    "an older stela wrote the boot files on the stick: they are prepared again"
+                    "an older stambha wrote the boot files on the stick: they are prepared again"
                         .into(),
                 );
             }
@@ -806,6 +812,10 @@ pub(super) fn plan(
         )
         .collect();
     notes.extend(network_notes(remote, offline(remote, &restore_bundles)));
+    // The network set here is joined only by a card the boot drives.
+    if record.wifi.is_some() {
+        notes.push(wifi::CHIP_NOTE.into());
+    }
     notes.extend(installed.notes.iter().cloned());
     // The USB holds every supported device's firmware, whatever this
     // computer has; its own devices only earn a note.
@@ -866,7 +876,7 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     match checked.nor_image {
         Some(_) => writeln!(
             text,
-            "  writes         this stick, and Stela's machine state on {}",
+            "  writes         this stick, and Stambha's machine state on {}",
             disk.state_description()
         )?,
         None => writeln!(text, "  writes         this stick only")?,
@@ -895,7 +905,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         let found = found.with_context(|| format!("this computer lists no disk {disk}"))?;
         ensure!(
             found.erasable(),
-            "{disk} ({}) is an internal disk; stela erases only a removable USB stick",
+            "{disk} ({}) is an internal disk; stambha erases only a removable USB stick",
             found.name
         );
         if let Some(why) = found.why_typed() {
@@ -933,7 +943,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         if !command.confirmed && !typed_back {
             ensure!(
                 environment.ui.interactive(),
-                "stela cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
+                "stambha cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
                  --confirm-disk with its model or size to erase it",
                 found.name,
                 host::size_text(found.bytes)
@@ -1122,7 +1132,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             disk.apple_region
         ),
         disk => format!(
-            "choose \"{INSTALL_CHOICE}\" in Stela's startup choices to install macOS onto \
+            "choose \"{INSTALL_CHOICE}\" in Stambha's startup choices to install macOS onto \
              {target}, then boot from the stick again, which starts the installed macOS",
             target = disk.apple_region
         ),
@@ -1130,7 +1140,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     writeln!(
         report,
         "Done. Eject the stick before you unplug it. Boot the PC from it (the PC's boot menu \
-         lists it as a UEFI USB device) and {start}.\nCheck it with {}",
+         lists it as a UEFI USB device) and {start}.\n{SECURE_BOOT_STEP}\nCheck it with {}",
         super::fix(&command.usb, "status")
     )?;
     Ok(report)

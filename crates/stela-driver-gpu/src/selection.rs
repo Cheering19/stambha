@@ -408,7 +408,7 @@ mod tests {
 
     fn unsupported(firmware_screen: bool) -> Found {
         Found {
-            stack: Err("no Stela GPU backend for this PCI vendor"),
+            stack: Err("no Stambha GPU backend for this PCI vendor"),
             firmware_screen,
         }
     }
@@ -497,7 +497,7 @@ mod tests {
         let chosen = all(&[unsupported(true), gpu(DISCRETE, false)]);
         assert_eq!(
             chosen.choices[0],
-            Choice::Unused("no Stela GPU backend for this PCI vendor")
+            Choice::Unused("no Stambha GPU backend for this PCI vendor")
         );
         assert_eq!(chosen.choices[1], Choice::First);
         // A display-only stack alone still starts, to show the picture.

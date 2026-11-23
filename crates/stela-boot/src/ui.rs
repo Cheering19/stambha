@@ -1,4 +1,4 @@
-//! Stela's look on the firmware framebuffer, shared by the startup menu,
+//! Stambha's look on the firmware framebuffer, shared by the startup menu,
 //! the disk picker and the boot console: dark gray pages under the logo and
 //! name, centred at the top, with orange for what is chosen and blue for
 //! what is new or done.
@@ -22,7 +22,7 @@ pub const RED: u32 = 0xe4574d;
 /// Page units the header takes at the top.
 pub const HEADER: usize = 88;
 const LOGO: usize = 32;
-const NAME: &str = "Stela";
+const NAME: &str = "Stambha";
 pub use stela_boot_core::screen::scale;
 
 /// A page drawn in memory and shown at once.
@@ -112,19 +112,21 @@ impl Canvas {
         }
     }
 
+    /// One glyph a character ([`Font::index`]).
     pub fn text_width(&self, text: &str, size: usize) -> usize {
-        text.len() * self.font.width * size
+        text.chars().count() * self.font.width * size
     }
 
     /// `text` from (`x`, `y`) at `size` times the font.
     pub fn text(&mut self, x: usize, y: usize, text: &str, size: usize, colour: u32) {
         let s = self.scale * size;
         let (glyph_width, glyph_height) = (self.font.width, self.font.height);
-        for (index, character) in text.bytes().enumerate() {
+        for (index, character) in text.chars().enumerate() {
             let left = (x + index * glyph_width * size) * self.scale;
+            let glyph = self.font.index(character);
             for gy in 0..glyph_height {
                 for gx in 0..glyph_width {
-                    if self.font.pixel(character, gx, gy) {
+                    if self.font.set(glyph, gx, gy) {
                         self.device_fill(left + gx * s, y * self.scale + gy * s, s, s, colour);
                     }
                 }
@@ -155,10 +157,12 @@ impl Canvas {
                 let mut sum = [0u32; 3];
                 for sy in 0..SAMPLES {
                     for sx in 0..SAMPLES {
-                        let u = (px * SAMPLES + sx) as f32 / (side * SAMPLES) as f32;
-                        let v = (py * SAMPLES + sy) as f32 / (side * SAMPLES) as f32;
-                        let colour =
-                            stela_boot_core::screen::logo_pixel(u, v).unwrap_or(BACKGROUND);
+                        let colour = stela_boot_core::screen::logo_pixel(
+                            (px * SAMPLES + sx) as u32,
+                            (py * SAMPLES + sy) as u32,
+                            (side * SAMPLES) as u32,
+                        )
+                        .unwrap_or(BACKGROUND);
                         for (channel, total) in sum.iter_mut().enumerate() {
                             *total += (colour >> (16 - 8 * channel)) & 0xff;
                         }

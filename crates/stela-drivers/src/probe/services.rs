@@ -24,6 +24,7 @@ use core::fmt;
 /// needs neither an engine stop nor a domain. A driver that masters takes
 /// [`NativeServices::prepare_requester`] and produces its own quiescence
 /// receipt.
+#[cfg_attr(not(feature = "native-acpi"), allow(dead_code))]
 pub(crate) fn claim_unmastered(
     services: &dyn NativeServices,
     address: Address,

@@ -79,7 +79,7 @@ pub(super) fn machine_ecid(options: EcidOptions, notes: &mut Vec<String>) -> Res
         (Some(given), _) => Ok(given),
         (None, Some(recorded)) => Ok(recorded),
         (None, None) if sep_provisioned && !new_ecid => bail!(
-            "this disk's machine state belongs to an earlier Stela machine. Pass that machine's \
+            "this disk's machine state belongs to an earlier Stambha machine. Pass that machine's \
              ECID with --ecid (its old stick's EFI/stela/setup.json, or its `state backup` file, \
              names it), or --new-ecid to start a new machine, which orphans the old state."
         ),

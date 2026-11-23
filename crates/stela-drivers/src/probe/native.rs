@@ -43,6 +43,7 @@ use core::{any::Any, cell::RefCell};
 
 pub mod hda;
 pub mod usb4;
+pub mod wifi_claim;
 
 /// A Broadcom Tigon3 adapter over owned BAR0 and APE mappings.
 pub type Tg3 = tg3::Packet<tg3::io::Mmio<OwnedConfig>, Rc<dyn crate::bus::pci::power::Timer>>;
@@ -137,10 +138,7 @@ impl Kind {
             && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
         {
             Some(Self::RealtekWifi)
-        } else if function.vendor == 0x10ec
-            && function.class[..2] == [2, 0x80]
-            && function.device == RTL8852CE_DEVICE
-        {
+        } else if super::rtl8852ce(function) {
             Some(Self::Rtw89Wifi)
         } else if function.vendor == 0x8086 && intel_pcie::DEVICE_IDS.contains(&function.device) {
             Some(Self::IntelBluetooth)
@@ -247,42 +245,91 @@ fn mediatek_identity<C: ConfigSpace>(
     })
 }
 
-/// A function claimed from the mount, before any device effect.
+/// A Wi-Fi function claimed from the mount and reset, with its own domain
+/// bound and its Bus Master seal released, before any driver effect.
 struct Claimed {
     function: Function<OwnedConfig>,
     domain: Arc<dyn DmaDomain>,
+    /// The binding of `domain` to this requester, kept for the rest of the
+    /// boot with the function.
+    attachment: Attachment,
     bars: [Option<Bar>; 6],
+    /// How the function was quiesced, which the boot log reports.
+    quiesced: wifi_claim::Quiesced,
 }
 
+/// Claim the Wi-Fi function at `address` for `chip`'s driver through the
+/// mount's cold preparation: `admit` first refuses a function the driver
+/// would refuse anyway, reading its configuration only; then
+/// [`wifi_claim::quiesce`] resets it to its power-on state, and only then is
+/// its quiescence acknowledged, its own domain bound and its seal released,
+/// so the driver's Bus Master is allowed. A function `admit` or the reset
+/// refuses keeps its preparation, and with it the seal: it never masters.
 #[expect(
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-fn claim(services: &dyn NativeServices, address: Address) -> Result<Claimed, Failure> {
-    // The Wi-Fi drivers set Bus Master before they reset their engines, so
-    // they produce no quiescence receipt yet: the function stays unmastered,
-    // and the seal refuses that write.
-    let requester = super::services::claim_unmastered(services, address)
+fn claim_quiesced(
+    services: &dyn NativeServices,
+    address: Address,
+    chip: wifi_claim::Chip,
+    admit: impl FnOnce(&mut Function<OwnedConfig>) -> Result<(), Error>,
+) -> Result<Claimed, Failure> {
+    let minimum = services
+        .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
-    let (requester, binding) = match requester.into_dma_binding() {
-        Ok(value) => value,
-        Err((error, owner)) => {
-            return Err(keep_error(Error::Native(ServiceError::Claim(error)), owner));
+    let mut preparing = services
+        .prepare_requester(address)
+        .map_err(|error| (Error::Native(error), None))?;
+    if let Err(error) = admit(preparing.function_mut()) {
+        return Err(keep_error(error, preparing));
+    }
+    let quiesced = match wifi_claim::quiesce(&mut preparing, chip, minimum.as_ref()) {
+        Ok(quiesced) => quiesced,
+        Err(error) => return Err(keep_error(Error::WifiClaim(chip, error), preparing)),
+    };
+    // The BARs as the reset's restore left them.
+    let bars = match preparing.function_mut().bars() {
+        Ok(bars) => bars,
+        Err(error) => return Err(keep_error(error, preparing)),
+    };
+    // SAFETY: `PreparingRequester::acknowledge_quiescence`'s contract,
+    // point by point:
+    // - Engine stop and submission exclusion, with no restart: Bus Master
+    //   has been clear since the mount parked the function, and the
+    //   preparation's seal has kept it so, so nothing the function ran
+    //   reached memory. `quiesce` then completed a Function Level Reset of
+    //   it, or a Secondary Bus Reset of its own bus (offered only when every
+    //   other function there is a parked, unclaimed function of the same
+    //   device), and found it answering again as the same function with Bus
+    //   Master, MSI, MSI-X and INTx off. Either reset returns every engine
+    //   of the function, its firmware's included, to the power-on state, in
+    //   which none runs until a driver programs it; no Stela queue, ring or
+    //   DMA address exists yet, and only the driver, after the binding below,
+    //   programs one.
+    // - Firmware, IRQ delivery and worker users retired: the mount's cold
+    //   grant excludes earlier firmware, IRQ and work users; no handler
+    //   exists, and the probe runs nothing else on this function.
+    // - Bypass and peer traffic: with Bus Master clear the function issues
+    //   no request, peer or otherwise; finalization rechecks the stopped
+    //   state, Enable No Snoop and ATS Enable among it, after the original
+    //   root's drain.
+    // - BARs and old backing kept: the preparation, then its failure or the
+    //   bound requester, keeps the configuration and root; the BARs are not
+    //   yet mapped, and the function had no Stela DMA backing.
+    let bound = match unsafe { preparing.acknowledge_quiescence() }.finalize() {
+        Ok(bound) => bound,
+        Err(failure) => {
+            return Err((Error::Preparation(failure.error), Some(Box::new(failure))));
         }
     };
-    let domain = match services.domain(binding) {
-        Ok(domain) => domain,
-        Err(error) => return Err(keep_error(Error::Native(error), requester)),
-    };
-    let mut function = requester.into_function();
-    let bars = match function.bars() {
-        Ok(bars) => bars,
-        Err(error) => return Err(keep_error(error, (function, domain))),
-    };
+    let domain = bound.attachment.domain();
     Ok(Claimed {
-        function,
+        function: bound.requester.into_function(),
         domain,
+        attachment: bound.attachment,
         bars,
+        quiesced,
     })
 }
 
@@ -524,8 +571,9 @@ pub type IntelWifi = wifi::intel::link::Station<
     wifi::intel::radio::bios::service::native::NativeBios,
 >;
 
-/// The owners an MT7925 station keeps: its claimed function and BAR0.
-pub type MediatekOwner = (Function<OwnedConfig>, Mapping);
+/// The owners an MT7925 station keeps: its claimed function, BAR0 and the
+/// binding of its own domain.
+pub type MediatekOwner = (RefCell<Function<OwnedConfig>>, Mapping, Attachment);
 
 /// An MT7925 station over its owned function and BAR0.
 pub type MediatekWifi = mediatek::station::Wifi<MediatekOwner>;
@@ -545,19 +593,41 @@ pub(super) unsafe fn mediatek_wifi(
     address: Address,
     completion: Option<crate::bus::irq::MsiMessage>,
     mut inputs: mediatek::attach::Inputs,
-) -> Result<Located<mediatek::attach::Attached<MediatekOwner>>, Failure> {
+) -> Result<
+    (
+        Located<mediatek::attach::Attached<MediatekOwner>>,
+        wifi_claim::Quiesced,
+    ),
+    Failure,
+> {
+    // Only an MT7925 attaches: another MediaTek function is refused before
+    // its claim resets it.
+    let admit = |function: &mut Function<OwnedConfig>| match mediatek_identity(function) {
+        Ok(pci) if pci.chip() == Some(mediatek::identity::Chip::Mt7925) => Ok(()),
+        Ok(pci) => Err(Error::MediatekWifi(
+            mediatek::attach::AttachError::UnsupportedChip(pci),
+        )),
+        Err(error) => Err(error.into()),
+    };
     let Claimed {
         mut function,
         domain,
+        attachment,
         bars,
-    } = claim(services, address)?;
+        quiesced,
+    } = claim_quiesced(services, address, wifi_claim::Chip::Mt7925, admit)?;
     let pci = match mediatek_identity(&mut function) {
         Ok(pci) => pci,
-        Err(error) => return Err(keep_error(error, (function, domain))),
+        Err(error) => return Err(keep_error(error, (function, domain, attachment))),
     };
     let registers = match map(services, address, &bars, 0) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+        Err(error) => {
+            return Err(keep_error(
+                Error::Native(error),
+                (function, domain, attachment),
+            ));
+        }
     };
     let (base, bytes) = match registers
         .bytes()
@@ -567,7 +637,7 @@ pub(super) unsafe fn mediatek_wifi(
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (function, domain, attachment, registers),
             ));
         }
     };
@@ -584,23 +654,46 @@ pub(super) unsafe fn mediatek_wifi(
     })();
     inputs.vector = match configured {
         Ok(vector) => vector,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => {
+            let error = unmastered(&mut function, error);
+            return Err(keep_error(error, (function, domain, attachment, registers)));
+        }
     };
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "The serialized BAR and queue retainers require Arc<dyn Any>; this PCI custody remains !Send and !Sync."
     )]
-    let owner = Arc::new((function, registers));
+    let owner = Arc::new((RefCell::new(function), registers, attachment));
     let kept = Box::new(owner.clone()) as Box<dyn Any>;
-    // SAFETY: the mount claimed the stopped function, mapped its BAR0
-    // uncached and supplied an isolating domain; `owner` keeps the function
-    // and mapping, and its interrupts are off.
-    match unsafe { mediatek::attach::attach(pci, base.cast(), bytes, owner, domain, inputs) } {
-        Ok(attached) => Ok(Located {
-            location: alloc::format!("{address}"),
-            link: attached,
-        }),
-        Err(error) => Err((Error::MediatekWifi(error), Some(kept))),
+    // SAFETY: the mount's cold preparation handed the function over, the
+    // claim reset it and bound its own domain (`claim_quiesced`); BAR0 is
+    // mapped uncached; `owner` keeps the function, the mapping and the
+    // binding, and its interrupts are off.
+    match unsafe {
+        mediatek::attach::attach(pci, base.cast(), bytes, owner.clone(), domain, inputs)
+    } {
+        Ok(attached) => Ok((
+            Located {
+                location: alloc::format!("{address}"),
+                link: attached,
+            },
+            quiesced,
+        )),
+        Err(error) => {
+            let error = unmastered(&mut owner.0.borrow_mut(), Error::MediatekWifi(error));
+            Err((error, Some(kept)))
+        }
+    }
+}
+
+/// `error`, after Bus Master is cleared on the Wi-Fi function whose attach
+/// it failed, so the function issues nothing more: what it may still reach
+/// stays kept with its owners. When Bus Master cannot be cleared, both are
+/// named ([`Error::WifiBusMaster`]).
+fn unmastered(function: &mut Function<OwnedConfig>, error: Error) -> Error {
+    match function.set_bus_master(false) {
+        Ok(()) => error,
+        Err(cleared) => Error::WifiBusMaster(Box::new(error), Box::new(cleared.into())),
     }
 }
 
@@ -620,15 +713,22 @@ pub(super) unsafe fn realtek_wifi(
     address: Address,
     completion: Option<crate::bus::irq::MsiMessage>,
     mut inputs: realtek_wifi::attach::Inputs,
-) -> Result<Located<RealtekWifi>, Failure> {
+) -> Result<(Located<RealtekWifi>, wifi_claim::Quiesced), Failure> {
     let Claimed {
         mut function,
         domain,
+        attachment,
         bars,
-    } = claim(services, address)?;
+        quiesced,
+    } = claim_quiesced(services, address, wifi_claim::Chip::Rtl8822c, |_| Ok(()))?;
     let registers = match map(services, address, &bars, 2) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+        Err(error) => {
+            return Err(keep_error(
+                Error::Native(error),
+                (function, domain, attachment),
+            ));
+        }
     };
     let (base, bytes) = match registers
         .bytes()
@@ -638,7 +738,7 @@ pub(super) unsafe fn realtek_wifi(
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (function, domain, attachment, registers),
             ));
         }
     };
@@ -664,7 +764,10 @@ pub(super) unsafe fn realtek_wifi(
     let (link_control, (subsystem_vendor, subsystem_device, pci_revision), vector) =
         match configured {
             Ok(configured) => configured,
-            Err(error) => return Err(keep_error(error, (function, domain, registers))),
+            Err(error) => {
+                let error = unmastered(&mut function, error);
+                return Err(keep_error(error, (function, domain, attachment, registers)));
+            }
         };
     inputs.link_control = link_control;
     inputs.vector = vector;
@@ -681,24 +784,30 @@ pub(super) unsafe fn realtek_wifi(
         clippy::arc_with_non_send_sync,
         reason = "The serialized Realtek backend retains Arc<dyn Any>; this PCI custody remains !Send and !Sync."
     )]
-    let owner: Arc<dyn Any> = Arc::new((function, registers));
+    let custody = Arc::new((RefCell::new(function), registers, attachment));
+    let owner: Arc<dyn Any> = custody.clone();
     let kept = Box::new(owner.clone()) as Box<dyn Any>;
-    // SAFETY: the mount claimed the stopped function, mapped its BAR2 uncached
-    // and supplied an isolating domain; `owner` keeps the function and mapping,
-    // and the device's interrupt masks are off until the station starts.
+    // SAFETY: the mount's cold preparation handed the function over, the
+    // claim reset it and bound its own domain (`claim_quiesced`); BAR2 is
+    // mapped uncached; `owner` keeps the function, the mapping and the
+    // binding, and the device's interrupt masks are off until the station
+    // starts.
     match unsafe {
         realtek_wifi::attach::attach(base.cast(), bytes, owner, domain, observed, inputs)
     } {
-        Ok(link) => Ok(Located {
-            location: alloc::format!("{address}"),
-            link,
-        }),
-        Err(error) => Err((Error::RealtekWifi(error), Some(kept))),
+        Ok(link) => Ok((
+            Located {
+                location: alloc::format!("{address}"),
+                link,
+            },
+            quiesced,
+        )),
+        Err(error) => {
+            let error = unmastered(&mut custody.0.borrow_mut(), Error::RealtekWifi(error));
+            Err((error, Some(kept)))
+        }
     }
 }
-
-/// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
-const RTL8852CE_DEVICE: u16 = 0xc852;
 
 /// An RTL8852CE station on its hardware: the live chip over its BAR2 window,
 /// kept connected to the `--wifi` network.
@@ -1534,26 +1643,50 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     address: Address,
     completion: Option<crate::bus::irq::MsiMessage>,
     inputs: wifi::intel::link::Inputs<B>,
-) -> Result<Located<wifi::intel::link::Station<wifi::intel::boot::NativeBootIo, B>>, Failure> {
+) -> Result<
+    (
+        Located<wifi::intel::link::Station<wifi::intel::boot::NativeBootIo, B>>,
+        wifi_claim::Quiesced,
+    ),
+    Failure,
+> {
     let minimum = services
         .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
-    use wifi::intel::attach::{AttachError, Pci, attach};
+    use wifi::intel::{
+        attach::{AttachError, Pci, attach},
+        identity::{self, IdentityError},
+    };
+    // Only a radio `iwl_pci_probe` identifies attaches: another is refused
+    // before its claim resets it.
+    let admit = |function: &mut Function<OwnedConfig>| match identity::device(function.device) {
+        Some(_) => Ok(()),
+        None => Err(Error::IntelWifi(AttachError::Identity(
+            IdentityError::UnsupportedPci,
+        ))),
+    };
     let Claimed {
         mut function,
         domain,
+        attachment,
         bars,
-    } = claim(services, address)?;
+        quiesced,
+    } = claim_quiesced(services, address, wifi_claim::Chip::Intel, admit)?;
     let registers = match map(services, address, &bars, 0) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+        Err(error) => {
+            return Err(keep_error(
+                Error::Native(error),
+                (function, domain, attachment),
+            ));
+        }
     };
     let window = match registers.address(0, 16384) {
         Ok(window) => window,
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (function, domain, attachment, registers),
             ));
         }
     };
@@ -1600,31 +1733,47 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     })();
     let (pci, vector) = match configured {
         Ok(configured) => configured,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => {
+            let error = unmastered(&mut function, error);
+            return Err(keep_error(error, (function, domain, attachment, registers)));
+        }
     };
-    let owner: Rc<dyn wifi::intel::boot::FunctionOwner> = Rc::new(IntelOwner {
+    let custody = Rc::new(IntelOwner {
         function: RefCell::new(function),
         _registers: registers,
+        _attachment: attachment,
         vector,
         minimum: minimum.clone(),
     });
+    let owner: Rc<dyn wifi::intel::boot::FunctionOwner> = custody.clone();
     let kept = |owner: &Rc<dyn wifi::intel::boot::FunctionOwner>| {
         Some(Box::new(owner.clone()) as Box<dyn Any>)
     };
-    // SAFETY: the mount claimed the stopped function and mapped its BAR0
-    // uncached; `owner` keeps both, and its interrupts are off.
+    let failed = |error: Error| unmastered(&mut custody.function.borrow_mut(), error);
+    // SAFETY: the mount's cold preparation handed the function over, the
+    // claim reset it and bound its own domain (`claim_quiesced`); BAR0 is
+    // mapped uncached; `owner` keeps the function, the mapping and the
+    // binding, and its interrupts are off.
     let io = unsafe {
         wifi::intel::boot::NativeBootIo::from_window(window.cast(), owner.clone(), minimum.clone())
     }
-    .map_err(|error| (Error::IntelWifi(AttachError::Boot(error)), kept(&owner)))?;
-    // SAFETY: the mount's domain isolates this requester, and the caller's
-    // contract covers `inputs`.
+    .map_err(|error| {
+        (
+            failed(Error::IntelWifi(AttachError::Boot(error))),
+            kept(&owner),
+        )
+    })?;
+    // SAFETY: `domain` is this requester's own, bound after its reset, and
+    // the caller's contract covers `inputs`.
     match unsafe { attach(io, pci, domain, inputs) } {
-        Ok(link) => Ok(Located {
-            location: alloc::format!("{address}"),
-            link,
-        }),
-        Err(error) => Err((Error::IntelWifi(error), kept(&owner))),
+        Ok(link) => Ok((
+            Located {
+                location: alloc::format!("{address}"),
+                link,
+            },
+            quiesced,
+        )),
+        Err(error) => Err((failed(Error::IntelWifi(error)), kept(&owner))),
     }
 }
 
@@ -1654,6 +1803,8 @@ impl IntelVector {
 struct IntelOwner {
     function: RefCell<Function<OwnedConfig>>,
     _registers: Mapping,
+    /// The binding of the radio's own domain.
+    _attachment: Attachment,
     vector: Option<IntelVector>,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
 }
@@ -3503,6 +3654,63 @@ mod tests {
         assert_eq!(Kind::of_identity(&identity(0xc852, [2, 0, 0])), None);
         // RTL8852BE still has no driver here.
         assert_eq!(Kind::of_identity(&identity(0xb852, [2, 0x80, 0])), None);
+    }
+
+    /// A function the startup menu offers Wi-Fi for is one the scan routes
+    /// to a Wi-Fi driver whose claim may set Bus Master: every RTL8852CE,
+    /// RTL8822CE and MT7925 ID, and the Intel radios `iwl_pci_probe`
+    /// identifies when the build reads ACPI. A MediaTek or Intel function no
+    /// driver here identifies, and a function of another class, are not
+    /// offered.
+    #[test]
+    fn wifi_starts_where_a_claim_may_master() {
+        let identity = |vendor, device, class| crate::bus::pci::Identity {
+            address: address(),
+            vendor,
+            device,
+            class,
+        };
+        for device in realtek_wifi::identity::RTL8852C_DEVICES {
+            let function = identity(0x10ec, device, [2, 0x80, 0]);
+            assert!(super::super::wifi_starts(&function));
+            assert_eq!(Kind::of_identity(&function), Some(Kind::Rtw89Wifi));
+        }
+        let mut started = alloc::vec![(0x14c3, 0x7925, Kind::MediatekWifi)];
+        started.push((0x14c3, 0x0717, Kind::MediatekWifi));
+        for device in realtek_wifi::identity::RTL8822C_DEVICES {
+            started.push((0x10ec, device, Kind::RealtekWifi));
+        }
+        for (vendor, device, kind) in started {
+            let function = identity(vendor, device, [2, 0x80, 0]);
+            assert_eq!(Kind::of_identity(&function), Some(kind));
+            assert!(
+                super::super::wifi_starts(&function),
+                "{vendor:04x}:{device:04x}"
+            );
+        }
+        for device in [0x2723, 0x2725, 0x272b, 0x51f0] {
+            let function = identity(0x8086, device, [2, 0x80, 0]);
+            assert_eq!(Kind::of_identity(&function), Some(Kind::IntelWifi));
+            assert_eq!(
+                super::super::wifi_starts(&function),
+                cfg!(feature = "native-acpi"),
+                "8086:{device:04x}"
+            );
+        }
+        // MT7921 and an Intel 9000-series radio route to a driver that
+        // refuses them; a Wi-Fi ID of another class is no Wi-Fi.
+        for (vendor, device, class) in [
+            (0x14c3, 0x7961, [2, 0x80, 0]),
+            (0x8086, 0x9df0, [2, 0x80, 0]),
+            (0x10ec, 0xc852, [2, 0, 0]),
+            (0x14c3, 0x7925, [2, 0, 0]),
+            (0x10ec, 0xc822, [2, 0, 0]),
+        ] {
+            assert!(
+                !super::super::wifi_starts(&identity(vendor, device, class)),
+                "{vendor:04x}:{device:04x}"
+            );
+        }
     }
 
     /// The register accesses a model window has seen.

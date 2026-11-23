@@ -283,39 +283,8 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
         .filter(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03)
         .map(|identity| identity.device)
         .collect();
-    let census: Vec<Pci> = functions
-        .iter()
-        .filter_map(|function| {
-            Pci::from_header(
-                function.address.segment,
-                function.address.bus,
-                &function.header,
-            )
-        })
-        .collect();
-    // An image that links another vendor's Vulkan driver drives the display
-    // controllers that vendor's stack takes (`GpuStack::select`): one of
-    // them is the GPU macOS starts with, so the NVIDIA-only notice does not
-    // apply. A controller its stack leaves out, as one whose Vulkan device
-    // cannot serve the Metal device, is no such GPU.
-    let driven = functions
-        .iter()
-        // The revision names an AMD GPU's market name.
-        .map(|function| (function.identity(), function.header[8]))
-        .filter(|(identity, _)| identity.vendor != NVIDIA && identity.class[0] == 0x03)
-        .find_map(|(identity, revision)| {
-            let adapter = stela_drivers::gpu::Adapter {
-                address: identity.address,
-                vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
-                device: identity.device,
-                class: identity.class,
-                revision,
-            };
-            stela_drivers::gpu::stack::GpuStack::select(&adapter)
-                .ok()
-                .filter(|stack| stack.draws())
-                .map(|stack| (adapter, stack))
-        });
+    let census = census_pci(functions);
+    let driven = drawn_by_other(functions);
     let notice = if driven.is_some() {
         NvidiaNotice::Driven
     } else {
@@ -590,42 +559,97 @@ pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {
     }
 }
 
+/// The census's functions as the firmware bundle reads them.
+pub(crate) fn census_pci(functions: &[crate::pci_io::FunctionObservation]) -> Vec<Pci> {
+    functions
+        .iter()
+        .filter_map(|function| {
+            Pci::from_header(
+                function.address.segment,
+                function.address.bus,
+                &function.header,
+            )
+        })
+        .collect()
+}
+
+/// Another vendor's display controller among `functions` and its stack, that
+/// this image drives: an image that links another vendor's Vulkan driver
+/// drives the display controllers that vendor's kernel driver takes, and one
+/// of them is the GPU macOS starts with, so the NVIDIA-only notice does not
+/// apply. A controller the kernel driver refuses (an amdgpu-era Radeon left
+/// to radeon, an Intel GPU outside xe's table) counts for nothing
+/// (`GpuStack::drawing`).
+fn drawn_by_other(
+    functions: &[crate::pci_io::FunctionObservation],
+) -> Option<(
+    stela_drivers::gpu::Adapter,
+    &'static stela_drivers::gpu::stack::GpuStack,
+)> {
+    functions
+        .iter()
+        // The revision names an AMD GPU's market name.
+        .map(|function| (function.identity(), function.header[8]))
+        .filter(|(identity, _)| identity.vendor != NVIDIA && identity.class[0] == 0x03)
+        .find_map(|(identity, revision)| {
+            let adapter = stela_drivers::gpu::Adapter {
+                address: identity.address,
+                vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
+                device: identity.device,
+                class: identity.class,
+                revision,
+            };
+            stela_drivers::gpu::stack::GpuStack::drawing(&adapter).map(|stack| (adapter, stack))
+        })
+}
+
+/// The page Install macOS opens before its disk picker
+/// (`install_caution::Caution`), from a census of the firmware's PCI
+/// functions taken now, before the choice: [`discover`]'s comes only after
+/// it. `None` when a card Stela drives answers, or when the census cannot be
+/// taken, which asks nothing.
+pub fn install_caution() -> Option<stela_boot_core::install_caution::Caution> {
+    let census = match crate::pci_io::capture() {
+        Ok(census) => census,
+        Err(error) => {
+            output::arguments(format_args!(
+                "INSTALL CAUTION not checked: no PCI census ({error:?})\n"
+            ));
+            return None;
+        }
+    };
+    let functions = &census.functions;
+    let other = drawn_by_other(functions).is_some();
+    let notice = nvidia_notice(&census_pci(functions));
+    let caution = stela_boot_core::install_caution::Caution::new(notice, other);
+    if caution.is_some() {
+        output::arguments(format_args!(
+            "INSTALL CAUTION {notice:?}: no graphics card Stela drives among {} PCI functions; \
+             Install macOS asks before its disk picker\n",
+            functions.len()
+        ));
+    }
+    caution
+}
+
 const NVIDIA: u16 = 0x10de;
 /// The [`NvidiaNotice`] the census chose, as its discriminant.
 static GPU_NOTICE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(NvidiaNotice::Driven as u8);
 
-/// Said once before an install or a start on a PC with no NVIDIA graphics
-/// card: the install itself draws through no GPU and would finish, and the
-/// installed macOS then could not start.
-pub const NO_NVIDIA_GPU_NOTICE: &str = "No NVIDIA graphics card found: macOS can be installed, \
-    but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 series card.";
-
-/// Said in the same place on a PC whose NVIDIA cards are all of chips Stela
-/// has no driver for, older or newer than the series it names.
-pub const NO_DRIVEN_NVIDIA_GPU_NOTICE: &str = "The NVIDIA graphics card here is not one Stela \
-    drives: macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 \
-    or 50 series card.";
-
-/// Said in the same place when no NVIDIA card Stela drives answers yet but
-/// a PCI port shows nothing below it: a card the firmware left powered off
-/// there, as on some laptops, answers only after Stela powers the port on.
-pub const NO_NVIDIA_GPU_YET_NOTICE: &str = "No NVIDIA graphics card Stela drives found yet: \
-    a card the PC keeps powered off, as some laptops do, is found only after Stela has started. \
-    macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 \
-    series card.";
-
 /// What to say before an install or a start when the census ([`discover`])
-/// found no NVIDIA display controller Stela drives.
+/// found no NVIDIA display controller Stela drives
+/// (`install_caution::gpu_words`).
 pub fn gpu_notice_found() -> Option<&'static str> {
     let notice = GPU_NOTICE.load(core::sync::atomic::Ordering::Relaxed);
     [
-        (NvidiaNotice::Absent, NO_NVIDIA_GPU_NOTICE),
-        (NvidiaNotice::NotDriven, NO_DRIVEN_NVIDIA_GPU_NOTICE),
-        (NvidiaNotice::NotYet, NO_NVIDIA_GPU_YET_NOTICE),
+        NvidiaNotice::Absent,
+        NvidiaNotice::NotDriven,
+        NvidiaNotice::NotYet,
     ]
     .into_iter()
-    .find_map(|(chosen, text)| (chosen as u8 == notice).then_some(text))
+    .find(|chosen| *chosen as u8 == notice)
+    .and_then(stela_boot_core::install_caution::gpu_words)
 }
 
 /// What the storage drivers need after ExitBootServices: the ECAM windows,

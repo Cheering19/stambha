@@ -31,6 +31,9 @@ pub const CHIP_REVISION: &str = "linux-firmware";
 /// `rtw_8822ce_id_table`.
 pub const RTL8822C_DEVICES: [u16; 2] = [0xc822, 0xc82f];
 
+/// `rtw8852ce_id_table`'s one device (`rtw8852ce.c`).
+pub const RTL8852C_DEVICES: [u16; 1] = [0xc852];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Profile {
     observed: Observed,
@@ -65,8 +68,7 @@ impl Profile {
         let chip = match observed.device {
             device if RTL8822C_DEVICES.contains(&device) => Chip::Rtl8822C,
             0xb852 | 0xb85b => Chip::Rtl8852B,
-            // rtw8852ce_id_table.
-            0xc852 => Chip::Rtl8852C,
+            device if RTL8852C_DEVICES.contains(&device) => Chip::Rtl8852C,
             _ => return Err(IdentityError::UnsupportedPci),
         };
         if observed.sys_cfg1 == u32::MAX {

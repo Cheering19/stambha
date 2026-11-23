@@ -360,6 +360,40 @@ impl Pipelines {
             .collect()
     }
 
+    /// The Vulkan pipelines `pipeline` compiled, which a command buffer
+    /// binding it may have run: a render pipeline's own, then its bicubic
+    /// and mesh variants; a compute pipeline's threadgroup shapes, then the
+    /// one its indirect commands set.
+    pub(super) fn vulkan_pipelines(&self, pipeline: BoundPipeline) -> Result<Vec<Pipeline>> {
+        Ok(match pipeline {
+            BoundPipeline::Render(id) => {
+                let render = self.render.get(id as u32)?;
+                render
+                    .state
+                    .pipeline
+                    .into_iter()
+                    .chain(render.bicubic.iter().map(|&(_, _, _, pipeline)| pipeline))
+                    .chain(render.variants.iter().map(|&(_, _, pipeline)| pipeline))
+                    .collect()
+            }
+            BoundPipeline::Compute(id) => {
+                let compute = self.compute.get(id as u32)?;
+                compute
+                    .variants
+                    .iter()
+                    .map(|&(_, pipeline)| pipeline)
+                    .chain(
+                        compute
+                            .state
+                            .indirect
+                            .as_ref()
+                            .map(|indirect| indirect.pipeline),
+                    )
+                    .collect()
+            }
+        })
+    }
+
     fn interface(&self, id: FunctionId) -> Result<&Interface> {
         self.functions.get(id.0)?.interface()
     }

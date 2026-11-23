@@ -436,12 +436,15 @@ fn open_host(
     // `--nor` naming the `--storage` partition keeps the machine state in
     // that partition's tail (`pc::machine_state`): one device, split below.
     let state_in_storage = options.nor.is_some() && options.nor == options.storage;
-    let targets: Vec<&Target> = options
+    // Owned: the devices' start sets the laptop features in `options`.
+    let owned_targets: Vec<Target> = options
         .storage
         .iter()
         .chain(options.restore_source.iter())
         .chain(options.nor.iter().filter(|_| !state_in_storage))
+        .cloned()
         .collect();
+    let targets: Vec<&Target> = owned_targets.iter().collect();
     #[cfg(feature = "diagnostics")]
     if options.audio_check.is_some() && !options.audio_own_hpet {
         output::fatal("the audio check requires an explicit --audio-own-hpet handoff");
@@ -759,7 +762,7 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
                 stela_soc::machine::sep_state::owner(&opened.3, ecid)
         {
             output::fatal(
-                "this macOS was installed by a Stela USB with another machine identity (ECID) \
+                "this macOS was installed by a Stambha USB with another machine identity (ECID) \
                  than this USB's, and neither its machine state nor its boot ticket names the \
                  one it was installed as. Start it with the USB that installed it, or run \
                  Install macOS, which replaces it.",
@@ -1643,7 +1646,7 @@ fn open_gpus(
         }
         Err(error) => {
             crate::status::warn(&format!(
-                "the GPU could not be claimed: {error}. This is a Stela bug; the boot log on \
+                "the GPU could not be claimed: {error}. This is a Stambha bug; the boot log on \
                  this USB holds the details"
             ));
             return None;
@@ -2462,7 +2465,7 @@ fn prepare_restore(
         let ecid = boot_ecid.unwrap_or_else(|| {
             output::fatal(
                 "install: the bundle names no machine ECID; on another computer, plug in this \
-                 USB and run `stela repair`",
+                 USB and run `stambha repair`",
             )
         });
         stela_runtime::restore::tss::Signer {
@@ -3211,7 +3214,7 @@ fn disk_writes(handoff: &Handoff) -> stela_runtime::pc::disk_writes::Pending {
     };
     stela_runtime::pc::disk_writes::Pending::decode(encoded).unwrap_or_else(|| {
         output::fatal(
-            "what this start was to write to the PC's disks did not reach Stela's drivers \
+            "what this start was to write to the PC's disks did not reach Stambha's drivers \
              whole; nothing was written. Start again",
         )
     })
@@ -3265,9 +3268,54 @@ struct HostDevices {
 
 /// Probe the host's devices once, with the native services when the
 /// platform has them, and open the partitions, inputs and networks.
+/// Whether the PC is a laptop, from its FADT's profile and the batteries
+/// and lid the probe attached, and the laptop features the boot then takes
+/// unasked, set in `options` as their options would be
+/// ([`stela_boot_core::laptop`]), with one line saying which and why. The
+/// trackpad needs a precision touchpad among `inputs` and a port the
+/// `guest_disks` left on the guest's hub. `--lid` and `--brightness-keys`
+/// were followed from the platform's start; what this takes is followed
+/// from here, the brightness keys' outputs attached now as hardware mode
+/// attached them with the option.
+fn take_laptop_features(
+    options: &mut Options,
+    power: &stela_drivers::probe::Power,
+    inputs: &[stela_drivers::input::InputDevice],
+    guest_disks: usize,
+    host_acpi: Option<&'static aml::HostAcpi>,
+    mmio: Option<&'static crate::native_mmio::Source>,
+) {
+    use stela_boot_core::laptop;
+    let facts = laptop::Facts {
+        pm_profile: mmio.and_then(|mmio| laptop::pm_profile(mmio.fadt())),
+        battery: !power.batteries.is_empty(),
+        lid: power.lid.is_some(),
+        precision_touchpad: inputs.iter().any(|device| device.touch_surface().is_some()),
+        trackpad_port: guest_disks
+            <= stela_soc::machine::UsbCables::disk_ports(
+                options.guest_network,
+                options.input,
+                true,
+            ),
+    };
+    let plan = laptop::plan(options, facts);
+    plan.apply(options);
+    output::arguments(format_args!("{}", plan.line()));
+    super::lid::configure(
+        options.lid() == stela_boot_core::options::Lid::Method,
+        options.lid_sleep,
+    );
+    if plan.takes_brightness_keys() {
+        super::aml::follow_brightness_keys(true);
+        if let Some(acpi) = host_acpi {
+            acpi.attach_brightness_keys();
+        }
+    }
+}
+
 fn start_devices(
     handoff: &Handoff,
-    options: &Options,
+    options: &mut Options,
     wanted: &Wanted<'_>,
     host_acpi: Option<&'static aml::HostAcpi>,
     native_mmio: &Option<&'static crate::native_mmio::Source>,
@@ -3297,6 +3345,7 @@ fn start_devices(
             && translation_store.is_none()
             && fdr_partition.is_none()
         {
+            output::arguments(format_args!("{}", stela_boot_core::laptop::UNREAD));
             (
                 Vec::new(),
                 None,
@@ -3449,6 +3498,16 @@ fn start_devices(
                     }
                     output::fatal(format_args!("host storage could not be opened: {error}"))
                 });
+            // Before the lid's line, which says what follows it, and the
+            // input and the trackpad's cabling, which read the options.
+            take_laptop_features(
+                options,
+                &power,
+                &inputs.devices,
+                usb_disks.len(),
+                host_acpi,
+                mmio,
+            );
             if let Some(acpi) = host_acpi {
                 acpi.retain_power(power);
             }
@@ -3517,18 +3576,13 @@ fn start_devices(
             host_usb = Some(usb);
             // The guest's controller is the model of Apple's internal USB
             // module, for every boot with host input. The host's controller
-            // is not lent: the guest's function would carry the host's
+            // is not lent raw: the guest's function would carry the host's
             // vendor commands and replies, which BlueTool's chip boot and
             // bluetoothd's bring-up do not take. It is released in the
-            // loader's root by its drop. The log says so once.
-            if let Some(line) = stela_boot_core::guest_bluetooth::model_line(
-                host_controller.is_some(),
-                options.input,
-            ) {
-                output::arguments(format_args!("{line}"));
-                host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
-            }
-            drop(host_controller);
+            // loader's root by its drop (`bluetooth::HostBluetooth::guest`,
+            // which says so once, or lends it with `--bluetooth-lend`).
+            host_bluetooth =
+                bluetooth::HostBluetooth::guest(host_controller, options, handoff.root);
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {

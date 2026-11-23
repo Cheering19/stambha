@@ -61,12 +61,12 @@ pub const VENDOR: [u32; 3] = [
 pub fn encryption_refusal(syscfg: u64) -> Option<&'static str> {
     if syscfg & SECURE_NESTED_PAGING != 0 {
         Some(
-            "SEV-SNP is on in the firmware setup, and Stela does not own its reverse map table: \
+            "SEV-SNP is on in the firmware setup, and Stambha does not own its reverse map table: \
              turn off SEV-SNP (sometimes called SNP Memory Coverage) in the firmware setup",
         )
     } else if syscfg & HOST_MULTI_KEY != 0 {
         Some(
-            "AMD host multi-key memory encryption is on in the firmware setup, which Stela does \
+            "AMD host multi-key memory encryption is on in the firmware setup, which Stambha does \
              not support: turn it off in the firmware setup",
         )
     } else {

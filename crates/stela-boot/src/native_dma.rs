@@ -116,7 +116,7 @@ pub(crate) fn firmware_units() -> Result<FirmwareUnits> {
             Ok(()) => {}
             Err(TableError::Capacity) => {
                 return Err(refuse!(
-                    "the host lists more IOMMU units than Stela can check"
+                    "the host lists more IOMMU units than Stambha can check"
                 ));
             }
             Err(error) => {

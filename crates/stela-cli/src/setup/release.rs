@@ -62,11 +62,11 @@ pub(super) fn allow_older(
         environment,
         yes,
         &format!(
-            "This stick has Stela {theirs}, newer than this stela ({CURRENT}). {}?",
+            "This stick has Stambha {theirs}, newer than this stambha ({CURRENT}). {}?",
             capitalized(doing)
         ),
         &format!(
-            "this stick has Stela {theirs}, newer than this stela ({CURRENT}): use stela \
+            "this stick has Stambha {theirs}, newer than this stambha ({CURRENT}): use stambha \
              {theirs} or newer"
         ),
     )
@@ -85,10 +85,10 @@ pub(super) fn describe(record: &Record) -> String {
     match &record.release {
         Some(version) => match compare(version, CURRENT) {
             Ordering::Equal => version.clone(),
-            Ordering::Less => format!("{version}; this stela is {CURRENT}"),
-            Ordering::Greater => format!("{version}, newer than this stela ({CURRENT})"),
+            Ordering::Less => format!("{version}; this stambha is {CURRENT}"),
+            Ordering::Greater => format!("{version}, newer than this stambha ({CURRENT})"),
         },
-        None => format!("0.3 or older; this stela is {CURRENT}"),
+        None => format!("Stela 0.3 or older; this stambha is {CURRENT}"),
     }
 }
 

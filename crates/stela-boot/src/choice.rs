@@ -31,6 +31,7 @@ use core::time::Duration;
 use stela_boot_core::{
     chosen_disk::{Adopted, adopt},
     options::{System, WIFI_PREFER, wifi_word},
+    wifi_page,
 };
 use stela_contracts::refuse;
 use stela_loader::mount_interface::{
@@ -305,8 +306,16 @@ struct Menu<'a> {
     /// The Wi-Fi network an entry joins (its `--wifi`), which `W` opens the
     /// Wi-Fi page for ([`crate::wifi_menu`]); none when no entry joins one.
     wifi: Option<String>,
-    /// What the Wi-Fi page chose, shown under the entries.
-    wifi_note: Option<String>,
+    /// The USB holds saved networks (`options::WIFI_SAVED`), which `W` also
+    /// opens the page for, to save or forget one, without `--wifi`.
+    wifi_saved: bool,
+    /// The saved network the Wi-Fi page chose to join first this boot, when
+    /// not `--wifi`'s ([`with_prefer`]).
+    wifi_prefer: Option<String>,
+    /// The PC may have a Wi-Fi chip the driver starts
+    /// ([`crate::wifi_menu::offered`]); without one the Wi-Fi line is not
+    /// shown and `W` opens nothing.
+    wifi_offered: bool,
 }
 
 /// What the menu was left with.
@@ -448,7 +457,9 @@ impl<'a> Menu<'a> {
                 .entries
                 .iter()
                 .find_map(|entry| System::parse(&entry.options).ok()?.ssid),
-            wifi_note: None,
+            wifi_saved: false,
+            wifi_prefer: None,
+            wifi_offered: true,
         }
     }
 
@@ -487,12 +498,15 @@ impl<'a> Menu<'a> {
             canvas.text(left + 20, y + 8, self.name(item), 1, ui::TEXT);
             y += ROW;
         }
-        // The Wi-Fi page's key, or what it chose, on the bottom line.
-        if let Some(wifi) = &self.wifi {
-            let line = self
-                .wifi_note
-                .clone()
-                .unwrap_or_else(|| format!("W: Wi-Fi networks ({wifi} by default)"));
+        // The network this boot joins first and the Wi-Fi page's key, on
+        // the bottom line.
+        if self.wifi_offered
+            && let Some(line) = wifi_page::status_line(
+                self.wifi.as_deref(),
+                self.wifi_prefer.as_deref(),
+                self.wifi_saved,
+            )
+        {
             canvas.text_centred(width / 2, height.saturating_sub(24), &line, 1, ui::DIM);
         }
         let (status, colour) = match (self.notice, self.countdown, self.held) {
@@ -535,7 +549,10 @@ impl<'a> Menu<'a> {
                     if let Some(chosen) = chosen {
                         return Some(Pick::Item(chosen));
                     }
-                    if matches!(key, 'w' | 'W') && self.wifi.is_some() {
+                    if matches!(key, 'w' | 'W')
+                        && self.wifi_offered
+                        && (self.wifi.is_some() || self.wifi_saved)
+                    {
                         return Some(Pick::Wifi);
                     }
                 }
@@ -611,28 +628,50 @@ fn asked() -> bool {
     pressed().is_some() || matches!(key(Some(GLANCE)), Wait::Key(_))
 }
 
-/// `menu` until one of `choices` is chosen; its options. Install macOS that
-/// chooses its disk always opens the disk picker first
+/// `menu` until one of `choices` is chosen; its options. Install macOS asks
+/// first on a PC with no graphics card Stela drives
+/// ([`crate::install_caution`]). Install macOS that chooses its disk always
+/// opens the disk picker first
 /// ([`installer::choose`]), where the partition chosen before can be chosen
 /// again, and returns to the menu when the picker is left. The picker gives
 /// a plan and writes nothing to the disk; the plan goes with the options. A
 /// firmware entry chosen restarts the PC into it. `None` without console
 /// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
-    // The network the Wi-Fi page chose to join first, when not `--wifi`'s.
-    let mut prefer: Option<String> = None;
+    menu.wifi_saved = crate::wifi_menu::saved(volume);
+    menu.wifi_offered = crate::wifi_menu::offered();
     loop {
         let index = match menu.run()? {
             Pick::Item(index) => index,
             Pick::Wifi => {
-                let configured = menu.wifi.clone()?;
-                if let Some(name) = crate::wifi_menu::run(volume, &configured) {
-                    menu.wifi_note = Some(format!("Wi-Fi: {name} first this boot"));
-                    prefer = (name != configured).then_some(name);
+                let configured = menu.wifi.clone();
+                let chosen = crate::wifi_menu::run(
+                    volume,
+                    configured.as_deref(),
+                    menu.wifi_prefer.as_deref(),
+                );
+                // Only a boot that joins `--wifi` takes a preference.
+                if let (Some(configured), Some(name)) = (configured.as_deref(), chosen) {
+                    menu.wifi_prefer = (name != configured).then_some(name);
                 }
+                // A preference the page forgot, or one whose key no boot can
+                // use, is no longer named as joined first.
+                menu.wifi_prefer = stela_boot_core::wifi_page::kept_preference(
+                    menu.wifi_prefer.take(),
+                    &crate::wifi_menu::listed(volume, configured.as_deref()),
+                );
+                menu.wifi_saved = crate::wifi_menu::saved(volume);
                 continue;
             }
         };
+        // Install macOS on a PC with no graphics card Stela drives asks
+        // first, once a boot: the install would finish and the Mac then not
+        // start ([`crate::install_caution`]).
+        if matches!(menu.items[index], Item::Choice(_, ChoiceKind::Setup))
+            && !crate::install_caution::confirmed()
+        {
+            continue;
+        }
         let n = match &menu.items[index] {
             Item::Choice(n, ChoiceKind::Setup)
                 if unchosen(choices.entries[*n].options.as_bytes()) =>
@@ -644,7 +683,9 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                     record(volume, disk);
                 }
                 let disk = disk_for(*kind, menu.disk.as_deref(), menu.found);
-                return Some(with_prefer(chosen(choices, *n, disk), prefer.as_deref()).into());
+                return Some(
+                    with_prefer(chosen(choices, *n, disk), menu.wifi_prefer.as_deref()).into(),
+                );
             }
             Item::Firmware(entry) => {
                 output::arguments(format_args!("CHOICE firmware entry ({})\n", entry.name));
@@ -663,7 +704,7 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 "CHOSEN DISK not recorded: Check only writes nothing, the record included\n"
             ));
             return Some(Chosen {
-                options: with_prefer(chosen(choices, n, Some(&disk)), prefer.as_deref()),
+                options: with_prefer(chosen(choices, n, Some(&disk)), menu.wifi_prefer.as_deref()),
                 plan: Some(plan),
             });
         }
@@ -677,7 +718,7 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
         }
         output::arguments(format_args!("CHOSEN DISK {disk}\n"));
         return Some(Chosen {
-            options: with_prefer(chosen(choices, n, Some(&disk)), prefer.as_deref()),
+            options: with_prefer(chosen(choices, n, Some(&disk)), menu.wifi_prefer.as_deref()),
             plan: Some(plan),
         });
     }

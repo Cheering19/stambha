@@ -522,7 +522,7 @@ fn lacks(name: &str, missing: &[(String, &str)], files: usize) -> ServiceError {
             let why = if held.contains(&Held::NoRoom) {
                 "the files read for such a GPU did not fit the firmware handoff"
             } else {
-                "the firmware showed a GPU of this family Stela drives or no PCI port with \
+                "the firmware showed a GPU of this family Stambha drives or no PCI port with \
                  nothing below it, so none was expected"
             };
             output::arguments(format_args!(

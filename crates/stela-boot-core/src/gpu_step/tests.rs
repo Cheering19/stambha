@@ -658,9 +658,9 @@ fn a_desktop_with_an_amd_card_alone() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:03:00.0 1002:744c rev c8 AMD Radeon RX 7900 XTX: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:03:00.0 1002:744c rev c8 AMD Radeon RX 7900 XTX: not used: AMDGPU is not ported to Stambha
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -680,9 +680,9 @@ fn a_desktop_with_an_intel_arc_card_alone() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the Intel Arc A770: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the Intel Arc A770: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:03:00.0 8086:56a0 rev 08 Intel Arc A770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:03:00.0 8086:56a0 rev 08 Intel Arc A770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -702,9 +702,9 @@ fn a_pc_with_an_amd_integrated_gpu_alone() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon 780M Graphics: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon 780M Graphics: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stambha
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -724,9 +724,9 @@ fn a_pc_with_an_intel_integrated_gpu_alone() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the Intel Iris Xe Graphics: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the Intel Iris Xe Graphics: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:00:02.0 8086:9a49 rev 01 Intel Iris Xe Graphics: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:9a49 rev 01 Intel Iris Xe Graphics: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -747,9 +747,9 @@ fn a_laptop_with_nvidia_and_intel_gpus_and_the_panel_on_the_intel_one() {
         pc,
         Build::Release,
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
-          No screen is connected to the NVIDIA GeForce RTX 4060 Laptop GPU, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the NVIDIA GeForce RTX 4060 Laptop GPU, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
-GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
@@ -774,7 +774,7 @@ fn a_laptop_with_nvidia_and_intel_gpus_and_the_mux_on_the_nvidia_one() {
         Build::Release,
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
 --
-GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
@@ -797,10 +797,10 @@ fn a_laptop_with_nvidia_and_amd_gpus_and_the_panel_on_the_amd_one() {
         pc,
         Build::Release,
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
-          No screen is connected to the NVIDIA GeForce RTX 4060 Laptop GPU, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the NVIDIA GeForce RTX 4060 Laptop GPU, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; started first
-GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stambha
 GPU SELECT started in this order: NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
     assert_boots(
@@ -825,7 +825,7 @@ fn a_laptop_with_nvidia_and_amd_gpus_and_the_mux_on_the_nvidia_one() {
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 4060 Laptop GPU)
 --
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; started first
-GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stambha
 GPU SELECT started in this order: NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
     assert_boots(
@@ -846,10 +846,10 @@ fn a_laptop_with_two_amd_gpus_and_the_panel_on_the_integrated_one() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7600M XT and the AMD Radeon 780M Graphics: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7600M XT and the AMD Radeon 780M Graphics: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:03:00.0 1002:7480 rev c7 AMD Radeon RX 7600M XT: not used: AMDGPU is not ported to Stela
-GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:03:00.0 1002:7480 rev c7 AMD Radeon RX 7600M XT: not used: AMDGPU is not ported to Stambha
+GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stambha
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -871,10 +871,10 @@ fn a_laptop_with_two_amd_gpus_and_the_mux_on_the_discrete_one() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7600M XT and the AMD Radeon 780M Graphics: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 7600M XT and the AMD Radeon 780M Graphics: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:03:00.0 1002:7480 rev c7 AMD Radeon RX 7600M XT: not used: AMDGPU is not ported to Stela
-GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:03:00.0 1002:7480 rev c7 AMD Radeon RX 7600M XT: not used: AMDGPU is not ported to Stambha
+GPU SELECT 0000:65:00.0 1002:15bf rev c1 AMD Radeon 780M Graphics: not used: AMDGPU is not ported to Stambha
 GPU SELECT started none"#,
     );
     assert_boots(
@@ -897,7 +897,7 @@ fn a_desktop_with_a_card_and_an_integrated_gpu_and_the_monitor_on_the_card() {
         Build::Release,
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
 --
-GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
@@ -920,9 +920,9 @@ fn a_desktop_with_a_card_and_an_integrated_gpu_and_the_monitor_on_the_motherboar
         pc,
         Build::Release,
         r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
-          No screen is connected to the NVIDIA GeForce RTX 5080, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the NVIDIA GeForce RTX 5080, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
-GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#,
     );
@@ -952,7 +952,7 @@ fn a_card_whose_claim_is_refused_leaves_the_integrated_gpu_to_draw() {
         Build::Release,
         r#"[ warn ]  Starting the GPU (the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest)
 --
-GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: the GPU's register BAR does not decode
 GPU SELECT started none
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
@@ -962,7 +962,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GP
         Build::Full,
         r#"[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
-          No screen is connected to the Intel UHD Graphics 770, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the Intel UHD Graphics 770, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
 GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: integrated, draws; started first
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: the GPU's register BAR does not decode
@@ -981,7 +981,7 @@ fn a_card_whose_driver_fails_leaves_the_integrated_gpu_that_shows_the_monitor_to
         r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The boot log on this USB says why
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
-GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
@@ -1009,7 +1009,7 @@ fn a_card_whose_driver_fails_with_the_monitor_on_it_gives_way_to_the_integrated_
         r#"[ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau stopped with an error. The screen the PC started on is wired to it and stays dark: the GPU was reset for its driver. The boot log on this USB says why
 [ warn ]  Starting the GPU (no GPU started; the lines above say why)
 --
-GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a780 rev 04 Intel UHD Graphics 770: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:01:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: nouveau did not bind it; Linux's first error: nouveau 0000:01:00.0: probe failed with error -5; no other GPU of this PC can draw in its place"#,
@@ -1033,9 +1033,9 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its driver's probe failed: no
 fn a_server_with_a_bmc_display_beside_a_card() {
     let pc: &[Gpu] = &[BMC.screen(), RTX_5080_SERVER];
     let both = r#"[  ok  ]  Starting the GPU (NVIDIA GeForce RTX 5080)
-          No screen is connected to the NVIDIA GeForce RTX 5080, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the NVIDIA GeForce RTX 5080, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
-GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stela GPU backend for this PCI vendor
+GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stambha GPU backend for this PCI vendor
 GPU SELECT 0000:41:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; started first
 GPU SELECT started in this order: NVIDIA GeForce RTX 5080 at 0000:41:00.0. A discrete GPU that draws gives the Metal device before an integrated one, and the next one does where it fails; the display is the first of them with a connected display, else the firmware's screen"#;
     assert_boots(pc, Build::Release, both);
@@ -1049,17 +1049,17 @@ fn a_server_with_only_a_bmc_display() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stela GPU backend for this PCI vendor
+GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stambha GPU backend for this PCI vendor
 GPU SELECT started none"#,
     );
     assert_boots(
         pc,
         Build::Full,
-        r#"[ warn ]  Starting the GPU (this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from 6th generation Core processors on)
+        r#"[ warn ]  Starting the GPU (this PC has no GPU Stambha drives: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from 6th generation Core processors on)
 --
-GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stela GPU backend for this PCI vendor
+GPU SELECT 0000:02:00.0 1a03:2000 rev 52 display adapter: not used: no Stambha GPU backend for this PCI vendor
 GPU SELECT started none"#,
     );
 }
@@ -1071,17 +1071,17 @@ fn a_desktop_with_only_a_gpu_no_build_drives() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 580 Series: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
+        r#"[ warn ]  Starting the GPU (this PC has no NVIDIA GPU, only the AMD Radeon RX 580 Series: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)
 --
-GPU SELECT 0000:03:00.0 1002:67df rev e7 AMD Radeon RX 580 Series: not used: AMDGPU is not ported to Stela
+GPU SELECT 0000:03:00.0 1002:67df rev e7 AMD Radeon RX 580 Series: not used: AMDGPU is not ported to Stambha
 GPU SELECT started none"#,
     );
     assert_boots(
         pc,
         Build::Full,
-        r#"[ warn ]  Starting the GPU (this PC has no GPU Stela drives, only the AMD Radeon RX 580 Series: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from 6th generation Core processors on)
+        r#"[ warn ]  Starting the GPU (this PC has no GPU Stambha drives, only the AMD Radeon RX 580 Series: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from 6th generation Core processors on)
 --
-GPU SELECT 0000:03:00.0 1002:67df rev e7 AMD Radeon RX 580 Series: not used: on this GPU's graphics generation (GFX8) Stela's Metal device is in no Apple GPU family: RADV has no raster order groups before GFX9, which the framebuffer reads of Apple3 need, and macOS draws its window server's framebuffers only on an Apple3 device
+GPU SELECT 0000:03:00.0 1002:67df rev e7 AMD Radeon RX 580 Series: not used: on this GPU's graphics generation (GFX8) Stambha's Metal device is in no Apple GPU family: RADV has no raster order groups before GFX9, which the framebuffer reads of Apple3 need, and macOS draws its window server's framebuffers only on an Apple3 device
 GPU SELECT started none"#,
     );
 }
@@ -1092,7 +1092,7 @@ fn a_card_refused_for_missing_firmware() {
     let pc: &[Gpu] = &[RTX_5080
         .screen()
         .refused(Reason::MissingFirmware, NO_FIRMWARE)];
-    let both = r#"[ warn ]  Starting the GPU (the USB has no firmware for this PC's NVIDIA GeForce RTX 5080. On another computer, plug in this USB and run `stela repair`)
+    let both = r#"[ warn ]  Starting the GPU (the USB has no firmware for this PC's NVIDIA GeForce RTX 5080. On another computer, plug in this USB and run `stambha repair`)
 --
 GPU SELECT 0000:01:00.0 10de:2c02 rev a1 NVIDIA GeForce RTX 5080: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
 GPU SELECT started none
@@ -1111,9 +1111,9 @@ fn a_laptop_whose_nvidia_gpu_lacks_firmware_draws_on_the_integrated_one() {
     assert_boots(
         pc,
         Build::Release,
-        r#"[ warn ]  Starting the GPU (the USB has no firmware for this PC's NVIDIA GeForce RTX 4060 Laptop GPU. On another computer, plug in this USB and run `stela repair`)
+        r#"[ warn ]  Starting the GPU (the USB has no firmware for this PC's NVIDIA GeForce RTX 4060 Laptop GPU. On another computer, plug in this USB and run `stambha repair`)
 --
-GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stela's Metal device on this Intel GPU
+GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: not used: no driver here runs Stambha's Metal device on this Intel GPU
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
 GPU SELECT started none
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: no pinned firmware for the observed GPU chipset was loaded; no other GPU of this PC can draw in its place"#,
@@ -1122,7 +1122,7 @@ GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refu
         pc,
         Build::Full,
         r#"[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
-[ warn ]  the USB has no firmware for this PC's NVIDIA GeForce RTX 4060 Laptop GPU. On another computer, plug in this USB and run `stela repair`
+[ warn ]  the USB has no firmware for this PC's NVIDIA GeForce RTX 4060 Laptop GPU. On another computer, plug in this USB and run `stambha repair`
 --
 GPU SELECT 0000:00:02.0 8086:a7a0 rev 04 Intel Iris Xe Graphics: integrated, draws; started first
 GPU SELECT 0000:01:00.0 10de:28e0 rev a1 NVIDIA GeForce RTX 4060 Laptop GPU: discrete, draws; not started: its claim was refused: no pinned firmware for the observed GPU chipset was loaded
@@ -1155,7 +1155,7 @@ fn a_release_never_mentions_the_amd_and_intel_ports() {
         );
         assert!(
             screen[0].ends_with(
-                ": Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)"
+                ": Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU)"
             ),
             "{screen:?}"
         );
@@ -1246,7 +1246,7 @@ fn a_desktop_card_with_the_monitor_on_it_and_an_integrated_gpu_falls_back_at_eac
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (Intel UHD Graphics 770, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
-          No screen is connected to the Intel UHD Graphics 770, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the Intel UHD Graphics 770, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the Intel UHD Graphics 770 at 0000:00:02.0 is claimed and started in its place"#,
             ),
@@ -1379,7 +1379,7 @@ fn a_laptop_with_the_panel_on_the_discrete_gpu_falls_back_at_each_stage() {
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (Intel Iris Xe Graphics, as the NVIDIA GeForce RTX 4060 Laptop GPU did not start)
 [ warn ]  the NVIDIA GeForce RTX 4060 Laptop GPU at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
-          No screen is connected to the Intel Iris Xe Graphics, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the Intel Iris Xe Graphics, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 4060 Laptop GPU: its claim was refused: the GPU's register BAR does not decode; the Intel Iris Xe Graphics at 0000:00:02.0 is claimed and started in its place"#,
             ),
@@ -1424,7 +1424,7 @@ fn a_desktop_with_two_cards_falls_back_at_each_stage() {
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; no other GPU of this PC can draw in its place"#,
                 r#"[  ok  ]  Starting the GPU (AMD Radeon RX 7900 XTX, as the NVIDIA GeForce RTX 5080 did not start)
 [ warn ]  the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: the GPU's register BAR does not decode. The boot log on this USB has the rest
-          No screen is connected to the AMD Radeon RX 7900 XTX, so Stela copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
+          No screen is connected to the AMD Radeon RX 7900 XTX, so Stambha copies each frame of macOS to the screen the PC started on. The picture is slower than on a screen connected to the GPU.
 --
 GPU FALLBACK 0000:01:00.0 NVIDIA GeForce RTX 5080: its claim was refused: the GPU's register BAR does not decode; the AMD Radeon RX 7900 XTX at 0000:03:00.0, started beside it, draws in its place"#,
             ),

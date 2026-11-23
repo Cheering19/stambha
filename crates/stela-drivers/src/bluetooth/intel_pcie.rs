@@ -91,7 +91,7 @@ pub struct Snapshot {
     pub mailbox_status: u32,
     pub mailboxes: [Option<u32>; 4],
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Error {
     Preparation(crate::bus::pci::requester::preparation::Error),
     Unsupported(&'static str),
@@ -116,9 +116,45 @@ pub enum Error {
         cleanup: Box<Error>,
     },
 }
+/// The failure line prints no byte of a refused frame: its length alone
+/// (`crate::bluetooth::redacted`).
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Intel PCIe Bluetooth {self:?}")
+        let error = crate::bluetooth::redacted::Lists(self);
+        write!(f, "Intel PCIe Bluetooth {error}")
+    }
+}
+impl core::fmt::Debug for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Preparation(error) => f.debug_tuple("Preparation").field(error).finish(),
+            Self::Unsupported(what) => f.debug_tuple("Unsupported").field(what).finish(),
+            Self::State(state) => f.debug_tuple("State").field(state).finish(),
+            Self::Dma(error) => f.debug_tuple("Dma").field(error).finish(),
+            Self::Mmio(what) => f.debug_tuple("Mmio").field(what).finish(),
+            Self::Native(error) => f.debug_tuple("Native").field(error).finish(),
+            Self::MinimumInterrupted => f.write_str("MinimumInterrupted"),
+            Self::Timeout(what) => f.debug_tuple("Timeout").field(what).finish(),
+            Self::Protocol {
+                requirement,
+                observed,
+            } => f
+                .debug_struct("Protocol")
+                .field("requirement", requirement)
+                .field("observed", observed)
+                .finish(),
+            Self::Controller(snapshot) => f.debug_tuple("Controller").field(snapshot).finish(),
+            Self::Packet { requirement, raw } => f
+                .debug_struct("Packet")
+                .field("requirement", requirement)
+                .field("raw", &crate::bluetooth::redacted::Bytes(raw))
+                .finish(),
+            Self::Cleanup { cause, cleanup } => f
+                .debug_struct("Cleanup")
+                .field("cause", cause)
+                .field("cleanup", cleanup)
+                .finish(),
+        }
     }
 }
 impl core::error::Error for Error {}

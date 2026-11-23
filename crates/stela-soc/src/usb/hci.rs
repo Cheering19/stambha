@@ -42,6 +42,11 @@
 //!   interface at number 2 for these modules (`data->diag`); bluetoothd
 //!   uses only interfaces 0 and 1 of this product (0x1000fef70) and Linux
 //!   runs without it, so the function has none.
+//! - [`Hci::bridged`], for a host controller lent behind that module
+//!   (`--bluetooth-lend`): the same identity, with the [`bridge`] deciding
+//!   for each command whether a shadow of the model answers it or the host's
+//!   controller does, and falling back to the model when the controller
+//!   fails or stalls. No vendor command reaches the host's controller.
 //!
 //! The configuration also carries the standard synchronous interface (Vol 4
 //! Part B 2.1.1): interface 1, alternate settings 0-5, each with an
@@ -73,6 +78,8 @@ use alloc::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
 use stela_contracts::refuse;
 use stela_drivers::usb::bluetooth::MAX_ACL_PAYLOAD;
 
+pub mod bridge;
+pub mod capture;
 pub mod model;
 
 const EVENTS: u8 = 0x81;
@@ -107,7 +114,9 @@ pub const TRACED_COMMANDS: u16 = 48;
 /// daemon that restarts begins each bring-up with one and need not
 /// configure the function again.
 const TRACED_BRING_UPS: u8 = 4;
-/// Parameter bytes a traced command shows.
+/// Parameter bytes a traced command shows, masked as the capture masks them
+/// (`capture`): an address keeps its last byte and vendor half, and names,
+/// keys, vendor parameters and anything no rule names are `xx`.
 pub const TRACED_BYTES: usize = 4;
 /// Trace entries held until the owner takes them; later ones are dropped.
 const TRACE_ENTRIES: usize = 64;
@@ -119,13 +128,13 @@ const UNKNOWN_COMMAND: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Traced {
     /// A command the model answered: its opcode, parameter length and
-    /// first parameter bytes (a vendor command's sub-command), and the
+    /// first parameter bytes, `None` where the mask hides one, and the
     /// event that answered it, if any, with its status and the length of
     /// its return parameters after the status.
     Command {
         opcode: u16,
         parameters: u8,
-        first: [u8; TRACED_BYTES],
+        first: [Option<u8>; TRACED_BYTES],
         answer: Option<Answered>,
     },
     /// The guest set the configuration to this value (0: unconfigured).
@@ -135,6 +144,12 @@ pub enum Traced {
     /// [`TRACED_COMMANDS`] commands were traced; an HCI Reset or the next
     /// configuration starts again.
     Ended,
+    /// The capture (`capture`) took its packets for this configuration.
+    CaptureEnded,
+    /// The capture took its packets of the boot's last configuration it
+    /// captures (`capture::CAPTURED_CONFIGURATIONS`), or another came after
+    /// it.
+    CaptureOver,
 }
 
 /// The event that answered a traced command.
@@ -144,6 +159,52 @@ pub struct Answered {
     pub event: u8,
     pub status: u8,
     pub returns: u8,
+}
+
+/// What `event` says of the command it answers, when it is a Command
+/// Complete or Command Status.
+fn answered(event: &[u8]) -> Option<Answered> {
+    match *event {
+        [COMMAND_COMPLETE, length, _, _, _, status, ..] => Some(Answered {
+            event: COMMAND_COMPLETE,
+            status,
+            returns: length.saturating_sub(4),
+        }),
+        [COMMAND_STATUS, _, status, ..] => Some(Answered {
+            event: COMMAND_STATUS,
+            status,
+            returns: 0,
+        }),
+        _ => None,
+    }
+}
+
+/// The opcode a Command Complete or Command Status answers.
+fn answered_opcode(event: &[u8]) -> Option<u16> {
+    match *event {
+        [COMMAND_COMPLETE, _, _, low, high, ..] | [COMMAND_STATUS, _, _, _, low, high, ..] => {
+            Some(u16::from_le_bytes([low, high]))
+        }
+        _ => None,
+    }
+}
+
+/// A command's first parameter bytes as the capture masks the whole
+/// command, `None` for a hidden one or past its parameters. The raw bytes
+/// are never held: the trace is in every boot's log.
+fn first_bytes(packet: &[u8]) -> [Option<u8>; TRACED_BYTES] {
+    let masked = capture::Captured::new(
+        capture::Direction::FromGuest,
+        capture::Kind::Command,
+        packet,
+    );
+    let mut first = [None; TRACED_BYTES];
+    let shown = masked.bytes.iter().zip(&masked.hidden).skip(COMMAND_HEADER);
+    first
+        .iter_mut()
+        .zip(shown)
+        .for_each(|(to, (&byte, &hidden))| *to = (!hidden).then_some(byte));
+    first
 }
 
 impl core::fmt::Display for Traced {
@@ -160,7 +221,11 @@ impl core::fmt::Display for Traced {
                 if !shown.is_empty() {
                     f.write_str("[")?;
                     for (index, byte) in shown.iter().enumerate() {
-                        write!(f, "{}{byte:02x}", if index == 0 { "" } else { " " })?;
+                        f.write_str(if index == 0 { "" } else { " " })?;
+                        match byte {
+                            Some(byte) => write!(f, "{byte:02x}")?,
+                            None => f.write_str("xx")?,
+                        }
                     }
                     f.write_str("] ")?;
                 }
@@ -186,6 +251,18 @@ impl core::fmt::Display for Traced {
             Self::Ended => write!(
                 f,
                 "trace ends after {TRACED_COMMANDS} commands until the next HCI Reset or configuration"
+            ),
+            Self::CaptureEnded => write!(
+                f,
+                "capture ends after {} packets until the next configuration",
+                capture::CAPTURED_PACKETS
+            ),
+            Self::CaptureOver => write!(
+                f,
+                "capture ends for this boot: at most {} packets of each of its first {} \
+                 configurations",
+                capture::CAPTURED_PACKETS,
+                capture::CAPTURED_CONFIGURATIONS
             ),
         }
     }
@@ -278,6 +355,13 @@ struct State {
     configured: u8,
     /// HCI Resets that may still start the trace again.
     bring_ups: u8,
+    /// Every packet, once the owner asks (`--bluetooth-trace`).
+    capture: capture::Capture,
+    /// The bridge, when a host controller is lent behind the module.
+    bridge: Option<Box<bridge::Bridge>>,
+    /// Traced commands of the bridge whose answers have not reached the
+    /// guest yet: opcode, parameter length, first parameter bytes.
+    awaiting: VecDeque<(u16, u8, [Option<u8>; TRACED_BYTES])>,
 }
 
 /// The function: its pipes and queues.
@@ -408,6 +492,18 @@ impl Hci {
         Self::with(&APPLE_MODULE, Some(Box::new(model::Model::new(address))))
     }
 
+    /// Apple's internal USB Bluetooth module with a host controller lent
+    /// behind it (`bridge`), whose shadow model's power-on BD_ADDR is
+    /// `address`. The owner carries the commands the bridge sends the
+    /// controller ([`Self::take`]) and its packets back
+    /// ([`Self::deliver_event`], [`Self::deliver_acl`]), and says when it
+    /// fails ([`Self::host_failed`]).
+    pub fn bridged(address: [u8; 6]) -> Self {
+        let mut hci = Self::with(&APPLE_MODULE, None);
+        hci.state.bridge = Some(Box::new(bridge::Bridge::new(address)));
+        hci
+    }
+
     fn with(identity: &Identity, model: Option<Box<model::Model>>) -> Self {
         Self {
             control: Control::new(descriptors(identity)),
@@ -425,6 +521,9 @@ impl Hci {
                 tracing: 0,
                 configured: 0,
                 bring_ups: 0,
+                capture: capture::Capture::default(),
+                bridge: None,
+                awaiting: VecDeque::new(),
             },
         }
     }
@@ -445,19 +544,64 @@ impl Hci {
         state.events.queue.len() < QUEUE_PACKETS && state.acl.queue.len() < QUEUE_PACKETS
     }
 
-    /// The model's BD_ADDR now; `None` for a host controller's function.
-    pub fn model_address(&self) -> Option<[u8; 6]> {
-        self.state.model.as_ref().map(|model| model.address())
+    /// How many packets from the host's controller both IN queues still
+    /// take.
+    pub fn room_left(&self) -> usize {
+        let state = &self.state;
+        let fuller = state.events.queue.len().max(state.acl.queue.len());
+        QUEUE_PACKETS.saturating_sub(fuller)
     }
 
-    /// Opcodes the model answered Unknown HCI Command that were not taken
-    /// before, each once.
+    /// The model's BD_ADDR now, the bridge's shadow's when bridged; `None`
+    /// for a host controller's function.
+    pub fn model_address(&self) -> Option<[u8; 6]> {
+        let state = &self.state;
+        let bridged = state.bridge.as_ref().map(|bridge| bridge.address());
+        bridged.or_else(|| state.model.as_ref().map(|model| model.address()))
+    }
+
+    /// Opcodes the model (or the bridge's shadow) answered Unknown HCI
+    /// Command that were not taken before, each once.
     pub fn take_unknown(&mut self) -> Vec<u16> {
-        self.state
+        let state = &mut self.state;
+        if let Some(bridge) = state.bridge.as_mut() {
+            return bridge.take_unknown();
+        }
+        state
             .model
             .as_mut()
             .map(|model| model.take_unknown())
             .unwrap_or_default()
+    }
+
+    /// Why the bridge fell back to the model, once it has.
+    pub fn fallback(&self) -> Option<bridge::Fallback> {
+        self.state.bridge.as_ref()?.fallen()
+    }
+
+    /// The bridge's counters; `None` unless bridged.
+    pub fn bridge_counters(&self) -> Option<bridge::Counters> {
+        Some(self.state.bridge.as_ref()?.counters())
+    }
+
+    /// Whether the guest wrote a BD_ADDR the lent controller does not have
+    /// (it keeps its own).
+    pub fn bridged_address_differs(&self) -> bool {
+        self.state
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.address_differs())
+    }
+
+    /// The lent host controller failed: the bridge falls back to the model,
+    /// which answers the command in flight.
+    pub fn host_failed(&mut self) {
+        let state = &mut self.state;
+        let Some(bridge) = state.bridge.as_mut() else {
+            return;
+        };
+        let steps = bridge.chip_failed(state.now);
+        state.steps(steps);
     }
 
     /// The function's trace since it was last taken.
@@ -465,32 +609,71 @@ impl Hci {
         core::mem::take(&mut self.state.trace)
     }
 
-    /// The next packet the guest sent for the host's controller.
+    /// Capture every packet from now on, [`capture::CAPTURED_PACKETS`] per
+    /// configuration (`--bluetooth-trace`).
+    pub fn capture(&mut self) {
+        let configured = self.up();
+        self.state.capture.enable(configured);
+    }
+
+    /// The packets captured since they were last taken.
+    pub fn take_captured(&mut self) -> Vec<capture::Captured> {
+        self.state.capture.take()
+    }
+
+    /// The next packet the guest sent for the host's controller; none once
+    /// the bridge fell back, which drops what was still queued.
     pub fn take(&mut self) -> Option<Outbound> {
-        self.state.outbound.pop_front()
+        let state = &mut self.state;
+        if state.bridge.as_ref().is_some_and(|b| b.fallen().is_some()) {
+            state.outbound.clear();
+            return None;
+        }
+        state.outbound.pop_front()
     }
 
     /// An event from the host's controller for the guest. Dropped (and
     /// counted) while the function is unconfigured or the queue is full.
+    /// The bridge, when there is one, decides what the guest gets of it.
     pub fn deliver_event(&mut self, packet: &[u8]) {
         if !self.up() {
             return;
         }
-        self.state.event(packet.to_vec());
+        let state = &mut self.state;
+        if state.bridge.is_some() {
+            state.captured(capture::Direction::FromChip, capture::Kind::Event, packet);
+        }
+        let now = state.now;
+        match state.bridge.as_mut() {
+            Some(bridge) => {
+                let steps = bridge.chip_event(packet, now);
+                state.steps(steps);
+            }
+            None => state.event(packet.to_vec()),
+        }
     }
 
     /// ACL data from the host's controller for the guest, dropped as an
-    /// event is.
+    /// event is, and always behind a bridge, which in milestone 1 lends no
+    /// connection (`bridge::Bridge::chip_acl`).
     pub fn deliver_acl(&mut self, packet: &[u8]) {
         if !self.up() {
             return;
         }
         let state = &mut self.state;
+        if let Some(bridge) = state.bridge.as_mut() {
+            let passes = bridge.chip_acl();
+            state.captured(capture::Direction::FromChip, capture::Kind::Acl, packet);
+            if !passes {
+                return;
+            }
+        }
         if state.acl.queue.len() >= QUEUE_PACKETS {
             state.counters.overflowed += 1;
             return;
         }
         state.counters.acl_to_guest += 1;
+        state.captured(capture::Direction::ToGuest, capture::Kind::Acl, packet);
         state.acl.queue.push_back(packet.to_vec());
     }
 }
@@ -514,7 +697,21 @@ impl State {
             return;
         }
         self.counters.events_to_guest += 1;
+        self.captured(capture::Direction::ToGuest, capture::Kind::Event, &packet);
         self.events.queue.push_back(packet);
+    }
+
+    fn captured(&mut self, direction: capture::Direction, kind: capture::Kind, packet: &[u8]) {
+        let end = self.capture.record(direction, kind, packet);
+        self.capture_ended(end);
+    }
+
+    fn capture_ended(&mut self, end: Option<capture::End>) {
+        match end {
+            Some(capture::End::Configuration) => self.trace(Traced::CaptureEnded),
+            Some(capture::End::Boot) => self.trace(Traced::CaptureOver),
+            None => {}
+        }
     }
 
     fn modeled_command(&mut self, packet: &[u8]) {
@@ -535,29 +732,11 @@ impl State {
             self.tracing -= 1;
             // The first event answers the command; a procedure's later
             // ones follow it.
-            let answer = events.first().and_then(|e| match e[..] {
-                [COMMAND_COMPLETE, length, _, _, _, status, ..] => Some(Answered {
-                    event: COMMAND_COMPLETE,
-                    status,
-                    returns: length.saturating_sub(4),
-                }),
-                [COMMAND_STATUS, _, status, ..] => Some(Answered {
-                    event: COMMAND_STATUS,
-                    status,
-                    returns: 0,
-                }),
-                _ => None,
-            });
-            let mut first = [0; TRACED_BYTES];
-            let shown = packet[COMMAND_HEADER..].iter().take(TRACED_BYTES);
-            first
-                .iter_mut()
-                .zip(shown)
-                .for_each(|(to, from)| *to = *from);
+            let answer = events.first().and_then(|e| answered(e));
             self.trace(Traced::Command {
                 opcode,
                 parameters: packet[2],
-                first,
+                first: first_bytes(packet),
                 answer,
             });
             if self.tracing == 0 {
@@ -565,6 +744,86 @@ impl State {
             }
         }
         events.into_iter().for_each(|e| self.event(e));
+    }
+
+    /// A command for the bridge, traced once its answer reaches the guest.
+    fn bridged_command(&mut self, packet: &[u8]) {
+        let Some(lent) = self.bridge.as_mut() else {
+            return;
+        };
+        let opcode = u16::from_le_bytes([packet[0], packet[1]]);
+        self.counters.commands += 1;
+        self.counters.unknown += u64::from(!model::implements(opcode));
+        if opcode == HCI_RESET && self.bring_ups > 0 {
+            self.bring_ups -= 1;
+            self.tracing = TRACED_COMMANDS;
+        }
+        let traced = self.tracing > 0;
+        if traced {
+            self.tracing -= 1;
+            self.awaiting
+                .push_back((opcode, packet[2], first_bytes(packet)));
+        }
+        let waits = lent.busy();
+        let steps = lent.command(packet, self.now);
+        let answers = steps.iter().any(|step| match step {
+            bridge::Step::Guest(event) => answered_opcode(event) == Some(opcode),
+            bridge::Step::Chip(_) => true,
+        });
+        self.steps(steps);
+        // Host Number Of Completed Packets, answered by no event.
+        if traced && !waits && !answers {
+            self.awaiting.pop_back();
+            self.trace(Traced::Command {
+                opcode,
+                parameters: packet[2],
+                first: first_bytes(packet),
+                answer: None,
+            });
+            self.trace_ended();
+        }
+    }
+
+    /// What the bridge decided: events for the guest, commands for the
+    /// owner to carry to the host's controller.
+    fn steps(&mut self, steps: Vec<bridge::Step>) {
+        for step in steps {
+            match step {
+                bridge::Step::Guest(event) => {
+                    self.trace_answer(&event);
+                    self.event(event);
+                }
+                bridge::Step::Chip(command) => {
+                    let command = command.into_bytes();
+                    self.captured(capture::Direction::ToChip, capture::Kind::Command, &command);
+                    self.outbound.push_back(Outbound::Command(command));
+                }
+            }
+        }
+    }
+
+    /// Traces the bridged command `event` answers.
+    fn trace_answer(&mut self, event: &[u8]) {
+        let (Some(opcode), Some(answer)) = (answered_opcode(event), answered(event)) else {
+            return;
+        };
+        let Some(&(_, parameters, first)) = self.awaiting.front().filter(|a| a.0 == opcode) else {
+            return;
+        };
+        self.awaiting.pop_front();
+        self.trace(Traced::Command {
+            opcode,
+            parameters,
+            first,
+            answer: Some(answer),
+        });
+        self.trace_ended();
+    }
+
+    fn trace_ended(&mut self) {
+        if self.tracing == 0 && self.awaiting.is_empty() {
+            self.trace(Traced::Ended);
+        }
     }
 
     fn modeled_acl(&mut self, packet: &[u8]) {
@@ -594,12 +853,30 @@ impl State {
             self.counters.malformed += 1;
             return Err(Stall);
         }
+        if self
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| !bridge.has_room())
+        {
+            return Err(Stall);
+        }
+        self.captured(
+            capture::Direction::FromGuest,
+            capture::Kind::Command,
+            packet,
+        );
         let opcode = u16::from_le_bytes([low, high]);
         let vendor = opcode >> 10 == VENDOR_GROUP;
         if self.model.is_some() {
             // The module answers the Broadcom commands it models.
             self.counters.vendor_refused += u64::from(vendor && !model::implements(opcode));
             self.modeled_command(packet);
+            return Ok(());
+        }
+        if self.bridge.is_some() {
+            // The shadow answers the vendor commands it models.
+            self.counters.vendor_refused += u64::from(vendor && !model::implements(opcode));
+            self.bridged_command(packet);
             return Ok(());
         }
         if vendor {
@@ -630,8 +907,15 @@ impl State {
             self.assembling.clear();
         } else if self.assembling.len() == ACL_HEADER + data {
             let packet = core::mem::take(&mut self.assembling);
+            self.captured(capture::Direction::FromGuest, capture::Kind::Acl, &packet);
             if self.model.is_some() {
                 self.modeled_acl(&packet);
+            } else if let Some(bridge) = self.bridge.as_mut() {
+                // Milestone 1 lends no connection: the shadow owns every
+                // one, so it returns the buffer as the model does.
+                self.counters.acl_discarded += 1;
+                let steps = bridge.acl(&packet);
+                self.steps(steps);
             } else {
                 self.counters.acl_to_host += 1;
                 self.outbound.push_back(Outbound::Acl(packet));
@@ -655,12 +939,19 @@ impl Requests for State {
         } else {
             (TRACED_COMMANDS, TRACED_BRING_UPS)
         };
+        let end = self.capture.configured(value);
+        self.capture_ended(end);
         self.halted = [false; 3];
         self.sco_setting = 0;
         self.outbound.clear();
         self.events.clear();
         self.acl.clear();
         self.assembling.clear();
+        // A command the queues dropped is no longer in flight.
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.resync();
+        }
+        self.awaiting.clear();
         Ok(())
     }
 
@@ -720,6 +1011,11 @@ impl BusPeer for Hci {
         if let Some(model) = self.state.model.as_mut() {
             model.power_on();
         }
+        // The shadow's, not the host's: a USB reset of the real controller
+        // would lose its patched firmware.
+        if let Some(bridge) = self.state.bridge.as_mut() {
+            bridge.reset();
+        }
         self.control.reset(&mut self.state)?;
         self.state
             .configure(0)
@@ -758,6 +1054,10 @@ impl Function for Hci {
             let events = model.advance(now);
             events.into_iter().for_each(|e| state.event(e));
         }
+        if let Some(bridge) = state.bridge.as_mut() {
+            let steps = bridge.advance(now);
+            state.steps(steps);
+        }
     }
 
     fn ready_at(&self, endpoint: u8) -> Option<u64> {
@@ -767,8 +1067,12 @@ impl Function for Hci {
         let state = &self.state;
         match endpoint {
             EVENTS if !state.events.queue.is_empty() => Some(0),
-            // A procedure's end is an event then.
-            EVENTS => state.model.as_ref().and_then(|model| model.deadline()),
+            // A procedure's end is an event then, and a forwarded command's
+            // deadline the model's answer.
+            EVENTS => match state.bridge.as_ref() {
+                Some(bridge) => bridge.deadline(),
+                None => state.model.as_ref().and_then(|model| model.deadline()),
+            },
             ACL_IN => (!state.acl.queue.is_empty()).then_some(0),
             _ => None,
         }
@@ -1110,25 +1414,26 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c03,
                     parameters: 0,
-                    first: [0; 4],
+                    first: [None; 4],
                     answer: complete(0, 0),
                 },
                 Traced::Command {
                     opcode: 0x1004,
                     parameters: 1,
-                    first: [2, 0, 0, 0],
+                    first: [Some(2), None, None, None],
                     answer: complete(0, 10),
                 },
+                // A vendor command's parameters are hidden.
                 Traced::Command {
                     opcode: 0xfc4c,
                     parameters: 1,
-                    first: [9, 0, 0, 0],
+                    first: [None; 4],
                     answer: complete(UNKNOWN_COMMAND, 0),
                 },
                 Traced::Command {
                     opcode: 0x0401,
                     parameters: 5,
-                    first: [0x33, 0x8b, 0x9e, 1],
+                    first: [Some(0x33), Some(0x8b), Some(0x9e), Some(1)],
                     answer: Some(Answered {
                         event: COMMAND_STATUS,
                         status: 0,
@@ -1138,7 +1443,7 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c35,
                     parameters: 5,
-                    first: [1, 0x40, 0, 1],
+                    first: [Some(1), Some(0x40), Some(0), Some(1)],
                     answer: None,
                 },
             ]
@@ -1150,6 +1455,10 @@ mod tests {
         assert_eq!(
             traced[1].to_string(),
             "command 0x1004 parameters=1 [02] answered complete status=0x00 returns=10"
+        );
+        assert_eq!(
+            traced[2].to_string(),
+            "command 0xfc4c parameters=1 [xx] answered complete status=0x01 returns=0"
         );
         assert_eq!(
             traced[4].to_string(),
@@ -1185,6 +1494,367 @@ mod tests {
         assert_eq!(traced[0], Traced::Configured(1));
         assert_eq!(traced.len(), 2);
         assert_eq!(Traced::Reset.to_string(), "bus reset");
+    }
+
+    /// The trace is in every boot's log, so its bytes are the capture's
+    /// masked ones: the Mac's name, the middle of the address bluetoothd
+    /// writes and of a neighbour's, and LE Encrypt's key show as `xx`, for
+    /// the model and for a lent controller alike.
+    #[test]
+    fn the_always_on_trace_shows_no_name_address_middle_or_key() {
+        // A synthetic name and addresses, in HCI order.
+        const NAME: &[u8] = b"Tester's Mac";
+        const PLATFORM: [u8; 6] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+        const NEIGHBOUR: [u8; 6] = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5];
+        let with = |opcode: u16, parameters: &[u8]| {
+            let mut packet = opcode.to_le_bytes().to_vec();
+            packet.push(parameters.len() as u8);
+            packet.extend_from_slice(parameters);
+            packet
+        };
+        let mut name = NAME.to_vec();
+        name.resize(248, 0);
+        let mut request = NEIGHBOUR.to_vec();
+        request.extend_from_slice(&[1, 0, 0, 0]);
+        let mut eir = vec![0, NAME.len() as u8 + 1, 0x09];
+        eir.extend_from_slice(NAME);
+        eir.resize(241, 0);
+        let commands = [
+            (with(0x0c13, &name), "parameters=248 [xx xx xx xx] "),
+            (with(0xfc01, &PLATFORM), "parameters=6 [a0 xx xx a3] "),
+            (with(0x0419, &request), "parameters=10 [b0 xx xx b3] "),
+            (with(0x2017, &[0x5a; 32]), "parameters=32 [xx xx xx xx] "),
+            (with(0x0c52, &eir), "parameters=241 [00 0d 09 xx] "),
+        ];
+        for mut hci in [modeled(), bridged()] {
+            hci.take_trace();
+            for (packet, shown) in &commands {
+                command(&mut hci, packet).unwrap();
+                // A lent controller answers what reaches it.
+                while let Some(Outbound::Command(sent)) = hci.take() {
+                    hci.deliver_event(&[COMMAND_STATUS, 4, 0, 1, sent[0], sent[1]]);
+                }
+                while hci.ready_at(EVENTS) == Some(0) {
+                    read(&mut hci, EVENTS, EVENT_PACKET);
+                }
+                let traced = hci.take_trace();
+                let [Traced::Command { first, .. }] = traced[..] else {
+                    panic!("one traced command: {traced:?}");
+                };
+                let line = traced[0].to_string();
+                assert!(line.contains(shown), "{line}");
+                for secret in [&NAME[..2], &PLATFORM[1..3], &NEIGHBOUR[1..3], &[0x5a, 0x5a]] {
+                    let hex = alloc::format!("{:02x} {:02x}", secret[0], secret[1]);
+                    assert!(!line.contains(&hex), "{line}");
+                    assert!(
+                        !first
+                            .windows(2)
+                            .any(|w| w == [Some(secret[0]), Some(secret[1])])
+                    );
+                }
+            }
+        }
+    }
+
+    /// `--bluetooth-trace`: once the owner asks, every packet after each
+    /// configuration, both ways, then one end line until the next
+    /// configuration; nothing before it asks.
+    #[test]
+    fn the_capture_holds_every_packet_after_each_configuration() {
+        use capture::{CAPTURED_PACKETS, Captured, Direction, Kind};
+        let mut hci = modeled();
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert!(hci.take_captured().is_empty(), "nothing until asked");
+        hci.capture();
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        let answer = read(&mut hci, EVENTS, EVENT_PACKET).concat();
+        assert_eq!(
+            hci.take_captured(),
+            [
+                Captured::new(Direction::FromGuest, Kind::Command, &[0x09, 0x10, 0]),
+                Captured::new(Direction::ToGuest, Kind::Event, &answer),
+            ]
+        );
+        // ACL data from the guest, and the model's return of its buffer.
+        hci.packet(ACL_OUT, Token::Out, &mut [1, 0, 1, 0, 7])
+            .unwrap();
+        let completed = read(&mut hci, EVENTS, EVENT_PACKET).concat();
+        assert_eq!(
+            hci.take_captured(),
+            [
+                Captured::new(Direction::FromGuest, Kind::Acl, &[1, 0, 1, 0, 7]),
+                Captured::new(Direction::ToGuest, Kind::Event, &completed),
+            ]
+        );
+        hci.take_trace();
+        // The bound counts every packet of the configuration.
+        let left = usize::from(CAPTURED_PACKETS) - 4;
+        for _ in 0..left / 2 {
+            command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+            read(&mut hci, EVENTS, EVENT_PACKET);
+        }
+        assert_eq!(hci.take_captured().len(), left);
+        assert_eq!(hci.take_trace().last(), Some(&Traced::CaptureEnded));
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert!(hci.take_captured().is_empty());
+        assert_eq!(
+            Traced::CaptureEnded.to_string(),
+            "capture ends after 1024 packets until the next configuration"
+        );
+        // A new configuration starts it again; a bus reset stops it.
+        transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert_eq!(hci.take_captured().len(), 2);
+        hci.reset().unwrap();
+        let mut hci = configured(hci);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert_eq!(hci.take_captured().len(), 2, "still asked for");
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        // That was the third configuration captured; the fourth is the
+        // boot's last, and the fifth says so.
+        hci.take_trace();
+        for _ in 0..3 {
+            transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+        }
+        let traced = hci.take_trace();
+        assert_eq!(
+            traced.iter().filter(|&&t| t == Traced::CaptureOver).count(),
+            1,
+            "{traced:?}"
+        );
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert!(hci.take_captured().is_empty());
+        assert_eq!(
+            Traced::CaptureOver.to_string(),
+            "capture ends for this boot: at most 1024 packets of each of its first 4 \
+             configurations"
+        );
+    }
+
+    /// A packet longer than the capture shows keeps its first bytes and
+    /// counts the rest; a host controller's packets are captured as they
+    /// reach the guest.
+    #[test]
+    fn a_captured_packet_keeps_its_first_bytes_and_counts_the_rest() {
+        use capture::{CAPTURED_BYTES, Captured, Direction, Kind};
+        let mut hci = controller();
+        hci.capture();
+        let mut long = vec![1, 0, 0, 2];
+        long.resize(ACL_HEADER + 512, 7);
+        let (first, rest) = long.split_at(512);
+        hci.packet(ACL_OUT, Token::Out, &mut first.to_vec())
+            .unwrap();
+        hci.packet(ACL_OUT, Token::Out, &mut rest.to_vec()).unwrap();
+        hci.deliver_acl(&long);
+        hci.deliver_event(&[0x0e, 4, 1, 0x03, 0x0c, 0]);
+        let captured = hci.take_captured();
+        assert_eq!(captured.len(), 3);
+        for (packet, direction) in captured[..2]
+            .iter()
+            .zip([Direction::FromGuest, Direction::ToGuest])
+        {
+            assert_eq!((packet.direction, packet.kind), (direction, Kind::Acl));
+            assert_eq!(packet.bytes.len(), CAPTURED_BYTES);
+            assert_eq!(packet.cut, long.len() - CAPTURED_BYTES);
+            // The HCI and L2CAP headers, then the payload hidden.
+            assert_eq!(packet.bytes[..8], long[..8]);
+            assert!(packet.hidden[8..].iter().all(|&h| h));
+        }
+        assert_eq!(
+            captured[2],
+            Captured::new(
+                Direction::ToGuest,
+                Kind::Event,
+                &[0x0e, 4, 1, 0x03, 0x0c, 0]
+            )
+        );
+    }
+
+    fn bridged() -> Hci {
+        configured(Hci::bridged(ADDRESS))
+    }
+
+    /// A host controller lent behind the module: the guest sees Apple's
+    /// module; its listed standard commands go to the owner for the host's
+    /// controller and their answers come back with one credit; vendor
+    /// commands and ACL data stay with the shadow.
+    #[test]
+    fn the_bridged_function_is_apples_module_with_the_hosts_controller_behind_it() {
+        use capture::Direction::{FromChip, FromGuest, ToChip, ToGuest};
+        let hci = Hci::bridged(ADDRESS);
+        let device = hci.control.descriptors.device;
+        assert_eq!(
+            device[4..14],
+            [0xff, 1, 1, 64, 0xac, 0x05, 0x8f, 0x82, 0x50, 0x01]
+        );
+        assert_eq!(hci.model_address(), Some(ADDRESS));
+        let mut hci = configured(hci);
+        hci.capture();
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert_eq!(hci.take(), Some(Outbound::Command(vec![0x03, 0x0c, 0])));
+        let mut buffer = [0; EVENT_PACKET];
+        assert_eq!(
+            hci.packet(EVENTS, Token::In, &mut buffer).unwrap(),
+            Reply::Nak,
+            "no answer before the controller's"
+        );
+        hci.deliver_event(&[COMMAND_COMPLETE, 3, 1, 0, 0]);
+        hci.deliver_event(&[COMMAND_COMPLETE, 4, 5, 0x03, 0x0c, 0]);
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET),
+            [vec![COMMAND_COMPLETE, 4, 1, 0x03, 0x0c, 0]]
+        );
+        // A vendor command stays here.
+        command(&mut hci, &[0x4c, 0xfc, 1, 9]).unwrap();
+        assert_eq!(hci.take(), None);
+        assert_eq!(read(&mut hci, EVENTS, EVENT_PACKET)[0][5], UNKNOWN_COMMAND);
+        assert_eq!(hci.take_unknown(), [0xfc4c]);
+        assert_eq!(hci.counters().commands, 2);
+        assert_eq!(hci.counters().vendor_refused, 1);
+        let directions: Vec<_> = hci.take_captured().iter().map(|c| c.direction).collect();
+        assert_eq!(
+            directions,
+            [
+                FromGuest, ToChip, FromChip, FromChip, ToGuest, FromGuest, ToGuest
+            ]
+        );
+        // ACL data from the guest names none of the controller's
+        // connections: the shadow returns its buffer.
+        hci.packet(ACL_OUT, Token::Out, &mut [1, 0, 1, 0, 7])
+            .unwrap();
+        assert_eq!(hci.take(), None);
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET),
+            [vec![0x13, 5, 1, 1, 0, 1, 0]]
+        );
+        // The controller's ACL data names no connection the guest knows:
+        // it is captured and dropped.
+        let dropped = hci.bridge_counters().unwrap().dropped;
+        hci.deliver_acl(&[2, 0, 1, 0, 8]);
+        assert_eq!(hci.ready_at(ACL_IN), None);
+        assert_eq!(hci.counters().acl_to_guest, 0);
+        assert_eq!(hci.bridge_counters().unwrap().dropped, dropped + 1);
+        let captured = hci.take_captured();
+        assert_eq!(captured.last().map(|c| c.direction), Some(FromChip));
+        assert_eq!(hci.fallback(), None);
+        // The trace names each command with its answer, whoever gave it.
+        let traced = hci.take_trace();
+        assert_eq!(traced[0], Traced::Configured(1));
+        assert_eq!(
+            traced[1].to_string(),
+            "command 0x0c03 parameters=0 answered complete status=0x00 returns=0"
+        );
+        assert_eq!(
+            traced[2].to_string(),
+            "command 0xfc4c parameters=1 [xx] answered complete status=0x01 returns=0"
+        );
+    }
+
+    /// The fallback: a forwarded command not answered by its deadline, or a
+    /// failed host controller, gets the model's answer, and the model
+    /// answers from then on.
+    #[test]
+    fn a_bridged_command_left_unanswered_gets_the_models_answer() {
+        let mut hci = bridged();
+        hci.set_time(100);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert!(hci.take().is_some());
+        assert_eq!(hci.ready_at(EVENTS), Some(100 + bridge::DEADLINE));
+        hci.set_time(100 + bridge::DEADLINE);
+        assert_eq!(hci.ready_at(EVENTS), Some(0));
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET).concat(),
+            [COMMAND_COMPLETE, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 0x02]
+        );
+        let fallback = hci.fallback().expect("fell back");
+        assert_eq!(fallback.to_string(), "0x1009 no answer in 1000 ms");
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert_eq!(hci.take(), None, "nothing goes out again");
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET)[0][3..6],
+            [0x03, 0x0c, 0]
+        );
+        // A host controller that fails.
+        let mut hci = bridged();
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        hci.take();
+        hci.host_failed();
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET)[0][3..6],
+            [0x03, 0x0c, 0]
+        );
+        assert_eq!(
+            hci.fallback().map(|f| f.cause),
+            Some(bridge::Cause::HostFailed)
+        );
+    }
+
+    /// A bus reset drops the command in flight; the controller's events stay
+    /// out until the guest's next HCI Reset is answered.
+    #[test]
+    fn a_bus_reset_of_a_bridged_function_keeps_the_controller_out_until_its_reset() {
+        let result = [&[0x2f, 255, 1][..], &[7; 254]].concat();
+        let mut hci = bridged();
+        command(&mut hci, &[0x14, 0x0c, 0]).unwrap();
+        hci.take();
+        hci.reset().unwrap();
+        let mut hci = configured(hci);
+        hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
+        hci.deliver_event(&result);
+        assert_eq!(hci.ready_at(EVENTS), None);
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        hci.take();
+        hci.deliver_event(&[COMMAND_COMPLETE, 4, 1, 0x03, 0x0c, 0]);
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        hci.deliver_event(&result);
+        assert_eq!(read(&mut hci, EVENTS, EVENT_PACKET).concat(), result);
+        // The shadow powers on again with a bus reset, as the model does.
+        command(&mut hci, &[0x01, 0xfc, 6, 9, 8, 7, 6, 5, 0x42]).unwrap();
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        assert_eq!(hci.model_address(), Some([9, 8, 7, 6, 5, 0x42]));
+        hci.reset().unwrap();
+        assert_eq!(hci.model_address(), Some(ADDRESS));
+        // A new configuration alone drops the command in flight too.
+        let mut hci = configured(hci);
+        command(&mut hci, &[0x14, 0x0c, 0]).unwrap();
+        hci.take();
+        transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+        assert_eq!(hci.ready_at(EVENTS), None, "no deadline left");
+        hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
+        assert_eq!(hci.ready_at(EVENTS), None, "the stale answer is dropped");
+        assert_eq!(hci.fallback(), None);
+    }
+
+    /// After the fallback nothing goes to the host's controller, not even a
+    /// command queued for it before.
+    #[test]
+    fn nothing_goes_to_the_controller_after_the_fallback() {
+        let mut hci = bridged();
+        hci.set_time(0);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        hci.set_time(bridge::DEADLINE);
+        assert!(hci.fallback().is_some());
+        assert_eq!(hci.take(), None, "the command queued before is dropped");
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert_eq!(hci.take(), None);
+    }
+
+    #[test]
+    fn the_room_left_is_the_fuller_queues() {
+        let mut hci = controller();
+        assert_eq!(hci.room_left(), QUEUE_PACKETS);
+        for _ in 0..60 {
+            hci.deliver_event(&[0x13, 0]);
+        }
+        hci.deliver_acl(&[1, 0, 0, 0]);
+        assert_eq!(hci.room_left(), QUEUE_PACKETS - 60);
+        for _ in 0..10 {
+            hci.deliver_event(&[0x13, 0]);
+        }
+        assert_eq!(hci.room_left(), 0);
     }
 
     #[test]

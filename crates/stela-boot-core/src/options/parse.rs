@@ -44,6 +44,12 @@ impl ParseState<'_> {
                 }
                 options.lid = Some(Lid::parse(value().ok_or(Error::Lid)?)?);
             }
+            LAPTOP => {
+                let laptop = Laptop::parse(value().ok_or(Error::Laptop)?)?;
+                if options.laptop.replace(laptop).is_some() {
+                    return Err(Error::DuplicateLaptop);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {
@@ -199,6 +205,8 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateTrackpad);
                 }
             }
+            BLUETOOTH_TRACE => options.bluetooth_trace = true,
+            BLUETOOTH_LEND => options.bluetooth_lend = true,
             "--usb-storage" => {
                 let serial = value().ok_or(Error::MissingUsbStorage)?;
                 if options.usb_storage.iter().any(|other| other == serial) {

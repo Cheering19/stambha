@@ -26,6 +26,7 @@ use crate::metal::{
     binding::HeapArray,
     command_buffer::Segment,
     error::{Error, Result, ensure},
+    fault_dump::ShaderImage,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, num::NonZeroU64};
@@ -520,6 +521,14 @@ pub trait Backend {
     /// The allocations [`Self::kept_bound`] named that were unbound since
     /// the last call.
     fn take_unbound(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Each stage of `pipeline` as the driver compiled it: its program
+    /// header, machine code and statistics, for a lost device's fault dump
+    /// ([`crate::metal::fault_dump`]). None when the driver does not report
+    /// them. Only CPU copies are read, so a lost device still answers.
+    fn shader_images(&mut self, _pipeline: Pipeline) -> Vec<ShaderImage> {
         Vec::new()
     }
 }

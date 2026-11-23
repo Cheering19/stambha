@@ -205,7 +205,7 @@ pub fn unreadable_store(blank: Option<bool>) -> Unreadable {
 
 /// Why the boot stops on [`Unreadable::Fatal`], and what to do.
 pub const UNREADABLE_STORE: &str = "NVRAM on the disk chosen for macOS cannot be read: choose \
-     Install macOS again, or on another computer plug in this USB and run `stela repair`";
+     Install macOS again, or on another computer plug in this USB and run `stambha repair`";
 
 #[cfg(test)]
 mod tests {
@@ -343,6 +343,6 @@ mod tests {
         assert_eq!(unreadable_store(Some(false)), Unreadable::Fatal);
         assert_eq!(unreadable_store(None), Unreadable::Fatal);
         assert!(UNREADABLE_STORE.contains("Install macOS"));
-        assert!(UNREADABLE_STORE.contains("`stela repair`"));
+        assert!(UNREADABLE_STORE.contains("`stambha repair`"));
     }
 }

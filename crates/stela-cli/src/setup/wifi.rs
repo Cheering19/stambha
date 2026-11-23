@@ -8,6 +8,14 @@ use std::{fs, path::Path};
 /// The key file on the ESP, as `stela.cfg`'s `--wifi` reads it by default.
 pub(super) const KEY_PATH: &str = "EFI/stela/wifi.key";
 
+/// Said wherever a network is set: the boot starts a Wi-Fi station only on
+/// a Realtek RTL8852CE card so far (`stela_drivers::probe`'s Wi-Fi routing),
+/// and setup cannot see the PC's card, as it usually runs on another
+/// computer. On any other PC the install needs Ethernet or no internet.
+pub(super) const CHIP_NOTE: &str = "Wi-Fi works only on a PC with a Realtek RTL8852CE Wi-Fi \
+    card so far. On any other PC, connect Ethernet during the install, or make an Offline \
+    installer (--installer offline), which needs no internet.";
+
 /// The network a setup joins, as its record keeps it. The passphrase is
 /// only in the key file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

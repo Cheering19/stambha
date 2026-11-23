@@ -22,6 +22,7 @@ pub mod compiler;
 pub mod deferred;
 pub mod device;
 pub mod error;
+pub mod fault_dump;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;

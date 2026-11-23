@@ -637,7 +637,7 @@ impl Shortfall {
             GpuMemory::Shared => "its own memory and the graphics built into the processor",
         };
         refuse!(
-            "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free: \
+            "this PC has {free} GB of RAM free; Stambha needs at least {needed} GB free: \
              {floor} GB for macOS and the rest for {rest}",
             free = %free,
             needed = %needed,

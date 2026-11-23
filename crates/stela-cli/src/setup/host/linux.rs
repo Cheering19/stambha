@@ -477,7 +477,7 @@ impl Host for System {
             static NOTED: Once = Once::new();
             NOTED.call_once(|| {
                 eprintln!(
-                    "Note: stela cannot tell which disk this computer runs from ({reason}), so it \
+                    "Note: stambha cannot tell which disk this computer runs from ({reason}), so it \
                      erases a stick only once its model or size is typed back."
                 );
             });

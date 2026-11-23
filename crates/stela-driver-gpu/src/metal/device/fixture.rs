@@ -173,6 +173,9 @@ pub(crate) struct MockBackend {
     pub(crate) descriptors: Vec<(u32, Descriptor)>,
     pub(crate) graphics: Vec<GraphicsPipelineInfo>,
     pub(crate) compute: Vec<ComputePipelineInfo>,
+    /// What the driver reports of every pipeline's shaders, for a lost
+    /// device's fault dump; none when unset.
+    pub(crate) shader_images: Vec<crate::metal::fault_dump::ShaderImage>,
     /// The pipelines each pipeline cache holds.
     pub(crate) caches: BTreeMap<u64, u8>,
     /// The data each pipeline cache was made from, in order.
@@ -493,6 +496,9 @@ impl Backend for MockBackend {
         self.source(info.source)?;
         self.graphics.push(info.clone());
         Ok(Pipeline(self.id()))
+    }
+    fn shader_images(&mut self, _pipeline: Pipeline) -> Vec<crate::metal::fault_dump::ShaderImage> {
+        self.shader_images.clone()
     }
     fn create_compute_pipeline(&mut self, info: &ComputePipelineInfo) -> Result<Pipeline> {
         if let Some(lock) = &self.deferring

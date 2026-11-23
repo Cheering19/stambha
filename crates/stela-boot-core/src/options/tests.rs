@@ -33,6 +33,38 @@ fn the_lid_is_ignored_unless_asked_and_its_sleep_needs_the_method() {
 }
 
 #[test]
+fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
+    // The default is auto, and writes nothing.
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.laptop(), Laptop::Auto);
+    assert_eq!(plain.laptop, None);
+    for (text, laptop) in [
+        ("--system --laptop auto", Laptop::Auto),
+        ("--system --laptop off", Laptop::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.laptop(), laptop);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --laptop", Error::Laptop),
+        ("--system --laptop on", Error::Laptop),
+        (
+            "--system --laptop off --laptop auto",
+            Error::DuplicateLaptop,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+    // `off` beside the opt-ins it leaves: each still parses as before.
+    let given =
+        System::parse("--system --laptop off --battery --lid method --brightness-keys").unwrap();
+    assert_eq!(given.battery, Some(Battery::Host));
+    assert_eq!(given.lid(), Lid::Method);
+    assert!(given.brightness_keys);
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),
@@ -406,6 +438,31 @@ fn every_option_survives_a_round_trip() {
          --restore-manifest m.plist --restore-identity 2"
     ));
     assert_eq!(restore.restore_manifest_path.as_deref(), Some("m.plist"));
+}
+
+/// The guest Bluetooth capture is off unless asked for, and survives the
+/// line a setup writes.
+#[test]
+fn the_bluetooth_capture_round_trips_and_is_off_by_default() {
+    assert!(!System::default().bluetooth_trace);
+    assert!(!round_trip("--system --input").bluetooth_trace);
+    let line = format!("--system --storage {DISK} --input {BLUETOOTH_TRACE}");
+    let options = round_trip(&line);
+    assert!(options.input && options.bluetooth_trace);
+    assert_eq!(options.to_string(), line);
+    assert!(!System::default().to_string().contains("bluetooth"));
+}
+
+/// Lending the host's controller is off unless asked for: a line without
+/// the flag gives every boot the model, as before.
+#[test]
+fn the_bluetooth_lend_round_trips_and_is_off_by_default() {
+    assert!(!System::default().bluetooth_lend);
+    assert!(!round_trip("--system --input --bluetooth-trace").bluetooth_lend);
+    let line = format!("--system --storage {DISK} --input {BLUETOOTH_LEND} {BLUETOOTH_TRACE}");
+    let options = round_trip(&line);
+    assert!(options.bluetooth_lend && options.bluetooth_trace);
+    assert_eq!(options.to_string(), line);
 }
 
 #[test]

@@ -136,7 +136,7 @@ pub(super) fn typed_disk(typed: &str) -> Result<Option<String>> {
         && digits(slice)
     {
         anyhow::bail!(
-            "{typed} is a partition; name the whole stick, disk{disk}, which stela erases whole"
+            "{typed} is a partition; name the whole stick, disk{disk}, which stambha erases whole"
         );
     }
     Ok(None)

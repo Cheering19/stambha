@@ -1,101 +1,210 @@
 //! The startup menu's Wi-Fi page (`W` at the menu, `choice::Menu`): the
 //! networks the USB saves, the `--wifi` one first, then each of
-//! `wifi.saved`'s (`options::WIFI_SAVED`). Enter on one has this boot join
-//! it first (`--wifi-prefer`); "Add a network" saves a name and a password
-//! typed here, and Delete forgets a saved network. A password shows as dots
-//! unless Tab shows it; no name or password reaches the log.
+//! `wifi.saved`'s (`options::WIFI_SAVED`), as a panel in the menu's look.
+//! Enter on one has this boot join it first (`--wifi-prefer`); "Join other
+//! network..." saves a name and a password typed in a dialog, and Delete or
+//! Backspace forgets a saved network once Enter confirms it. What the page
+//! holds, how keys change it and what it draws are
+//! `stela_boot_core::wifi_page`'s; this reads and writes the file and paints.
+//! A password shows as dots unless Tab shows it; no name or password reaches
+//! the log.
 use crate::{
     choice::{Press, Wait, key},
     console::{Framebuffer, font},
     output,
     ui::{self, Canvas},
 };
-use alloc::{format, string::String, vec::Vec};
-use stela_boot_core::{options::WIFI_SAVED, wifi_saved};
-use stela_drivers::net::wifi::network::{SSID_BYTES, Secret};
+use alloc::{string::String, vec::Vec};
+use stela_boot_core::{
+    options::{WIFI_SAVED, WIFI_SAVED_NEW},
+    wifi_hardware,
+    wifi_page::{self, Action, Draw, Geometry, Key, Network, Page, Save, Scene, Tone},
+    wifi_saved,
+};
+use stela_drivers::net::wifi::network::Secret;
 use uefi::{
     CString16,
     fs::{FileSystem, PathBuf},
 };
 
-const ROW: usize = 36;
-const ADD: &str = "Add a network...";
+/// Whether the startup menu offers Wi-Fi on this PC, from the firmware's PCI
+/// census before ExitBootServices (`stela_boot_core::wifi_hardware`); one
+/// line says which way it decided.
+pub(crate) fn offered() -> bool {
+    let hardware = match crate::pci_io::capture() {
+        Ok(census) => {
+            let functions: Vec<_> = census
+                .functions
+                .iter()
+                .map(crate::pci_io::FunctionObservation::identity)
+                .collect();
+            let pci = crate::storage::census_pci(&census.functions);
+            wifi_hardware::decide(Ok(wifi_hardware::Census {
+                functions: &functions,
+                unread: census.failures.len(),
+                empty_ports: stela_loader::host_firmware::bundle::empty_ports(&pci).count(),
+            }))
+        }
+        Err(error) => wifi_hardware::decide(Err(&alloc::format!("{error}"))),
+    };
+    output::arguments(format_args!("{}", hardware.line()));
+    hardware.offered()
+}
 
 /// The page until a network is chosen, the one `--wifi` names being
-/// `configured`: the chosen network's name, or `None` when the page is left
-/// with Escape or the console has no input.
-pub(crate) fn run(volume: &mut FileSystem, configured: &str) -> Option<String> {
+/// `configured` and the one chosen before `prefer`: the chosen network's
+/// name, or `None` when the page is left with Escape, the console has no
+/// input, or no `--wifi` is set, when a network can be saved or forgotten
+/// but not chosen.
+pub(crate) fn run(
+    volume: &mut FileSystem,
+    configured: Option<&str>,
+    prefer: Option<&str>,
+) -> Option<String> {
     let (screen, font) = Framebuffer::from_firmware().zip(font::console())?;
     let mut canvas = Canvas::new(screen, font);
-    let mut selected = 0;
-    let mut notice: Option<String> = None;
+    let mut page = Page::new(networks(volume, configured), configured.is_some(), prefer);
     loop {
-        let mut names = Vec::from([String::from(configured)]);
-        names.extend(
-            saved_names(volume)
-                .into_iter()
-                .filter(|name| name != configured),
-        );
-        let items = names.len() + 1;
-        selected = selected.min(items - 1);
-        draw_list(&mut canvas, &names, selected, notice.as_deref());
-        canvas.show();
-        match key(None) {
-            Wait::Key(Press::Up) => selected = (selected + items - 1) % items,
-            Wait::Key(Press::Down) => selected = (selected + 1) % items,
-            Wait::Key(Press::Escape) | Wait::NoInput => return None,
-            Wait::Key(Press::Enter) if selected < names.len() => {
-                return Some(names.swap_remove(selected));
+        let scene = page.scene(geometry(&canvas));
+        paint(&mut canvas, &scene);
+        drop(scene);
+        let key = match key(None) {
+            Wait::Key(press) => translate(press),
+            Wait::NoInput => return None,
+            Wait::Nothing | Wait::Timeout => continue,
+        };
+        match page.press(key) {
+            Action::Stay => {}
+            Action::Leave => return None,
+            Action::Join(name) => return Some(name),
+            Action::Forget(name) => {
+                let forgot = forget(volume, name.as_bytes());
+                page.forgotten(&name, forgot, networks(volume, configured));
             }
-            Wait::Key(Press::Enter) => match add(volume, &mut canvas) {
-                Ok(Some(name)) => return Some(name),
-                Ok(None) => notice = None,
-                Err(why) => notice = Some(String::from(why)),
-            },
-            Wait::Key(Press::Delete) if selected > 0 && selected < names.len() => {
-                notice = Some(match forget(volume, names[selected].as_bytes()) {
-                    Ok(()) => format!("Forgot {}.", names[selected]),
-                    Err(why) => String::from(why),
-                });
+            Action::Save(save) => {
+                let name = save.name.clone();
+                let written = add(volume, save);
+                if let Action::Join(name) = page.saved(&name, written, networks(volume, configured))
+                {
+                    return Some(name);
+                }
             }
-            Wait::Key(_) | Wait::Nothing | Wait::Timeout => {}
         }
     }
 }
 
-/// The networks the saved file names, in order; a name that is not UTF-8
-/// cannot be chosen by name and is left out.
-fn saved_names(volume: &mut FileSystem) -> Vec<String> {
-    let mut file = read(volume);
-    let names = wifi_saved::names(&file)
-        .into_iter()
-        .filter_map(|name| String::from_utf8(name).ok())
-        .collect();
+/// Whether the USB holds a saved networks file, so the menu offers the page
+/// even when no entry sets `--wifi`.
+pub(crate) fn saved(volume: &mut FileSystem) -> bool {
+    path().is_some_and(|path| matches!(volume.try_exists(&path), Ok(true)))
+}
+
+/// A key as the page reads it: Backspace and Tab come as characters.
+fn translate(press: Press) -> Key {
+    match press {
+        Press::Up => Key::Up,
+        Press::Down => Key::Down,
+        Press::Home => Key::Home,
+        Press::End => Key::End,
+        Press::Delete => Key::Delete,
+        Press::Escape => Key::Escape,
+        Press::Enter => Key::Enter,
+        Press::Character('\u{8}') => Key::Backspace,
+        Press::Character('\t') => Key::Tab,
+        Press::Character(character) => Key::Character(character),
+        Press::Left | Press::Right | Press::Other => Key::Other,
+    }
+}
+
+/// The networks the page lists, for the menu to check its preference
+/// against once the page closed (`wifi_page::kept_preference`).
+pub(crate) fn listed(volume: &mut FileSystem, configured: Option<&str>) -> Vec<Network> {
+    networks(volume, configured)
+}
+
+/// The networks to list: `configured`, then the saved file's; the file's
+/// bytes are wiped once read.
+fn networks(volume: &mut FileSystem, configured: Option<&str>) -> Vec<Network> {
+    let mut file = saved_file(volume).unwrap_or_default();
+    let listed = wifi_saved::listing(&file);
     wifi_saved::wipe(&mut file);
-    names
+    wifi_page::networks(configured, listed)
 }
 
 fn path() -> Option<PathBuf> {
     CString16::try_from(WIFI_SAVED).map(PathBuf::from).ok()
 }
 
-/// The saved file's bytes; none when it is absent or unreadable.
-fn read(volume: &mut FileSystem) -> Vec<u8> {
-    path()
-        .and_then(|path| volume.read(&path).ok())
-        .unwrap_or_default()
+/// The copy a write makes first ([`WIFI_SAVED_NEW`]).
+fn spare_path() -> Option<PathBuf> {
+    CString16::try_from(WIFI_SAVED_NEW).map(PathBuf::from).ok()
 }
 
-fn write(volume: &mut FileSystem, bytes: &[u8]) -> Result<(), &'static str> {
-    let path = path().ok_or("The saved networks file has no path.")?;
-    volume
-        .write(&path, bytes)
-        .map_err(|_| "The saved networks could not be written to the USB.")
+/// What `path` holds on `volume`.
+fn stored(volume: &mut FileSystem, path: Option<PathBuf>) -> wifi_saved::Stored {
+    let Some(path) = path else {
+        return wifi_saved::Stored::Unreadable;
+    };
+    match volume.try_exists(&path) {
+        Ok(false) => wifi_saved::Stored::Absent,
+        Ok(true) => match volume.read(&path) {
+            Ok(bytes) => wifi_saved::Stored::Bytes(bytes),
+            Err(_) => wifi_saved::Stored::Unreadable,
+        },
+        Err(_) => wifi_saved::Stored::Unreadable,
+    }
 }
+
+/// The saved networks' bytes as the page and the boot read them
+/// (`wifi_saved::current`): `None` when the file is there but did not read.
+pub(crate) fn saved_file(volume: &mut FileSystem) -> Option<Vec<u8>> {
+    let saved = stored(volume, path());
+    let spare = stored(volume, spare_path());
+    wifi_saved::current(saved, spare)
+}
+
+/// Whether `path` reads back as `bytes`; what was read is wiped.
+fn reads_back(volume: &mut FileSystem, path: &PathBuf, bytes: &[u8]) -> bool {
+    match volume.read(path) {
+        Ok(mut read) => {
+            let same = read == bytes;
+            wifi_saved::wipe(&mut read);
+            same
+        }
+        Err(_) => false,
+    }
+}
+
+/// Write `bytes` as the saved networks. The firmware file protocol has no
+/// truncate and uefi's `write` deletes a file before it writes it again, so
+/// the bytes go to [`WIFI_SAVED_NEW`] first and are read back: a write of
+/// the file itself that stops after the delete leaves that copy, which
+/// [`saved_file`] then reads. The copy goes once the file reads back whole.
+fn write(volume: &mut FileSystem, bytes: &[u8]) -> Result<(), &'static str> {
+    const FAILED: &str = "The saved networks could not be written to the USB.";
+    let path = path().ok_or("The saved networks file has no path.")?;
+    let spare = spare_path().ok_or("The saved networks file has no path.")?;
+    volume.write(&spare, bytes).map_err(|_| FAILED)?;
+    if !reads_back(volume, &spare, bytes) {
+        return Err(FAILED);
+    }
+    volume.write(&path, bytes).map_err(|_| FAILED)?;
+    if !reads_back(volume, &path, bytes) {
+        return Err(FAILED);
+    }
+    // The file is whole: the copy is no longer needed, and one left behind
+    // is read only while the file is absent.
+    let _ = volume.remove_file(&spare);
+    Ok(())
+}
+
+/// Refused when the saved networks are there but did not read: writing a
+/// change over them would erase every network the file holds.
+const UNREAD: &str = "The saved networks could not be read from the USB, so nothing was changed.";
 
 /// Forget the saved network `name`: every line of it leaves the file.
 fn forget(volume: &mut FileSystem, name: &[u8]) -> Result<(), &'static str> {
-    let mut file = read(volume);
+    let mut file = saved_file(volume).ok_or(UNREAD)?;
     let mut kept = wifi_saved::without(&file, name);
     let written = write(volume, &kept);
     wifi_saved::wipe(&mut file);
@@ -110,43 +219,23 @@ fn forget(volume: &mut FileSystem, name: &[u8]) -> Result<(), &'static str> {
     written
 }
 
-/// Ask for a network's name and password and save them: the name, or `None`
-/// when either question is left with Escape.
-fn add(volume: &mut FileSystem, canvas: &mut Canvas) -> Result<Option<String>, &'static str> {
-    let Some(name) = typed(
-        canvas,
-        "Network name",
-        "Type the Wi-Fi network's name exactly.",
-        false,
-    ) else {
-        return Ok(None);
-    };
-    let name = String::from_utf8(name).map_err(|_| "A network name is plain text.")?;
-    if !(1..=SSID_BYTES).contains(&name.len()) {
-        return Err("A network name is 1 to 32 bytes.");
+/// Save the network the dialog took, in place of any line of the same name;
+/// its password is wiped as `save` drops.
+fn add(volume: &mut FileSystem, save: Save) -> Result<(), &'static str> {
+    // The dialog takes only a key `Secret::parse` takes; checked again, as
+    // nothing else stands between it and the file.
+    if Secret::parse(&save.password).is_err() {
+        return Err(wifi_page::PASSWORD_LENGTH);
     }
-    let title = format!("Password for {name}");
-    let Some(mut password) = typed(
-        canvas,
-        &title,
-        "8 to 63 characters, or 64 hex digits. Tab shows or hides it.",
-        true,
-    ) else {
-        return Ok(None);
-    };
-    let usable = Secret::parse(&password).is_ok();
-    if !usable {
-        wifi_saved::wipe(&mut password);
-        return Err("A Wi-Fi password is 8 to 63 characters, or 64 hex digits.");
-    }
-    let mut file = read(volume);
-    let mut updated = wifi_saved::without(&file, name.as_bytes());
-    let mut line = wifi_saved::line(name.as_bytes(), &password);
+    let mut file = saved_file(volume).ok_or(UNREAD)?;
+    let mut updated = wifi_saved::without(&file, save.name.as_bytes());
+    let mut line = wifi_saved::line(save.name.as_bytes(), &save.password);
     updated.extend_from_slice(&line);
     let written = write(volume, &updated);
-    for bytes in [&mut password, &mut file, &mut updated, &mut line] {
+    for bytes in [&mut file, &mut updated, &mut line] {
         wifi_saved::wipe(bytes);
     }
+    drop(save);
     output::arguments(format_args!(
         "CHOICE Wi-Fi: a network saved at the menu ({}; its name and password are not logged)\n",
         match written {
@@ -154,105 +243,50 @@ fn add(volume: &mut FileSystem, canvas: &mut Canvas) -> Result<Option<String>, &
             Err(_) => "not written",
         }
     ));
-    written.map(|()| Some(name))
+    written
 }
 
-/// One line of text typed in, `secret` showing it as dots until Tab: the
-/// bytes, or `None` on Escape.
-fn typed(canvas: &mut Canvas, title: &str, hint: &str, secret: bool) -> Option<Vec<u8>> {
-    let mut text: Vec<u8> = Vec::new();
-    let mut shown = !secret;
-    loop {
-        let field = match shown {
-            true => String::from_utf8_lossy(&text).into_owned(),
-            false => "\u{2022}".repeat(text.len()),
-        };
-        draw_field(canvas, title, hint, &field);
-        canvas.show();
-        match key(None) {
-            Wait::Key(Press::Enter) => return Some(text),
-            Wait::Key(Press::Escape) | Wait::NoInput => {
-                wifi_saved::wipe(&mut text);
-                return None;
-            }
-            Wait::Key(Press::Character('\u{8}')) => {
-                if let Some(last) = text.last_mut() {
-                    *last = 0;
-                }
-                text.pop();
-            }
-            Wait::Key(Press::Character('\t')) if secret => shown = !shown,
-            Wait::Key(Press::Character(character)) if !character.is_control() => {
-                let mut bytes = [0; 4];
-                let encoded = character.encode_utf8(&mut bytes).as_bytes();
-                // Room for a PSK's 64 digits; a name stops at 32 bytes.
-                let limit = match secret {
-                    true => 64,
-                    false => SSID_BYTES,
-                };
-                if text.len() + encoded.len() <= limit {
-                    text.extend_from_slice(encoded);
-                }
-            }
-            Wait::Key(_) | Wait::Nothing | Wait::Timeout => {}
-        }
+/// The canvas as the page lays out on it.
+fn geometry(canvas: &Canvas) -> Geometry {
+    let (width, height) = canvas.size();
+    Geometry {
+        width,
+        height,
+        top: ui::HEADER + 24,
+        glyph: canvas.text_width(" ", 1),
     }
 }
 
-/// The page's frame: the header, a title and the column the rows fill.
-fn frame(canvas: &mut Canvas, title: &str) -> (usize, usize, usize) {
+fn colour(tone: Tone) -> u32 {
+    match tone {
+        Tone::Background => ui::BACKGROUND,
+        Tone::Card => ui::CARD,
+        Tone::Raised => ui::RAISED,
+        Tone::Text => ui::TEXT,
+        Tone::Dim => ui::DIM,
+        Tone::Orange => ui::ORANGE,
+        Tone::Blue => ui::BLUE,
+        Tone::Red => ui::RED,
+    }
+}
+
+/// The page's background and header, then `scene`, shown at once.
+fn paint(canvas: &mut Canvas, scene: &Scene) {
     let (width, height) = canvas.size();
     canvas.fill(0, 0, width, height, ui::BACKGROUND);
-    let top = canvas.header() + 24;
-    let column = width.saturating_sub(32).min(440);
-    let left = (width - column) / 2;
-    canvas.text(left + 16, top, title, 1, ui::TEXT);
-    (left, top + 40, column)
-}
-
-/// The footer: a notice in orange, else the keys, dim.
-fn footer(canvas: &mut Canvas, notice: Option<&str>, keys: &str) {
-    let (width, height) = canvas.size();
-    let (text, colour) = match notice {
-        Some(notice) => (notice, ui::ORANGE),
-        None => (keys, ui::DIM),
-    };
-    canvas.text_centred(width / 2, height.saturating_sub(56), text, 1, colour);
-}
-
-fn draw_list(canvas: &mut Canvas, names: &[String], selected: usize, notice: Option<&str>) {
-    let (left, top, column) = frame(canvas, "Wi-Fi networks");
-    let (_, height) = canvas.size();
-    let rows: Vec<&str> = names.iter().map(String::as_str).chain([ADD]).collect();
-    let fits = (height.saturating_sub(top + 120) / ROW).max(1);
-    let first = stela_boot_core::screen::window(selected, rows.len(), fits);
-    let mut y = top;
-    for index in (first..rows.len()).take(fits) {
-        if index == selected {
-            canvas.panel(left, y, column, ROW - 4, 8, ui::RAISED);
-            canvas.panel(left + 6, y + 9, 3, ROW - 22, 1, ui::ORANGE);
+    canvas.header();
+    for draw in &scene.draws {
+        match draw {
+            Draw::Panel {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                tone,
+            } => canvas.panel(*x, *y, *width, *height, *radius, colour(*tone)),
+            Draw::Text { x, y, text, tone } => canvas.text(*x, *y, text, 1, colour(*tone)),
         }
-        let colour = match index == rows.len() - 1 {
-            true => ui::BLUE,
-            false => ui::TEXT,
-        };
-        canvas.text(left + 20, y + 8, rows[index], 1, colour);
-        if index == 0 {
-            canvas.text_right(left + column - 16, y + 8, "default", 1, ui::DIM);
-        }
-        y += ROW;
     }
-    footer(
-        canvas,
-        notice,
-        "Enter: join first this boot   Delete: forget   Esc: back",
-    );
-}
-
-fn draw_field(canvas: &mut Canvas, title: &str, hint: &str, field: &str) {
-    let (left, top, column) = frame(canvas, title);
-    canvas.panel(left, top, column, ROW, 8, ui::RAISED);
-    canvas.text(left + 16, top + 10, field, 1, ui::TEXT);
-    canvas.text(left + 16, top + ROW + 16, hint, 1, ui::DIM);
-    footer(canvas, None, "Enter: next   Esc: back");
+    canvas.show();
 }

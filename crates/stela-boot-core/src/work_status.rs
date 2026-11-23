@@ -35,9 +35,11 @@ pub enum Cause {
 /// The reason line for `cause`, `detail` naming the refusal the log has.
 pub fn reason(cause: Cause, detail: &str) -> String {
     let what = match cause {
-        Cause::Records => "the loader's records of its work stacks are not intact (a Stela fault)",
+        Cause::Records => {
+            "the loader's records of its work stacks are not intact (a Stambha fault)"
+        }
         Cause::Capture => {
-            "Stela did not keep the firmware's memory map and PCI and ACPI settings (a Stela fault)"
+            "Stambha did not keep the firmware's memory map and PCI and ACPI settings (a Stambha fault)"
         }
         Cause::Processor => "the engine is not on the processor the firmware booted",
         Cause::Clock => "the processor's time-stamp counter rate was not measured",
@@ -46,7 +48,7 @@ pub fn reason(cause: Cause, detail: &str) -> String {
             "the firmware's memory type ranges (MTRRs) do not make the work stacks' memory \
              write-back; a firmware (BIOS) update may correct them"
         }
-        Cause::Code => "Stela's code is not kept where the firmware loaded it",
+        Cause::Code => "Stambha's code is not kept where the firmware loaded it",
         Cause::Continuation => "the boot processor refused to run on the work stacks",
         Cause::Memory => "there was no memory left for the work stacks' records",
     };
@@ -59,7 +61,7 @@ pub fn reason(cause: Cause, detail: &str) -> String {
 /// methods and the GPU need those stacks.
 pub fn foreground(reason: &str) -> String {
     format!(
-        "Starting the disks and USB devices without Stela's work stacks, so without the \
+        "Starting the disks and USB devices without Stambha's work stacks, so without the \
          firmware's ACPI methods and without a GPU: {reason}"
     )
 }
@@ -67,7 +69,7 @@ pub fn foreground(reason: &str) -> String {
 /// The screen line for a GPU left unstarted because the owned work stacks are
 /// unavailable for `reason`.
 pub fn gpu_without_work(reason: &str) -> String {
-    format!("the GPU needs Stela's work stacks, which this PC did not allow: {reason}")
+    format!("the GPU needs Stambha's work stacks, which this PC did not allow: {reason}")
 }
 
 /// The screen line for a GPU left unstarted because no steady service clock
@@ -95,7 +97,7 @@ pub fn devices_failed(timed_out: bool, limit_s: u64, detail: &str) -> String {
              every device's own limit ({detail})"
         )
     } else {
-        format!("the disks and USB devices could not start on Stela's work stacks ({detail})")
+        format!("the disks and USB devices could not start on Stambha's work stacks ({detail})")
     }
 }
 
@@ -130,11 +132,11 @@ mod tests {
             reason(
                 Cause::Capture,
                 "firmware records: the firmware's final memory map has 700 entries, more \
-                 than the 512 Stela keeps"
+                 than the 512 Stambha keeps"
             ),
-            "Stela did not keep the firmware's memory map and PCI and ACPI settings (a Stela \
+            "Stambha did not keep the firmware's memory map and PCI and ACPI settings (a Stambha \
              fault) (firmware records: the firmware's final memory map has 700 entries, \
-             more than the 512 Stela keeps)"
+             more than the 512 Stambha keeps)"
         );
     }
 
@@ -149,7 +151,7 @@ mod tests {
         assert!(line.ends_with("booted (x)"), "{line}");
         let gpu = gpu_without_work("r");
         assert!(
-            gpu.starts_with("the GPU needs Stela's work stacks"),
+            gpu.starts_with("the GPU needs Stambha's work stacks"),
             "{gpu}"
         );
         assert!(gpu.ends_with(": r"), "{gpu}");

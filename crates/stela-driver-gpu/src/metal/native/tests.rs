@@ -20,6 +20,17 @@ mod lifecycle;
 mod submission;
 
 #[test]
+fn only_nvk_is_asked_for_internal_representations() {
+    use crate::metal::vulkan::DriverId;
+    assert!(super::reads_representations(DriverId::MesaNvk));
+    // RADV dereferences the representation it never kept without the
+    // capture flag; ANV and Venus are not asked either.
+    assert!(!super::reads_representations(DriverId::MesaRadv));
+    assert!(!super::reads_representations(DriverId::IntelOpenSourceMesa));
+    assert!(!super::reads_representations(DriverId::MesaVenus));
+}
+
+#[test]
 fn in_flight_retirement_observes_a_timeline_once_per_ready_run() {
     let main = vk::Semaphore::from_raw(1);
     let sparse_step = vk::Semaphore::from_raw(2);

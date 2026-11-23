@@ -5,21 +5,21 @@ Download the archive for your system, unpack it and plug in the USB stick. Then 
 Make a new stick (this erases it):
 
 ```
-sudo ./stela
+sudo ./stambha
 ```
 
-Update an existing Stela stick to v@VERSION@:
+Update an existing Stambha stick to v@VERSION@:
 
 ```
-sudo ./stela update
+sudo ./stambha update
 ```
 
-On Windows, open Terminal with Run as administrator and write `.\stela.exe` in place of `sudo ./stela`.
+On Windows, open Terminal with Run as administrator and write `.\stambha.exe` in place of `sudo ./stambha`.
 
-On macOS, stela is not notarized. If macOS says it cannot be opened, run this once in the unpacked folder:
+On macOS, stambha is not notarized. If macOS says it cannot be opened, run this once in the unpacked folder:
 
 ```
-xattr -d com.apple.quarantine stela
+xattr -d com.apple.quarantine stambha
 ```
 
 Then boot the PC from the stick.
@@ -28,8 +28,8 @@ Then boot the PC from the stick.
 
 ## Boot log
 
-If Stela does not work, save the boot log and include `log.txt` in your report:
+If Stambha does not work, save the boot log and include `log.txt` in your report:
 
 ```
-sudo ./stela log --output log.txt
+sudo ./stambha log --output log.txt
 ```

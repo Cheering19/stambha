@@ -74,6 +74,37 @@ fn decode(word: &[u8]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// What a read of a saved networks file found.
+pub enum Stored {
+    /// No such file.
+    Absent,
+    /// Its bytes.
+    Bytes(Vec<u8>),
+    /// The file is there but did not read.
+    Unreadable,
+}
+
+/// The saved networks: [`WIFI_SAVED`](crate::options::WIFI_SAVED)'s bytes
+/// (`saved`) when it reads, else, when a menu write it could not finish left
+/// it absent, the copy that write made first
+/// ([`WIFI_SAVED_NEW`](crate::options::WIFI_SAVED_NEW), `spare`); empty when
+/// neither is there. `None` when the one that counts is there but does not
+/// read: it is not an empty file, and a change written over it would erase
+/// every network it holds. The bytes not returned are wiped.
+pub fn current(saved: Stored, spare: Stored) -> Option<Vec<u8>> {
+    let (chosen, mut other) = match (saved, spare) {
+        (Stored::Bytes(bytes), spare) => (Some(bytes), spare),
+        (Stored::Unreadable, spare) => (None, spare),
+        (Stored::Absent, Stored::Bytes(bytes)) => (Some(bytes), Stored::Absent),
+        (Stored::Absent, Stored::Absent) => (Some(Vec::new()), Stored::Absent),
+        (Stored::Absent, Stored::Unreadable) => (None, Stored::Absent),
+    };
+    if let Stored::Bytes(bytes) = &mut other {
+        wipe(bytes);
+    }
+    chosen
+}
+
 /// Overwrite a decoded secret before its memory is freed.
 pub fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
@@ -102,15 +133,38 @@ fn named_lines(file: &[u8]) -> impl Iterator<Item = (&[u8], Option<Vec<u8>>)> {
 /// name each line holds, whether or not its secret is usable, its secret
 /// never decoded; each name once.
 pub fn names(file: &[u8]) -> Vec<Vec<u8>> {
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    for (_, name) in named_lines(file) {
-        if let Some(name) = name.filter(|name| (1..=SSID_BYTES).contains(&name.len()))
-            && !names.contains(&name)
-        {
-            names.push(name);
+    listing(file)
+        .into_iter()
+        .map(|listed| listed.name)
+        .collect()
+}
+
+/// One saved network as the startup menu's Wi-Fi page lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    /// One to [`SSID_BYTES`] bytes, decoded.
+    pub name: Vec<u8>,
+    /// A line of it is one usable network ([`parse`]); its secret is
+    /// decoded to tell, and wiped, as [`parse`] does.
+    pub usable: bool,
+}
+
+/// The networks `file` saves, in order, each once: the names [`names`]
+/// gives, each with whether a line of it is one a boot can join.
+pub fn listing(file: &[u8]) -> Vec<Listed> {
+    let mut listed: Vec<Listed> = Vec::new();
+    for (line, name) in named_lines(file) {
+        let Some(name) = name.filter(|name| (1..=SSID_BYTES).contains(&name.len())) else {
+            continue;
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line).trim_ascii();
+        let usable = network(line).is_some();
+        match listed.iter_mut().find(|known| known.name == name) {
+            Some(known) => known.usable |= usable,
+            None => listed.push(Listed { name, usable }),
         }
     }
-    names
+    listed
 }
 
 /// `file` without the lines of the network `ssid`, as the menu forgets it
@@ -136,8 +190,11 @@ pub fn line(ssid: &[u8], secret: &[u8]) -> Vec<u8> {
         if n == 1 {
             line.push(b' ');
         }
-        for &byte in word {
-            if byte == b'%' || byte <= b' ' || byte >= 0x7f {
+        for (at, &byte) in word.iter().enumerate() {
+            // A line that starts with `#` reads as a comment, so a name's
+            // leading `#` is written as `%23`.
+            let comment = n == 0 && at == 0 && byte == b'#';
+            if comment || byte == b'%' || byte <= b' ' || byte >= 0x7f {
                 line.extend_from_slice(alloc::format!("%{byte:02X}").as_bytes());
             } else {
                 line.push(byte);
@@ -158,6 +215,46 @@ mod tests {
             .iter()
             .map(|network| &network.ssid[..])
             .collect()
+    }
+
+    #[test]
+    fn a_name_that_starts_with_a_hash_is_saved_as_a_network_not_a_comment() {
+        let mut file = line(b"#Home", b"hunter2hunter2");
+        assert_eq!(file, b"%23Home hunter2hunter2\n");
+        let saved = parse(&file);
+        assert_eq!(saved_names(&saved), [&b"#Home"[..]]);
+        assert_eq!(names(&file), [b"#Home".to_vec()]);
+        // Forgotten again by its name.
+        assert!(without(&file, b"#Home").is_empty());
+        // A `#` past the first byte, or in the secret, is written as it is.
+        assert_eq!(line(b"Home#2", b"pass#word1"), b"Home#2 pass#word1\n");
+        wipe(&mut file);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_never_taken_for_an_empty_one() {
+        let bytes = |text: &[u8]| Stored::Bytes(text.to_vec());
+        // The file, whatever the spare holds.
+        assert_eq!(
+            current(bytes(b"Home pass1234"), bytes(b"Old pass1234")),
+            Some(b"Home pass1234".to_vec())
+        );
+        assert_eq!(
+            current(bytes(b"Home pass1234"), Stored::Unreadable),
+            Some(b"Home pass1234".to_vec())
+        );
+        // There but unreadable: nothing to write over, spare or not.
+        assert_eq!(current(Stored::Unreadable, Stored::Absent), None);
+        assert_eq!(current(Stored::Unreadable, bytes(b"New pass1234")), None);
+        // Left absent by a write that deleted it and stopped: the copy that
+        // write made first.
+        assert_eq!(
+            current(Stored::Absent, bytes(b"New pass1234")),
+            Some(b"New pass1234".to_vec())
+        );
+        assert_eq!(current(Stored::Absent, Stored::Unreadable), None);
+        // Never saved: empty.
+        assert_eq!(current(Stored::Absent, Stored::Absent), Some(Vec::new()));
     }
 
     #[test]
@@ -206,6 +303,36 @@ mod tests {
             super::names(file),
             [b"home".to_vec(), b"Mom's phone".to_vec()]
         );
+    }
+
+    #[test]
+    fn the_listing_tells_which_saved_keys_a_boot_can_use() {
+        let file = b"# mine\nhome bad\ncafe coffee-time\nhome secret-two\nlab short\n";
+        let listed = listing(file);
+        let names: Vec<(&[u8], bool)> = listed
+            .iter()
+            .map(|listed| (&listed.name[..], listed.usable))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (&b"home"[..], true),
+                (&b"cafe"[..], true),
+                (&b"lab"[..], false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_password_with_spaces_and_percent_signs_round_trips() {
+        let written = line(b"Cafe 5G", b"100% pass word");
+        let saved = parse(&written);
+        assert_eq!(saved.unusable, 0);
+        let Secret::Passphrase(phrase) = &saved.networks[0].secret else {
+            panic!("passphrase expected");
+        };
+        assert_eq!(phrase.as_bytes(), b"100% pass word");
+        assert_eq!(listing(&written)[0].name, b"Cafe 5G".to_vec());
     }
 
     #[test]

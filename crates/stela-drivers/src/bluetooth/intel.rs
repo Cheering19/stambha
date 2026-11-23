@@ -182,9 +182,12 @@ pub enum Error {
         cleanup: Box<super::intel_pcie::Error>,
     },
 }
+/// The failure line prints no byte the controller sent: an identity's
+/// address shows its vendor half and last byte, its TLVs their lengths, and
+/// any other byte list its length (`super::redacted`).
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Intel Bluetooth {self:?}")
+        write!(f, "Intel Bluetooth {}", super::redacted::Lists(self))
     }
 }
 impl core::error::Error for Error {}

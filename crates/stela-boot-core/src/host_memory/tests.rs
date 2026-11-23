@@ -430,7 +430,7 @@ fn too_little_ram_says_how_much_is_needed() {
     let refusal = staged(4 * GIB, 8, 8).unwrap_err();
     assert_eq!(
         refusal.to_string(),
-        "this PC has 4.0 GB of RAM free; Stela needs at least 7 GB free: \
+        "this PC has 4.0 GB of RAM free; Stambha needs at least 7 GB free: \
          3 GB for macOS and the rest for its own memory"
     );
     let two_cores = staged(5 * GIB, 2, 2).unwrap_err();
@@ -717,7 +717,7 @@ fn a_host_short_of_an_integrated_gpus_least_share_is_refused() {
     let refusal = sizes(6 * GIB, 8, 8, GpuMemory::Shared).unwrap_err();
     assert_eq!(
         refusal.to_string(),
-        "this PC has 6.0 GB of RAM free; Stela needs at least 7 GB free: 3 GB for macOS \
+        "this PC has 6.0 GB of RAM free; Stambha needs at least 7 GB free: 3 GB for macOS \
          and the rest for its own memory and the graphics built into the processor"
     );
 }

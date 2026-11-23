@@ -72,22 +72,22 @@ impl Stick {
     /// What it holds, in a few words.
     fn summary(&self) -> String {
         let stela = || match self.record.as_ref().and_then(|r| r.release.clone()) {
-            Some(version) => format!("Stela {version}"),
-            None => "Stela".into(),
+            Some(version) => format!("Stambha {version}"),
+            None => "Stambha".into(),
         };
         match &self.state {
             State::Empty if self.disk.bytes < NETWORK_MIN => {
                 "too small: an installer needs 8 GB or more".into()
             }
             State::Empty if self.disk.partitions.is_empty() => "empty".into(),
-            State::Empty => "no Stela on it".into(),
+            State::Empty => "no Stambha on it".into(),
             State::Interrupted => "a create stopped part way".into(),
             State::Replacing(_) => format!("{}, a macOS switch stopped part way", stela()),
-            State::Newer(version) => format!("Stela {version}, newer than this stela"),
+            State::Newer(version) => format!("Stambha {version}, newer than this stambha"),
             State::Older => format!("{}, update available", stela()),
             State::Damaged(_) => format!("{}, needs repair", stela()),
             State::Healthy => stela(),
-            State::Unreadable(_) => "may hold Stela: its record cannot be read".into(),
+            State::Unreadable(_) => "may hold Stambha: its record cannot be read".into(),
         }
     }
 
@@ -104,7 +104,7 @@ impl Stick {
         Some(format!(
             "{} · {} · macOS {}",
             match &record.release {
-                Some(version) => format!("Stela {version}"),
+                Some(version) => format!("Stambha {version}"),
                 None => "Stela 0.3 or older".into(),
             },
             record.install_kind().name(),
@@ -119,13 +119,13 @@ impl Stick {
             State::Empty if self.disk.bytes < NETWORK_MIN => None,
             // Without a terminal, erasing needs the stick typed back.
             State::Empty => Some(format!(
-                "stela create {} --confirm-disk {}",
+                "stambha create {} --confirm-disk {}",
                 self.path(),
                 host::size_text(self.disk.bytes).replace(' ', "")
             )),
             _ => self.due().map(|action| match several {
-                true => format!("stela {} {}", super::command_words(&action), self.path()),
-                false => format!("stela {}", super::command_words(&action)),
+                true => format!("stambha {} {}", super::command_words(&action), self.path()),
+                false => format!("stambha {}", super::command_words(&action)),
             }),
         }
     }
@@ -298,12 +298,12 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
             State::Newer(version) => {
                 let _ = writeln!(
                     text,
-                    "  This stela is {}. Download stela {version} or newer to change this stick.",
+                    "  This stambha is {}. Download stambha {version} or newer to change this stick.",
                     release::CURRENT
                 );
             }
             State::Older => {
-                let _ = writeln!(text, "  This stela is {}.", release::CURRENT);
+                let _ = writeln!(text, "  This stambha is {}.", release::CURRENT);
             }
             State::Damaged(problems) => {
                 for problem in problems {
@@ -356,7 +356,7 @@ pub(super) fn run(environment: &Environment<'_>, request: Request) -> Result<()>
         }
         return Ok(());
     }
-    ui.intro(&format!("Stela {}", release::CURRENT))?;
+    ui.intro(&format!("Stambha {}", release::CURRENT))?;
     match look(environment, request) {
         // Escape at a question stops there; what ran before it stays done.
         Err(error) if super::ui::cancelled(&error) => ui.cancel("Stopped."),
@@ -577,7 +577,7 @@ fn row(choice: Choice, stick: &Stick, offers: &Offers, first: bool) -> super::wi
         }
         Choice::Update if first => ("Update".into(), ""),
         Choice::Update => (
-            format!("Update to Stela {}", release::CURRENT),
+            format!("Update to Stambha {}", release::CURRENT),
             offers.update.as_str(),
         ),
         Choice::Repair => (
@@ -678,7 +678,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         }
         State::Newer(version) => {
             ui.warning(&format!(
-                "This stick has Stela {version}, newer than this stela ({}). Download stela \
+                "This stick has Stambha {version}, newer than this stambha ({}). Download stambha \
                  {version} or newer to change it.",
                 release::CURRENT
             ))?;
@@ -687,7 +687,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         State::Older => {
             ui.info(&offers.update)?;
             first(
-                &format!("Update this stick to Stela {}?", release::CURRENT),
+                &format!("Update this stick to Stambha {}?", release::CURRENT),
                 &[Choice::Update],
             )?
         }
@@ -705,7 +705,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         // Erasing it is a choice of its own, never the way in.
         State::Unreadable(reason) => {
             ui.warning(&format!(
-                "This stick may hold Stela, but stela cannot read it: {}",
+                "This stick may hold Stambha, but stambha cannot read it: {}",
                 sentence(reason)
             ))?;
             Choice::Other
@@ -802,11 +802,11 @@ fn update_text(environment: &Environment<'_>, record: Option<&Record>) -> String
             sources::locate(environment, &lookup).ok()
         });
     match download {
-        None => "Updates Stela on the stick; its boot files stay.".into(),
+        None => "Updates Stambha on the stick; its boot files stay.".into(),
         Some(source) => match sources::download_bytes(&source) {
-            0 => "Updates Stela on the stick and prepares the boot files again.".into(),
+            0 => "Updates Stambha on the stick and prepares the boot files again.".into(),
             bytes => format!(
-                "Updates Stela on the stick and prepares the boot files again (downloads {}).",
+                "Updates Stambha on the stick and prepares the boot files again (downloads {}).",
                 host::size_text(bytes)
             ),
         },
@@ -943,7 +943,7 @@ pub(super) fn perform(environment: &Environment<'_>, request: Request) -> Result
 }
 
 /// How a run that changed the stick closes.
-const DONE: &str = "Done. Check it any time with `stela status`.";
+const DONE: &str = "Done. Check it any time with `stambha status`.";
 
 /// Run `request` and show what it did, or save it to the request's output
 /// file; and the line that closes the run: where the file went, what

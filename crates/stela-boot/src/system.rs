@@ -21,7 +21,7 @@ use alloc::{format, string::String, vec::Vec};
 use core::{arch::asm, ops::Range, ptr::NonNull};
 use stela_boot_core::firmware_map::{self, RuntimeMapping};
 use stela_boot_core::firmware_runtime;
-use stela_boot_core::options::{DEFAULT_WIFI_KEY, System, WIFI_SAVED};
+use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_runtime::pc;
@@ -323,14 +323,13 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
             volume.read(uefi::fs::PathBuf::from(path)).ok()
         })
         .unwrap_or_default();
-    // The other saved networks, beside the key: none when the file is absent.
+    // The other saved networks, beside the key: none when the file is absent
+    // or unreadable; the copy a menu write left when it could not finish the
+    // file stands for an absent one (`wifi_menu::saved_file`).
     let wifi_saved = system
         .ssid
         .as_ref()
-        .and_then(|_| {
-            let path = uefi::CString16::try_from(WIFI_SAVED).ok()?;
-            volume.read(uefi::fs::PathBuf::from(path)).ok()
-        })
+        .and_then(|_| crate::wifi_menu::saved_file(&mut volume))
         .unwrap_or_default();
     let host_devices = system.storage.is_some()
         || system.preboot.is_some()
@@ -344,7 +343,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.install.is_some()
         || system.guest_network;
     let storage = if host_devices {
-        crate::status::begin("Finding the PCI devices Stela drives itself");
+        crate::status::begin("Finding the PCI devices Stambha drives itself");
         let found = storage::discover()?;
         crate::status::done("");
         if let Some(notice) = storage::gpu_notice_found() {
@@ -764,11 +763,11 @@ fn translation_store(
             crate::status::warn(&format!("this PC's memory has no room for it; {stays}"))
         }
         PackRead::Whole(bytes) => crate::status::warn(&format!(
-            "{} MB; {stays}: `stela repair` on another computer prepares the file",
+            "{} MB; {stays}: `stambha repair` on another computer prepares the file",
             mb(bytes)
         )),
         PackRead::None => crate::status::warn(&format!(
-            "{stays}: `stela repair` on another computer prepares the file"
+            "{stays}: `stambha repair` on another computer prepares the file"
         )),
     }
     if files.len() < MAX_FILES {
@@ -843,7 +842,7 @@ fn load(
     // copy comes between.
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
     let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
-    crate::status::begin("Setting up Stela's memory");
+    crate::status::begin("Setting up Stambha's memory");
     let image = memory::prepare_image(&snapshot)?;
     let mut memory = memory::reserve(cores, &image.ram, system.code_window)?;
     let tsc_hz = crate::firmware::tsc_hz();

@@ -22,7 +22,7 @@ const SUPPORTED_INTEL: &str = "an Intel GPU from 6th generation Core processors 
 /// display mux whose integrated GPU Stela does not start).
 pub fn shown_by_copy(gpu: &str) -> String {
     format!(
-        "No screen is connected to the {gpu}, so Stela copies each frame of macOS to the screen \
+        "No screen is connected to the {gpu}, so Stambha copies each frame of macOS to the screen \
          the PC started on. The picture is slower than on a screen connected to the GPU."
     )
 }
@@ -49,7 +49,7 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     match drawer {
         Some(_) => format!("the {gpu} shows the picture on the screens wired to it"),
         None => format!(
-            "the {gpu} only shows screens wired to it: this Stela has no Vulkan driver for it"
+            "the {gpu} only shows screens wired to it: this Stambha has no Vulkan driver for it"
         ),
     }
 }
@@ -139,11 +139,11 @@ pub enum Reason {
 const HOLDS: &str = "the USB holds the firmware for";
 /// Its end when reading them before the firmware's exit failed.
 const READ_FAILED: &str = ", but reading it from the USB failed. The boot log on this USB \
-    says why; `stela repair` on another computer writes the files again";
+    says why; `stambha repair` on another computer writes the files again";
 /// Its end when they were not read because the GPU answered only after the
 /// firmware's exit.
 const NOT_READ: &str = ", but it was not read: the GPU answered only after the PC's firmware \
-    handed over to Stela. The boot log on this USB says why";
+    handed over to Stambha. The boot log on this USB says why";
 
 /// The screen line for the GPU `device` of `vendor`, `name` by its market
 /// name, at PCI `address` that did not start for `reason`, `why` the
@@ -163,7 +163,7 @@ pub fn refused(
         return match (reason, why.is_empty()) {
             (Reason::MissingFirmware, _) => format!(
                 "the USB has no firmware for {gpu}. On another computer, plug in this USB and \
-                 run `stela repair`"
+                 run `stambha repair`"
             ),
             (Reason::FirmwareReadFailed, _) => format!("{HOLDS} {gpu}{READ_FAILED}"),
             (Reason::FirmwareNotRead, _) => format!("{HOLDS} {gpu}{NOT_READ}"),
@@ -177,10 +177,12 @@ pub fn refused(
     }
     // Whether Stela's GPU driver runs the chip at all.
     match (nvidia_chip(device).is_some(), reason) {
-        (false, _) => format!("the {name} at {address} is not supported: Stela needs {SUPPORTED}"),
+        (false, _) => {
+            format!("the {name} at {address} is not supported: Stambha needs {SUPPORTED}")
+        }
         (true, Reason::MissingFirmware) => format!(
             "the USB has no firmware for this PC's {name}. On another computer, plug in this USB \
-             and run `stela repair`"
+             and run `stambha repair`"
         ),
         (true, Reason::FirmwareReadFailed) => {
             format!("{HOLDS} this PC's {name} at {address}{READ_FAILED}")
@@ -298,11 +300,11 @@ pub fn driver_stopped(
     };
     match (failed_start, firmware) {
         (Some(error), Some(firmware)) => format!(
-            "{gpu} did not start ({error}). {firmware}. Stela cannot yet finish the GPU \
+            "{gpu} did not start ({error}). {firmware}. Stambha cannot yet finish the GPU \
              driver's cleanup after that ({stop})"
         ),
         (Some(error), None) => format!(
-            "{gpu} did not start ({error}), and Stela cannot yet finish the GPU driver's \
+            "{gpu} did not start ({error}), and Stambha cannot yet finish the GPU driver's \
              cleanup after that ({stop})"
         ),
         (None, _) => format!("the GPU driver stopped: {stop}"),
@@ -542,14 +544,14 @@ pub fn none(adapters: &[Adapter], ports: &[Vendor]) -> String {
     let amd = ports.contains(&Vendor::Amd);
     let intel = ports.contains(&Vendor::Intel);
     if !amd && !intel {
-        return format!("this PC has no NVIDIA GPU{only}: Stela needs {SUPPORTED}");
+        return format!("this PC has no NVIDIA GPU{only}: Stambha needs {SUPPORTED}");
     }
     let mut needed = alloc::vec![SUPPORTED];
     needed.extend(amd.then_some(SUPPORTED_AMD));
     needed.extend(intel.then_some(SUPPORTED_INTEL));
     let (last, rest) = needed.split_last().unwrap_or((&SUPPORTED, &[]));
     format!(
-        "this PC has no GPU Stela drives{only}: Stela needs {}, or {last}",
+        "this PC has no GPU Stambha drives{only}: Stambha needs {}, or {last}",
         rest.join(", ")
     )
 }
@@ -579,7 +581,7 @@ mod tests {
                 .starts_with("the USB has no firmware for the Intel Iris Xe Graphics at 00:02.0"),
             "{missing}"
         );
-        assert!(missing.ends_with("run `stela repair`"), "{missing}");
+        assert!(missing.ends_with("run `stambha repair`"), "{missing}");
         let named = refused(
             Vendor::Intel,
             gpu,
@@ -789,7 +791,7 @@ mod tests {
             missing.contains("this PC's NVIDIA GeForce RTX 3070."),
             "{missing}"
         );
-        assert!(missing.ends_with("run `stela repair`"), "{missing}");
+        assert!(missing.ends_with("run `stambha repair`"), "{missing}");
         // The files are on the USB: no `stela repair` for a GPU that
         // answered late, and the USB is not said to lack them.
         let laptop = "NVIDIA GeForce RTX 4060 Max-Q / Mobile";
@@ -805,7 +807,7 @@ mod tests {
             late,
             "the USB holds the firmware for this PC's NVIDIA GeForce RTX 4060 Max-Q / Mobile at \
              01:00.0, but it was not read: the GPU answered only after the PC's firmware handed \
-             over to Stela. The boot log on this USB says why"
+             over to Stambha. The boot log on this USB says why"
         );
         let failed = refused(
             Vendor::Nvidia,
@@ -877,10 +879,12 @@ mod tests {
         );
         assert_eq!(
             pascal,
-            "the NVIDIA GeForce GTX 1080 at 01:00.0 is not supported: Stela needs an NVIDIA \
+            "the NVIDIA GeForce GTX 1080 at 01:00.0 is not supported: Stambha needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none(&[], &[Vendor::Nvidia]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(
+            none(&[], &[Vendor::Nvidia]).starts_with("this PC has no NVIDIA GPU: Stambha needs")
+        );
     }
 
     #[test]
@@ -906,24 +910,24 @@ mod tests {
         assert_eq!(
             none(&[amd, intel, other], &[Vendor::Nvidia]),
             "this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX and the Intel UHD \
-             Graphics 770: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series \
+             Graphics 770: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series \
              GPU"
         );
         assert_eq!(
             none(&[other], &[Vendor::Nvidia]),
-            "this PC has no NVIDIA GPU: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 \
+            "this PC has no NVIDIA GPU: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 \
              or 50 series GPU"
         );
         // One with the AMD and Intel ports says what else it drives.
         assert_eq!(
             none(&[other], &[Vendor::Nvidia, Vendor::Amd, Vendor::Intel]),
-            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+            "this PC has no GPU Stambha drives: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, \
              30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from \
              6th generation Core processors on"
         );
         assert_eq!(
             none(&[], &[Vendor::Nvidia, Vendor::Amd]),
-            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+            "this PC has no GPU Stambha drives: Stambha needs an NVIDIA GeForce GTX 16 or RTX 20, \
              30, 40 or 50 series GPU, or an AMD Radeon RX Vega or later GPU"
         );
     }
@@ -961,7 +965,7 @@ mod tests {
         );
         assert_eq!(
             shown_by_copy(amd),
-            "No screen is connected to the AMD Radeon Graphics, so Stela copies each frame of \
+            "No screen is connected to the AMD Radeon Graphics, so Stambha copies each frame of \
              macOS to the screen the PC started on. The picture is slower than on a screen \
              connected to the GPU."
         );
@@ -977,7 +981,7 @@ mod tests {
                 Some(Vendor::Nvidia)
             ),
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22), and \
-             Stela cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
+             Stambha cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
              unavailable; request retained)"
         );
         assert_eq!(
@@ -1010,7 +1014,7 @@ mod tests {
                 maker
             ),
             "the AMD GPU did not start (amdgpu 0000:01:00.0: psp reg (0x16080) wait timed out, \
-             mask: 8000ffff, read: 80020115 exp: 80000000), and Stela cannot yet finish the GPU \
+             mask: 8000ffff, read: 80020115 exp: 80000000), and Stambha cannot yet finish the GPU \
              driver's cleanup after that (IRQ action retirement unavailable; request retained)"
         );
         // An address only as a prefix of a longer one names nothing.
@@ -1021,7 +1025,7 @@ mod tests {
         assert_eq!(failed_maker("[drm] failed", &[]), None);
         assert_eq!(
             driver_stopped("x", Some("[drm] failed"), None, None),
-            "the GPU did not start ([drm] failed), and Stela cannot yet finish the GPU driver's \
+            "the GPU did not start ([drm] failed), and Stambha cannot yet finish the GPU driver's \
              cleanup after that (x)"
         );
     }
@@ -1060,7 +1064,7 @@ mod tests {
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22). The \
              GPU's own firmware, GSP-RM 570.144, ended its initialisation (GSP_INIT_DONE, right \
              after it booted) with NV_ERR_TIMEOUT (0x65): a step timed out inside that firmware, \
-             after it had raised RECOVERY_ACTION, its mark that the GPU needs a reset. Stela \
+             after it had raised RECOVERY_ACTION, its mark that the GPU needs a reset. Stambha \
              cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
              unavailable; request retained)"
         );

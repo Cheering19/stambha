@@ -133,11 +133,18 @@ pub const WIFI_COUNTRY: &str = "--wifi-country";
 /// startup menu's Wi-Fi page chose it (`choice::wifi`).
 pub const WIFI_PREFER: &str = "--wifi-prefer";
 pub const USB4_APPROVE: &str = "--usb4-approve";
+pub const BLUETOOTH_TRACE: &str = "--bluetooth-trace";
+pub const BLUETOOTH_LEND: &str = "--bluetooth-lend";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
 /// The saved networks a boot with `--wifi` also joins when its network is
 /// not in range (`wifi_saved`); none when the file is absent.
 pub const WIFI_SAVED: &str = "\\EFI\\stela\\wifi.saved";
+/// What the startup menu's Wi-Fi page writes first when it changes
+/// [`WIFI_SAVED`], whose rewrite deletes the file before writing it: it
+/// stands for that file when a write it could not finish left it absent
+/// (`wifi_saved::current`).
+pub const WIFI_SAVED_NEW: &str = "\\EFI\\stela\\wifi.saved.new";
 /// IEEE 802.11 SSIDs are 1 to 32 octets.
 const SSID_BYTES: core::ops::RangeInclusive<usize> = 1..=32;
 pub const IPV4: &str = "--ipv4";
@@ -201,7 +208,8 @@ impl fmt::Display for TestBattery {
 /// What the host does with its lid (`--lid`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Lid {
-    /// Nothing, the default: Linux's kernel only reports the lid, its
+    /// Nothing, the default, though a laptop takes [`Self::Method`]
+    /// unasked ([`crate::laptop`]): Linux's kernel only reports the lid, its
     /// userspace decides, and a wrong `_LID` reading is common enough that
     /// Linux keeps DMI quirks for it.
     #[default]
@@ -232,10 +240,48 @@ impl Lid {
     }
 }
 
+/// Whether a boot on a laptop takes its laptop features unasked
+/// (`--laptop auto|off`, [`crate::laptop`]): a hand-written opt-out setup
+/// never writes, so the options revision stays 13.
+pub const LAPTOP: &str = "--laptop";
+
+/// `--laptop`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Laptop {
+    /// The default: on a laptop, behave as if `--battery`, `--lid method`,
+    /// `--brightness-keys` and, with `--input` and a precision touchpad,
+    /// `--trackpad mt2` were given, where the line does not give them.
+    #[default]
+    Auto,
+    /// Take none of them: each is the opt-in its option is.
+    Off,
+}
+
+impl Laptop {
+    const NAMES: [(&'static str, Self); 2] = [("auto", Self::Auto), ("off", Self::Off)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, laptop)| *laptop)
+            .ok_or(Error::Laptop)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, laptop)| *laptop == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
-/// revision stays 13).
+/// revision stays 13). A laptop with a precision touchpad takes `mt2`
+/// unasked ([`crate::laptop`]).
 pub const TRACKPAD: &str = "--trackpad";
 
 /// The trackpad `--trackpad` cables: a Magic Trackpad 2 (05AC:0265), or
@@ -491,6 +537,16 @@ pub struct System {
     /// pointer, fed whole frames by the host's precision touchpads, which
     /// then no longer move the native mouse ([`TRACKPAD`], with `--input`).
     pub trackpad: Option<GuestTrackpad>,
+    /// Log every packet of the guest's Bluetooth controller, 1024 per
+    /// configuration (`--bluetooth-trace`), masked: addresses keep their
+    /// vendor half and last byte, names, payloads and keys are hidden. A raw
+    /// capture is not offered.
+    pub bluetooth_trace: bool,
+    /// Lend the host's Bluetooth controller to the guest behind the model of
+    /// Apple's module, which answers its vendor commands and takes over
+    /// when the host's fails or stalls (`--bluetooth-lend`). Without it the
+    /// guest gets the model alone.
+    pub bluetooth_lend: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -546,8 +602,12 @@ pub struct System {
     /// Step a display output with `_BCL` and `_BCM` in the firmware's
     /// `_DOD` at its brightness notifications (`--brightness-keys`): Linux
     /// does only where ACPI video owns the backlight, which Stela cannot
-    /// tell.
+    /// tell. A laptop takes it unasked, as it takes `--battery` and
+    /// `--lid method` ([`crate::laptop`]).
     pub brightness_keys: bool,
+    /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
+    /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
+    pub laptop: Option<Laptop>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -658,6 +718,8 @@ impl Default for System {
             idle_skip: false,
             input: false,
             trackpad: None,
+            bluetooth_trace: false,
+            bluetooth_lend: false,
             native_cores: None,
             guest_pes: None,
             code_window: None,
@@ -673,6 +735,7 @@ impl Default for System {
             lid: None,
             lid_sleep: false,
             brightness_keys: false,
+            laptop: None,
             amx_native: None,
             ecid: None,
             network_check: None,
@@ -835,6 +898,12 @@ impl System {
         self.lid.unwrap_or_default()
     }
 
+    /// Whether a laptop takes its laptop features unasked: `--laptop`,
+    /// else [`Laptop::Auto`].
+    pub fn laptop(&self) -> Laptop {
+        self.laptop.unwrap_or_default()
+    }
+
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
     /// cables, so none without host input. The hub's disk-port count and
     /// the cabling both read this, so they agree.
@@ -939,7 +1008,7 @@ impl System {
             verified
         } else if self.preboot.is_some() {
             self.native_cores.or(self.guest_pes).ok_or(refuse!(
-                "Preboot CPU count is unavailable before reservation; run stela repair or specify --guest-pes N"
+                "Preboot CPU count is unavailable before reservation; run stambha repair or specify --guest-pes N"
             ))?
         } else {
             1
@@ -961,7 +1030,7 @@ impl System {
             && self.guest_pes != Some(source_pes)
         {
             return Err(refuse!(
-                "Preboot CPU count changed; run stela repair or update --guest-pes N"
+                "Preboot CPU count changed; run stambha repair or update --guest-pes N"
             ));
         }
         // Fewer cores than assigned run when firmware leaves no AP startup
@@ -1171,6 +1240,8 @@ impl fmt::Display for System {
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
         line.value(TRACKPAD, self.trackpad.map(GuestTrackpad::name))?;
+        line.flag(BLUETOOTH_LEND, self.bluetooth_lend)?;
+        line.flag(BLUETOOTH_TRACE, self.bluetooth_trace)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;
@@ -1195,6 +1266,7 @@ impl fmt::Display for System {
         line.value("--lid", self.lid.map(Lid::name))?;
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
+        line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;

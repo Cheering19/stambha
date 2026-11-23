@@ -1,4 +1,4 @@
-//! `cargo xtask dist`: the release `stela` with its matching `stela.efi`
+//! `cargo xtask dist`: the release `stambha` with its matching `stela.efi`
 //! embedded. The boot image builds first, from the pinned sources `gpu
 //! fetch` checks out; `stela-cli`'s build script then embeds the file
 //! `STELA_EFI` names. The embedded image carries no debug sections: setup
@@ -23,7 +23,7 @@ pub fn run() -> Result<()> {
     crate::clang::toolset()?.apply(&mut command);
     exec(&mut command)?;
     let release = root().join("target/release");
-    println!("{}", release.join("stela").display());
+    println!("{}", release.join("stambha").display());
     println!("{}", efi.display());
     Ok(())
 }

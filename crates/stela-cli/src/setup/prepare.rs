@@ -72,7 +72,7 @@ pub(super) fn supported(environment: &Environment<'_>, ipsw: &Path, build: &str)
         .map_err(|error| anyhow::anyhow!("{}: {error}", ipsw.display()))?;
     if entry.build != build {
         eprintln!(
-            "Note: macOS {build} is not tested with Stela yet; it is treated as {}",
+            "Note: macOS {build} is not tested with Stambha yet; it is treated as {}",
             entry.build
         );
     }
@@ -138,7 +138,7 @@ pub(super) fn prepare_kind(
         let generation = bundle::generation(&output)?;
         ensure!(
             generation == environment.generation(),
-            "the prepared bundle is {generation}, not the {} this stela and its stela.efi use",
+            "the prepared bundle is {generation}, not the {} this stambha and its stela.efi use",
             environment.generation()
         );
         let bytes = bundle::bytes(&output)?;
@@ -437,7 +437,7 @@ fn prepare_ramdisk(options: RamdiskOptions<'_>, update: bool) -> Result<()> {
     boot::prepare(&line)?;
     let tree = fs::read(output.join("devicetree.adt"))?;
     stela_soc_data::board::board(&tree)
-        .map_err(|reason| anyhow::anyhow!("Stela cannot run {model} yet: {reason}"))?;
+        .map_err(|reason| anyhow::anyhow!("Stambha cannot run {model} yet: {reason}"))?;
     Ok(())
 }
 

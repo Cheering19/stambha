@@ -92,7 +92,7 @@ pub fn refusal(family: &str, generation: u8) -> Option<&'static str> {
 
 /// Why the port leaves out a GPU of a generation before
 /// [`FIRST_APPLE_GENERATION`], as the boot reports it.
-pub const NO_APPLE_FAMILY: &str = "on this GPU's graphics generation (GFX8) Stela's Metal device \
+pub const NO_APPLE_FAMILY: &str = "on this GPU's graphics generation (GFX8) Stambha's Metal device \
                                    is in no Apple GPU family: RADV has no raster order groups \
                                    before GFX9, which the framebuffer reads of Apple3 need, and \
                                    macOS draws its window server's framebuffers only on an Apple3 \
@@ -100,10 +100,10 @@ pub const NO_APPLE_FAMILY: &str = "on this GPU's graphics generation (GFX8) Stel
 
 /// Why the port leaves out a GPU [`serves`] refuses, as the boot reports
 /// it.
-pub const LEFT_OUT: &str = "RADV, its Vulkan driver, cannot give Stela's Metal device what it \
+pub const LEFT_OUT: &str = "RADV, its Vulkan driver, cannot give Stambha's Metal device what it \
                             requires on this GPU (half-float shader arithmetic, shaderFloat16, \
                             before the GFX8 graphics generation; no Vulkan device at all on a \
-                            compute accelerator), and Stela drives no GPU that cannot serve it";
+                            compute accelerator), and Stambha drives no GPU that cannot serve it";
 
 #[cfg(test)]
 mod tests {

@@ -287,8 +287,8 @@ pub fn take(variables: &mut Variables) -> Result<bool, String> {
 pub fn untaken_reason(record: Record, why: &str) -> String {
     format!(
         "the Metal plugin repair's request ({}) could not be marked as taken in the machine \
-         state on the PC's disk: {why}. A repair boot now would repeat at every start, so Stela \
-         stopped before it; stela log saves the boot logs for a report",
+         state on the PC's disk: {why}. A repair boot now would repeat at every start, so Stambha \
+         stopped before it; stambha log saves the boot logs for a report",
         record.name()
     )
 }
@@ -300,8 +300,8 @@ pub fn untaken_reason(record: Record, why: &str) -> String {
 pub fn unstored_reason(what: &str, why: &str) -> String {
     format!(
         "the Metal plugin repair's record ({what}) could not be stored in the machine state on \
-         the PC's disk: {why}. A restart would not know it and could repeat this boot, so Stela \
-         stopped instead of restarting; stela log saves the boot logs for a report"
+         the PC's disk: {why}. A restart would not know it and could repeat this boot, so Stambha \
+         stopped instead of restarting; stambha log saves the boot logs for a report"
     )
 }
 
@@ -349,8 +349,8 @@ pub fn decide(report: Report, boot: Boot, record: Record, persistent: bool) -> D
 /// this release: the record lives on the PC's own disk, which only a
 /// system started on that PC reaches.
 const AGAIN: &str = "start another system on this PC (Linux, Windows or a live USB), plug in \
-                     the stick and run stela repair, which lets the repair run again at the next \
-                     start; stela log saves the boot logs for a report";
+                     the stick and run stambha repair, which lets the repair run again at the next \
+                     start; stambha log saves the boot logs for a report";
 
 /// The stop's reason for a normal boot that finds the plugin missing
 /// ([`Decision::StopMissing`]): what the last repair boot reported
@@ -379,13 +379,13 @@ pub fn stop_reason(
     if !persistent {
         return format!(
             "{MISSING}, and the machine state's NVRAM was not read at this start, so no \
-             automatic repair can be recorded (its NVRAM lines in the log say why); stela log \
+             automatic repair can be recorded (its NVRAM lines in the log say why); stambha log \
              saves the boot logs for a report"
         );
     }
     format!(
         "{MISSING}, and NVRAM holds a repair record ({}) this start did not take, as when NVRAM \
-         is not read before the boot (its NVRAM lines in the log say why); stela log saves the \
+         is not read before the boot (its NVRAM lines in the log say why); stambha log saves the \
          boot logs for a report",
         record.name()
     )

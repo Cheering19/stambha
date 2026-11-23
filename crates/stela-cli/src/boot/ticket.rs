@@ -84,9 +84,9 @@ fn signing_answer(bytes: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "the network did not let stela reach Apple ({} bytes came back{}). A network that wants \
+        "the network did not let stambha reach Apple ({} bytes came back{}). A network that wants \
          a sign-in first does this: open a web page on this computer, sign in to the network, \
-         and run stela again",
+         and run stambha again",
         bytes.len(),
         if bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"<html")) {
             ", a web page"

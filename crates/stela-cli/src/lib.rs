@@ -1,5 +1,5 @@
-//! The `stela` command line makes and maintains the USB stick that boots
-//! Stela to install macOS on a PC, and reads its boot logs. Research and
+//! The `stambha` command line makes and maintains the USB stick that boots
+//! Stambha to install macOS on a PC, and reads its boot logs. Research and
 //! development commands belong to `stela-dev`, which uses this library's
 //! boot-bundle and restore-image tools.
 use clap::Parser;
@@ -35,10 +35,10 @@ fn examples() -> String {
     let disk = setup::host::DISK_EXAMPLE;
     format!(
         "Examples:
-  stela                 Choose what to do, step by step
-  stela update          Update the plugged-in stick
-  stela log             Save the boot logs to log.txt
-  stela create {disk} --confirm-disk 64.0GB --installer offline"
+  stambha               Choose what to do, step by step
+  stambha update        Update the plugged-in stick
+  stambha log           Save the boot logs to log.txt
+  stambha create {disk} --confirm-disk 64.0GB --installer offline"
     )
 }
 
@@ -50,7 +50,7 @@ fn help_template() -> String {
 
 {{usage-heading}} {{usage}}
 
-Run stela without a command to see the plugged-in sticks and choose what
+Run stambha without a command to see the plugged-in sticks and choose what
 to do next.
 
 Commands:
@@ -64,14 +64,15 @@ Options:
     )
 }
 
-const ABOUT: &str = "Make and maintain the USB stick that installs macOS on a PC with Stela";
+const ABOUT: &str = "Make and maintain the USB stick that installs macOS on a PC with Stambha";
 
 #[derive(Parser)]
 #[command(
-    name = "stela",
-    version,
+    name = "stambha",
+    display_name = "Stambha",
+    version = env!("STELA_SHOWN_VERSION"),
     about = ABOUT,
-    override_usage = "stela [COMMAND [STICK]] [OPTIONS]",
+    override_usage = "stambha [COMMAND [STICK]] [OPTIONS]",
     help_template = help_template(),
     after_help = examples(),
 )]
@@ -110,14 +111,14 @@ fn replaced(words: &[std::ffi::OsString]) -> Option<String> {
         && ["setup", "boot-log", "configure"].contains(&first.as_ref())
     {
         return Some(format!(
-            "stela {first} was replaced in 0.4: run stela, or see stela --help"
+            "stambha {first} was replaced in 0.4: run stambha, or see stambha --help"
         ));
     }
     words
         .iter()
         .any(|word| *word == "--usb" || word.starts_with("--usb="))
         .then(|| {
-            "--usb was replaced in 0.4: name the stick after the command, or see stela --help"
+            "--usb was replaced in 0.4: name the stick after the command, or see stambha --help"
                 .into()
         })
 }
@@ -204,7 +205,7 @@ mod tests {
             &["configure", "--wifi", "Home"],
         ] {
             let text = said(words).unwrap();
-            assert!(text.ends_with("was replaced in 0.4: run stela, or see stela --help"));
+            assert!(text.ends_with("was replaced in 0.4: run stambha, or see stambha --help"));
         }
         assert!(
             said(&["status", "--usb", "/Volumes/STELA"])

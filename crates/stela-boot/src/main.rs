@@ -38,6 +38,7 @@ use stela_boot_core::heap;
 mod host_check;
 mod host_firmware;
 mod host_inventory;
+mod install_caution;
 mod installer;
 mod la57;
 mod layout;
@@ -325,7 +326,7 @@ fn main() -> Status {
         connected.connected, connected.handles, connected.network, connected.slow
     ));
     status::done("");
-    status::begin("Reading Stela's settings");
+    status::begin("Reading Stambha's settings");
     let (mut volume, mut firmware_root) = firmware::volume().unwrap_or_else(|e| output::fatal(e));
     let host_firmware =
         host_firmware::read(&mut firmware_root).unwrap_or_else(|e| output::fatal(e));

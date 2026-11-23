@@ -75,7 +75,7 @@ fn discovered(adapter: &Adapter) -> bool {
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     if LEFT_TO_RADEON.binary_search(&adapter.device).is_ok() {
         return Err(
-            "amdgpu leaves this GPU to an older driver (radeon, r128 or mach64), which is not ported to Stela",
+            "amdgpu leaves this GPU to an older driver (radeon, r128 or mach64), which is not ported to Stambha",
         );
     }
     if let Some(why) = generation(adapter.device)
