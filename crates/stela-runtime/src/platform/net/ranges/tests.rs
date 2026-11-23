@@ -340,11 +340,7 @@ fn a_failed_range_says_what_it_got_and_a_failed_read_ahead_is_noted() {
     let line = alloc::format!(
         "REMOTE IMAGE range at 8192 failed (1/{ATTEMPTS}): timed out: TCP transfer; got=8192 next=8192\n"
     );
-    assert!(
-        source.notes.iter().any(|note| *note == line),
-        "{:?}",
-        source.notes
-    );
+    assert!(source.notes.contains(&line), "{:?}", source.notes);
     // The read-ahead's failure is said and the next read retries it.
     reader.source_mut().read_errors.push_back(NetError::Reset);
     reader.pump();

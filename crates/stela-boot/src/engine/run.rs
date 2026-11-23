@@ -3253,8 +3253,10 @@ pub(super) fn hle_report<H: Host, D: stela_engine::machine::Devices>(machine: &M
     let line = machine
         .hle_statistics()
         .line(machine.processor(), machine.hle_signatures());
-    output::arguments(format_args!("{line}
-"));
+    output::arguments(format_args!(
+        "{line}
+"
+    ));
 }
 
 /// `BEAT SHORT …`: the fields of the `BEAT` line that say the guest runs,

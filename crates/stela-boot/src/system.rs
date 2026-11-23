@@ -865,11 +865,9 @@ fn load(
         stela_boot_core::host_core::Plan::Refused(why) => output::arguments(format_args!(
             "HOST CORE off: {why}; {pes} PEs, as without --host-core\n"
         )),
-        stela_boot_core::host_core::Plan::Reserve { executors } => {
-            output::arguments(format_args!(
-                "HOST CORE plan: {executors} processors reserved, {pes} PEs and the host core last\n"
-            ))
-        }
+        stela_boot_core::host_core::Plan::Reserve { executors } => output::arguments(format_args!(
+            "HOST CORE plan: {executors} processors reserved, {pes} PEs and the host core last\n"
+        )),
     }
     let cores = host_core.executors(pes);
     // The translation cache takes only what the parts and the guest leave,
