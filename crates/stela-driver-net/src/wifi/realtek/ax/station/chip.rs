@@ -158,8 +158,11 @@ pub trait Chip {
     fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String>;
     /// Queue a data frame; `Ok(None)` when there is no room now.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String>;
-    /// Program the association (M3 spec S10).
-    fn associate(&mut self, association: &Association) -> Result<(), String>;
+    /// Program the association (M3 spec S10): `Ok(true)` once programmed,
+    /// `Ok(false)` while a wait of the chip's own (the port update's
+    /// beacon interval) has not passed, when the same association is asked
+    /// again at a later poll. Nothing waits in the call.
+    fn associate(&mut self, association: &Association) -> Result<bool, String>;
     /// Leave the BSS set, authenticated to or associated with (M3 spec
     /// S11), and release its channel.
     fn disassociate(&mut self) -> Result<(), String>;

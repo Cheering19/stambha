@@ -458,6 +458,18 @@ impl Link for Adapter {
             _ => None,
         }
     }
+    /// A Wi-Fi radio's connection keeper's slowest step, for a host
+    /// service turn that ran long.
+    fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
+        match self {
+            #[cfg(feature = "native-acpi")]
+            Self::IntelWifi(device) => device.slowest_step(),
+            Self::MediatekWifi(device) => device.slowest_step(),
+            Self::RealtekWifi(device) => device.slowest_step(),
+            Self::Rtw89Wifi(device) => device.slowest_step(),
+            _ => None,
+        }
+    }
     fn mac(&self) -> Mac {
         match self {
             Self::Virtio(device) => device.mac(),

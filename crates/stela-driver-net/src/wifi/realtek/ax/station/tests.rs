@@ -203,6 +203,11 @@ struct Air {
     /// The chip reports beacon loss during a scan, before the beacon it
     /// hears, and with the AP's answer to an authentication.
     lost_unassociated: bool,
+    /// The chip's association answers "not yet" this many times before
+    /// it is programmed, as the live chip's waits out its port update.
+    associate_waits: u32,
+    /// The calls of [`Chip::associate`], each "not yet" among them.
+    associate_calls: u32,
 }
 
 impl Air {
@@ -479,8 +484,14 @@ impl Chip for Model {
         air.unanswered.push_back((token, frame.bytes.to_vec()));
         Ok(Some(token))
     }
-    fn associate(&mut self, association: &Association) -> Result<(), String> {
-        self.0.borrow_mut().calls.push(Call::Associate(Joined {
+    fn associate(&mut self, association: &Association) -> Result<bool, String> {
+        let mut air = self.0.borrow_mut();
+        air.associate_calls += 1;
+        if air.associate_waits > 0 {
+            air.associate_waits -= 1;
+            return Ok(false);
+        }
+        air.calls.push(Call::Associate(Joined {
             bssid: association.bssid,
             aid: association.aid,
             channel: association.channel,
@@ -491,7 +502,7 @@ impl Chip for Model {
             edca: association.edca,
             short_slot: association.short_slot,
         }));
-        Ok(())
+        Ok(true)
     }
     /// Leaving deletes what keys are left, as `Live::leave` does.
     fn disassociate(&mut self) -> Result<(), String> {
@@ -1080,6 +1091,48 @@ fn the_handshake_installs_ptk_then_gtk_and_opens_the_port() {
     assert!(line.contains("keys 2, port open"), "{line}");
     assert!(!line.contains("last"), "{line}");
     assert_eq!(wifi.receive(), Ok(None));
+}
+
+/// The live chip's association waits out its port update's beacon interval
+/// across polls (101 ms at 100 TU, which boot 23 spent busy on PE 0): the
+/// station stays admitted and asks again, nothing else is programmed or
+/// fails meanwhile, message 1 heard during the wait is kept, and the
+/// handshake then opens the port.
+#[test]
+fn an_association_that_waits_is_asked_again_and_the_port_still_opens() {
+    let (mut wifi, model) = wifi_with(|air| air.associate_waits = 20);
+    assert!(run(&mut wifi, &model, |_, air| air.associate_calls == 1));
+    // The AP's message 1 comes as the association still waits.
+    let mut ap = authenticator();
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 0, [0x88, 0x8e], &ap.message_1()));
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    {
+        let air = model.0.borrow();
+        // Asked once per poll until programmed, programmed once.
+        assert_eq!(air.associate_calls, 21);
+        assert_eq!(air.count(|c| matches!(c, Call::Associate(_))), 1);
+        assert_eq!(air.count(|c| matches!(c, Call::Disassociate)), 0);
+        assert!(air.keys().is_empty());
+    }
+    let line = progress(&mut wifi);
+    assert!(!line.contains("last"), "{line}");
+    // Message 1, kept through the wait, is answered once associated.
+    assert!(run(&mut wifi, &model, |_, air| !air.eapol().is_empty()));
+    ap.message_2(&model.0.borrow().eapol()[0]);
+    model
+        .0
+        .borrow_mut()
+        .hear(data(LOCAL, 1, [0x88, 0x8e], &ap.message_3_with(&RSN, &[])));
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.eapol().len() > 1 && progress(wifi).contains("acked 2")
+    }));
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
+    assert_eq!(model.0.borrow().keys(), [(true, 0, 0), (false, 1, 1)]);
 }
 
 #[test]
