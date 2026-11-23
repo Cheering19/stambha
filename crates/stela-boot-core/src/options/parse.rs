@@ -39,6 +39,7 @@ impl ParseState<'_> {
             "--lid-sleep" => options.lid_sleep = true,
             "--brightness-keys" => options.brightness_keys = true,
             ACPI_HARDWARE => options.acpi_hardware = true,
+            KEEP_RUNNING_ON_PANIC => options.keep_running_on_panic = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

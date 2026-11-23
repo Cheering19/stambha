@@ -1020,8 +1020,12 @@ pub fn store_usb_log() {
 pub fn flush_due() {
     let hz = TSC_HZ.load(Ordering::Relaxed);
     let now = rdtsc();
+    let soon = STORE_SOON.swap(false, Ordering::Relaxed);
     flush_where(
         |sink| {
+            if soon {
+                return true;
+            }
             let seconds = match sink.kind {
                 Log::Usb => USB_FLUSH_SECONDS,
                 _ => MACHINE_FLUSH_SECONDS,
@@ -1031,6 +1035,17 @@ pub fn flush_due() {
         false,
     );
 }
+
+/// Make every open log's store due at the next [`flush_due`], whatever its
+/// interval: the service's next look at the logs, within a second, stores
+/// them through the path it always does, never this caller's processor.
+/// For a guest panic, whose lines should reach the stick before the stop.
+pub fn store_soon() {
+    STORE_SOON.store(true, Ordering::Relaxed);
+}
+
+/// [`store_soon`] asked for a store.
+static STORE_SOON: AtomicBool = AtomicBool::new(false);
 
 /// Move the log stores in progress on; nothing to do while none runs.
 pub fn advance_logs() {
