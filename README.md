@@ -40,9 +40,9 @@ and supports the Metal3 and Apple7 GPU families.
 
 ## Install
 
-1. Download `stela` from the
+1. Download `stambha` from the
    [releases page](https://github.com/tylertms/Stela/releases).
-2. Run `sudo ./stela` (Linux, macOS) or double-click `stela.exe`
+2. Run `sudo ./stambha` (Linux, macOS) or double-click `stambha.exe`
    (Windows).
 3. Choose the USB stick and the installer, then confirm. This erases the USB
    stick.
@@ -50,33 +50,33 @@ and supports the Metal3 and Apple7 GPU families.
 
 ## Update
 
-Download the new `stela`, plug the USB stick in and run:
+Download the new `stambha`, plug the USB stick in and run:
 
 ```sh
-sudo ./stela update
+sudo ./stambha update
 ```
 
 On Windows, open Terminal with Run as administrator and run:
 
 ```
-.\stela.exe update
+.\stambha.exe update
 ```
 
 ## Logs
 
-If Stela does not work, plug the USB stick into any computer with `stela` and
+If Stela does not work, plug the USB stick into any computer with `stambha` and
 save the boot log. Include `log.txt` in your GitHub Issue. Save it before you
 start Stela again many times: the log keeps the start of each of the last
 eight boots, but only the latest part of a long run.
 
 ```sh
-sudo ./stela log --output log.txt
+sudo ./stambha log --output log.txt
 ```
 
 On Windows, open Terminal with Run as administrator and run:
 
 ```
-.\stela.exe log --output log.txt
+.\stambha.exe log --output log.txt
 ```
 
 ## Build
@@ -91,7 +91,7 @@ cd Stela
 cargo xtask dist
 ```
 
-This writes `target/release/stela`. The first build fetches and compiles
+This writes `target/release/stambha`. The first build fetches and compiles
 Linux, Mesa and LLVM sources and takes a long time.
 
 ## Legal
