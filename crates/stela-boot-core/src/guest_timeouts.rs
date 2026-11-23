@@ -80,10 +80,18 @@ pub const PROFILE_LOCK_FACTOR: u64 = 4;
 /// The largest scale a profiled boot gets: 2 s for a ticket spinlock.
 pub const MAX_PROFILED_LOCK_SCALE: u64 = MAX_LOCK_SCALE * 2;
 
+/// The least scale any boot's lock timeouts get: a host as fast as the
+/// modeled chip still stalls a PE for host work, a cold block's compile or
+/// a translation read, and a warm boot stalled every PE for 104-162 ms,
+/// past `ticket-lock`'s 125 ms. Twice gives 250 ms; a real deadlock still
+/// panics within a second (`lock-panic`'s 0.5 s becomes 1 s).
+pub const LOCK_SCALE_FLOOR: u64 = 2;
+
 /// The scale this boot's lock timeouts get: the host's ([`lock_scale`]),
-/// times [`PROFILE_LOCK_FACTOR`] under `--profile`.
+/// at least [`LOCK_SCALE_FLOOR`], times [`PROFILE_LOCK_FACTOR`] under
+/// `--profile`.
 pub fn boot_lock_scale(core_hz: u64, profile: bool) -> u64 {
-    let scale = lock_scale(core_hz);
+    let scale = lock_scale(core_hz).max(LOCK_SCALE_FLOOR);
     match profile {
         true => scale
             .saturating_mul(PROFILE_LOCK_FACTOR)
@@ -216,15 +224,25 @@ mod tests {
         // The profiled boot that panicked on a ticket spinlock: 5.04 GHz.
         assert_eq!(lock_scale(5_040_280_837), 1);
         assert!(boot_lock_scale(5_040_280_837, true) >= 4);
-        assert_eq!(
-            boot_lock_scale(5_040_280_837, false),
-            lock_scale(5_040_280_837)
-        );
         // A slower host's own scale is multiplied too, up to the bound.
         assert_eq!(boot_lock_scale(3_000_000_000, true), 8);
         assert_eq!(boot_lock_scale(100_000_000, true), MAX_PROFILED_LOCK_SCALE);
-        assert_eq!(boot_lock_scale(0, false), 1);
         assert!(boot_lock_scale(0, true) >= PROFILE_LOCK_FACTOR);
+    }
+
+    #[test]
+    fn every_boot_gets_at_least_the_floor_and_a_slower_host_its_own_scale() {
+        // 125 ms for a ticket spinlock left no margin for the 104-162 ms
+        // stalls of a warm boot: 250 ms.
+        assert_eq!(boot_lock_scale(5_040_280_837, false), LOCK_SCALE_FLOOR);
+        assert_eq!(boot_lock_scale(0, false), LOCK_SCALE_FLOOR);
+        assert_eq!(boot_lock_scale(1_100_000_000, false), 4);
+        assert_eq!(boot_lock_scale(100_000_000, false), MAX_LOCK_SCALE);
+        assert_eq!(
+            lock_scale_arguments(boot_lock_scale(5_040_280_837, false)),
+            " ml-timeout-ticket-lock-scale=2 ml-timeout-lock-scale=2 \
+             ml-timeout-lock-panic-scale=2"
+        );
     }
 
     #[test]
