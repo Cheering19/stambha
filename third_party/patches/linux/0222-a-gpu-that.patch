@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:18:11 +0000
+Subject: [PATCH] fix(nouveau): a GPU that stopped answering for good is no
+ longer read or written, and every timer wait ends at once on it or on a timer
+ that reads all ones, where a teardown of a GPU off the bus spun 30 s through
+ VMM flush waits until the step watchdog stopped the boot
+
+Once nvkm_device_gone() has found BOOT_0 all ones for a second, the
+nvkm_rd*() accessors give all ones and the nvkm_wr*() ones drop the
+write without reaching the bus: on a link that is down each access
+waits out the root port's completion timeout. nvkm_nsec() and its
+usec/msec forms end at once with -ENODEV on such a device, before
+their condition runs, and nvkm_timer_wait_test() ends a wait whose
+PTIMER reads all ones with -ENODEV instead of after 16 stalled reads,
+feeding nvkm_device_gone(); neither warns, as the loss is said once
+where it is found. On a Ryzen 5800H + RTX 3050 laptop, the channel
+teardown after the loss ran tu102_vmm_flush() thousands of times, each
+a stalled timer, a "timeout" warning and a backtrace, for 30 s.
+---
+ .../drm/nouveau/include/nvkm/core/device.h    | 36 +++++++++++++++----
+ .../drm/nouveau/include/nvkm/subdev/timer.h   | 16 ++++++---
+ .../gpu/drm/nouveau/nvkm/subdev/timer/base.c  | 12 +++++++
+ 3 files changed, 53 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+index db6961b4a9e1bc4e412afe7db62039df00655bf6..f577337a81643978dcdae4ce7df646a9bc062131 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -134,13 +134,35 @@ struct nvkm_device_chip {
+ 
+ struct nvkm_device *nvkm_device_find(u64 name);
+ 
+-/* privileged register interface accessor macros */
+-#define nvkm_rd08(d,a) ioread8((d)->pri + (a))
+-#define nvkm_rd16(d,a) ioread16_native((d)->pri + (a))
+-#define nvkm_rd32(d,a) ioread32_native((d)->pri + (a))
+-#define nvkm_wr08(d,a,v) iowrite8((v), (d)->pri + (a))
+-#define nvkm_wr16(d,a,v) iowrite16_native((v), (d)->pri + (a))
+-#define nvkm_wr32(d,a,v) iowrite32_native((v), (d)->pri + (a))
++/*
++ * privileged register interface accessor macros
++ *
++ * Once the device stopped answering for good (nvkm_device_gone()), a read
++ * gives all ones, as the bus would, and a write is dropped, without either
++ * reaching the bus: on a link that is down, each access waits out the root
++ * port's completion timeout, and a teardown's thousands of them held one
++ * task for the whole step watchdog.
++ */
++static inline u8 nvkm_gone_rd08(void) { return 0xff; }
++static inline u16 nvkm_gone_rd16(void) { return 0xffff; }
++static inline u32 nvkm_gone_rd32(void) { return 0xffffffff; }
++#define nvkm_rd08(d,a) (unlikely(READ_ONCE((d)->gone)) ? nvkm_gone_rd08() : ioread8((d)->pri + (a)))
++#define nvkm_rd16(d,a) \
++	(unlikely(READ_ONCE((d)->gone)) ? nvkm_gone_rd16() : ioread16_native((d)->pri + (a)))
++#define nvkm_rd32(d,a) \
++	(unlikely(READ_ONCE((d)->gone)) ? nvkm_gone_rd32() : ioread32_native((d)->pri + (a)))
++#define nvkm_wr08(d,a,v) ({                                                    \
++	if (likely(!READ_ONCE((d)->gone)))                                     \
++		iowrite8((v), (d)->pri + (a));                                 \
++})
++#define nvkm_wr16(d,a,v) ({                                                    \
++	if (likely(!READ_ONCE((d)->gone)))                                     \
++		iowrite16_native((v), (d)->pri + (a));                         \
++})
++#define nvkm_wr32(d,a,v) ({                                                    \
++	if (likely(!READ_ONCE((d)->gone)))                                     \
++		iowrite32_native((v), (d)->pri + (a));                         \
++})
+ #define nvkm_mask(d,a,m,v) ({                                                  \
+ 	struct nvkm_device *_device = (d);                                     \
+ 	u32 _addr = (a), _temp = nvkm_rd32(_device, _addr);                    \
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/timer.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/timer.h
+index 439a3f72b0d7d4ba79f8b671cb35469b1b9a5cd3..ef7702a2b32a82ed2fed7438bba78283301bdeaf 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/timer.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/timer.h
+@@ -47,6 +47,11 @@ s64 nvkm_timer_wait_test(struct nvkm_timer_wait *);
+  *
+  * NVKM_DELAY can be passed for 'cond' to disable the timeout warning,
+  * which is useful for unconditional delay loops.
++ *
++ * A device that stopped answering (nvkm_device_gone()) ends the wait at
++ * once with -ENODEV, before 'cond' runs, and so does a wait whose timer
++ * reads all ones (nvkm_timer_wait_test()); neither warns, as the device's
++ * loss is said once where it is found.
+  */
+ #define NVKM_DELAY _warn = false;
+ #define nvkm_nsec(d,n,cond...) ({                                              \
+@@ -55,11 +60,14 @@ s64 nvkm_timer_wait_test(struct nvkm_timer_wait *);
+ 	s64 _taken = 0;                                                        \
+                                                                                \
+ 	nvkm_timer_wait_init((d), (n), &_wait);                                \
+-	do {                                                                   \
+-		cond                                                           \
+-	} while ((_taken = nvkm_timer_wait_test(&_wait)) >= 0);                \
++	if (unlikely(READ_ONCE((d)->gone)))                                    \
++		_taken = -ENODEV;                                              \
++	else                                                                   \
++		do {                                                           \
++			cond                                                   \
++		} while ((_taken = nvkm_timer_wait_test(&_wait)) >= 0);        \
+                                                                                \
+-	if (_warn && _taken < 0)                                               \
++	if (_warn && _taken < 0 && _taken != -ENODEV)                          \
+ 		dev_WARN(_wait.tmr->subdev.device->dev, "timeout\n");          \
+ 	_taken;                                                                \
+ })
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/timer/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/timer/base.c
+index e971b6643483cb38c45d6820cb711dfbddbe8548..681defebfec1a5c3db4f99db0ab046975d45fd96 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/timer/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/timer/base.c
+@@ -29,6 +29,18 @@ nvkm_timer_wait_test(struct nvkm_timer_wait *wait)
+ 	struct nvkm_subdev *subdev = &wait->tmr->subdev;
+ 	u64 time = nvkm_timer_read(wait->tmr);
+ 
++	/*
++	 * A timer that reads all ones is a device that does not answer: end
++	 * the wait at once, without the 16 reads of a stalled timer, each of
++	 * which waits out a completion timeout on a link that is down. The
++	 * look counts towards nvkm_device_gone(), which says once that the
++	 * device went silent and, after a second of it, that it is gone.
++	 */
++	if (unlikely(time == ~0ULL)) {
++		nvkm_device_gone(subdev->device);
++		return -ENODEV;
++	}
++
+ 	if (wait->reads == 0) {
+ 		wait->time0 = time;
+ 		wait->time1 = time;
