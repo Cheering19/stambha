@@ -334,20 +334,25 @@ fn census_pci(functions: &[crate::pci_io::FunctionObservation]) -> Vec<Pci> {
 
 /// The stack of another vendor's display controller among `functions` that
 /// this image drives: an image that links another vendor's Vulkan driver
-/// drives that vendor's display controllers itself, and one of them is the
-/// GPU macOS starts with, so the NVIDIA-only notice does not apply.
+/// drives the display controllers that vendor's kernel driver takes, and one
+/// of them is the GPU macOS starts with, so the NVIDIA-only notice does not
+/// apply. A controller the kernel driver refuses (an amdgpu-era Radeon left
+/// to radeon, an Intel GPU outside xe's table) counts for nothing
+/// (`GpuStack::drawing`).
 fn drawn_by_other(
     functions: &[crate::pci_io::FunctionObservation],
-) -> Option<&'static &'static stela_drivers::gpu::stack::GpuStack> {
+) -> Option<&'static stela_drivers::gpu::stack::GpuStack> {
     functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)
         .filter(|identity| identity.vendor != NVIDIA && identity.class[0] == 0x03)
         .find_map(|identity| {
-            let vendor = stela_drivers::gpu::Vendor::from_pci(identity.vendor);
-            stela_drivers::gpu::stack::STACKS
-                .iter()
-                .find(|stack| stack.vendor == vendor && stack.draws())
+            stela_drivers::gpu::stack::GpuStack::drawing(&stela_drivers::gpu::Adapter {
+                address: identity.address,
+                vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
+                device: identity.device,
+                class: identity.class,
+            })
         })
 }
 
