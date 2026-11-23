@@ -408,6 +408,17 @@ pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
 /// opens no translation store and applies no pending disk plan. A
 /// hand-written opt-in setup never writes, so the options revision stays 13.
 pub const CORE_TRIAL: &str = "--core-trial";
+/// Runs tier 2 (`--tier2 on|off`, off unless given): blocks the engine
+/// finds hot are compiled again as superblocks (`stela_engine`'s
+/// `machine::engine::tier2`), which no translation store keeps. A
+/// hand-written opt-in setup never writes, so the options revision stays 13.
+pub const TIER2: &str = "--tier2";
+
+/// Checks tier 2 (`--tier2-check`, which runs tier 2): one entry in 64 into
+/// a tier-2 block that only reads memory runs again as tier 1 from the same
+/// start, and a block whose end differs goes for good, tier 1's end
+/// standing. A debug mode, hand-written as [`TIER2`] is.
+pub const TIER2_CHECK: &str = "--tier2-check";
 
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
@@ -752,6 +763,11 @@ pub struct System {
     pub tlbi_verify_check: bool,
     /// A read-only bring-up boot ([`CORE_TRIAL`]).
     pub core_trial: bool,
+    /// Run tier 2 ([`TIER2`]): `Some(true)` for `on`, `Some(false)` for
+    /// `off`, `None` unless given (off).
+    pub tier2: Option<bool>,
+    /// Check tier 2 ([`TIER2_CHECK`]), which runs it.
+    pub tier2_check: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -899,6 +915,8 @@ impl Default for System {
             tlbi_keep: None,
             tlbi_verify_check: false,
             core_trial: false,
+            tier2: None,
+            tier2_check: false,
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
@@ -1119,6 +1137,11 @@ impl System {
     /// [`GpuAspm::Firmware`].
     pub fn gpu_aspm(&self) -> GpuAspm {
         self.gpu_aspm.unwrap_or_default()
+    }
+
+    /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
+    pub fn tier2_runs(&self) -> bool {
+        self.tier2 == Some(true) || self.tier2_check
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1501,6 +1524,8 @@ impl fmt::Display for System {
         )?;
         line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
         line.flag(CORE_TRIAL, self.core_trial)?;
+        line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
+        line.flag(TIER2_CHECK, self.tier2_check)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;

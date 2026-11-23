@@ -2767,6 +2767,14 @@ impl Heartbeat {
             output::arguments(format_args!("{paths}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
+            // What tier 2 did over the whole run, on every PE (`--tier2`).
+            let mut tier2 = stela_engine::machine::engine::tier2::Tier2Counts::default();
+            for counts in per_pe.iter() {
+                tier2 += counts.tier2;
+            }
+            if tier2 != Default::default() {
+                output::arguments(format_args!("{}\n", tier2_report(&tier2)));
+            }
             // Where TLBIs of everything came from, over the whole run: the
             // guest PCs that issued the most, merged over the PEs.
             let mut sites = stela_engine::machine::engine::WholeTlbiSites::default();
@@ -3583,4 +3591,29 @@ impl BeatCost {
         ));
         output::arguments(format_args!("{line}\n"));
     }
+}
+
+/// `PES TIER2`: what tier 2 did over the run, summed over the PEs: blocks
+/// promoted (their heat reached the threshold), installed in their tier-1
+/// blocks' places, left as tier 1 compiled them, and refused; the exits to
+/// the engine from tier-2 blocks and of those the side exits; the tier-2
+/// blocks taken away after a check found them wrong; and the checks
+/// `--tier2-check` made, the mismatches it found, the entries it could not
+/// check, and the entry PC of the last mismatch.
+pub(super) fn tier2_report(tier2: &stela_engine::machine::engine::tier2::Tier2Counts) -> String {
+    format!(
+        "PES TIER2 promoted={} installed={} unchanged={} refused={} exits={} exits_side={} \
+         deopts={} checks={} check_mismatches={} check_skipped={} mismatch_pc={:#x}",
+        tier2.promoted,
+        tier2.installed,
+        tier2.unchanged,
+        tier2.refused,
+        tier2.exits,
+        tier2.exits_side,
+        tier2.deopts,
+        tier2.checks,
+        tier2.check_mismatches,
+        tier2.check_skipped,
+        tier2.mismatch_pc,
+    )
 }

@@ -637,6 +637,8 @@ pub struct Statistics {
     pub self_loops: u64,
     /// Of `compiled`, the regions (`CompiledBlock::region`).
     pub regions: u64,
+    /// What tier 2 did (`--tier2`, [`super::tier2`]).
+    pub tier2: super::tier2::Tier2Counts,
     /// Counter ticks spent analyzing and compiling `compiled`.
     pub compile_ticks: u64,
     /// Blocks taken from the persistent translation store instead of
@@ -956,6 +958,7 @@ impl core::ops::AddAssign for Statistics {
         let Self {
             blocks,
             replaced_retired,
+            tier2,
             chained,
             links,
             stamped_tails,
@@ -1144,6 +1147,7 @@ impl core::ops::AddAssign for Statistics {
         }
         self.whole_tlbi_trigger.add(&whole_tlbi_trigger);
         self.tlbi_keep.add(&tlbi_keep);
+        self.tier2 += tier2;
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
         }

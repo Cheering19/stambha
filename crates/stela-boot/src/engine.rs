@@ -1327,6 +1327,9 @@ fn run_machine<H: Host>(
         output::arguments(format_args!("HLE {}\n", hle.describe(&options.hle_off)));
     }
     machine.set_hle(hle);
+    let tier2 = tier2_options(options);
+    machine.set_tier2(tier2);
+    output::arguments(format_args!("{}", tier2_line(tier2)));
     let amx_model = options.amx_model();
     machine.set_amx_model(amx_model.0);
     if amx_model == stela_boot_core::options::AmxModel::ALL {
@@ -1757,4 +1760,35 @@ pub(crate) unsafe fn in_loader_root_at_stop<T>(root: u64, call: impl FnOnce() ->
 pub(crate) fn stop_gpus_for_fatal() {
     #[cfg(feature = "nvk")]
     gpu::gate::stop_for_fatal();
+}
+
+/// What `--tier2` and `--tier2-check` ask of every PE's machine.
+pub(crate) fn tier2_options(
+    options: &stela_boot_core::options::System,
+) -> Option<stela_engine::machine::engine::tier2::Tier2Options> {
+    options
+        .tier2_runs()
+        .then(|| stela_engine::machine::engine::tier2::Tier2Options::on(options.tier2_check))
+}
+
+/// The boot's line saying whether tier 2 runs.
+fn tier2_line(tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>) -> String {
+    match tier2 {
+        None => {
+            String::from("TIER2 off: hot blocks keep their tier-1 code (--tier2 on runs tier 2)\n")
+        }
+        Some(options) => format!(
+            "TIER2 on (--tier2): blocks at heat {} are compiled again as superblocks, never stored; \
+             check {}\n",
+            options.threshold,
+            if options.check {
+                format!(
+                    "on (--tier2-check), one tier-2 entry in {}",
+                    options.check_every
+                )
+            } else {
+                String::from("off")
+            }
+        ),
+    }
 }

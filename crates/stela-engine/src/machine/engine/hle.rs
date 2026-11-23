@@ -185,6 +185,44 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Ok(None)
     }
 
+    /// The offset of the first word after the first of `source`, the bytes
+    /// at `pc` (`physical`), where an enabled signature's function starts:
+    /// where a compile there could install a composite. Tier 2
+    /// ([`super::tier2`]) ends a superblock before it, so no branch of the
+    /// superblock lands inside on the original's words instead of reaching
+    /// the composite. Every match counts, refused or not; nothing is
+    /// counted. `None` with HLE off.
+    pub(super) fn hle_entry_after(
+        &mut self,
+        pc: u64,
+        physical: u64,
+        source: &[u8],
+    ) -> Option<usize> {
+        if self.hle.config.enabled == 0 {
+            return None;
+        }
+        let (table, enabled) = (self.hle.config.table.clone(), self.hle.config.enabled);
+        (INSTRUCTION as usize..source.len())
+            .step_by(INSTRUCTION as usize)
+            .find(|&offset| {
+                let at = pc + offset as u64;
+                // A prefix past its fetch page is a function that crosses
+                // it, which no compile replaces.
+                if (at & (FETCH_PAGE - 1)) + PREFIX_BYTES as u64 > FETCH_PAGE {
+                    return false;
+                }
+                let mut head = [0; PREFIX_BYTES];
+                match source.get(offset..offset + PREFIX_BYTES) {
+                    Some(bytes) => head.copy_from_slice(bytes),
+                    None if self.host.read_ram(physical + offset as u64, &mut head) => {}
+                    None => return false,
+                }
+                crate::hle::find(&table, enabled, &head).any(|(_, signature)| {
+                    self.hle_matches(physical + offset as u64, &source[offset..], signature)
+                })
+            })
+    }
+
     /// Whether `signature`'s function starts at `physical`: from `source`
     /// when it holds the whole function, else from RAM. The function's
     /// bytes are left in the scratch buffer either way.

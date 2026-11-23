@@ -107,6 +107,8 @@ pub(crate) struct Settings {
     /// `--hle` and `--hle-off`: the functions native routines replace, as
     /// on the home machine.
     pub hle: stela_engine::hle::Config,
+    /// `--tier2` and `--tier2-check`, as on the home machine.
+    pub tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -141,6 +143,7 @@ pub(crate) fn spawn<H: Host>(
             amx_model: settings.amx_model,
             tlbi_keep: settings.tlbi_keep,
             hle: settings.hle.clone(),
+            tier2: settings.tier2,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -166,6 +169,7 @@ struct Pe {
     amx_model: u32,
     tlbi_keep: (bool, bool),
     hle: stela_engine::hle::Config,
+    tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
 
 impl Pe {
@@ -181,6 +185,7 @@ impl Pe {
             amx_model,
             tlbi_keep,
             hle,
+            tier2,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -206,6 +211,7 @@ impl Pe {
         machine.set_amx_model(amx_model);
         machine.set_tlbi_keep(tlbi_keep.0, tlbi_keep.1);
         machine.set_hle(hle);
+        machine.set_tier2(tier2);
         if step_timing {
             host::pmu::start(pe);
         }

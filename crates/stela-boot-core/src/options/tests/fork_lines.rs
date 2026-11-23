@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 9] {
+fn forks() -> [Fork; 11] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -189,6 +189,22 @@ fn forks() -> [Fork; 9] {
             ],
             duplicate: Some(Error::DuplicateHle),
         },
+        Fork {
+            valid: &["--tier2 on", "--tier2 off"],
+            set: |o, t| o.tier2 = Some(on(t)),
+            bad: &[
+                ("--tier2", Error::Tier2),
+                ("--tier2 yes", Error::Tier2),
+                ("--tier2 ON", Error::Tier2),
+            ],
+            duplicate: Some(Error::DuplicateTier2),
+        },
+        Fork {
+            valid: &["--tier2-check"],
+            set: |o, _| o.tier2_check = true,
+            bad: &[],
+            duplicate: None,
+        },
     ]
 }
 
@@ -235,6 +251,7 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert_eq!(options.gpu_aspm, None);
         assert!(!options.hle && options.hle_off.is_empty());
         assert!(!options.core_trial);
+        assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());
     }
 }
 
@@ -255,7 +272,7 @@ fn each_fork_option_means_the_same_in_every_place_of_every_line() {
             }
         }
     }
-    // 8 lines of 3 to 11 groups, 18 spellings.
+    // 8 lines of 3 to 11 groups, 19 spellings.
     assert!(checked > 1000, "{checked}");
 }
 

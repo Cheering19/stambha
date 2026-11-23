@@ -10539,6 +10539,8 @@ mod stage2_syndrome;
 mod table_base;
 mod tagged;
 mod thread_switch;
+mod tier1_golden;
+mod tier2_interactions;
 mod timer_native;
 mod tlbi_keep;
 

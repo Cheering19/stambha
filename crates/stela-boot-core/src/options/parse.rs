@@ -65,6 +65,17 @@ impl ParseState<'_> {
                 Error::DuplicateTlbiVerifyCheck,
             )?,
             CORE_TRIAL => options.core_trial = true,
+            TIER2 => {
+                let on = match value().ok_or(Error::Tier2)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::Tier2),
+                };
+                if options.tier2.replace(on).is_some() {
+                    return Err(Error::DuplicateTier2);
+                }
+            }
+            TIER2_CHECK => options.tier2_check = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);
@@ -454,6 +465,9 @@ impl ParseState<'_> {
         let options = &mut self.options;
         if options.native_rounds || options.native_shared_check || options.native_bootstrap_check {
             options.parallel = false;
+        }
+        if options.tier2_check && options.tier2 == Some(false) {
+            return Err(Error::Tier2CheckOff);
         }
         if options.ssid.is_some() && options.wifi_key.is_none() {
             options.wifi_key = Some(String::from(DEFAULT_WIFI_KEY));

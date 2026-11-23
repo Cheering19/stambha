@@ -525,8 +525,7 @@ fn every_option_survives_a_round_trip() {
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
          --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
-         --acpi-hardware --keep-running-on-panic --amx-native off --hle --hle-off bzero \
-         --monitor-trace \
+         --acpi-hardware --keep-running-on-panic --tier2 on --tier2-check --amx-native off \n         --hle --hle-off bzero \n         --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
          --load 0x10000004000 --entry 0x10000008000 --x0 7 --budget 99 --break 0x10 \
@@ -546,6 +545,8 @@ fn every_option_survives_a_round_trip() {
     assert!(!System::default().acpi_hardware);
     assert!(options.keep_running_on_panic);
     assert!(!System::default().keep_running_on_panic);
+    assert_eq!(options.tier2, Some(true));
+    assert!(options.tier2_check && options.tier2_runs());
     assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
     assert!(options.hle);
@@ -1128,4 +1129,37 @@ fn a_disk_boot_runs_on_four_six_or_eight_native_cores() {
         over.validate_native_cores(LAPTOP_THREADS, 9, MAC_MINI_CPUS)
             .is_err()
     );
+}
+
+/// Tier 2 is off unless `--tier2 on` or `--tier2-check` asks for it, and
+/// both are hand-written: a line without them parses as it did.
+#[test]
+fn tier2_runs_only_when_asked() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(
+        (plain.tier2, plain.tier2_check, plain.tier2_runs()),
+        (None, false, false)
+    );
+    for (line, tier2, check, runs) in [
+        ("--system --tier2 on", Some(true), false, true),
+        ("--system --tier2 off", Some(false), false, false),
+        ("--system --tier2-check", None, true, true),
+        ("--system --tier2 on --tier2-check", Some(true), true, true),
+    ] {
+        let options = System::parse(line).unwrap();
+        assert_eq!(
+            (options.tier2, options.tier2_check, options.tier2_runs()),
+            (tier2, check, runs),
+            "{line}"
+        );
+        assert_eq!(round_trip(line).tier2, tier2, "{line}");
+    }
+    for (line, error) in [
+        ("--system --tier2", Error::Tier2),
+        ("--system --tier2 yes", Error::Tier2),
+        ("--system --tier2 on --tier2 off", Error::DuplicateTier2),
+        ("--system --tier2 off --tier2-check", Error::Tier2CheckOff),
+    ] {
+        assert_eq!(System::parse(line).err(), Some(error), "{line}");
+    }
 }

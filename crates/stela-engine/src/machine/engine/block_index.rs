@@ -543,6 +543,7 @@ mod tests {
             part: super::super::board::NO_PART,
             device_stub: false,
             hle: None,
+            tier2: false,
         }
     }
 

@@ -257,6 +257,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some(),
             regions: self.regions,
+            // Tier 1: tier 2 compiles with its own (`Self::promote`).
+            traces: false,
         })
     }
 

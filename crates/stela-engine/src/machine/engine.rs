@@ -99,6 +99,8 @@ pub mod step_timing;
 mod stored;
 mod system;
 mod tags;
+pub mod tier2;
+mod tier2_check;
 mod unprivileged;
 mod watch;
 pub use budget::RunBudget;
@@ -484,6 +486,8 @@ struct Block {
     /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
     /// ends, which a fault inside it is taken back from.
     hle: Option<hle::Mark>,
+    /// A tier-2 block ([`tier2`]), installed in its tier-1 block's place.
+    tier2: bool,
 }
 
 // The board keeps one per block, millions in all.
@@ -1209,6 +1213,13 @@ pub struct Machine<H: Host, D: Devices> {
     known_sites: Box<[Option<device_access::KnownSite>; device_access::KNOWN_SITES]>,
     /// The block being installed is a device site's stub.
     installing_stub: bool,
+    /// The block being installed is a tier-2 block ([`tier2`]), which takes
+    /// its tier-1 block's place.
+    installing_tier2: bool,
+    /// Tier 2 (`--tier2`), when it runs.
+    tier2: Option<Box<tier2::Tier2>>,
+    /// A `--tier2-check` replay runs: no run in it starts another check.
+    tier2_checking: bool,
     /// A System exit at a word that is not System was reported
     /// ([`Self::report_exit_mismatch`]).
     exit_mismatch_reported: bool,
@@ -1582,6 +1593,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             device_sites: BTreeMap::new(),
             known_sites: Box::new([const { None }; device_access::KNOWN_SITES]),
             installing_stub: false,
+            installing_tier2: false,
+            tier2: None,
+            tier2_checking: false,
             exit_mismatch_reported: false,
             first_translated: None,
             survey: None,

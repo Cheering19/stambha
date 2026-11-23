@@ -292,7 +292,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return Ok(());
             }
         }
-        let step = self.execute(index, if single { 0 } else { self.chain_budget() });
+        // `--tier2-check`: a sampled tier-2 entry runs alone, then as tier 1.
+        let step = if self.tier2_check_due(index, single) {
+            self.tier2_checked(index)
+        } else {
+            self.execute(index, if single { 0 } else { self.chain_budget() })
+        };
         if self.native_failure.is_some() {
             return step;
         }
@@ -533,6 +538,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         {
             return Err(self.fail_native(index, fault, NativeFailureReason::UnknownCode));
         }
+        // Tier 2's heat: where the run started, and where its budget ran out.
+        self.tier2_heat(index, last, exhausted);
         // A sampled run whose budget ran out was in `last` at a uniformly
         // chosen transfer (`step_timing::HotBlocks`).
         if sampled
@@ -585,9 +592,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // A transfer entered the last block, with the BTYPE it names: 0
         // from every thunk but those of BR and BLR forms.
         let btype = (chained > 0).then_some((block >> chain::BLOCK_BTYPE_SHIFT) as u8);
-        match exit {
+        let step = match exit {
             NativeExit::Exit { next_pc, kind } => {
                 let (kind, skipped) = ExitWord::split(kind);
+                self.tier2_exit(last, skipped);
                 // What a loop or region retired past the rows of its exit
                 // (`GuestState::loop_retired`): its direct exits move it
                 // themselves, an exit at an instruction leaves it here.
@@ -691,7 +699,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.set_doing(0);
                 handled
             }
-        }
+        };
+        // A block the run made hot, once its exit completed and linked.
+        self.tier2_after_run();
+        step
     }
 
     /// Why the run that ended at block `index`'s branch-kind exit of `kind`
