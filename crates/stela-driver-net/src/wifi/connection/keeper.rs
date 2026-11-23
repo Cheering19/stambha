@@ -38,7 +38,7 @@ use crate::{
         supplicant::{self, Akm, EAPOL, IntegrityKey, MultiLink, Step, Supplicant},
     },
 };
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
 use core::fmt::Display;
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
@@ -56,6 +56,9 @@ pub enum Stage {
     NeedsDrain,
     /// Anything between those.
     Busy,
+    /// The radio gave up on its hardware: only [`Radio::recover`] can bring
+    /// the link back, and nothing does on a radio that cannot recover.
+    Lost,
 }
 
 /// What the radio reported since the keeper last looked.
@@ -114,12 +117,46 @@ pub trait Radio: Link {
     const NAME: &'static str;
     /// mac80211's `hw.conf.listen_interval` for this driver.
     const LISTEN_INTERVAL: u16;
+    /// Whether a join under SAE may resume a cached PMKSA by open-system
+    /// authentication and its PMKID, as wpa_supplicant's SME does, instead
+    /// of running the whole exchange again. A radio whose joins are proven
+    /// on hardware only through the whole exchange keeps to it.
+    const RESUMES_PMKSA: bool = true;
+    /// Whether the keeper's failures reach the link's user as
+    /// [`Link::receive`]'s errors, the latest one once, instead of as
+    /// diagnostics ([`Link::take_diagnostic`]): the contract a radio whose
+    /// boot handling is proven on it keeps.
+    const FAILS_THROUGH_RECEIVE: bool = false;
 
     /// Whether `error` only asks to try again once queued frames drain.
     fn deferred(error: &Self::Error) -> bool;
 
     /// Service the radio.
     fn service(&mut self) -> Result<(), Self::Error>;
+
+    /// Whether [`Self::recover`] can bring the radio back once it is
+    /// [`Stage::Lost`].
+    fn recoverable(&self) -> bool {
+        false
+    }
+
+    /// One step of resetting the lost radio's hardware and bringing it back
+    /// to [`Stage::Idle`] with the same station address, as Linux's chip
+    /// reset work does (`mt7925_mac_reset_work`, iwlwifi's firmware restart,
+    /// rtw88's firmware crash recovery). Everything the radio held before is
+    /// gone; the keeper joins again once a step returns
+    /// [`Recovery::Done`].
+    ///
+    /// One call returns within [`RECOVERY_STEP_US`]: it does one bounded
+    /// slice of the bring-up, such as one reset wait, one batch of firmware
+    /// chunks or one command, and returns [`Recovery::Pending`] until the
+    /// bring-up is complete. The keeper calls it again on its next poll. The
+    /// radio bounds the whole attempt as Linux bounds each of its waits and
+    /// returns an error once it fails, saying why; the next attempt starts
+    /// over from the reset.
+    fn recover(&mut self) -> Result<Recovery, String> {
+        Err(format!("{}: cannot recover", Self::NAME))
+    }
     fn take_event(&mut self) -> Option<Event>;
     fn stage(&self) -> Stage;
     fn station(&self) -> &Station;
@@ -249,14 +286,49 @@ pub trait Radio: Link {
     unsafe fn retire_peer(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Where one [`Radio::recover`] step left the recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// More steps follow, on the next polls.
+    Pending,
+    /// The radio is back at [`Stage::Idle`].
+    Done,
+}
+
+/// The longest one [`Radio::recover`] step may hold a poll: one runtime
+/// command at its bound, with room for the register accesses around it.
+pub const RECOVERY_STEP_US: u64 = RUNTIME_COMMAND_TIMEOUT_US + 10_000;
+
+/// `mt7925_mac_reset_work`'s ten chip reset attempts.
+pub const RECOVERY_ATTEMPTS: u32 = 10;
+
+/// The pause after a failed chip reset attempt, so that a radio that keeps
+/// failing still lets its caller run.
+const RECOVERY_RETRY_US: u64 = 1_000_000;
+
 /// The longest a scan may run.
 const SCAN_BUDGET_US: u64 = 30_000_000;
+/// wpa_supplicant's `dot11RSNAConfigPMKLifetime`: 12 hours.
+const PMK_LIFETIME_US: u64 = 43_200_000_000;
+/// How many PMKSAs the station keeps, as `pmksa_cache_add` caps its list.
+const PMKSA_ENTRIES: usize = 32;
+/// The longest one firmware command may hold a station poll. Firmware
+/// answers in a few milliseconds; polls run from guest exits, which must end
+/// well inside the platform's exit bound (about 0.5 s), so a hung firmware
+/// costs the radio, never the machine. Every driver's runtime commands use
+/// this bound and report a command past it as a timeout, which loses the
+/// radio through `Stage::Lost`. Boot-time attach keeps its own longer waits.
+pub const RUNTIME_COMMAND_TIMEOUT_US: u64 = 50_000;
 /// wpa_supplicant's default `scan_interval` after a scan finds nothing.
 const SCAN_INTERVAL_US: u64 = 5_000_000;
 /// The delay before reconnecting once the AP drops the association.
 const RECONNECT_US: u64 = 100_000;
 /// wpa_supplicant's 10 s authentication timeout around the handshake.
 const HANDSHAKE_TIMEOUT_US: u64 = 10_000_000;
+/// How long a station may take from its start to carrier: one whole scan,
+/// then authentication and association, then the 4-way handshake within
+/// its timeout. A wired PHY's wait would end before the scan does.
+pub const CARRIER_WAIT_US: u64 = SCAN_BUDGET_US + 5_000_000 + HANDSHAKE_TIMEOUT_US;
 /// The longest an SAE exchange may take, its commits, anti-clogging retry
 /// and confirms included: the same 10 s wpa_supplicant allows.
 const SAE_BUDGET_US: u64 = 10_000_000;
@@ -289,6 +361,26 @@ pub(crate) fn outranks(a: (usize, i8), b: (usize, i8)) -> bool {
         (false, true) => false,
         _ => a.1 > b.1,
     }
+}
+
+/// Whether `bss` protects its frames: privacy, an RSN element or a WPA
+/// element, any of which keeps an open network's station out.
+fn protected(bss: &Bss) -> bool {
+    let wpa = {
+        let mut rest = &bss.elements[..];
+        let mut found = false;
+        while let [id, length, tail @ ..] = rest {
+            let Some((body, next)) = tail.split_at_checked(usize::from(*length)) else {
+                break;
+            };
+            found |= *id == 221 && body.starts_with(&[0x00, 0x50, 0xf2, 1]);
+            rest = next;
+        }
+        found
+    };
+    bss.capabilities & connection::PRIVACY != 0
+        || security::rsn_element(&bss.elements).is_some()
+        || wpa
 }
 
 /// `cfg80211_6ghz_power_type_valid`: whether a client may use the 6 GHz
@@ -360,14 +452,49 @@ fn keyed_link(link_id: u8, local: Mac, bss: &Bss) -> supplicant::Link {
 
 /// The handshake of an association with `bss` under `security` and `pmk`.
 fn candidate(bss: &Bss, security: Security, pmk: Zeroizing<[u8; 32]>) -> Candidate {
+    cached_candidate(bss, security, pmk, None)
+}
+
+/// The candidate of an open network's BSS: no keys and no handshake.
+fn open_candidate(bss: &Bss) -> Candidate {
     Candidate {
         bssid: bss.bssid,
-        security,
+        security: None,
+        pmk: Zeroizing::new([0; 32]),
+        own_rsn: Vec::new(),
+        peer_rsn: Vec::new(),
+        links: None,
+    }
+}
+
+/// The candidate of an association that names `pmkid`, whose 4-way
+/// handshake repeats the request's RSN element.
+fn cached_candidate(
+    bss: &Bss,
+    security: Security,
+    pmk: Zeroizing<[u8; 32]>,
+    pmkid: Option<[u8; 16]>,
+) -> Candidate {
+    Candidate {
+        bssid: bss.bssid,
+        security: Some(security),
         pmk,
-        own_rsn: security.element(),
+        own_rsn: security.element_with(pmkid),
         peer_rsn: element(48, security::rsn_element(&bss.elements).unwrap_or_default()),
         links: None,
     }
+}
+
+/// A PMKSA cache entry: the PMK and PMKID an SAE exchange with `bssid`
+/// gave, until `expires`.
+struct Pmksa {
+    bssid: Mac,
+    pmk: Zeroizing<[u8; 32]>,
+    pmkid: [u8; 16],
+    /// Whether the exchange was hash-to-element, so a resumed association
+    /// carries the same RSNXE.
+    h2e: bool,
+    expires: u64,
 }
 
 /// The chosen BSS of the network.
@@ -375,7 +502,8 @@ struct Candidate {
     /// The authenticator: the BSS, or the AP MLD of a multi-link
     /// association.
     bssid: Mac,
-    security: Security,
+    /// The association's suites; none for an open network.
+    security: Option<Security>,
     /// The PMK the 4-way handshake proves: the passphrase's or the PSK, or
     /// the SAE exchange's.
     pmk: Zeroizing<[u8; 32]>,
@@ -411,7 +539,10 @@ struct Authenticating<H> {
     bss: Bss,
     security: Security,
     session: Arc<external::Session>,
-    exchange: Exchange,
+    /// The password element's derivation, a bounded share per poll, until
+    /// the exchange's first commit goes out.
+    deriving: Option<sae::Deriving>,
+    exchange: Option<Exchange>,
     /// Whether the exchange derives its element by hash-to-element.
     h2e: bool,
     /// The AP MLD links the association requests.
@@ -452,11 +583,17 @@ enum State<H, M> {
         /// Secondary-link IGTKs waiting for earlier frames and key users.
         link_integrity: Vec<(u8, IntegrityKey)>,
     },
+    /// Associated with an open network's BSS: its port is open with no keys.
+    Open,
     /// Leave the association, then scan once `at` passes.
     Leaving {
         at: u64,
     },
 }
+
+/// How many diagnostics wait at most, and how many are remembered so
+/// that each is queued once.
+const MAX_NOTICES: usize = 32;
 
 /// `WLAN_REASON_MICHAEL_MIC_FAILURE`.
 const MICHAEL_FAILURE: u16 = 14;
@@ -477,9 +614,27 @@ pub struct Keeper<R: Radio> {
     state: State<R::Handle, R::Management>,
     /// wpa_supplicant's `auth_failures` for the network.
     failures: u32,
-    /// The latest failure, which `receive` reports once.
+    /// The latest failure, which `receive` reports once, for a radio that
+    /// [`Radio::FAILS_THROUGH_RECEIVE`]; such a radio queues no notices.
     failure: Option<String>,
     reported: Option<String>,
+    /// Diagnostics not taken yet, each message once.
+    notices: VecDeque<String>,
+    /// Every message queued so far, so that each is queued once.
+    noticed: Vec<String>,
+    /// The radio's latest error, the reason if it is lost.
+    last_error: Option<String>,
+    /// Why the radio stopped for good; the keeper no longer retries.
+    lost: Option<String>,
+    /// wpa_supplicant's PMKSA cache: an SAE exchange's PMK and PMKID per AP.
+    pmksa: Vec<Pmksa>,
+    /// The AP whose cached PMKSA the current association resumes; the entry
+    /// goes if the association or its handshake fails.
+    resuming: Option<Mac>,
+    /// Recovery attempts that failed since the radio was lost.
+    recovery_failures: u32,
+    /// When the next recovery attempt may start.
+    recover_at: u64,
     /// wpa_supplicant's `last_michael_mic_error`.
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
@@ -531,6 +686,14 @@ impl<R: Radio> Keeper<R> {
             failures: 0,
             failure: None,
             reported: None,
+            notices: VecDeque::new(),
+            noticed: Vec::new(),
+            last_error: None,
+            lost: None,
+            pmksa: Vec::new(),
+            resuming: None,
+            recovery_failures: 0,
+            recover_at: 0,
             michael_failed: None,
             directed: false,
             slowest: None,
@@ -578,21 +741,146 @@ impl<R: Radio> Keeper<R> {
         &self.link
     }
 
-    /// The radio, for device models.
-    #[cfg(test)]
+    /// The radio, for its vendor's setup and for device models.
     pub(crate) fn radio_mut(&mut self) -> &mut R {
         &mut self.link
     }
 
+    /// A diagnostic, queued for [`Link::take_diagnostic`] once per message, as
+    /// wpa_supplicant logs an event: it never fails the link.
     fn fail(&mut self, message: String) {
-        if self.reported.as_ref() != Some(&message) {
-            self.failure = Some(message);
+        if R::FAILS_THROUGH_RECEIVE {
+            if self.reported.as_ref() != Some(&message) {
+                self.failure = Some(message);
+            }
+            return;
+        }
+        if self.noticed.contains(&message) {
+            return;
+        }
+        if self.noticed.len() == MAX_NOTICES {
+            self.noticed.remove(0);
+        }
+        self.noticed.push(message.clone());
+        if self.notices.len() == MAX_NOTICES {
+            self.notices.pop_front();
+        }
+        self.notices.push_back(message);
+    }
+
+    /// The failure `receive` has not reported yet, for a radio that
+    /// [`Radio::FAILS_THROUGH_RECEIVE`].
+    fn take_failure(&mut self) -> Option<String> {
+        let failure = self.failure.take()?;
+        self.reported = Some(failure.clone());
+        Some(failure)
+    }
+
+    /// Why the radio stopped for good, once it has.
+    pub fn lost(&self) -> Option<&str> {
+        self.lost.as_deref()
+    }
+
+    /// The radio gave up on its hardware. A radio that can recover is reset
+    /// step by step and joins again, as `mt7925_mac_reset_work` resets the
+    /// chip and mac80211 reconnects. Only a failed attempt waits before the
+    /// next; after [`RECOVERY_ATTEMPTS`] failures in a row the radio is lost
+    /// for good, and so is one that cannot recover.
+    fn recover(&mut self, now: u64) {
+        if !self.link.recoverable() {
+            self.lose();
+            return;
+        }
+        if now < self.recover_at {
+            return;
+        }
+        if let Some(reason) = self.last_error.take() {
+            self.fail(reason);
+        }
+        match self.link.recover() {
+            Ok(Recovery::Pending) => {}
+            Ok(Recovery::Done) => {
+                self.recovery_failures = 0;
+                self.fail(format!(
+                    "{}: recovered by a chip reset; joining again",
+                    R::NAME
+                ));
+                self.state = State::Waiting { at: now };
+            }
+            Err(error) => {
+                self.recovery_failures += 1;
+                let message = format!(
+                    "{}: chip reset {} of {RECOVERY_ATTEMPTS} failed: {error}",
+                    R::NAME,
+                    self.recovery_failures
+                );
+                if self.recovery_failures >= RECOVERY_ATTEMPTS {
+                    self.last_error = Some(message);
+                    self.lose();
+                } else {
+                    self.fail(message);
+                    self.recover_at = now + RECOVERY_RETRY_US;
+                }
+            }
         }
     }
 
+    /// Whether the radio is lost and waits for its recovery.
+    fn recovering(&self) -> bool {
+        self.lost.is_none() && self.link.recoverable() && self.link.stage() == Stage::Lost
+    }
+
+    /// The radio gave up on its hardware for good: report why once and stop
+    /// retrying against it, as wpa_supplicant stops on an interface that
+    /// is removed.
+    fn lose(&mut self) {
+        let reason = self
+            .last_error
+            .take()
+            .unwrap_or_else(|| format!("{}: the radio stopped for good", R::NAME));
+        self.fail(reason.clone());
+        self.lost = Some(reason);
+    }
+
+    /// `pmksa_cache_add`: keep the SAE exchange's PMKSA with `bssid`,
+    /// replacing an older one, the oldest going once the cache is full.
+    fn remember(
+        &mut self,
+        bssid: Mac,
+        pmk: Zeroizing<[u8; 32]>,
+        pmkid: [u8; 16],
+        h2e: bool,
+        now: u64,
+    ) {
+        self.pmksa.retain(|entry| entry.bssid != bssid);
+        if self.pmksa.len() == PMKSA_ENTRIES {
+            self.pmksa.remove(0);
+        }
+        self.pmksa.push(Pmksa {
+            bssid,
+            pmk,
+            pmkid,
+            h2e,
+            expires: now.saturating_add(PMK_LIFETIME_US),
+        });
+    }
+
+    /// `pmksa_cache_get`: the unexpired PMKSA with `bssid`.
+    fn cached(&mut self, bssid: Mac, now: u64) -> Option<(Zeroizing<[u8; 32]>, [u8; 16], bool)> {
+        self.pmksa.retain(|entry| entry.expires > now);
+        self.pmksa
+            .iter()
+            .find(|entry| entry.bssid == bssid)
+            .map(|entry| (entry.pmk.clone(), entry.pmkid, entry.h2e))
+    }
+
     /// A connection attempt failed: leave it and wait as wpa_supplicant
-    /// waits after `failures` attempts.
+    /// waits after `failures` attempts. One that resumed a cached PMKSA
+    /// drops it, as `wpa_sm_aborted_cached` does, so the next runs SAE.
     fn failed(&mut self, now: u64, message: String) {
+        if let Some(bssid) = self.resuming.take() {
+            self.pmksa.retain(|entry| entry.bssid != bssid);
+        }
         self.failures = self.failures.saturating_add(1);
         self.fail(message);
         if self.link.stage() != Stage::Idle {
@@ -605,6 +893,9 @@ impl<R: Radio> Keeper<R> {
 
     /// Service the link, take its notices and advance the connection.
     fn poll(&mut self) {
+        if self.lost.is_some() {
+            return;
+        }
         let now = self.clock.now_us();
         // A rotation waits for the frames queued before it to be taken.
         if let State::Connected {
@@ -618,7 +909,13 @@ impl<R: Radio> Keeper<R> {
             }
         }
         if let Err(error) = self.timed("radio service", |keeper| keeper.link.service()) {
-            self.fail(format!("{error}"));
+            let message = format!("{error}");
+            self.fail(message.clone());
+            self.last_error = Some(message);
+        }
+        if self.link.stage() == Stage::Lost {
+            self.recover(now);
+            return;
         }
         while let Some(event) = self.link.take_event() {
             match event {
@@ -660,11 +957,21 @@ impl<R: Radio> Keeper<R> {
 
     fn advance(&mut self, now: u64) {
         let stage = self.link.stage();
+        if stage == Stage::Lost {
+            self.recover(now);
+            return;
+        }
         match &self.state {
             State::Waiting { at } if now >= *at && stage == Stage::Idle => self.scan(now),
             State::Scanning(_) if stage == Stage::Scanned => self.scanned(now),
+            State::Authenticating(authenticating) if authenticating.deriving.is_some() => {
+                self.derive(now)
+            }
             State::Authenticating(authenticating)
-                if authenticating.exchange.accepted()
+                if authenticating
+                    .exchange
+                    .as_ref()
+                    .is_some_and(Exchange::accepted)
                     && self.link.station().external_authenticated() =>
             {
                 self.associate(now)
@@ -674,6 +981,7 @@ impl<R: Radio> Keeper<R> {
             | State::Joining(_)
             | State::Handshake { .. }
             | State::Connected { .. }
+            | State::Open
                 if matches!(stage, Stage::Idle | Stage::NeedsDrain) =>
             {
                 self.failed(
@@ -807,11 +1115,13 @@ impl<R: Radio> Keeper<R> {
     /// channel bars is not one cfg80211 connects to. A failure names the
     /// preferred network only: an alternate is "saved network N".
     fn choose(&mut self, now: u64) {
-        // The candidate index, the BSS and its security.
-        let mut best: Option<(usize, R::Handle, &Bss, Security)> = None;
+        // The candidate index, the BSS and its security, none for an open
+        // network.
+        let mut best: Option<(usize, R::Handle, &Bss, Option<Security>)> = None;
         // The candidate index and why its BSS was refused, the preferred
         // network's reason first.
         let mut refusal: Option<(usize, String)> = None;
+        let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
         let six = self.link.channels(Band::Ghz6);
         let observed = self.link.bss();
         for &(handle, bss) in &observed {
@@ -837,14 +1147,28 @@ impl<R: Radio> Keeper<R> {
                 );
                 continue;
             }
-            let passphrase = matches!(self.candidates[index].0.secret, Secret::Passphrase(_));
+            let secret = &self.candidates[index].0.secret;
+            let passphrase = matches!(secret, Secret::Passphrase(_));
+            let outranks_best = |best: &Option<(usize, R::Handle, &Bss, Option<Security>)>| {
+                best.as_ref()
+                    .is_none_or(|&(at, _, b, _)| outranks((index, signal(bss)), (at, signal(b))))
+            };
+            if matches!(secret, Secret::Open) {
+                // key_mgmt=NONE: a BSS without privacy, RSN or WPA alone.
+                if protected(bss) {
+                    refuse(
+                        &mut refusal,
+                        String::from("is protected, and the network has no key"),
+                    );
+                } else if outranks_best(&best) {
+                    best = Some((index, handle, bss, None));
+                }
+                continue;
+            }
             match Security::select_on(bss.channel.band, &bss.elements, passphrase) {
                 Ok(security) => {
-                    let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
-                    if best.as_ref().is_none_or(|&(at, _, b, _)| {
-                        outranks((index, signal(bss)), (at, signal(b)))
-                    }) {
-                        best = Some((index, handle, bss, security));
+                    if outranks_best(&best) {
+                        best = Some((index, handle, bss, Some(security)));
                     }
                 }
                 Err(reason) => {
@@ -882,7 +1206,41 @@ impl<R: Radio> Keeper<R> {
         // chosen network's.
         self.network = self.candidates[index].0.clone();
         self.pmk = self.candidates[index].1.clone();
-        let started = if security.akm == Akm::Sae {
+        let Some(security) = security else {
+            let started =
+                self.association_for(&bss, None, None, None)
+                    .and_then(|(join, profile)| {
+                        self.link
+                            .join(handle, join, profile)
+                            .map_err(|error| format!("{error}"))
+                    });
+            match started {
+                Ok(()) => self.state = State::Joining(Box::new(open_candidate(&bss))),
+                Err(message) => self.failed(now, message),
+            }
+            return;
+        };
+        let cached = (R::RESUMES_PMKSA && security.akm == Akm::Sae)
+            .then(|| self.cached(bss.bssid, now))
+            .flatten();
+        let started = if let Some((pmk, pmkid, h2e)) = cached {
+            // pmksa_cache_get: resume the AP's PMKSA by open-system
+            // authentication and its PMKID, as wpa_supplicant's SME does.
+            let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);
+            self.resuming = Some(bss.bssid);
+            self.association_with(&bss, security, rsnxe, Some(pmkid))
+                .and_then(|(join, profile)| {
+                    self.link
+                        .join(handle, join, profile)
+                        .map_err(|error| format!("{error}"))?;
+                    Ok(State::Joining(Box::new(cached_candidate(
+                        &bss,
+                        security,
+                        pmk,
+                        Some(pmkid),
+                    ))))
+                })
+        } else if security.akm == Akm::Sae {
             self.authenticate(handle, bss, security)
                 .map(State::Authenticating)
         } else {
@@ -942,35 +1300,55 @@ impl<R: Radio> Keeper<R> {
         }
         .map_err(|error| format!("{error}"))?;
         let derivation = Derivation::for_rsnxe(connection::find(&bss.elements, 244));
-        let mut unavailable = None;
-        let mut random = || {
-            let mut bytes = [0; 32];
-            if let Err(error) = self.entropy.fill(&mut bytes) {
-                unavailable = Some(error);
-            }
-            bytes
-        };
-        let exchange = Exchange::for_session(
-            &session,
-            derivation,
-            passphrase.as_bytes(),
-            None,
-            &mut random,
-        );
-        if let Some(error) = unavailable {
-            return Err(format!("{} SAE: {error}", R::NAME));
-        }
-        let exchange = exchange.map_err(|error| format!("{} SAE: {error:?}", R::NAME))?;
-        self.send_sae(&session, exchange.commit())?;
+        let deriving =
+            sae::Deriving::for_session(&session, derivation, passphrase.as_bytes(), None)
+                .map_err(|error| format!("{} SAE: {error:?}", R::NAME))?;
         Ok(Box::new(Authenticating {
             handle,
             bss,
             security,
             session,
-            exchange,
+            deriving: Some(deriving),
+            exchange: None,
             h2e: derivation == Derivation::HashToElement,
             links,
         }))
+    }
+
+    /// One bounded share of the password element's derivation; the step
+    /// that finds it sends the exchange's first commit.
+    fn derive(&mut self, now: u64) {
+        let State::Authenticating(authenticating) = &mut self.state else {
+            return;
+        };
+        let Some(deriving) = authenticating.deriving.as_mut() else {
+            return;
+        };
+        let entropy = &self.entropy;
+        let mut unavailable = None;
+        let mut random = || {
+            let mut bytes = [0; 32];
+            if let Err(error) = entropy.fill(&mut bytes) {
+                unavailable = Some(error);
+            }
+            bytes
+        };
+        let stepped = deriving.step(&mut random);
+        if let Some(error) = unavailable {
+            return self.failed(now, format!("{} SAE: {error}", R::NAME));
+        }
+        let exchange = match stepped {
+            Ok(Some(exchange)) => exchange,
+            Ok(None) => return,
+            Err(error) => return self.failed(now, format!("{} SAE: {error:?}", R::NAME)),
+        };
+        let commit = exchange.commit();
+        authenticating.deriving = None;
+        authenticating.exchange = Some(exchange);
+        let session = authenticating.session.clone();
+        if let Err(message) = self.send_sae(&session, commit) {
+            self.failed(now, message);
+        }
     }
 
     /// `ieee80211_mgd_assoc` for an AP MLD: when the NIC reports MLO and
@@ -1108,7 +1486,11 @@ impl<R: Radio> Keeper<R> {
         if !Arc::ptr_eq(received.session(), &authenticating.session) {
             return;
         }
-        let reply = match authenticating.exchange.receive_from(received) {
+        // Nothing the AP sends precedes the station's first commit.
+        let Some(exchange) = authenticating.exchange.as_mut() else {
+            return;
+        };
+        let reply = match exchange.receive_from(received) {
             Ok(reply) => reply,
             Err(sae::Error::Confirm) => {
                 return self.failed(
@@ -1145,10 +1527,17 @@ impl<R: Radio> Keeper<R> {
             exchange,
             h2e,
             links,
+            ..
         } = *authenticating;
-        let Some(pmk) = exchange.pmk() else {
+        let Some(pmk) = exchange.as_ref().and_then(Exchange::pmk) else {
             return self.failed(now, format!("{}: SAE gave no PMK", R::NAME));
         };
+        // pmksa_cache_add after SAE, for a single-link AP.
+        if links.is_none()
+            && let Some(pmkid) = exchange.as_ref().and_then(Exchange::pmkid)
+        {
+            self.remember(bss.bssid, pmk.clone(), pmkid, h2e, now);
+        }
         let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);
         let started =
             self.association(&bss, security, rsnxe)
@@ -1182,6 +1571,29 @@ impl<R: Radio> Keeper<R> {
         security: Security,
         rsnxe: Option<&[u8]>,
     ) -> Result<(Join, R::Profile), String> {
+        self.association_with(bss, security, rsnxe, None)
+    }
+
+    /// The association whose RSN element names `pmkid`.
+    fn association_with(
+        &self,
+        bss: &Bss,
+        security: Security,
+        rsnxe: Option<&[u8]>,
+        pmkid: Option<[u8; 16]>,
+    ) -> Result<(Join, R::Profile), String> {
+        self.association_for(bss, Some(security), rsnxe, pmkid)
+    }
+
+    /// The association under `security`, or an open network's without
+    /// privacy or RSN element and with an open port.
+    fn association_for(
+        &self,
+        bss: &Bss,
+        security: Option<Security>,
+        rsnxe: Option<&[u8]>,
+        pmkid: Option<[u8; 16]>,
+    ) -> Result<(Join, R::Profile), String> {
         let band = bss.channel.band;
         let advertisement = self
             .link
@@ -1207,7 +1619,9 @@ impl<R: Radio> Keeper<R> {
                 self.link.supported_channels(band),
             )
         });
-        let own_rsn = security.element();
+        let own_rsn = security
+            .map(|security| security.element_with(pmkid))
+            .unwrap_or_default();
         let elements = connection::request_elements(
             &Request {
                 ssid: &self.network.ssid,
@@ -1227,9 +1641,12 @@ impl<R: Radio> Keeper<R> {
                 .map_err(|error| format!("{} request capabilities: {error:?}", R::NAME))?;
         }
         let rates = local.rates().supported & peer.rates().supported;
-        let capability = connection::capability(band, chosen.mode, spectrum.is_some());
+        let mut capability = connection::capability(band, chosen.mode, spectrum.is_some());
+        if security.is_none() {
+            capability &= !connection::PRIVACY;
+        }
         let width = chosen.definition.width;
-        let request = if security.management.is_some() {
+        let request = if security.is_some_and(|security| security.management.is_some()) {
             AssociationRequest::new_modern_with_local_pmf(
                 capability,
                 R::LISTEN_INTERVAL,
@@ -1274,7 +1691,11 @@ impl<R: Radio> Keeper<R> {
         let join = Join {
             bssid: bss.bssid,
             channel: bss.channel,
-            policy: PortPolicy::Controlled,
+            policy: if security.is_some() {
+                PortPolicy::Controlled
+            } else {
+                PortPolicy::Open
+            },
             request,
         };
         Ok((join, profile))
@@ -1314,8 +1735,14 @@ impl<R: Radio> Keeper<R> {
                 link.accepted = accepted.contains(&link.link_id);
             }
         }
+        let Some(security) = candidate.security else {
+            // key_mgmt=NONE: the association opens the port.
+            self.state = State::Open;
+            self.failures = 0;
+            return;
+        };
         match Supplicant::new(
-            candidate.security.suites(),
+            security.suites(),
             candidate.pmk,
             self.link.mac(),
             candidate.bssid,
@@ -1575,6 +2002,8 @@ impl<R: Radio> Keeper<R> {
         else {
             unreachable!("matched above")
         };
+        // The resumed PMKSA keyed the handshake: it stays cached.
+        self.resuming = None;
         self.state = State::Connected {
             supplicant,
             bssid,
@@ -1612,13 +2041,6 @@ impl<R: Radio> Keeper<R> {
         }
         Ok(())
     }
-
-    /// The failure `receive` has not reported yet.
-    fn take_failure(&mut self) -> Option<String> {
-        let failure = self.failure.take()?;
-        self.reported = Some(failure.clone());
-        Some(failure)
-    }
 }
 
 impl<R: Radio> Link for Keeper<R> {
@@ -1627,26 +2049,59 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn carrier(&mut self) -> bool {
         self.poll();
-        self.link.carrier()
+        self.lost.is_none() && self.link.carrier()
     }
+    /// The radio's own wait where it names one (the RTL8852CE's
+    /// `WIFI_CARRIER_WAIT_US`); otherwise [`CARRIER_WAIT_US`], a scan, a
+    /// join and the handshake, where a wired PHY's wait would end first.
     fn carrier_wait_us(&self) -> u64 {
-        self.link.carrier_wait_us()
+        match self.link.carrier_wait_us() {
+            crate::WIRED_CARRIER_WAIT_US => CARRIER_WAIT_US,
+            own => own,
+        }
     }
+    /// Each distinct message once.
+    fn take_diagnostic(&mut self) -> Option<String> {
+        self.notices.pop_front()
+    }
+    /// A recovering radio is polled for its steps.
     fn signals(&self) -> bool {
-        self.link.signals()
+        self.lost.is_none() && !self.recovering() && self.link.signals()
     }
     fn due_us(&self) -> Option<u64> {
-        self.link.due_us()
+        self.lost.is_none().then(|| self.link.due_us()).flatten()
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
-        self.link.transmit(frame)
+        if let Some(lost) = &self.lost {
+            return Err(LinkError::Adapter(lost.clone()));
+        }
+        if self.recovering() {
+            return Err(LinkError::NoCarrier);
+        }
+        match self.link.transmit(frame) {
+            // The next poll recovers the radio.
+            Err(_) if self.recovering() => Err(LinkError::NoCarrier),
+            result => result,
+        }
     }
+    /// A notice is never an error here: only a radio lost for good, or the
+    /// radio's own receive error, is.
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.poll();
+        if let Some(lost) = &self.lost {
+            return Err(LinkError::Adapter(lost.clone()));
+        }
         if let Some(failure) = self.take_failure() {
             return Err(LinkError::Adapter(failure));
         }
-        self.link.receive()
+        if self.recovering() {
+            return Ok(None);
+        }
+        match self.link.receive() {
+            // The next poll recovers the radio.
+            Err(_) if self.recovering() => Ok(None),
+            result => result,
+        }
     }
     fn diagnostic(&mut self) -> Option<String> {
         self.link.diagnostic()

@@ -51,7 +51,6 @@ const LINKED_LOW: u16 = 250;
 const LINKED_HIGH: u16 = 500;
 const LINKED_MAX: u8 = 0x5a;
 const LINKED_MID: u8 = 0x40;
-const LINKED_MIN: u8 = 0x20;
 const COVERAGE_ALARMS: [u16; 3] = [5000, 4000, 2000];
 const COVERAGE_MAX: u8 = 0x2a;
 const COVERAGE_MID: u8 = 0x26;
@@ -71,7 +70,7 @@ pub struct Traffic {
 }
 const RSSI_GAIN_OFFSET: u8 = 15;
 /// `DECLARE_EWMA(rssi, 10, 16)`.
-const AVERAGE_PRECISION: u32 = 10;
+pub(in crate::wifi::realtek) const AVERAGE_PRECISION: u32 = 10;
 const AVERAGE_WEIGHT: u32 = 4;
 /// `rtw_phy_get_rssi_level`'s table and `RA_FLOOR_UP_GAP`.
 const LEVELS: [u8; 7] = [20, 34, 38, 42, 46, 50, 100];
@@ -147,9 +146,10 @@ const RF_AAC_CTRL: u8 = 0xca;
 const RF_SYN_AAC: u8 = 0xc9;
 const RF_FAST_LCK: u8 = 0xcc;
 const RF_WHOLE: u32 = 0xfffff;
-/// `read_poll_timeout`'s step and how many fit its 100 ms.
+/// `read_poll_timeout`'s step, and 20 of rtw88's 100: the lock runs from the
+/// watchdog, whose caller this must not hold, and settles in a few steps.
 const LCK_POLL_US: u64 = 1000;
-const LCK_POLLS: usize = 100;
+const LCK_POLLS: usize = 20;
 /// `RTW_TP_SHIFT` and `DECLARE_EWMA(tp, 10, 2)`.
 const MBPS_SHIFT: u32 = 18;
 const THROUGHPUT_WEIGHT: u32 = 1;
@@ -260,7 +260,7 @@ fn mask_of<I: Io>(io: &mut I, register: u32, mask: u32) -> Result<u32, io::Error
 }
 
 /// `ewma_add`, in ten fraction bits.
-fn average_in(internal: &mut u64, value: u64, weight: u32) {
+pub(in crate::wifi::realtek) fn average_in(internal: &mut u64, value: u64, weight: u32) {
     let value = value << AVERAGE_PRECISION;
     *internal = if *internal == 0 {
         value
@@ -353,15 +353,37 @@ fn rssi(power: &[i8]) -> u8 {
     linear_2_db(sum >> (power.len() - 1))
 }
 
-/// `query_phy_status` of a frame's driver information, under the upper and
-/// lower CCK gains the PHY's tables left, for a frame at `rate`.
-pub fn phy_status(info: &[u8], [upper, lower]: [u8; 2], rate: u8) -> Option<Signal> {
+/// How a chip's `query_phy_status` reads a frame's PHY status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusFormat {
+    /// rtw8822c's: two paths, and a CCK frame's power corrected by its gain
+    /// outside the upper and lower CCK gains the PHY's tables left.
+    Rtl8822C { cck_bounds: [u8; 2] },
+    /// rtw8821c's: one path, a CCK frame's power from its LNA and VGA
+    /// indices by the board's `lna_gain_table`, and no error vector or
+    /// frequency offset kept.
+    Rtl8821C { rfe: u8 },
+}
+
+/// rtw8821c's `lna_gain_table_0`, for RFE 0, and `lna_gain_table_1`.
+const LNA_GAIN_8821C_RFE0: [i8; 8] = [22, 8, -6, -22, -31, -40, -46, -52];
+const LNA_GAIN_8821C: [i8; 16] = [
+    10, 6, 2, -2, -6, -10, -14, -17, -20, -24, -28, -31, -34, -37, -40, -44,
+];
+
+/// `query_phy_status` of a frame's driver information, in `format`, for a
+/// frame at `rate`.
+pub fn phy_status(info: &[u8], format: StatusFormat, rate: u8) -> Option<Signal> {
     let word_at = |at: usize| {
         let bytes = info.get(at * 4..)?.first_chunk::<4>()?;
         Some(u32::from_le_bytes(*bytes))
     };
     let word = word_at(0)?;
     let reading = |at: u32| (word >> at) as u8 as i8;
+    let [upper, lower] = match format {
+        StatusFormat::Rtl8822C { cck_bounds } => cck_bounds,
+        StatusFormat::Rtl8821C { rfe } => return phy_status_8821c(word, word_at(3), rfe),
+    };
     match word & 15 {
         0 => {
             let gain = ((word >> 16) & 0x3f) as u8;
@@ -394,6 +416,34 @@ pub fn phy_status(info: &[u8], [upper, lower]: [u8; 2], rate: u8) -> Option<Sign
         }
         _ => None,
     }
+}
+
+/// rtw8821c's `query_phy_status`: page 0's `get_cck_rx_pwr`, page 1's
+/// path A, whose bandwidth nothing here reads.
+fn phy_status_8821c(word: u32, word3: Option<u32>, rfe: u8) -> Option<Signal> {
+    let power = match word & 15 {
+        0 => {
+            let word3 = word3?;
+            let vga = ((word3 >> 8) & 0x1f) as u8;
+            let lna = (((word3 >> 23) & 1) << 3 | ((word3 >> 13) & 7)) as usize;
+            let table: &[i8] = if rfe == 0 {
+                &LNA_GAIN_8821C_RFE0
+            } else {
+                &LNA_GAIN_8821C
+            };
+            // An index past the table is rtw88's warning and -120 dBm.
+            table
+                .get(lna)
+                .map_or(-120, |&gain| gain.wrapping_sub((vga << 1) as i8))
+        }
+        1 => ((word >> 8) as u8 as i8).wrapping_sub(110).max(-120),
+        _ => return None,
+    };
+    Some(Signal {
+        rssi: rssi(&[power]),
+        power_dbm: power,
+        ofdm: None,
+    })
 }
 
 /// `query_phy_status_page1`'s reading of an error vector.
@@ -438,6 +488,17 @@ fn response_rates(rate: u8) -> u32 {
     (1 << (order + CCK_ORDERS)) - 1
 }
 
+/// One `false_alarm_statistics` of a chip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Alarms {
+    /// `total_fa_cnt`.
+    pub total: u16,
+    /// `cck_fa_cnt`.
+    pub cck: u32,
+    /// `cck_ok_cnt + cck_err_cnt`.
+    pub cck_frames: u32,
+}
+
 /// What a station starts tracking from.
 #[derive(Debug)]
 pub struct Initial {
@@ -450,7 +511,29 @@ pub struct Initial {
     pub lck_reference: u8,
     /// regulatory.db's `dfs_region` of the country.
     pub dfs_region: u8,
+    /// The chip's `dig_min`.
+    pub dig_min: u8,
+    /// The chip's `cck_pd_set`.
+    pub cck: CckPd,
 }
+
+/// A chip's `cck_pd_set`: what a new CCK packet detection level writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CckPd {
+    /// `rtw8822c_phy_cck_pd_set`: the threshold and carrier sense of the
+    /// width and path count in use, each moved by the level's step.
+    Stepped,
+    /// `rtw8821c_phy_cck_pd_set`: `REG_PWRTH`'s threshold from its table and
+    /// `REG_PWRTH2`'s carrier sense ratio two above `default` a level.
+    Absolute { default: u8 },
+}
+
+/// `rtw8821c_phy_cck_pd_set`'s thresholds by level, and their registers.
+const ABSOLUTE_THRESHOLDS: [u32; 5] = [3, 7, 13, 13, 13];
+const REG_PWRTH: u32 = 0xa08;
+const PWRTH: u32 = 0x3f_0000;
+const REG_PWRTH2: u32 = 0xaa8;
+const PWRTH2: u32 = 0x1f_0000;
 
 /// `rtw_cfo_track`.
 #[derive(Debug)]
@@ -500,6 +583,8 @@ struct Thermal {
     internal: [u64; 2],
     averages: [u8; 2],
     lck_reference: u8,
+    /// A synthesizer lock went on unsettled, not yet told.
+    lock_unsettled: bool,
 }
 
 /// `rtw_phy_pwrtrack_get_pwridx`.
@@ -521,16 +606,19 @@ fn swing(band: Band, cck: bool) -> (&'static [Swing; 2], &'static [Swing; 2]) {
     }
 }
 
-/// `rtw8822c_do_lck`.
-fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<(), rf::Error> {
+/// `rtw8822c_do_lck`: whether the lock settled within its wait. rtw88 goes
+/// on either way, as this does.
+fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<bool, rf::Error> {
     rf.write(Path::A, RF_SYN_CTRL, RF_WHOLE, 0x80010)?;
     rf.write(Path::A, RF_SYN_PFD, RF_WHOLE, 0x1f0fa)?;
     rf.table_delay_us(1)?;
     rf.write(Path::A, RF_AAC_CTRL, RF_WHOLE, 0x80000)?;
     rf.write(Path::A, RF_SYN_AAC, RF_WHOLE, 0x80001)?;
+    let mut settled = false;
     for _ in 0..LCK_POLLS {
         rf.table_delay_us(LCK_POLL_US)?;
         if rf.read(Path::A, RF_AAC_CTRL, 0x1000)? != 1 {
+            settled = true;
             break;
         }
     }
@@ -539,7 +627,8 @@ fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<(), rf::Erro
     rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)?;
     rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x4f000)?;
     rf.table_delay_us(1)?;
-    rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)
+    rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)?;
+    Ok(settled)
 }
 
 /// `rtw_dm_info`'s tracking state, with the peer's `rtw_sta_info`.
@@ -560,6 +649,8 @@ pub struct Dynamic {
     /// `cck_fa_avg`, none after each reset.
     cck_average: Option<u32>,
     cck_levels: [[u8; 2]; 2],
+    cck: CckPd,
+    dig_min: u8,
     /// `dm_path_div`.
     tx_path: Path,
     path_sums: [u32; 2],
@@ -599,6 +690,8 @@ impl Dynamic {
             damping_rssi: 0,
             cck_average: None,
             cck_levels: [[0; 2]; 2],
+            cck: initial.cck,
+            dig_min: initial.dig_min,
             tx_path: Path::A,
             path_sums: [0; 2],
             path_counts: [0; 2],
@@ -618,6 +711,7 @@ impl Dynamic {
                 internal: [0; 2],
                 averages: [0; 2],
                 lck_reference: initial.lck_reference,
+                lock_unsettled: false,
             },
             energy_threshold: match initial.dfs_region {
                 DFS_ETSI => Some(EDCCA_ETSI),
@@ -775,6 +869,15 @@ impl Dynamic {
         let Some(new) = self.cck_level(average, linked) else {
             return Ok(());
         };
+        if let CckPd::Absolute { default } = self.cck {
+            if self.cck_levels[0][0] == new {
+                return Ok(());
+            }
+            self.cck_average = None;
+            self.cck_levels[0][0] = new;
+            set_mask(io, REG_PWRTH, PWRTH, ABSOLUTE_THRESHOLDS[usize::from(new)])?;
+            return set_mask(io, REG_PWRTH2, PWRTH2, u32::from(default + new * 2));
+        }
         let paths = mask_of(io, REG_CCK_PATHS, CCK_PATHS)? as usize;
         let width = mask_of(io, REG_WIDTH, WIDTH)? as usize;
         if width > 1 || paths > 1 {
@@ -957,7 +1060,7 @@ impl Dynamic {
             }
             if thermal.averages[0].abs_diff(thermal.lck_reference) >= LCK_THRESHOLD {
                 thermal.lck_reference = thermal.averages[0];
-                lock_synthesizer(&mut rf)?;
+                thermal.lock_unsettled |= !lock_synthesizer(&mut rf)?;
             }
         }
         let (raise, lower) = swing(band, self.tx_rate <= LAST_CCK_RATE);
@@ -1005,9 +1108,19 @@ impl Dynamic {
         (self.average >> AVERAGE_PRECISION) as u8
     }
 
+    /// Whether a synthesizer lock went on before it settled, once each time.
+    pub fn take_unsettled_lock(&mut self) -> bool {
+        core::mem::take(&mut self.thermal.lock_unsettled)
+    }
+
     /// `si->rssi_level`.
     pub fn level(&self) -> u8 {
         self.level
+    }
+
+    /// `dm_info->tx_rate`.
+    pub fn tx_rate(&self) -> u8 {
+        self.tx_rate
     }
 
     pub fn current_gain(&self) -> u8 {
@@ -1096,8 +1209,8 @@ impl Dynamic {
             .find_map(|(threshold, step)| (alarms > threshold).then_some(step))
             .unwrap_or(0);
         let (max, mid, min, floor) = if linked {
-            let floor = self.min_rssi.max(LINKED_MIN);
-            (LINKED_MAX, LINKED_MID, LINKED_MIN, floor)
+            let floor = self.min_rssi.max(self.dig_min);
+            (LINKED_MAX, LINKED_MID, self.dig_min, floor)
         } else {
             (COVERAGE_MAX, COVERAGE_MID, MAX_COVERAGE, MAX_COVERAGE)
         };
@@ -1190,6 +1303,8 @@ mod tests {
             power_tracked: true,
             lck_reference: 0x20,
             dfs_region: 1,
+            dig_min: 0x20,
+            cck: CckPd::Stepped,
         })
     }
 
@@ -1207,15 +1322,56 @@ mod tests {
         // Page 0, power 70, gain 10 under a lower bound of 12.
         info[1] = 70;
         info[2] = 10;
-        let signal = phy_status(&info, [30, 12], 0).unwrap();
+        let signal = phy_status(
+            &info,
+            StatusFormat::Rtl8822C {
+                cck_bounds: [30, 12],
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(signal.power_dbm, 70 + 4 - 110);
         assert_eq!(signal.rssi, 64);
         // Gain 34 over an upper bound of 30.
         info[2] = 34;
         assert_eq!(
-            phy_status(&info, [30, 12], 0).unwrap().power_dbm,
+            phy_status(
+                &info,
+                StatusFormat::Rtl8822C {
+                    cck_bounds: [30, 12]
+                },
+                0
+            )
+            .unwrap()
+            .power_dbm,
             70 - 8 - 110
         );
+    }
+
+    #[test]
+    fn an_rtl8821c_reads_cck_power_from_its_lna_table_and_ofdm_from_path_a() {
+        let format = |rfe| StatusFormat::Rtl8821C { rfe };
+        let mut info = [0; 16];
+        // Page 0, LNA 0b1010 (high bit 23, low bits 15:13), VGA 6.
+        info[12..16].copy_from_slice(&((1 << 23) | (2 << 13) | (6 << 8) as u32).to_le_bytes());
+        let signal = phy_status(&info, format(2), 0).unwrap();
+        assert_eq!(signal.power_dbm, -28 - 12);
+        assert_eq!(signal.rssi, rssi(&[-40]));
+        // RFE 0's table has eight entries: index 10 is past it.
+        assert_eq!(phy_status(&info, format(0), 0).unwrap().power_dbm, -120);
+        info[12..16].copy_from_slice(&((1 << 13) | (3 << 8) as u32).to_le_bytes());
+        assert_eq!(phy_status(&info, format(0), 0).unwrap().power_dbm, 8 - 6);
+        assert_eq!(phy_status(&info[..8], format(0), 0), None, "short");
+        // Page 1: path A's power alone, no error vector or offsets kept.
+        let mut info = [0; 4];
+        info[0] = 1;
+        info[1] = 60;
+        info[2] = 100;
+        let signal = phy_status(&info, format(0), 0).unwrap();
+        assert_eq!(signal.power_dbm, -50);
+        assert_eq!(signal.ofdm, None);
+        info[0] = 2;
+        assert_eq!(phy_status(&info, format(0), 0), None);
     }
 
     #[test]
@@ -1224,10 +1380,21 @@ mod tests {
         info[0] = 1;
         info[1] = 60;
         info[2] = 70;
-        assert_eq!(phy_status(&info, [0, 0], 0).unwrap().power_dbm, -40);
+        assert_eq!(
+            phy_status(&info, StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0)
+                .unwrap()
+                .power_dbm,
+            -40
+        );
         info[0] = 2;
-        assert_eq!(phy_status(&info, [0, 0], 0), None);
-        assert_eq!(phy_status(&[1, 2], [0, 0], 0), None);
+        assert_eq!(
+            phy_status(&info, StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0),
+            None
+        );
+        assert_eq!(
+            phy_status(&[1, 2], StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0),
+            None
+        );
     }
 
     #[test]
@@ -1303,6 +1470,38 @@ mod tests {
         dynamic.detect_cck(&mut bus, 700, false).unwrap();
         assert_eq!(dynamic.cck_average, Some(700));
         assert_eq!(dynamic.cck_levels[0][1], 0);
+    }
+
+    #[test]
+    fn an_rtl8821c_level_writes_its_threshold_and_carrier_sense_absolutely() {
+        let mut bus = Bus::default();
+        bus.0.insert(REG_PWRTH, 0xff00_ffff);
+        let mut dynamic = at_gain(0x30);
+        dynamic.cck = CckPd::Absolute { default: 6 };
+        dynamic.heard(30);
+        dynamic.sample(true);
+        // Level two, whatever width or paths the PHY stands at.
+        dynamic.detect_cck(&mut bus, 0, true).unwrap();
+        assert_eq!(bus.get(REG_PWRTH), 0xff0d_ffff);
+        assert_eq!(bus.get(REG_PWRTH2), 10 << 16);
+        assert_eq!(dynamic.cck_average, None);
+        // The same level writes nothing again.
+        bus.0.insert(REG_PWRTH2, 0);
+        dynamic.detect_cck(&mut bus, 0, true).unwrap();
+        assert_eq!(bus.get(REG_PWRTH2), 0);
+        dynamic.detect_cck(&mut bus, 0, false).unwrap();
+        assert_eq!(bus.get(REG_PWRTH), 0xff03_ffff);
+        assert_eq!(bus.get(REG_PWRTH2), 6 << 16);
+    }
+
+    #[test]
+    fn a_linked_gain_keeps_above_the_chips_own_floor() {
+        let mut dynamic = at_gain(0x1c);
+        dynamic.dig_min = 0x1c;
+        dynamic.sample(true);
+        assert_eq!(dynamic.gain(0, true), None, "0x1c is the RTL8821C's floor");
+        dynamic.dig_min = 0x20;
+        assert_eq!(dynamic.gain(0, true), Some(0x20));
     }
 
     #[test]
@@ -1473,6 +1672,85 @@ mod tests {
         assert_eq!(bus.get(0x820) & 0xff, 0x31);
         assert_eq!(bus.get(0x1e2c) & 0xffff, 0x0400);
         assert_eq!(bus.get(0x824), 0x0303_0000);
+    }
+
+    /// A radio whose synthesizer lock stays busy or not, counting its delays.
+    struct Synthesizer {
+        bus: Bus,
+        busy: bool,
+        delays: usize,
+    }
+
+    // SAFETY: nothing here reaches hardware; this is a map of words.
+    unsafe impl Io for Synthesizer {
+        fn profile(&self) -> Profile {
+            profile()
+        }
+        fn read8(&mut self, register: u32) -> Result<u8, io::Error> {
+            self.bus.read8(register)
+        }
+        fn read16(&mut self, register: u32) -> Result<u16, io::Error> {
+            self.bus.read16(register)
+        }
+        fn read32(&mut self, register: u32) -> Result<u32, io::Error> {
+            let value = self.bus.read32(register)?;
+            let lock = 0x3c00 + u32::from(RF_AAC_CTRL) * 4;
+            Ok(if register == lock && self.busy {
+                value | 0x1000
+            } else {
+                value
+            })
+        }
+        fn write8(&mut self, register: u32, value: u8) -> Result<(), io::Error> {
+            self.bus.write8(register, value)
+        }
+        fn write16(&mut self, register: u32, value: u16) -> Result<(), io::Error> {
+            self.bus.write16(register, value)
+        }
+        fn write32(&mut self, register: u32, value: u32) -> Result<(), io::Error> {
+            self.bus.write32(register, value)
+        }
+        fn delay_us(&mut self, microseconds: u64) {
+            if microseconds == LCK_POLL_US {
+                self.delays += 1;
+            }
+        }
+        fn submit_beacon(&mut self, _: &[u8]) -> Result<(), io::Error> {
+            Ok(())
+        }
+        unsafe fn beacon_consumed(&mut self) -> Result<(), io::Error> {
+            Ok(())
+        }
+        fn quarantine(&mut self) {}
+    }
+
+    #[test]
+    fn a_synthesizer_lock_waits_20_ms_at_most_and_says_whether_it_settled() {
+        use crate::wifi::realtek::registers::{
+            FW_READY, REG_MCUFW_CTRL, REG_RF_CTRL, REG_SYS_CFG1, REG_SYS_FUNC_EN, REG_WLRF1,
+        };
+        for busy in [false, true] {
+            let mut bus = Bus::default();
+            bus.0.insert(REG_SYS_CFG1, profile().observed().sys_cfg1);
+            bus.0.insert(REG_MCUFW_CTRL, FW_READY.into());
+            bus.0.insert(REG_SYS_FUNC_EN, 3);
+            bus.0.insert(REG_RF_CTRL, 7);
+            bus.0.insert(REG_WLRF1, 0x0700_0000);
+            let mut radio = Synthesizer {
+                bus,
+                busy,
+                delays: 0,
+            };
+            let report = Features::of_two_paths(profile());
+            // SAFETY: the model radio belongs to this test alone.
+            let mut rf = unsafe { rf::Registers::new(&mut radio, &report) }.unwrap();
+            assert_eq!(lock_synthesizer(&mut rf).unwrap(), !busy);
+            drop(rf);
+            assert_eq!(radio.delays, if busy { LCK_POLLS } else { 1 });
+            // The lock ends as rtw88 ends it, settled or not.
+            let fast = 0x3c00 + u32::from(RF_FAST_LCK) * 4;
+            assert_eq!(radio.bus.get(fast) & RF_WHOLE, 0x0f000);
+        }
     }
 
     #[test]

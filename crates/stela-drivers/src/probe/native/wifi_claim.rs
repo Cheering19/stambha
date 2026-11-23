@@ -1,6 +1,6 @@
 //! The cold claim of a Wi-Fi function whose driver sets Bus Master before it
-//! resets its engines: an Intel radio (iwlwifi), a MediaTek MT7925 (mt7925e)
-//! or a Realtek RTL8822CE (rtw88). Their claim used to keep the
+//! resets its engines: an Intel radio (iwlwifi), a MediaTek MT7921 or MT7922
+//! (mt7921e) or MT7925 (mt7925e), or a Realtek RTL8822CE or RTL8821CE (rtw88). Their claim used to keep the
 //! preparation's seal for good, so the Bus Master each driver sets was
 //! refused and none became a station (issues #224 and #18).
 //!
@@ -48,19 +48,38 @@ use core::fmt;
 pub enum Chip {
     /// An Intel radio `iwl_pci_probe` identifies (`intel::identity::device`).
     Intel,
+    /// A MediaTek MT7921 (`mediatek::identity::Chip::Mt7921`).
+    Mt7921,
+    /// A MediaTek MT7922 (`mediatek::identity::Chip::Mt7922`).
+    Mt7922,
     /// A MediaTek MT7925 (`mediatek::identity::Chip::Mt7925`).
     Mt7925,
     /// A Realtek RTL8822CE (`realtek::identity::RTL8822C_DEVICES`).
     Rtl8822c,
+    /// A Realtek RTL8821CE (`realtek::chip::RTL8821C`).
+    Rtl8821c,
 }
 
 impl Chip {
+    /// The claim of the MediaTek chip the function's IDs name.
+    pub fn mediatek(chip: crate::net::wifi::mediatek::identity::Chip) -> Self {
+        use crate::net::wifi::mediatek::identity::Chip as Mediatek;
+        match chip {
+            Mediatek::Mt7921 => Self::Mt7921,
+            Mediatek::Mt7922 => Self::Mt7922,
+            Mediatek::Mt7925 => Self::Mt7925,
+        }
+    }
+
     /// The chip as the boot log names it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Intel => "Intel Wi-Fi",
+            Self::Mt7921 => "MT7921",
+            Self::Mt7922 => "MT7922",
             Self::Mt7925 => "MT7925",
             Self::Rtl8822c => "RTL8822CE",
+            Self::Rtl8821c => "RTL8821CE",
         }
     }
 }
@@ -89,7 +108,7 @@ pub enum Flr {
     Absent,
     /// It advertises one Linux's `quirk_no_flr` refuses: a MediaTek MT7922
     /// or MT7925, whose configuration reads stay all-ones after it. Every
-    /// MT7925 ID is treated so.
+    /// MT7922 and MT7925 ID is treated so, the quirk naming one of each.
     Broken,
 }
 
@@ -221,7 +240,7 @@ pub fn flr<C: ConfigSpace>(
     function: &mut Function<C>,
     chip: Chip,
 ) -> Result<Result<(), Flr>, Error> {
-    if chip == Chip::Mt7925 || flr_quirk(function.vendor, function.device) {
+    if matches!(chip, Chip::Mt7922 | Chip::Mt7925) || flr_quirk(function.vendor, function.device) {
         return Ok(Err(Flr::Broken));
     }
     let Some(express) = function

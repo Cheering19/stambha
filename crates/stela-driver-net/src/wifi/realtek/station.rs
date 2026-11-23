@@ -24,7 +24,7 @@ use crate::{
     Clock, Link, LinkError, Mac,
     wifi::{
         Band, Channel, RadioStatus, RawRate, Timestamp,
-        connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Stage},
+        connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Recovery, Stage},
         frame::Mpdu,
         mediatek::reorder::Reorder,
         network::Network,
@@ -188,6 +188,26 @@ pub trait Device {
     /// What the hardware does not do yet, each named once or more.
     fn limitation(&mut self) -> Option<&'static str> {
         None
+    }
+    /// The device was quarantined: no call reaches it again until a
+    /// [`Self::recover`] that is [`Recovery::Done`].
+    fn lost(&self) -> bool {
+        false
+    }
+    /// Whether [`Self::recover`] can bring a lost device back.
+    fn recoverable(&self) -> bool {
+        false
+    }
+    /// One bounded step of a chip reset of the lost device, which runs again
+    /// at the same address with nothing of before once it is
+    /// [`Recovery::Done`].
+    fn recover(&mut self) -> Result<Recovery, String> {
+        Err(String::from("no chip reset"))
+    }
+    /// Nothing holds frames back: a calibration [`Self::prepare_transmit`]
+    /// began has ended. Each [`Self::receive`] takes a step of it.
+    fn ready(&self) -> bool {
+        true
     }
 }
 
@@ -574,6 +594,11 @@ pub struct Rtl8822c<D: Device> {
     departing: Option<Ticket>,
     left: bool,
     reported: Vec<&'static str>,
+    /// Frames and reports refused and dropped, as mac80211 counts `rx_dropped`.
+    dropped: u64,
+    /// A join whose authentication waits for the calibration
+    /// `rtw_ops_mgd_prepare_tx` began, as mac80211 waits for that call.
+    pending_join: Option<(usize, Join)>,
 }
 
 impl<D: Device> Rtl8822c<D> {
@@ -621,7 +646,92 @@ impl<D: Device> Rtl8822c<D> {
             departing: None,
             left: false,
             reported: Vec::new(),
+            dropped: 0,
+            pending_join: None,
         })
+    }
+
+    /// Forget everything of the device before its chip reset, as mac80211's
+    /// restart starts over with no station, keys or agreements. What was
+    /// told once stays told.
+    fn reset(&mut self) -> Result<(), Error> {
+        let Self {
+            device: _,
+            address,
+            clock,
+            country: _,
+            channels: _,
+            station,
+            scanner,
+            hop,
+            scanned,
+            observed,
+            outbox,
+            events: _,
+            following,
+            received,
+            held,
+            parked,
+            changes,
+            aggregating,
+            unaggregated,
+            no_amsdu,
+            rate_amsdu,
+            tail_joins,
+            admitted,
+            context,
+            keys,
+            next_slot,
+            management_cipher,
+            integrity,
+            tuned,
+            agreements,
+            fragments,
+            report,
+            reporting,
+            port_open,
+            watchdog_at,
+            watchdogs,
+            departing,
+            left,
+            reported: _,
+            dropped: _,
+            pending_join,
+        } = self;
+        *station = Station::new(*address).map_err(Error::Station)?;
+        *scanner = Scanner::new(*address).map_err(Error::Scan)?;
+        *hop = None;
+        *scanned = None;
+        observed.clear();
+        outbox.clear();
+        *following = None;
+        received.clear();
+        held.clear();
+        parked.clear();
+        changes.clear();
+        *aggregating = Default::default();
+        *unaggregated = [false; 8];
+        *no_amsdu = [false; 8];
+        *rate_amsdu = 0;
+        *tail_joins = false;
+        *admitted = None;
+        *context = None;
+        keys.clear();
+        *next_slot = 0;
+        *management_cipher = None;
+        *integrity = None;
+        *tuned = None;
+        *agreements = Default::default();
+        *fragments = Fragments::default();
+        *report = 0;
+        *reporting = None;
+        *port_open = false;
+        *watchdog_at = clock.now_us() + WATCHDOG_US;
+        *watchdogs = 0;
+        *departing = None;
+        *left = false;
+        *pending_join = None;
+        Ok(())
     }
 
     /// Keep `self` connected to `network`; `entropy` gives each handshake's
@@ -695,6 +805,24 @@ impl<D: Device> Rtl8822c<D> {
         if self.change_agreements().is_err() {
             self.unsupported("a transmit agreement that would not end");
         }
+    }
+
+    /// mac80211's authentication of a join, on a radio ready to send.
+    fn begin_join(&mut self, handle: usize, join: Join) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        let now = self.clock.now_us();
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        let mut policy = Admitted(&self.channels);
+        let action = if join.request.pmf().is_some() {
+            self.station
+                .begin_modern_pmf(join, observed, now, &mut policy)
+        } else {
+            self.station
+                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        }
+        .map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
     }
 
     /// `rtw_sta_remove` and `rtw_ops_bss_info_changed` of the disassociation.
@@ -1264,52 +1392,71 @@ impl<D: Device> Rtl8822c<D> {
         self.rate_amsdu = bit_rate::max_amsdu(bit_rate::bit_rate(rate, short_gi, width));
     }
 
+    /// Frames and reports refused since attach, which mac80211 drops.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Everything the device received in one look. As mac80211 does, a frame
+    /// or report the station refuses is dropped and counted, and the rest of
+    /// the look goes on; only the device failing ends it, after the frames
+    /// already taken from the ring are handled.
     fn take_incoming(&mut self, now: u64) -> Result<(), Error> {
         let mut incoming = Vec::new();
         Self::hardware(self.device.receive(&mut |item| incoming.push(item)))?;
         while let Some(limitation) = self.device.limitation() {
             self.unsupported(limitation);
         }
+        let mut failure = None;
         for item in incoming {
-            match item {
-                Incoming::Report(Report::Transmitted {
-                    number,
-                    acknowledged,
-                }) => {
-                    if self.reporting == Some(number) {
-                        self.reporting = None;
-                        self.station
-                            .management_status(acknowledged, now)
-                            .map_err(Error::Station)?;
-                    }
-                    if let Some(following) = &mut self.following {
-                        following.reported(number, acknowledged, now);
-                    }
+            match self.take(item, now) {
+                Ok(()) => {}
+                Err(error @ (Error::Hardware(_) | Error::Pending)) => {
+                    failure.get_or_insert(error);
                 }
-                Incoming::Report(Report::Rate {
-                    mac_id: MAC_ID,
-                    rate,
-                    short_gi,
-                    width,
-                }) => self.rate_reported(rate, short_gi, width),
-                Incoming::Report(_) => {}
-                Incoming::Frame(frame) => {
-                    if let Some(mpdu) = self.mpdu(frame)
-                        && let Err(error) = self.frame(mpdu, now)
-                    {
-                        match error {
-                            // mac80211 drops a frame the station cannot use;
-                            // the exchange it answers retries or times out.
-                            Error::Station(_) => {
-                                self.unsupported("a management frame the station refuses");
-                            }
-                            error => return Err(error),
-                        }
-                    }
-                }
+                // Counted only: a note would reach the keeper as a failure.
+                Err(_) => self.dropped = self.dropped.saturating_add(1),
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn take(&mut self, item: Incoming, now: u64) -> Result<(), Error> {
+        match item {
+            Incoming::Report(Report::Transmitted {
+                number,
+                acknowledged,
+            }) => {
+                if let Some(following) = &mut self.following {
+                    following.reported(number, acknowledged, now);
+                }
+                if self.reporting == Some(number) {
+                    self.reporting = None;
+                    self.station
+                        .management_status(acknowledged, now)
+                        .map_err(Error::Station)?;
+                }
+                Ok(())
+            }
+            Incoming::Report(Report::Rate {
+                mac_id: MAC_ID,
+                rate,
+                short_gi,
+                width,
+            }) => {
+                self.rate_reported(rate, short_gi, width);
+                Ok(())
+            }
+            Incoming::Report(_) => Ok(()),
+            // Nothing is heard before the radio first tunes.
+            Incoming::Frame(_) if self.tuned.is_none() => Ok(()),
+            Incoming::Frame(frame) => match self.mpdu(frame) {
+                Some(mpdu) => self.frame(mpdu, now),
+                // `ieee80211_rx_monitor`/`__ieee80211_rx_handle_packet`: a
+                // frame too short or of an unknown version is dropped.
+                None => Err(Error::Refused("a malformed frame")),
+            },
+        }
     }
 
     /// The frame `received` holds, on the channel the radio stands on.
@@ -1751,6 +1898,10 @@ impl<D: Device> Rtl8822c<D> {
     fn operate(&mut self) -> Result<(), Error> {
         let now = self.clock.now_us();
         self.take_incoming(now)?;
+        if self.pending_join.is_some() && self.device.ready() {
+            let (handle, join) = self.pending_join.take().ok_or(Error::Pending)?;
+            self.begin_join(handle, join)?;
+        }
         Self::hardware(self.device.coexist(now))?;
         self.announce_streams()?;
         self.watchdog(now)?;
@@ -1896,18 +2047,37 @@ impl<D: Device> Radio for Rtl8822c<D> {
         self.operate()
     }
 
+    fn recoverable(&self) -> bool {
+        self.device.recoverable()
+    }
+
+    /// rtw88's `rtw_fw_recovery_work` resets the chip and mac80211 restarts
+    /// with nothing of before; the keeper then joins again.
+    fn recover(&mut self) -> Result<Recovery, String> {
+        let step = self.device.recover()?;
+        if step == Recovery::Done {
+            self.reset().map_err(|error| format!("{error:?}"))?;
+        }
+        Ok(step)
+    }
+
     fn take_event(&mut self) -> Option<keeper::Event> {
         self.events.pop_front()
     }
 
     fn stage(&self) -> Stage {
-        if self.left {
+        if self.device.lost() {
+            Stage::Lost
+        } else if self.left {
             Stage::NeedsDrain
         } else if self.scanned.is_some() {
             Stage::Scanned
         } else if self.admitted.is_some() {
             Stage::Admitted
-        } else if self.hop.is_none() && self.station.phase() == Peering::Idle {
+        } else if self.hop.is_none()
+            && self.pending_join.is_none()
+            && self.station.phase() == Peering::Idle
+        {
             Stage::Idle
         } else {
             Stage::Busy
@@ -1967,6 +2137,7 @@ impl<D: Device> Radio for Rtl8822c<D> {
 
     fn begin_scan(&mut self, request: scan::Request, budget_us: u64) -> Result<(), Error> {
         let now = self.clock.now_us();
+        self.pending_join = None;
         self.power_save(false)?;
         self.observed
             .retain(|heard| now.saturating_sub(heard.at) < BSS_EXPIRY_US);
@@ -2020,22 +2191,14 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn join(&mut self, handle: usize, join: Join, _: ()) -> Result<(), Error> {
-        let observed = self.observed(handle)?;
-        let bss = observed.bss().clone();
+        let bss = self.observed(handle)?.bss().clone();
         self.approach(&bss)?;
-        let now = self.clock.now_us();
-        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
-        let mut policy = Admitted(&self.channels);
-        let action = if join.request.pmf().is_some() {
-            self.station
-                .begin_modern_pmf(join, observed, now, &mut policy)
+        if self.device.ready() {
+            self.begin_join(handle, join)
         } else {
-            self.station
-                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+            self.pending_join = Some((handle, join));
+            Ok(())
         }
-        .map_err(Error::Station)?;
-        self.act(action);
-        Ok(())
     }
 
     fn begin_external_authentication(
@@ -2294,6 +2457,7 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn deauthenticate(&mut self, reason: u16) -> Result<(), Error> {
+        self.pending_join = None;
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
         }

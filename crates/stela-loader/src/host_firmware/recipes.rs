@@ -802,6 +802,12 @@ pub const REALTEK_WIFI: &[Recipe] = &[
         "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4",
         &REALTEK_WIFI_LICENSE,
     ),
+    wifi(
+        "rtw88/rtw8821c_fw.bin",
+        139472,
+        "2ef409bc418549fcf294061dd0cae1fc22fd9da79b60524950b25de18732f3f0",
+        &REALTEK_WIFI_LICENSE,
+    ),
 ];
 
 /// The Realtek USB Bluetooth driver's RTL8852CU files at linux-firmware
@@ -2068,7 +2074,7 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
                 "mediatek/WIFI_RAM_CODE_MT7961_1.bin",
             ],
         ),
-        (0x14c3, 0x7922 | 0x0616) => (
+        (0x14c3, 0x7922 | 0x0616) | (0x0b48, 0x7922) => (
             "wifi-mt792x",
             "pci:14c3:7922",
             &[
@@ -2086,6 +2092,8 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
         ),
         // `rtw_8822ce_id_table`.
         (0x10ec, 0xc822 | 0xc82f) => ("realtek-wifi", "pci:10ec:c822", &["rtw88/rtw8822c_fw.bin"]),
+        // `rtw_8821ce_id_table`.
+        (0x10ec, 0xb821 | 0xc821) => ("realtek-wifi", "pci:10ec:c821", &["rtw88/rtw8821c_fw.bin"]),
         (0x8086, _) if !intel_wifi_images(device).is_empty() => {
             intel = format!("pci:8086:{device:04x}");
             ("wifi-intel", &intel, intel_wifi_images(device))
@@ -2297,6 +2305,12 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
             recipe.image.member == request.name && request.name == "rtw89/rtw8852c_fw-2.bin"
         });
     }
+    // The RTL8821C chip's binding, likewise.
+    if request.target.hardware == "pci:10ec:c821" && request.target.revision == "linux-firmware" {
+        return REALTEK_WIFI.iter().find(|recipe| {
+            recipe.image.member == request.name && request.name == "rtw88/rtw8821c_fw.bin"
+        });
+    }
     let pci: Vec<_> = request.target.hardware.split(':').collect();
     if pci.len() != 8
         || pci[0] != "pci"
@@ -2333,6 +2347,7 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
                     "rtw88/rtw8822c_fw.bin" | "rtw88/rtw8822c_wow_fw.bin"
                 )
         }
+        "b821" | "c821" => syscfg & (1 << 23) == 0 && request.name == "rtw88/rtw8821c_fw.bin",
         "b852" | "b85b" => {
             // Return the exact requested container at every observed cut.
             // Original rtw89 owns suit selection and its failure semantics;

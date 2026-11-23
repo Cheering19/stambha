@@ -2306,6 +2306,12 @@ impl<C: Chip> Radio for Rtl8852c<C> {
     const NAME: &'static str = "rtw89";
     /// rtw89 leaves `max_listen_interval` at mac80211's default, as rtw88.
     const LISTEN_INTERVAL: u16 = 5;
+    /// Every RTL8852CE join runs the whole SAE exchange, the path its
+    /// hardware runs proved; resuming a PMKSA has not run on it.
+    const RESUMES_PMKSA: bool = false;
+    /// The boot reports an RTL8852CE keeper's failures from its receive
+    /// errors, as its hardware runs proved.
+    const FAILS_THROUGH_RECEIVE: bool = true;
 
     fn deferred(error: &Error) -> bool {
         matches!(error, Error::Pending)

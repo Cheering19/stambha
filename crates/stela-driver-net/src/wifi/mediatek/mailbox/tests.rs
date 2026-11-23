@@ -7,6 +7,7 @@ use super::super::{
     },
 };
 use super::*;
+use stela_driver_base::stepped::block_on;
 extern crate std;
 use alloc::sync::Arc;
 use std::sync::Mutex;
@@ -340,26 +341,35 @@ unsafe impl QueueIo for DeviceIo {
                         assert_eq!(&body[4..8], &[0, 0, 24, 0]);
                         model.roc_requests.push(body.to_vec());
                         model.roc_channel = Some(body[10]);
-                        let mut grant = vec![0; 68];
+                        // UNI_EVENT_ROC after the chip's RXD: the grant TLV
+                        // after the event's four reserved bytes.
+                        let at = base + 20;
+                        let mut grant = vec![0; at + 16];
                         grant[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
-                        grant[36] = 0x27;
-                        grant[38] = 6;
-                        grant[50] = 20;
-                        grant[52] = body[8];
-                        grant[53] = body[9].wrapping_add(u8::from(model.wrong_roc_token));
-                        grant[54] = 0xa5; // raw status is not inspected by source grant callback
-                        grant[55] = body[10];
-                        grant[57] = body[12];
-                        grant[59] = body[14];
-                        grant[61] = body[19];
-                        grant[62] = 0;
-                        grant[64..68].copy_from_slice(&body[20..24]);
+                        grant[base + 4] = 0x27;
+                        grant[base + 6] = 6;
+                        grant[at - 2] = 20;
+                        grant[at] = body[8];
+                        grant[at + 1] = body[9].wrapping_add(u8::from(model.wrong_roc_token));
+                        grant[at + 2] = 0xa5; // raw status is not inspected by source grant callback
+                        grant[at + 3] = body[10];
+                        grant[at + 5] = body[12];
+                        grant[at + 7] = body[14];
+                        grant[at + 9] = body[19];
+                        grant[at + 10] = 0;
+                        grant[at + 12..at + 16].copy_from_slice(&body[20..24]);
                         device_receive(&self.rx, &grant, true, 0);
                     } else {
                         assert_eq!(body.len(), 16);
                         model.roc_channel = None;
                     }
                 }
+                return Ok(());
+            }
+            // UNI_CHIP_CONFIG_CHIP_CFG settings such as thermal protection,
+            // sent without a wait, which firmware does not answer.
+            if unified && command == 14 && packet[52..54] == [2, 0] {
+                assert_eq!(packet[43], 6);
                 return Ok(());
             }
             let capability = (unified && command == 14) || (!unified && command == 0x8a);
@@ -438,6 +448,14 @@ unsafe impl QueueIo for DeviceIo {
                 );
                 return Ok(());
             }
+            {
+                // A connac2 client's CE commands, which no event answers.
+                let mut model = self.response.lock().unwrap();
+                if !unified && model.client_execution && self.chip != Chip::Mt7925 {
+                    model.client_commands.push(packet.clone());
+                    return Ok(());
+                }
+            }
             let mut response = vec![0u8; base + 12 + if unified { 8 } else { 0 }];
             response[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
             response[base..base + 2].copy_from_slice(&12u16.to_le_bytes());
@@ -486,9 +504,12 @@ unsafe impl QueueIo for DeviceIo {
                     model.raw_disabled.insert(u16::from(body[1]));
                     model.initial_commands.push(packet.clone());
                 }
+                // STA_REC_KEY_V3, or connac2's STA_REC_KEY_V2.
+                let key_tag = if self.chip == Chip::Mt7925 { 0x27 } else { 17 };
+                let connac2 = self.chip != Chip::Mt7925;
                 if model.key_execution
                     && command == 3
-                    && (!model.client_execution || packet.get(56) == Some(&0x27))
+                    && (!model.client_execution || packet.get(56) == Some(&key_tag))
                 {
                     // Execute the DMA-read key body before ACK. A
                     // negative/absent ACK may still leave programmed state;
@@ -514,7 +535,12 @@ unsafe impl QueueIo for DeviceIo {
                 if model.client_execution {
                     model.client_commands.push(packet.clone());
                     // The model transmits on BSS 0, an MLD association's setup link.
-                    if command == 2 && packet[48] == 0 && packet[52] == 0 && packet.len() > 84 {
+                    // connac2's RLM is a BSS_INFO_UPDATE of its own, after
+                    // the BASIC one (mt76_connac_mcu_uni_set_chctx).
+                    if command == 2
+                        && packet[48] == 0
+                        && ((packet[52] == 0 && packet.len() > 84) || (connac2 && packet[52] == 2))
+                    {
                         let mut rest = &packet[52..];
                         while !rest.is_empty() {
                             let len = u16::from_le_bytes(rest[2..4].try_into().unwrap()) as usize;
@@ -524,7 +550,11 @@ unsafe impl QueueIo for DeviceIo {
                             rest = &rest[len..];
                         }
                     }
-                    if command == 3 && packet.get(56) != Some(&0x27) {
+                    if connac2 && command == 3 && packet.get(56) != Some(&key_tag) {
+                        let body = &packet[48..];
+                        let slot = u16::from(body[1]) | u16::from(body[6]) << 8;
+                        Self::connac2_station_record(&mut model, slot, body);
+                    } else if command == 3 && packet.get(56) != Some(&key_tag) {
                         let body = &packet[48..];
                         let slot = u16::from(body[1]);
                         if body[8] == 6 {
@@ -597,6 +627,96 @@ unsafe impl QueueIo for DeviceIo {
             device_receive(&self.rx, &response, true, if drop { 1 << 14 } else { 0 });
         }
         Ok(())
+    }
+}
+impl DeviceIo {
+    /// A connac2 client's STA_REC_UPDATE as the firmware applies it: the
+    /// peer's BASIC record and its connection state, the broadcast entry's
+    /// WTBL, the WTBL half of a block-ack session (whose STA_REC_BA half
+    /// follows) and the 12-byte STA_REC_BA record.
+    fn connac2_station_record(model: &mut Response, slot: u16, body: &[u8]) {
+        let tags = |mut rest: &[u8]| {
+            let mut out = Vec::new();
+            while rest.len() >= 4 {
+                let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+                assert!(len >= 4 && len <= rest.len());
+                out.push((u16::from_le_bytes([rest[0], rest[1]]), rest[..len].to_vec()));
+                rest = &rest[len..];
+            }
+            assert!(rest.is_empty());
+            out
+        };
+        let records = tags(&body[8..]);
+        assert_eq!(
+            usize::from(u16::from_le_bytes([body[2], body[3]])),
+            records.len()
+        );
+        // Every request ends with its WTBL, whose nested TLVs it counts.
+        let (tag, wtbl) = records.last().unwrap();
+        if *tag != 6 {
+            assert_eq!(*tag, 13);
+            assert_eq!(u16::from(wtbl[4]) | u16::from(wtbl[8]) << 8, slot);
+            let nested = tags(&wtbl[12..]);
+            assert_eq!(
+                usize::from(u16::from_le_bytes([wtbl[6], wtbl[7]])),
+                nested.len()
+            );
+            if nested.iter().any(|(tag, _)| *tag == 8) {
+                // The WTBL BA half; STA_REC_BA carries the session.
+                assert_eq!(records.len(), 1);
+                assert_eq!(wtbl[5], 2); // WTBL_SET
+                return;
+            }
+            assert_eq!(wtbl[5], 1); // WTBL_RESET_AND_SET
+        }
+        match records[0].0 {
+            0 => {
+                let basic = &records[0].1;
+                assert_eq!(basic.len(), 20);
+                if basic[8] != 0 {
+                    // The RX header translation stays off for raw 802.11.
+                    let nested = tags(&records.last().unwrap().1[12..]);
+                    let translation = nested.iter().find(|(tag, _)| *tag == 6).unwrap();
+                    assert_eq!(&translation.1[4..8], &[1, 0, 1, 0]);
+                    model.peers.insert(slot, body.to_vec());
+                    model.raw_disabled.insert(slot);
+                } else {
+                    model.peers.remove(&slot);
+                    model.raw_disabled.remove(&slot);
+                }
+            }
+            13 => {
+                // The interface's own broadcast entry, without BASIC.
+                assert_eq!(records.len(), 1);
+                model.peers.insert(slot, body.to_vec());
+                model.raw_disabled.insert(slot);
+            }
+            6 => {
+                assert_eq!(body.len(), 20);
+                assert_eq!(&body[8..12], &[6, 0, 12, 0]);
+                let tid = body[12];
+                assert!(tid < 8);
+                if body[13] == 1 {
+                    assert!(body[14] <= 1);
+                    if body[15] == 0 {
+                        model.transmit_ba.remove(&(slot, tid));
+                    } else {
+                        assert_eq!(body[15], 1 << tid);
+                        assert_ne!(body[18..20], [0, 0]);
+                        model.transmit_ba.insert((slot, tid), body.to_vec());
+                    }
+                } else {
+                    assert_eq!(body[13], 2); // recipient direction
+                    if body[15] == 0 {
+                        model.receive_ba.remove(&(slot, tid));
+                    } else {
+                        assert_eq!(body[15], 1 << tid);
+                        model.receive_ba.insert((slot, tid), body.to_vec());
+                    }
+                }
+            }
+            tag => panic!("unmodeled connac2 STA_REC {tag}"),
+        }
     }
 }
 pub(crate) fn identity(chip: Chip) -> Identity {
@@ -737,7 +857,7 @@ fn full_prepared_download_uses_real_tx_and_rx_iova_memory_for_every_chip() {
         let provider = catalog(&requests, patch_bytes(), ram_bytes());
         let prepared = requests.load(&provider).unwrap();
         let mut engine = Downloader::new(mailbox);
-        let report = engine.download(&prepared).unwrap();
+        let report = block_on(engine.download(&prepared)).unwrap();
         assert_eq!(report.patch, PatchState::Uploaded);
         assert_eq!(report.release, ReleaseState::Released);
         assert!(report.firmware_start_acknowledged);
@@ -874,7 +994,7 @@ fn boot_and_runtime_share_one_dma_sequence() {
         let provider = catalog(&requests, patch_bytes(), ram_bytes());
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(mailbox);
-        downloader.download(&prepared).unwrap();
+        block_on(downloader.download(&prepared)).unwrap();
         let mut mailbox = downloader.into_transport();
         let mut sequence = wm.lock().unwrap().completed.last().unwrap()[39];
         assert_eq!(mailbox.replies().len(), 6);
@@ -960,11 +1080,13 @@ fn unmatched_dropped_and_late_runtime_responses_never_acknowledge_a_context() {
             assert_eq!(
                 failure.cause,
                 match case {
-                    5 => Cause::Message(mcu::Error::NotResponse),
                     6 => Cause::CoreDump,
+                    // A dropped reply is freed as mt76 frees it; the command
+                    // then waits for its deadline like an unmatched one.
                     _ => Cause::Timeout,
                 }
             );
+            assert_eq!(mailbox.dropped_events(), u64::from(case == 5));
             if case == 7 {
                 let actual = mailbox
                     .interrupted_unified_reply()
@@ -1092,7 +1214,7 @@ fn exact_firmware_target_is_checked_before_the_first_mcu_command() {
     let provider = catalog(&wrong, patch_bytes(), ram_bytes());
     let prepared = wrong.load(&provider).unwrap();
     let mut downloader = Downloader::new(m);
-    let error = downloader.download(&prepared).unwrap_err();
+    let error = block_on(downloader.download(&prepared)).unwrap_err();
     assert_eq!(error.stage, Stage::FirmwareTarget);
     assert_eq!(error.failure.kind, FailureKind::FirmwareTarget);
     assert_eq!(error.failure.port, PortState::Usable);
@@ -1160,8 +1282,7 @@ fn pinned_download_crosses_owned_dma_and_mcu_event_path() {
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(m);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -1613,7 +1734,7 @@ fn an_interface_rebinds_its_slots_to_a_station_mld_link_address() {
     let context = initial_context(Chip::Mt7925, 0);
     // SAFETY: modeled exclusive interface resources with no earlier users.
     let mut interface = unsafe { Interface::claim(&mailbox, context, ()) }.unwrap();
-    interface.activate(&mut mailbox).unwrap();
+    block_on(interface.activate(&mut mailbox)).unwrap();
     let link = super::super::mcu::device::Context {
         address: crate::Mac([2, 0xa, 0, 0, 0, 1]),
         ..context
@@ -1669,7 +1790,7 @@ fn native_initial_interface_requires_both_real_commands_and_later_user_drain() {
         let mut interface =
             unsafe { Interface::claim(&mailbox, context, KeyResource(drops.clone())) }.unwrap();
         assert!(interface.registered_context().is_none());
-        interface.activate(&mut mailbox).unwrap();
+        block_on(interface.activate(&mut mailbox)).unwrap();
         assert_eq!(interface.registered_context(), Some(context));
         assert!(response.lock().unwrap().device_active);
         assert!(response.lock().unwrap().bss_active);
@@ -1681,7 +1802,7 @@ fn native_initial_interface_requires_both_real_commands_and_later_user_drain() {
                 .collect::<Vec<_>>(),
             vec![Step::ActivateDevice, Step::ActivateBss]
         );
-        assert!(interface.activate(&mut mailbox).is_err());
+        assert!(block_on(interface.activate(&mut mailbox)).is_err());
         let receipt = interface.deactivate(&mut mailbox).unwrap();
         assert!(interface.registered_context().is_none());
         assert!(interface.needs_drain());
@@ -1765,7 +1886,7 @@ fn partial_initial_registration_or_uncertain_publication_keeps_contexts() {
             if case == 6 {
                 wm.lock().unwrap().fail_publish = true;
             }
-            assert!(interface.activate(&mut mailbox).is_err());
+            assert!(block_on(interface.activate(&mut mailbox)).is_err());
             assert!(interface.registered_context().is_none());
             assert!(interface.is_quarantined());
             if case < 6 {
@@ -1775,7 +1896,7 @@ fn partial_initial_registration_or_uncertain_publication_keeps_contexts() {
                 assert!(response.lock().unwrap().bss_active);
             }
             let published = wm.lock().unwrap().completed.len();
-            assert!(interface.activate(&mut mailbox).is_err());
+            assert!(block_on(interface.activate(&mut mailbox)).is_err());
             assert_eq!(wm.lock().unwrap().completed.len(), published);
             if case < 2 {
                 assert_eq!(
@@ -1823,14 +1944,14 @@ fn source_already_inactive_applies_only_to_bss_deactivation() {
                 response.lock().unwrap().bss_status = 0xc0000001;
             }
             assert!(matches!(
-                interface.activate(&mut mailbox),
+                block_on(interface.activate(&mut mailbox)),
                 Err(Dev::Firmware {
                     status: 0xc0000001,
                     ..
                 })
             ));
         } else {
-            interface.activate(&mut mailbox).unwrap();
+            block_on(interface.activate(&mut mailbox)).unwrap();
             if case == 2 {
                 response.lock().unwrap().bss_status = 0xc0000001;
             } else {
@@ -1900,11 +2021,11 @@ fn owner_receipt_survives_wrong_controller() {
         )
     }
     .unwrap();
-    assert_eq!(first.activate(&mut b), Err(Dev::WrongMailbox));
+    assert_eq!(block_on(first.activate(&mut b)), Err(Dev::WrongMailbox));
     assert!(awm.lock().unwrap().completed.is_empty());
     assert!(bwm.lock().unwrap().completed.is_empty());
-    first.activate(&mut a).unwrap();
-    second.activate(&mut b).unwrap();
+    block_on(first.activate(&mut a)).unwrap();
+    block_on(second.activate(&mut b)).unwrap();
     let own = first.deactivate(&mut a).unwrap();
     let other = second.deactivate(&mut b).unwrap();
     assert_eq!(
@@ -2110,8 +2231,7 @@ fn pinned_firmware_and_linux_capability_reports_cross_native_dma_query() {
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(mailbox);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -2378,8 +2498,7 @@ fn images_and_eeprom_source_reports_cross_native_dma_with_kept_clc_owner() {
         let auxiliary = prepared.retain_auxiliary();
         let mut downloader = Downloader::new(mailbox);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -2436,7 +2555,7 @@ fn native_download_binding_keeps_inputs_and_separate_skipped_patch_outcome() {
             let prepared = requests.load(&provider).unwrap();
             let auxiliary = prepared.retain_auxiliary();
             let patch_hash = prepared.patch_image().sha256();
-            mailbox.download_with_binding(&prepared).unwrap();
+            block_on(mailbox.download_with_binding(&prepared)).unwrap();
             drop(prepared);
             drop(provider);
             let binding = mailbox.download_binding().unwrap();
@@ -2505,7 +2624,8 @@ fn failed_native_bound_download_keeps_uncertain_owner_without_any_binding() {
     let requests = Requests::new(&identity(Chip::Mt7922));
     let provider = catalog(&requests, patch_bytes(), ram_bytes());
     let prepared = requests.load(&provider).unwrap();
-    let firmware::Error::Protocol(error) = mailbox.download_with_binding(&prepared).unwrap_err()
+    let firmware::Error::Protocol(error) =
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err()
     else {
         panic!("actual protocol failure")
     };
@@ -2517,7 +2637,7 @@ fn failed_native_bound_download_keeps_uncertain_owner_without_any_binding() {
     assert!(mailbox.is_poisoned());
     let count = wm.lock().unwrap().completed.len();
     assert_eq!(
-        mailbox.download_with_binding(&prepared).unwrap_err(),
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err(),
         firmware::Error::NotFresh
     );
     assert_eq!(wm.lock().unwrap().completed.len(), count);
@@ -2538,7 +2658,8 @@ fn bound_download_checks_native_identity_before_commands_and_raw_boot_invalidate
     let provider = catalog(&requests, patch_bytes(), ram_bytes());
     let prepared = requests.load(&provider).unwrap();
     let (mut wrong, wm, fwdl, _) = setup(Chip::Mt7922, true, false, 0);
-    let firmware::Error::Protocol(error) = wrong.download_with_binding(&prepared).unwrap_err()
+    let firmware::Error::Protocol(error) =
+        block_on(wrong.download_with_binding(&prepared)).unwrap_err()
     else {
         panic!("actual native target check")
     };
@@ -2550,14 +2671,14 @@ fn bound_download_checks_native_identity_before_commands_and_raw_boot_invalidate
     // SAFETY: modeled requester stopped despite no submitted command.
     unsafe { wrong.release_after_quiesce() }.unwrap();
     let (mut mailbox, _, _, _) = setup(chip, true, false, 0);
-    mailbox.download_with_binding(&prepared).unwrap();
+    block_on(mailbox.download_with_binding(&prepared)).unwrap();
     assert!(mailbox.download_binding().is_some());
     mailbox
         .command(Command::PatchSemaphore as u8, &0u32.to_le_bytes())
         .unwrap();
     assert!(mailbox.download_binding().is_none());
     assert_eq!(
-        mailbox.download_with_binding(&prepared).unwrap_err(),
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err(),
         firmware::Error::NotFresh
     );
     assert!(mailbox.download_binding().is_none());
@@ -2581,7 +2702,7 @@ fn pinned_downloads_bind_same_owned_clc_input_past_provider_lifetime() {
         );
         let prepared = requests.load(&provider).unwrap();
         let auxiliary = prepared.retain_auxiliary();
-        mailbox.download_with_binding(&prepared).unwrap();
+        block_on(mailbox.download_with_binding(&prepared)).unwrap();
         drop(prepared);
         drop(provider);
         let binding = mailbox.download_binding().unwrap();
@@ -2593,5 +2714,68 @@ fn pinned_downloads_bind_same_owned_clc_input_past_provider_lifetime() {
         assert!(auxiliary.select_clc(0).unwrap().region().is_some());
         // SAFETY: modeled requester/firmware/all users stopped.
         unsafe { mailbox.release_after_quiesce() }.unwrap();
+    }
+}
+#[test]
+fn dropped_and_surplus_events_are_freed_while_the_command_still_completes() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    use super::super::mcu::runtime::Command as Uni;
+    let (mut mailbox, _, _, rx) = setup(Chip::Mt7925, true, false, 0);
+    let event = |n: u32| {
+        let mut actual = vec![0; 48];
+        actual[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
+        actual[36] = 0x27;
+        actual[38] = 6;
+        actual[44..48].copy_from_slice(&n.to_le_bytes());
+        actual
+    };
+    // A frame the hardware marked dropped (MT_DMA_CTL_DROP) is freed.
+    device_receive(&rx, &event(0), true, 1 << 14);
+    let reply = mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap();
+    assert_eq!(reply.status, 0);
+    assert!(mailbox.take_events().is_empty());
+    assert_eq!(mailbox.dropped_events(), 1);
+    // More asynchronous events than the mailbox holds: the surplus is
+    // freed and the mailbox stays usable, as mt76 frees what it cannot take.
+    // Events held across commands until the controller takes them.
+    for n in 0..(MAX_EVENTS as u32 + 3) {
+        device_receive(&rx, &event(n), true, 0);
+        assert_eq!(mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap().status, 0);
+    }
+    assert_eq!(mailbox.take_events().len(), MAX_EVENTS);
+    assert_eq!(mailbox.dropped_events(), 4);
+    assert!(!mailbox.is_poisoned());
+    assert_eq!(mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap().status, 0);
+    // SAFETY: the model device is stopped and drained, so nothing still uses what this
+    // releases.
+    unsafe { mailbox.release_after_quiesce() }.unwrap();
+}
+#[test]
+fn a_runtime_command_the_firmware_never_answers_ends_within_the_runtime_bound() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for runtime in [false, true] {
+        let response = Arc::new(Mutex::new(Response::default()));
+        let (mut mailbox, _, _, _) = setup_controlled(Chip::Mt7925, false, false, 1, response);
+        if runtime {
+            mailbox.enter_runtime();
+        }
+        let start = crate::Clock::ticks();
+        let result = mailbox.unified(mcu::runtime::Command::StationRecord, &[0; 8]);
+        let waited = crate::Clock::ticks() - start;
+        assert_eq!(result.unwrap_err().port, PortState::Uncertain);
+        assert_eq!(mailbox.last_failure().unwrap().cause, Cause::Timeout);
+        assert!(mailbox.is_poisoned());
+        // The attach waits out its 3 s; a station poll ends within a model
+        // counter read or two past the runtime bound.
+        if runtime {
+            assert!(waited >= RUNTIME_TIMEOUT_US, "{waited}");
+            assert!(waited <= RUNTIME_TIMEOUT_US + 1_000, "{waited}");
+        } else {
+            assert!(waited >= PCI_TIMEOUT_US, "{waited}");
+        }
     }
 }

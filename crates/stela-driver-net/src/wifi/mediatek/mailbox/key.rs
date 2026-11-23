@@ -148,7 +148,11 @@ impl<C: 'static> HardwareKey<C> {
     /// The old key and peer generation are removed and all RX/TX,
     /// firmware, IRQ/deferred users drained. The same physical slot remains
     /// exclusively owned; the new scope/context belongs to its real acknowledged
-    /// peer. Preserve this owner and all material history across rebinding.
+    /// peer. Preserve this owner across rebinding.
+    ///
+    /// The new association starts its own IGTK history: its handshake gives
+    /// each IGTK's IPN, so an AP's unchanged IGTK installs again with the
+    /// AP's replay floor, as mac80211 installs it on every association.
     pub(in crate::wifi::mediatek) unsafe fn rebind(
         &mut self,
         context: Context,
@@ -164,6 +168,7 @@ impl<C: 'static> HardwareKey<C> {
         let s = self.owned_mut();
         s.context = context;
         s.scope = scope;
+        s.igtk_history = [None; bip::HISTORY_CAPACITY];
         Ok(())
     }
     /// Apply canonical replay checks to a normalized vendor RX frame.
@@ -281,9 +286,7 @@ impl<C: 'static> HardwareKey<C> {
                 let status = reply.status;
                 state.reply = Some(reply);
                 if accepted {
-                    if mailbox.identity.chip == crate::wifi::mediatek::identity::Chip::Mt7925 {
-                        bip::remember(state, ticket.identity(), material);
-                    }
+                    bip::remember(state, ticket.identity(), material);
                     Ok(ticket.identity())
                 } else {
                     Err(Error::Firmware(status))
@@ -356,6 +359,27 @@ impl<C: 'static> HardwareKey<C> {
         state.other_igtk = None;
         state.pending_igtk = None;
         Ok(())
+    }
+}
+impl<C: 'static> HardwareKey<C> {
+    /// Forget the key after the firmware that held it was reset, as
+    /// `mt7925_mac_reset_work` drops every key with its interfaces.
+    ///
+    /// # Safety
+    /// The whole WLAN subsystem holding this key was reset, its DMA stopped
+    /// and its receive users drained; no command may still name the key.
+    pub(in crate::wifi::mediatek) unsafe fn retire_after_reset(&mut self) {
+        let state = self.owned_mut();
+        // SAFETY: the reset above removed the key from the hardware and the
+        // caller drained every user.
+        unsafe { state.slot.retire_after_drain() };
+        state.phase = Phase::Empty;
+        state.candidate = None;
+        state.reply = None;
+        state.gtk = None;
+        state.igtk = None;
+        state.other_igtk = None;
+        state.pending_igtk = None;
     }
 }
 impl<C: 'static> Drop for HardwareKey<C> {

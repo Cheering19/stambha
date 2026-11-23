@@ -4,14 +4,18 @@
 //! efuse.h. Only the single-attempt Download creates a Report; pure
 //! decoding creates diagnostics, never firmware/PHY/ownership evidence.
 use super::{
-    identity::{Chip, Profile},
-    io::{Error, Io},
+    identity::Profile,
+    io::{Error, Io, sleep},
     registers::*,
 };
 
 const REQUEST: u8 = 0xfd;
 const REPORT: u8 = 0x19;
 const LENGTH: usize = 13;
+/// rtw88 reads the report after the whole efuse dump, some milliseconds after
+/// firmware is ready; read at once here, it may still be on its way.
+const REPORT_POLLS: usize = 2000;
+const REPORT_POLL_US: u64 = 10;
 
 /// Source-decoded capabilities. Zero is the source "ignore" value, not proof
 /// of unavailable hardware. HCI/protocol numbers remain raw source encodings;
@@ -50,6 +54,15 @@ impl Report {
             profile,
             raw,
             capabilities: decode(1 << 27, &raw),
+        }
+    }
+    /// What a one-path radio on `profile` reports.
+    pub(crate) fn of_one_path(profile: Profile) -> Self {
+        let raw = [0; LENGTH];
+        Self {
+            profile,
+            raw,
+            capabilities: decode(0, &raw),
         }
     }
 }
@@ -102,7 +115,7 @@ pub fn decode(sys_cfg1: u32, raw: &[u8; LENGTH]) -> Capabilities {
 
 fn identity<I: Io>(io: &mut I) -> Result<Profile, Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C {
+    if profile.rtw88().is_none() {
         return Err(Error::WrongChip);
     }
     if io.read32(REG_SYS_CFG1)? != profile.observed().sys_cfg1 {
@@ -124,10 +137,17 @@ pub(super) fn request<I: Io>(io: &mut I) -> Result<(), Error> {
 
 /// Called only after that same Download requested then observed ready,
 /// with no raw-I/O escape/reset/mailbox worker between request and this read.
-pub(super) fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
+pub(super) async fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
     let profile = identity(io)?;
     ready(io)?;
-    let id = io.read8(REG_C2HEVT)?;
+    let mut id = io.read8(REG_C2HEVT)?;
+    for _ in 0..REPORT_POLLS {
+        if id != REQUEST {
+            break;
+        }
+        sleep(io, REPORT_POLL_US).await;
+        id = io.read8(REG_C2HEVT)?;
+    }
     if id != REPORT {
         return Err(Error::HardwareFeatureId { observed: id });
     }
@@ -162,12 +182,16 @@ mod tests {
     extern crate std;
     use super::*;
     use alloc::vec::Vec;
+    use stela_driver_base::stepped::block_on;
 
     struct Registers {
         profile: Profile,
         raw: [u8; LENGTH],
         id: u8,
         raw_reads: usize,
+        /// Reads of the mailbox that still find the request.
+        pending_reads: usize,
+        delays: usize,
         change_identity_after_payload: bool,
         lose_ready_after_payload: bool,
         events: Vec<u8>,
@@ -187,6 +211,8 @@ mod tests {
                 raw,
                 id: REPORT,
                 raw_reads: 0,
+                pending_reads: 0,
+                delays: 0,
                 change_identity_after_payload: false,
                 lose_ready_after_payload: false,
                 events: Vec::new(),
@@ -204,7 +230,10 @@ mod tests {
             self.profile
         }
         fn read8(&mut self, register: u32) -> Result<u8, Error> {
-            let value = if register == REG_C2HEVT {
+            let value = if register == REG_C2HEVT && self.pending_reads != 0 {
+                self.pending_reads -= 1;
+                REQUEST
+            } else if register == REG_C2HEVT {
                 self.id
             } else {
                 let index = (register - REG_C2HEVT - 2) as usize;
@@ -246,8 +275,9 @@ mod tests {
         fn write32(&mut self, _: u32, _: u32) -> Result<(), Error> {
             panic!("no feature 32-bit store")
         }
-        fn delay_us(&mut self, _: u64) {
-            panic!("source report has no polling/delay")
+        fn delay_us(&mut self, microseconds: u64) {
+            assert_eq!(microseconds, REPORT_POLL_US);
+            self.delays += 1;
         }
         fn submit_beacon(&mut self, _: &[u8]) -> Result<(), Error> {
             panic!("no feature beacon")
@@ -260,6 +290,27 @@ mod tests {
         }
     }
     #[test]
+    fn a_report_still_on_its_way_is_waited_for_within_bounds() {
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.pending_reads = 5;
+        block_on(read(&mut registers)).unwrap();
+        assert_eq!(registers.delays, 5);
+        assert_eq!(registers.id, 0, "the report is acknowledged");
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.pending_reads = usize::MAX;
+        assert!(matches!(
+            block_on(read(&mut registers)),
+            Err(Error::HardwareFeatureId { observed: REQUEST })
+        ));
+        assert_eq!(registers.delays, REPORT_POLLS);
+        assert_eq!(registers.raw_reads, 0);
+        // Any other mailbox value is no report, at once.
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.id = 0x12;
+        assert!(block_on(read(&mut registers)).is_err());
+        assert_eq!(registers.delays, 0);
+    }
+    #[test]
     fn late_identity_and_ready_loss_cannot_publish_or_ack_a_partial_report() {
         for ready in [false, true] {
             let mut registers = Registers::new(1 << 27, [255; LENGTH]);
@@ -268,7 +319,7 @@ mod tests {
             } else {
                 registers.change_identity_after_payload = true;
             }
-            let result = read(&mut registers);
+            let result = block_on(read(&mut registers));
             if ready {
                 assert!(matches!(
                     result,
@@ -292,7 +343,7 @@ mod tests {
             let raw = trace[offset + 4..offset + 17].try_into().unwrap();
             offset += 17;
             let mut io = Registers::new(sys, raw);
-            let report = read(&mut io).unwrap();
+            let report = block_on(read(&mut io)).unwrap();
             // Source ID + 13 byte loads + ACK. Additional native guards
             // and ACK readback remain separate from donor's operations.
             assert_eq!(

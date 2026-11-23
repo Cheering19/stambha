@@ -81,6 +81,12 @@ impl<L: Link> Link for Located<L> {
     fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
         self.link.slowest_step()
     }
+    /// The driver's one-time diagnostics, such as a Wi-Fi keeper's failed
+    /// connection attempts, which the adapter forwards for the drivers it
+    /// names (`probe.rs` `Adapter::take_diagnostic`).
+    fn take_diagnostic(&mut self) -> Option<String> {
+        self.link.take_diagnostic()
+    }
 }
 
 /// The drivers here that attach through [`NativeServices`].
@@ -95,7 +101,7 @@ pub(super) enum Kind {
     Ish,
     /// An Intel Wi-Fi function, which `iwl_pci_probe` identifies further.
     IntelWifi,
-    /// A MediaTek Wi-Fi function; only MT7925 attaches.
+    /// A MediaTek Wi-Fi function; MT7921, MT7922 and MT7925 attach.
     MediatekWifi,
     /// A Realtek Wi-Fi function; only RTL8822C attaches.
     RealtekWifi,
@@ -134,11 +140,18 @@ impl Kind {
             Some(Self::Ish)
         } else if function.vendor == 0x8086 && function.class[..2] == [2, 0x80] {
             Some(Self::IntelWifi)
-        } else if function.vendor == 0x14c3 && function.class[..2] == [2, 0x80] {
+        } else if matches!(
+            (function.vendor, function.device),
+            (0x14c3, _) | (0x0b48, 0x7922)
+        ) && function.class[..2] == [2, 0x80]
+        {
             Some(Self::MediatekWifi)
         } else if function.vendor == 0x10ec
             && function.class[..2] == [2, 0x80]
-            && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+            && (realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+                || realtek_wifi::chip::RTL8821C
+                    .devices
+                    .contains(&function.device))
         {
             Some(Self::RealtekWifi)
         } else if super::rtl8852ce(function) {
@@ -174,8 +187,8 @@ impl Kind {
             Self::Sfh => "AMD sensor hub",
             Self::Ish => "Intel sensor hub",
             Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
-            Self::MediatekWifi => "mt7925 Wi-Fi (with --wifi)",
-            Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
+            Self::MediatekWifi => "MT7921/MT7922/MT7925 Wi-Fi (with --wifi)",
+            Self::RealtekWifi => "rtw88 RTL8822CE/RTL8821CE Wi-Fi (with --wifi)",
             Self::Rtw89Wifi => "rtw89 Wi-Fi (with --wifi)",
             Self::IntelBluetooth => "Intel PCIe Bluetooth",
             Self::Bcm4377 => "bcm4377 Bluetooth",
@@ -239,10 +252,10 @@ struct Claimed {
     quiesced: wifi_claim::Quiesced,
 }
 
-/// Claim the Wi-Fi function at `address` for `chip`'s driver through the
-/// mount's cold preparation: `admit` first refuses a function the driver
-/// would refuse anyway, reading its configuration only; then
-/// [`wifi_claim::quiesce`] resets it to its power-on state, and only then is
+/// Claim the Wi-Fi function at `address` through the mount's cold
+/// preparation: `admit` first refuses a function the driver would refuse
+/// anyway, reading its configuration only, and names the chip it is
+/// claimed for; then [`wifi_claim::quiesce`] resets it to its power-on state, and only then is
 /// its quiescence acknowledged, its own domain bound and its seal released,
 /// so the driver's Bus Master is allowed. A function `admit` or the reset
 /// refuses keeps its preparation, and with it the seal: it never masters.
@@ -253,8 +266,7 @@ struct Claimed {
 fn claim_quiesced(
     services: &dyn NativeServices,
     address: Address,
-    chip: wifi_claim::Chip,
-    admit: impl FnOnce(&mut Function<OwnedConfig>) -> Result<(), Error>,
+    admit: impl FnOnce(&mut Function<OwnedConfig>) -> Result<wifi_claim::Chip, Error>,
 ) -> Result<Claimed, Failure> {
     let minimum = services
         .minimum_delay()
@@ -262,9 +274,10 @@ fn claim_quiesced(
     let mut preparing = services
         .prepare_requester(address)
         .map_err(|error| (Error::Native(error), None))?;
-    if let Err(error) = admit(preparing.function_mut()) {
-        return Err(keep_error(error, preparing));
-    }
+    let chip = match admit(preparing.function_mut()) {
+        Ok(chip) => chip,
+        Err(error) => return Err(keep_error(error, preparing)),
+    };
     let quiesced = match wifi_claim::quiesce(&mut preparing, chip, minimum.as_ref()) {
         Ok(quiesced) => quiesced,
         Err(error) => return Err(keep_error(Error::WifiClaim(chip, error), preparing)),
@@ -581,13 +594,15 @@ pub(super) unsafe fn mediatek_wifi(
     ),
     Failure,
 > {
-    // Only an MT7925 attaches: another MediaTek function is refused before
-    // its claim resets it.
+    // Only an MT7921, MT7922 or MT7925 attaches: another MediaTek function,
+    // an MT7920 among them, is refused before its claim resets it.
     let admit = |function: &mut Function<OwnedConfig>| match mediatek_identity(function) {
-        Ok(pci) if pci.chip() == Some(mediatek::identity::Chip::Mt7925) => Ok(()),
-        Ok(pci) => Err(Error::MediatekWifi(
-            mediatek::attach::AttachError::UnsupportedChip(pci),
-        )),
+        Ok(pci) => match pci.chip() {
+            Some(chip) => Ok(wifi_claim::Chip::mediatek(chip)),
+            None => Err(Error::MediatekWifi(
+                mediatek::attach::AttachError::UnsupportedChip(pci),
+            )),
+        },
         Err(error) => Err(error.into()),
     };
     let Claimed {
@@ -596,7 +611,7 @@ pub(super) unsafe fn mediatek_wifi(
         attachment,
         bars,
         quiesced,
-    } = claim_quiesced(services, address, wifi_claim::Chip::Mt7925, admit)?;
+    } = claim_quiesced(services, address, admit)?;
     let pci = match mediatek_identity(&mut function) {
         Ok(pci) => pci,
         Err(error) => return Err(keep_error(error, (function, domain, attachment))),
@@ -701,7 +716,18 @@ pub(super) unsafe fn realtek_wifi(
         attachment,
         bars,
         quiesced,
-    } = claim_quiesced(services, address, wifi_claim::Chip::Rtl8822c, |_| Ok(()))?;
+    } = claim_quiesced(services, address, |function| {
+        Ok(
+            if realtek_wifi::chip::RTL8821C
+                .devices
+                .contains(&function.device)
+            {
+                wifi_claim::Chip::Rtl8821c
+            } else {
+                wifi_claim::Chip::Rtl8822c
+            },
+        )
+    })?;
     let registers = match map(services, address, &bars, 2) {
         Ok(registers) => registers,
         Err(error) => {
@@ -725,6 +751,15 @@ pub(super) unsafe fn realtek_wifi(
     };
     let configured = (|| -> Result<_, Error> {
         let link_control = crate::bus::pci::link_control_word(&function)?;
+        // rtw_pci_phy_cfg: a chip whose requests must not time out. One
+        // without device control 2 goes on, as Linux does.
+        let spec = realtek_wifi::chip::for_device(function.device);
+        if spec
+            .and_then(|spec| spec.rtw88.as_ref())
+            .is_some_and(|spec| spec.pcie_completion_timeout_off)
+        {
+            function.disable_completion_timeout()?;
+        }
         let config = function.config();
         let identity = (
             config.read16(0x2c)?,
@@ -1641,7 +1676,7 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     // Only a radio `iwl_pci_probe` identifies attaches: another is refused
     // before its claim resets it.
     let admit = |function: &mut Function<OwnedConfig>| match identity::device(function.device) {
-        Some(_) => Ok(()),
+        Some(_) => Ok(wifi_claim::Chip::Intel),
         None => Err(Error::IntelWifi(AttachError::Identity(
             IdentityError::UnsupportedPci,
         ))),
@@ -1652,7 +1687,7 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
         attachment,
         bars,
         quiesced,
-    } = claim_quiesced(services, address, wifi_claim::Chip::Intel, admit)?;
+    } = claim_quiesced(services, address, admit)?;
     let registers = match map(services, address, &bars, 0) {
         Ok(registers) => registers,
         Err(error) => {
@@ -3592,7 +3627,7 @@ mod tests {
 
     /// A function the startup menu offers Wi-Fi for is one the scan routes
     /// to a Wi-Fi driver whose claim may set Bus Master: every RTL8852CE,
-    /// RTL8822CE and MT7925 ID, and the Intel radios `iwl_pci_probe`
+    /// RTL8822CE, MT7921, MT7922 and MT7925 ID, and the Intel radios `iwl_pci_probe`
     /// identifies when the build reads ACPI. A MediaTek or Intel function no
     /// driver here identifies, and a function of another class, are not
     /// offered.
@@ -3610,9 +3645,21 @@ mod tests {
             assert_eq!(Kind::of_identity(&function), Some(Kind::Rtw89Wifi));
         }
         let mut started = alloc::vec![(0x14c3, 0x7925, Kind::MediatekWifi)];
-        started.push((0x14c3, 0x0717, Kind::MediatekWifi));
-        for device in realtek_wifi::identity::RTL8822C_DEVICES {
-            started.push((0x10ec, device, Kind::RealtekWifi));
+        for (vendor, device) in [
+            (0x14c3, 0x0717),
+            (0x14c3, 0x7961),
+            (0x14c3, 0x0608),
+            (0x14c3, 0x7922),
+            (0x14c3, 0x0616),
+            (0x0b48, 0x7922),
+        ] {
+            started.push((vendor, device, Kind::MediatekWifi));
+        }
+        for device in realtek_wifi::identity::RTL8822C_DEVICES
+            .iter()
+            .chain(realtek_wifi::chip::RTL8821C.devices)
+        {
+            started.push((0x10ec, *device, Kind::RealtekWifi));
         }
         for (vendor, device, kind) in started {
             let function = identity(vendor, device, [2, 0x80, 0]);
@@ -3631,10 +3678,10 @@ mod tests {
                 "8086:{device:04x}"
             );
         }
-        // MT7921 and an Intel 9000-series radio route to a driver that
+        // MT7920 and an Intel 9000-series radio route to a driver that
         // refuses them; a Wi-Fi ID of another class is no Wi-Fi.
         for (vendor, device, class) in [
-            (0x14c3, 0x7961, [2, 0x80, 0]),
+            (0x14c3, 0x7920, [2, 0x80, 0]),
             (0x8086, 0x9df0, [2, 0x80, 0]),
             (0x10ec, 0xc852, [2, 0, 0]),
             (0x14c3, 0x7925, [2, 0, 0]),

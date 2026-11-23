@@ -1,5 +1,5 @@
 extern crate std;
-use super::super::tests::{done, setup_modern, setup_modern_radio};
+use super::super::tests::{CHIPS, done, setup_modern, setup_on, setup_radio_on};
 use super::*;
 use crate::bus::dma::memory::{CacheAttribute, MemoryError, PageGeometry, PinnedPages};
 use crate::wifi::mediatek::{
@@ -39,7 +39,10 @@ impl Drop for Provider {
 }
 type TestLink = ManagedLink<Bar, Q, NativeGuard, Provider>;
 fn setup_link() -> (TestLink, Model, Join, scan::result::Bss, Arc<AtomicUsize>) {
-    let (client, model) = setup_modern();
+    setup_link_on(Chip::Mt7925)
+}
+fn setup_link_on(chip: Chip) -> (TestLink, Model, Join, scan::result::Bss, Arc<AtomicUsize>) {
+    let (client, model) = setup_on(chip);
     let (join, bss) = modern_inputs(&client);
     let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
@@ -177,7 +180,7 @@ fn incoming_control(model: &Model, pn: Option<u64>, marker: u8) {
     if pn.is_none() {
         bytes[1] &= !0x40;
     }
-    let mut raw = incoming_bytes(&bytes, pn.map(|n| (1, 0, n)), false);
+    let mut raw = incoming_bytes_on(model.chip, &bytes, pn.map(|n| (1, 0, n)), false);
     raw[4] = 1; // source WCID remains required for plaintext data too
     device_receive(&model.queues[&0xd4520], &raw, true, 0);
 }
@@ -318,7 +321,7 @@ fn an_open_network_carries_plaintext_ethernet_once_associated() {
     assert_eq!(frames[0][1] & 0x40, 0);
     let mut bytes = data(false);
     bytes[1] &= !0x40;
-    let mut raw = incoming_bytes(&bytes, None, false);
+    let mut raw = incoming_bytes_on(model.chip, &bytes, None, false);
     raw[4] = 1;
     device_receive(&model.queues[&0xd4520], &raw, true, 0);
     link.service().unwrap();
@@ -581,9 +584,10 @@ fn static_wep_with_shared_key_auth_carries_data_like_mt7925_set_key() {
         assert_eq!(&ethernet[12..14], &0x800u16.to_be_bytes());
     }
     // The ICV error is mt7925_mac_fill_rx's RX_FLAG_ONLY_MONITOR: never
-    // delivered, and reported once as rejected receive content.
+    // delivered, and counted as a refused frame.
     wep(true);
-    assert!(link.service().is_err());
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     assert!(link.receive().unwrap().is_none());
 }
 #[test]
@@ -600,6 +604,43 @@ fn aborting_a_join_deauthenticates_like_ieee80211_mgd_deauth() {
     assert_eq!(departed[0][..2], [0xc0, 0]);
     assert_eq!(departed[0][24..], 3u16.to_le_bytes());
     retire(&mut link, &model);
+}
+#[test]
+fn a_connac2_join_adds_only_the_peer_before_authentication_like_mt7921_mac_sta_add() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        let (mut link, model, join, bss, _) = setup_link_on(chip);
+        scan_join(&mut link, &model, join, bss);
+        assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
+        // After the CE scan request, one UNI STA_REC_UPDATE: the peer's
+        // BASIC record first, in STATE_NONE; no BSS or broadcast entry.
+        let commands = model.response.lock().unwrap().client_commands.clone();
+        let scan = commands
+            .iter()
+            .rposition(|p| p[43] & 2 == 0 && p[36] == 3)
+            .unwrap();
+        let after = &commands[scan + 1..];
+        assert_eq!(after.len(), 1);
+        let record = &after[0];
+        assert_eq!((record[43] & 2, record[34]), (2, 3));
+        assert_eq!(record[49], 1);
+        let mut rest = &record[56..];
+        let mut tags = Vec::new();
+        while rest.len() >= 4 {
+            let n = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
+            assert!(n >= 4 && n <= rest.len(), "{tags:?} {n}");
+            let tag = u16::from_le_bytes([rest[0], rest[1]]);
+            if tag == 7 {
+                assert_eq!(rest[8], 0);
+            }
+            tags.push(tag);
+            rest = &rest[n..];
+        }
+        assert_eq!(tags.first(), Some(&0));
+        assert!(tags.contains(&7));
+    }
 }
 #[test]
 fn the_link_carries_each_aes_cipher_like_mt7925_set_key() {
@@ -734,14 +775,17 @@ fn unpublished_allocation_failure_and_bad_rx_never_forge_completion_or_close_val
     link.state().source.1.store(false, Ordering::Relaxed);
     incoming(&model, &data(false), Some((1, 0, 1)), false);
     assert!(link.receive().unwrap().is_some());
+    // The replay is dropped and counted.
     incoming(&model, &data(false), Some((1, 0, 1)), false);
-    assert!(matches!(link.receive(), Err(LinkError::Adapter(_))));
+    assert!(link.receive().unwrap().is_none());
+    assert_eq!(link.rejected_frames(), 1);
     link.transmit(&eth(0x800)).unwrap();
     finish_tx(&model);
     let mut bad = incoming_bytes(&data(false), Some((1, 0, 2)), false);
     bad[7] |= 2;
     device_receive(&model.queues[&0xd4520], &bad, true, 0);
-    assert!(matches!(link.receive(), Err(LinkError::Adapter(_))));
+    assert!(link.receive().unwrap().is_none());
+    assert_eq!(link.rejected_frames(), 2);
     assert!(
         link.state()
             .client
@@ -777,160 +821,174 @@ fn actual_2ghz_he20_profile_scans_associates_and_carries_ethernet_on_its_real_ch
         number: 1,
         frequency_mhz: 2412,
     };
-    let (client, model) = setup_modern_radio(false, channel);
-    let actual = client.local_advertisement(Band::Ghz2).unwrap();
-    let mut local = vec![0, 1, b'x'];
-    let mut at = 0;
-    while at < actual.elements().len() {
-        let n = usize::from(actual.elements()[at + 1]);
-        let ie = &actual.elements()[at..at + 2 + n];
-        // A real frontend can select the HE subset. Preserve its
-        // original source maps after parsing exactly the advertised bytes.
-        if ie[0] != 255 || ie[2] != 108 {
-            local.extend_from_slice(ie);
+    for chip in CHIPS {
+        let (client, model) = setup_radio_on(chip, channel);
+        let actual = client.local_advertisement(Band::Ghz2).unwrap();
+        let mut local = vec![0, 1, b'x'];
+        let mut at = 0;
+        while at < actual.elements().len() {
+            let n = usize::from(actual.elements()[at + 1]);
+            let ie = &actual.elements()[at..at + 2 + n];
+            // A real frontend can select the HE subset. Preserve its
+            // original source maps after parsing exactly the advertised bytes.
+            if ie[0] != 255 || ie[2] != 108 {
+                local.extend_from_slice(ie);
+            }
+            at += 2 + n;
         }
-        at += 2 + n;
-    }
-    local.extend_from_slice(&[
-        48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2,
-    ]);
-    let caps = Capabilities::parse(Band::Ghz2, Role::Station, &local)
-        .unwrap()
-        .with_local_he_source_maps(*actual.he_source_maps())
+        local.extend_from_slice(&[
+            48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2,
+        ]);
+        let caps = Capabilities::parse(Band::Ghz2, Role::Station, &local)
+            .unwrap()
+            .with_local_he_source_maps(*actual.he_source_maps())
+            .unwrap();
+        let request = AssociationRequest::new_modern_with_local(
+            0x11,
+            10,
+            local.clone(),
+            caps,
+            Mode::He,
+            Width::Mhz20,
+        )
         .unwrap();
-    let request = AssociationRequest::new_modern_with_local(
-        0x11,
-        10,
-        local.clone(),
-        caps,
-        Mode::He,
-        Width::Mhz20,
-    )
-    .unwrap();
-    let mut ap = Vec::new();
-    at = 0;
-    while at < local.len() {
-        let n = usize::from(local[at + 1]);
-        let ie = &local[at..at + 2 + n];
-        if ie[0] == 221 {
-            ap.extend_from_slice(&[
-                221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42,
-                0x43, 94, 0, 0x62, 0x32, 47, 0,
-            ]);
-        } else {
-            let offset = ap.len();
-            ap.extend_from_slice(ie);
-            if ie[0] == 1 {
-                for q in 0..4 {
-                    ap[offset + 2 + q] |= 0x80;
+        let mut ap = Vec::new();
+        at = 0;
+        while at < local.len() {
+            let n = usize::from(local[at + 1]);
+            let ie = &local[at..at + 2 + n];
+            if ie[0] == 221 {
+                ap.extend_from_slice(&[
+                    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0,
+                    0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0,
+                ]);
+            } else {
+                let offset = ap.len();
+                ap.extend_from_slice(ie);
+                if ie[0] == 1 {
+                    for q in 0..4 {
+                        ap[offset + 2 + q] |= 0x80;
+                    }
                 }
             }
+            at += 2 + n;
         }
-        at += 2 + n;
+        let mut ht = [0; 22];
+        ht[0] = 1;
+        ap.extend_from_slice(&[61, 22]);
+        ap.extend_from_slice(&ht);
+        ap.extend_from_slice(&[255, 7, 36, 3, 0, 0, 0, 0xff, 0xff, 5, 4, 0, 2, 0, 0]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+        let mut link = ManagedLink::new(
+            client,
+            Provider(drops.clone(), core::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let receive = |bytes: &[u8], pn: Option<u64>| {
+            let mut raw = incoming_bytes_on(chip, bytes, pn.map(|n| (1, 0, n)), false);
+            raw[13] = 1;
+            device_receive(&model.queues[&0xd4520], &raw, true, 0);
+        };
+        link.begin_scan(
+            scan::Request::new(vec![channel], vec![], vec![]).unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        let mut body = vec![0; 8];
+        body.extend_from_slice(&100u16.to_le_bytes());
+        body.extend_from_slice(&0x11u16.to_le_bytes());
+        body.extend_from_slice(&ap);
+        let mut beacon = response(0x80, &body);
+        beacon[4..10].fill(255);
+        receive(&beacon, None);
+        link.service().unwrap();
+        let handle = link.bss().next().unwrap().0;
+        done(&model);
+        link.service().unwrap();
+        // SAFETY: completed model scan/radio/RX work independently drained.
+        unsafe { link.retire_scan_after_drain() }.unwrap();
+        let mut profile = profile();
+        profile.channel = channel;
+        profile.basic_rates = 15;
+        profile.supported_rates = 0xfff;
+        profile.slot_time = 20;
+        let join = Join {
+            bssid: AP,
+            channel,
+            policy: station::PortPolicy::Controlled,
+            request,
+        };
+        link.join(handle, join, profile).unwrap();
+        assert_eq!(finish_tx_on(&model, 1)[0][..2], [0xb0, 0]);
+        link.service().unwrap();
+        receive(&response(0xb0, &[0, 0, 2, 0, 0, 0]), None);
+        link.service().unwrap();
+        assert_eq!(finish_tx_on(&model, 1)[0][..2], [0, 0]);
+        link.service().unwrap();
+        let mut assoc = vec![0x11, 0, 0, 0, 1, 0xc0];
+        assoc.extend_from_slice(&ap);
+        receive(&response(0x10, &assoc), None);
+        link.service().unwrap();
+        link.configure().unwrap();
+        secure(&mut link);
+        // The authorized port enters power save first.
+        link.service().unwrap();
+        // The association's long slot, in connac2's MAC timing registers
+        // (mt792x_mac_set_timeing): the 2.4 GHz SIFS and 20 us.
+        let icr0 = |slot: u32| (1, 0x210a4, 360 | (2 << 10) | (10 << 16) | (slot << 24));
+        if chip != Chip::Mt7925 {
+            let log = model.bar.0.lock().unwrap().log.clone();
+            assert!(log.contains(&icr0(20)));
+            assert!(!log.contains(&icr0(9)));
+        }
+        // A beacon turning on Short Slot Time moves the BSS to 9 us, as
+        // mt7925_mcu_set_timing sends it and mt792x_mac_set_timeing programs it.
+        let mut short = beacon.clone();
+        short[35] |= 0x04;
+        receive(&short, None);
+        link.service().unwrap();
+        if chip == Chip::Mt7925 {
+            let command = model
+                .response
+                .lock()
+                .unwrap()
+                .client_commands
+                .last()
+                .unwrap()
+                .clone();
+            assert_eq!(command[48 + 4..48 + 14], [23, 0, 20, 0, 1, 0, 0, 0, 9, 0]);
+        } else {
+            assert!(model.bar.0.lock().unwrap().log.contains(&icr0(9)));
+        }
+        assert_eq!(
+            link.state()
+                .client
+                .client
+                .state()
+                .profile
+                .unwrap()
+                .slot_time,
+            9
+        );
+        link.transmit(&eth(0x800)).unwrap();
+        assert_eq!(finish_tx_on(&model, 1).len(), 1);
+        link.service().unwrap();
+        // Its TX-free starts TID 0's block-ack session, as
+        // mt7925_tx_check_aggr does, and the next frame waits for it.
+        drain_notices(&mut link);
+        assert!(link.state().client.client.state().transmit_ba[0].is_some());
+        link.transmit(&eth(0x800)).unwrap();
+        assert_eq!(link.state().held.len(), 1);
+        receive(&data(false), Some(1));
+        let frame = link.receive().unwrap().unwrap();
+        assert_eq!(&frame[12..14], &0x800u16.to_be_bytes());
+        assert_eq!(model.response.lock().unwrap().home_channel, Some(1));
+        stop(&mut link, &model);
+        drop(link);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(model.drops.load(Ordering::Relaxed), 1);
     }
-    let mut ht = [0; 22];
-    ht[0] = 1;
-    ap.extend_from_slice(&[61, 22]);
-    ap.extend_from_slice(&ht);
-    ap.extend_from_slice(&[255, 7, 36, 3, 0, 0, 0, 0xff, 0xff, 5, 4, 0, 2, 0, 0]);
-    let drops = Arc::new(AtomicUsize::new(0));
-    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
-    let mut link = ManagedLink::new(
-        client,
-        Provider(drops.clone(), core::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    let receive = |bytes: &[u8], pn: Option<u64>| {
-        let mut raw = incoming_bytes(bytes, pn.map(|n| (1, 0, n)), false);
-        raw[13] = 1;
-        device_receive(&model.queues[&0xd4520], &raw, true, 0);
-    };
-    link.begin_scan(
-        scan::Request::new(vec![channel], vec![], vec![]).unwrap(),
-        1_000_000,
-    )
-    .unwrap();
-    let mut body = vec![0; 8];
-    body.extend_from_slice(&100u16.to_le_bytes());
-    body.extend_from_slice(&0x11u16.to_le_bytes());
-    body.extend_from_slice(&ap);
-    let mut beacon = response(0x80, &body);
-    beacon[4..10].fill(255);
-    receive(&beacon, None);
-    link.service().unwrap();
-    let handle = link.bss().next().unwrap().0;
-    done(&model);
-    link.service().unwrap();
-    // SAFETY: completed model scan/radio/RX work independently drained.
-    unsafe { link.retire_scan_after_drain() }.unwrap();
-    let mut profile = profile();
-    profile.channel = channel;
-    profile.basic_rates = 15;
-    profile.supported_rates = 0xfff;
-    profile.slot_time = 20;
-    let join = Join {
-        bssid: AP,
-        channel,
-        policy: station::PortPolicy::Controlled,
-        request,
-    };
-    link.join(handle, join, profile).unwrap();
-    assert_eq!(finish_tx_on(&model, 1)[0][..2], [0xb0, 0]);
-    link.service().unwrap();
-    receive(&response(0xb0, &[0, 0, 2, 0, 0, 0]), None);
-    link.service().unwrap();
-    assert_eq!(finish_tx_on(&model, 1)[0][..2], [0, 0]);
-    link.service().unwrap();
-    let mut assoc = vec![0x11, 0, 0, 0, 1, 0xc0];
-    assoc.extend_from_slice(&ap);
-    receive(&response(0x10, &assoc), None);
-    link.service().unwrap();
-    link.configure().unwrap();
-    secure(&mut link);
-    // The authorized port enters power save first.
-    link.service().unwrap();
-    // A beacon turning on Short Slot Time moves the BSS to 9 us, as
-    // mt7925_mcu_set_timing sends it.
-    let mut short = beacon.clone();
-    short[35] |= 0x04;
-    receive(&short, None);
-    link.service().unwrap();
-    let command = model
-        .response
-        .lock()
-        .unwrap()
-        .client_commands
-        .last()
-        .unwrap()
-        .clone();
-    assert_eq!(command[48 + 4..48 + 14], [23, 0, 20, 0, 1, 0, 0, 0, 9, 0]);
-    assert_eq!(
-        link.state()
-            .client
-            .client
-            .state()
-            .profile
-            .unwrap()
-            .slot_time,
-        9
-    );
-    link.transmit(&eth(0x800)).unwrap();
-    assert_eq!(finish_tx_on(&model, 1).len(), 1);
-    link.service().unwrap();
-    // Its TX-free starts TID 0's block-ack session, as
-    // mt7925_tx_check_aggr does, and the next frame waits for it.
-    drain_notices(&mut link);
-    assert!(link.state().client.client.state().transmit_ba[0].is_some());
-    link.transmit(&eth(0x800)).unwrap();
-    assert_eq!(link.state().held.len(), 1);
-    receive(&data(false), Some(1));
-    let frame = link.receive().unwrap().unwrap();
-    assert_eq!(&frame[12..14], &0x800u16.to_be_bytes());
-    assert_eq!(model.response.lock().unwrap().home_channel, Some(1));
-    stop(&mut link, &model);
-    drop(link);
-    assert_eq!(drops.load(Ordering::Relaxed), 1);
-    assert_eq!(model.drops.load(Ordering::Relaxed), 1);
 }
 #[test]
 fn native_rx_ring_failure_cannot_leave_cached_association_carrier_up() {
@@ -986,7 +1044,8 @@ fn malformed_rx_preserves_authentication_timeout() {
         .clock;
     crate::test_clock::advance(clock, 550_000);
     incoming(&model, &response(0xb1, &[0, 0, 2, 0, 0, 0]), None, false);
-    assert!(link.service().is_err());
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     assert_eq!(link.phase(), Phase::Joining);
     // The rejected frame still permits the timed retry and packet release.
     assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
@@ -1016,17 +1075,8 @@ fn rejected_rx(model: &Model, protocol_version: bool) {
         device_receive(&model.queues[&0xd4520], &raw, true, 0);
     }
 }
-fn deferred_message(link: &TestLink) -> std::string::String {
-    format!(
-        "{}",
-        link.state()
-            .deferred_error
-            .as_ref()
-            .expect("original deferred RX error")
-    )
-}
 #[test]
-fn queued_valid_receive_alternates_original_error_under_repeated_bad_rx() {
+fn refused_frames_are_dropped_and_counted_while_valid_data_flows() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1039,36 +1089,40 @@ fn queued_valid_receive_alternates_original_error_under_repeated_bad_rx() {
     }
     assert_eq!(link.queues().data_frames, 3);
     for n in 1..=3 {
+        // ieee80211_rx_handlers drops a frame of another protocol version
+        // or with a cipher mismatch and goes on.
         rejected_rx(&model, n % 2 == 0);
+        let head = model.queues[&0xd4520].lock().unwrap().head;
         let received = link.receive().unwrap().unwrap();
         assert_eq!(received.last(), Some(&n));
         assert_eq!(link.queues().data_frames, usize::from(3 - n));
-        let original = deferred_message(&link);
-        assert!(
-            if n % 2 == 0 {
-                original.contains("ProtocolVersion")
-            } else {
-                original.contains("WrongProfile")
-            },
-            "actual deferred diagnostic: {original}"
-        );
-        let head = model.queues[&0xd4520].lock().unwrap().head;
-        let syncs = model.memory.lock().unwrap().syncs.len();
-        assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
-        // Error-only return did not consume/refill RX, service timers or
-        // retire/publish a packet; the next frame will service afresh.
-        assert_eq!(model.queues[&0xd4520].lock().unwrap().head, head);
-        assert_eq!(model.memory.lock().unwrap().syncs.len(), syncs);
-        assert!(link.state().deferred_error.is_none());
+        assert_eq!(link.rejected_frames(), u64::from(n));
+        // The refused frame was taken from the ring and its buffer reposted.
+        assert_ne!(model.queues[&0xd4520].lock().unwrap().head, head);
         assert!(link.carrier());
     }
     assert!(link.receive().unwrap().is_none());
+    // Valid frames around a refused one both arrive.
+    incoming(&model, &data(false), Some((1, 0, 4)), false);
+    rejected_rx(&model, true);
+    let mut last = data(false);
+    *last.last_mut().unwrap() = 0x44;
+    incoming(&model, &last, Some((1, 0, 5)), false);
+    let mut received = Vec::new();
+    for _ in 0..6 {
+        if let Some(frame) = link.receive().unwrap() {
+            received.push(frame);
+        }
+    }
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[1].last(), Some(&0x44));
+    assert_eq!(link.rejected_frames(), 4);
     stop(&mut link, &model);
     drop(link);
     assert_eq!(provider.load(Ordering::Relaxed), 1);
 }
 #[test]
-fn shared_deferred_error_survives_explicit_service_and_prevents_next_tx_publication() {
+fn a_refused_frame_never_holds_back_transmission() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1077,35 +1131,21 @@ fn shared_deferred_error_survives_explicit_service_and_prevents_next_tx_publicat
     let ptk = secure(&mut link);
     drop(drain_notices(&mut link));
     queued_data(&mut link, &model, 1, 0x41);
-    queued_data(&mut link, &model, 2, 0x42);
     rejected_rx(&model, false);
-    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x41));
-    let original = deferred_message(&link);
     rejected_rx(&model, true);
-    let explicit = link.service().unwrap_err();
-    assert!(format!("{explicit}").contains("ProtocolVersion"));
-    assert_eq!(deferred_message(&link), original);
+    // Each pass takes one data frame, as one NAPI budget slot.
+    link.service().unwrap();
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 2);
     rejected_rx(&model, true);
-    let tx = model.queues[&0xd4300].lock().unwrap().head;
-    let rx = model.queues[&0xd4520].lock().unwrap().head;
-    assert_eq!(
-        link.transmit(&eth(0x800)),
-        Err(LinkError::Adapter(original))
-    );
-    assert_eq!(model.queues[&0xd4300].lock().unwrap().head, tx);
-    assert_eq!(model.queues[&0xd4520].lock().unwrap().head, rx);
-    assert!(link.state().deferred_error.is_none());
-    // The still-pending bad RX cannot starve control publication.
+    link.transmit(&eth(0x800)).unwrap();
     let receipt = link.send_control(&control(), Some(ptk)).unwrap();
-    let deferred = deferred_message(&link);
-    assert!(deferred.contains("ProtocolVersion"));
+    assert_eq!(link.rejected_frames(), 3);
     let frames = finish_tx(&model);
-    assert_eq!(frames.len(), 1);
-    assert_ne!(frames[0][1] & 0x40, 0);
-    link.service().unwrap(); // real TX retirement does not consume the error
-    assert_eq!(deferred_message(&link), deferred);
-    assert_eq!(link.receive(), Err(LinkError::Adapter(deferred)));
-    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x42));
+    assert_eq!(frames.len(), 2);
+    assert_ne!(frames[1][1] & 0x40, 0);
+    link.service().unwrap();
+    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x41));
     let notices = drain_notices(&mut link);
     assert_eq!(
         notices
@@ -1144,21 +1184,7 @@ fn data_and_eapol_alternate_single_publication() {
                 link.transmit(&frame).unwrap();
                 None
             };
-            let original = deferred_message(&link);
-            assert!(original.contains("ProtocolVersion"));
-            let head = model.queues[&0xd4300].lock().unwrap().head;
-            if control_port {
-                assert_eq!(
-                    format!("{}", link.send_control(&control(), None).unwrap_err()),
-                    original
-                );
-            } else {
-                assert_eq!(
-                    link.transmit(&eth(0x800)),
-                    Err(LinkError::Adapter(original))
-                );
-            }
-            assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
+            assert_eq!(link.rejected_frames(), n as u64 + 1);
             let frames = finish_tx(&model);
             assert_eq!(frames.len(), 1 + usize::from(!control_port && n > 0));
             assert_eq!(frames.last().unwrap()[1] & 0x40 == 0, control_port);
@@ -1183,7 +1209,7 @@ fn data_and_eapol_alternate_single_publication() {
     }
 }
 #[test]
-fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() {
+fn a_refused_frame_does_not_mask_a_native_submission_failure() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1197,10 +1223,9 @@ fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() 
     let submission = link.transmit(&eth(0x800)).unwrap_err();
     assert!(!format!("{submission:?}").contains("ProtocolVersion"));
     assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
-    let original = deferred_message(&link);
-    assert!(original.contains("ProtocolVersion"));
+    assert_eq!(link.rejected_frames(), 1);
     link.state().source.1.store(false, Ordering::Relaxed);
-    assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
+    assert_eq!(link.receive(), Ok(None));
     assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
     link.transmit(&eth(0x800)).unwrap();
     assert_eq!(finish_tx(&model).len(), 1);
@@ -1210,7 +1235,7 @@ fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() 
     assert_eq!(provider.load(Ordering::Relaxed), 1);
 }
 #[test]
-fn deferred_error_cannot_bypass_fresh_native_hard_failure_for_any_packet_io() {
+fn a_native_hard_failure_after_a_refused_frame_fails_the_next_packet_io() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1223,23 +1248,12 @@ fn deferred_error_cannot_bypass_fresh_native_hard_failure_for_any_packet_io() {
         queued_data(&mut link, &model, 2, 0x52);
         rejected_rx(&model, true);
         assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x51));
-        let original = deferred_message(&link);
+        assert_eq!(link.rejected_frames(), 1);
         model.queues[&0xd4520].lock().unwrap().fail_publish = true;
         incoming(&model, &data(false), Some((1, 0, 3)), false);
         let tx = model.queues[&0xd4300].lock().unwrap().head;
-        let deferred = match operation {
-            0 => link.receive().map(|_| ()),
-            1 => link.transmit(&eth(0x800)),
-            _ => link
-                .send_control(&control(), None)
-                .map(|_| ())
-                .map_err(|e| LinkError::Adapter(format!("{e}"))),
-        };
-        assert_eq!(deferred, Err(LinkError::Adapter(original)));
-        assert!(link.carrier());
-        assert_eq!(link.queues().data_frames, 1);
-        // Next possible delivery/submission must observe the real failing
-        // RX DDONE refill, close carrier and discard held data first.
+        // The failing RX DDONE refill closes carrier and discards held data
+        // before any delivery or submission.
         let result = match operation {
             0 => link.receive().map(|_| ()),
             1 => link.transmit(&eth(0x800)),
@@ -1276,7 +1290,6 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
         queued_data(&mut link, &model, 2, 0x62);
         rejected_rx(&model, true);
         assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x61));
-        let original = deferred_message(&link);
         if revoke {
             link.revoke().unwrap();
         } else {
@@ -1287,10 +1300,7 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
         // SAFETY: model peer/key removal and all old users drained.
         unsafe { link.retire_peer_after_drain() }.unwrap();
         if revoke {
-            assert_eq!(
-                format!("{}", link.send_control(&control(), None).unwrap_err()),
-                original
-            );
+            assert!(link.send_control(&control(), None).is_err());
             assert!(link.transmit(&eth(0x800)).is_err());
             assert!(!matches!(link.receive(), Ok(Some(_))));
             model.response.lock().unwrap().clc_processing = false;
@@ -1302,8 +1312,6 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
             associate(&mut link, &model, join, bss);
             secure(&mut link);
             assert_ne!(link.station().association_epoch(), Some(old_epoch));
-            assert_eq!(deferred_message(&link), original);
-            assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
             assert!(link.receive().unwrap().is_none());
             queued_data(&mut link, &model, 1, 0x63);
             assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x63));
@@ -1315,7 +1323,7 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
     }
 }
 #[test]
-fn soft_rx_plus_real_tx_retirement_poison_is_never_deferred_as_packet_rejection() {
+fn a_tx_retirement_poison_after_a_refused_frame_fails_at_once() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1337,10 +1345,10 @@ fn soft_rx_plus_real_tx_retirement_poison_is_never_deferred_as_packet_rejection(
                 .map(|_| ())
                 .map_err(|e| LinkError::Adapter(format!("{e}"))),
         };
-        // Preserve the original first RX diagnostic, but a later native
-        // retirement failure makes the whole service failure immediate.
-        assert!(matches!(result,Err(LinkError::Adapter(ref e)) if e.contains("ProtocolVersion")));
-        assert!(link.state().deferred_error.is_none());
+        // The refused frame is only counted; the native retirement failure
+        // is the error.
+        assert!(matches!(result, Err(LinkError::Adapter(ref e)) if !e.contains("ProtocolVersion")));
+        assert_eq!(link.rejected_frames(), 1);
         let c = link.state().client.client.state();
         assert!(c.controller.state().data_tx.as_ref().unwrap().is_poisoned());
         assert_eq!(c.phase, Phase::Associated);

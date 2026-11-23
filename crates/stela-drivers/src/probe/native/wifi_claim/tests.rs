@@ -179,12 +179,16 @@ fn plan_takes_flr_first_then_the_bus_and_otherwise_nothing() {
     }
 }
 
-/// An Intel radio or an RTL8822CE that advertises FLR gets one, and no bus
+/// An Intel radio, an RTL8822CE or an RTL8821CE that advertises FLR gets one, and no bus
 /// reset even when one is offered; it answers again as the same stopped
 /// function, and Bus Master is never written.
 #[test]
 fn a_radio_with_flr_is_reset_function_level() {
-    for ((vendor, device), chip) in [(AX210, Chip::Intel), (RTL8822CE, Chip::Rtl8822c)] {
+    for ((vendor, device), chip) in [
+        (AX210, Chip::Intel),
+        (RTL8822CE, Chip::Rtl8822c),
+        ((0x10ec, 0xc821), Chip::Rtl8821c),
+    ] {
         let (mut peer, state) = model(vendor, device, FLR);
         state.borrow_mut().bus_reset = true;
         let quiesced = run(&mut peer, chip).unwrap();
@@ -199,7 +203,11 @@ fn a_radio_with_flr_is_reset_function_level() {
 /// offers.
 #[test]
 fn a_radio_without_flr_gets_the_bus_reset() {
-    for ((vendor, device), chip) in [(AX210, Chip::Intel), (RTL8822CE, Chip::Rtl8822c)] {
+    for ((vendor, device), chip) in [
+        (AX210, Chip::Intel),
+        (RTL8822CE, Chip::Rtl8822c),
+        ((0x10ec, 0xc821), Chip::Rtl8821c),
+    ] {
         let (mut peer, state) = model(vendor, device, 0);
         state.borrow_mut().bus_reset = true;
         let quiesced = run(&mut peer, chip).unwrap();
@@ -237,6 +245,43 @@ fn an_mt7925_never_gets_its_flr() {
     assert_eq!(flr(&mut peer.function, Chip::Intel), Ok(Err(Flr::Broken)));
     let (mut peer, _) = model(0x14c3, 0x0616, FLR);
     assert_eq!(flr(&mut peer.function, Chip::Intel), Ok(Err(Flr::Broken)));
+}
+
+/// An MT7922 is denied its FLR under each of its IDs, as the MT7925 is,
+/// Linux's quirk_no_flr naming 14c3:0616; an MT7921, which the quirk does
+/// not name, gets the FLR it advertises.
+#[test]
+fn an_mt7922_never_gets_its_flr_and_an_mt7921_does() {
+    for (vendor, device) in [(0x14c3, 0x7922), (0x14c3, 0x0616), (0x0b48, 0x7922)] {
+        let (mut peer, state) = model(vendor, device, FLR);
+        assert_eq!(
+            flr(&mut peer.function, Chip::Mt7922),
+            Ok(Err(Flr::Broken)),
+            "{vendor:04x}:{device:04x}"
+        );
+        state.borrow_mut().bus_reset = true;
+        let quiesced = run(&mut peer, Chip::Mt7922).unwrap();
+        assert_eq!(quiesced.reset, Reset::SecondaryBus);
+        assert_eq!(state.borrow().events, ["bus-reset"]);
+    }
+    for device in [0x7961, 0x0608] {
+        let (mut peer, state) = model(0x14c3, device, FLR);
+        state.borrow_mut().bus_reset = true;
+        let quiesced = run(&mut peer, Chip::Mt7921).unwrap();
+        assert_eq!(quiesced.reset, Reset::FunctionLevel);
+        assert_eq!(quiesced.chip, Chip::Mt7921);
+        assert_eq!(state.borrow().events, ["flr"]);
+    }
+    assert_eq!(Chip::Mt7921.name(), "MT7921");
+    assert_eq!(Chip::Mt7922.name(), "MT7922");
+    use crate::net::wifi::mediatek::identity::Chip as Mediatek;
+    for (mediatek, chip) in [
+        (Mediatek::Mt7921, Chip::Mt7921),
+        (Mediatek::Mt7922, Chip::Mt7922),
+        (Mediatek::Mt7925, Chip::Mt7925),
+    ] {
+        assert_eq!(Chip::mediatek(mediatek), chip);
+    }
 }
 
 /// A radio neither reset reaches stays sealed: nothing is written, and the

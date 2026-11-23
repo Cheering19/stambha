@@ -40,9 +40,13 @@ pub struct Deep {
 }
 
 impl Deep {
-    /// `rtw_update_lps_deep_mode` of `fw->feature`.
-    pub fn new(features: u32) -> Self {
-        let mode = if features & POWER_GATE_FEATURE != 0 {
+    /// `rtw_update_lps_deep_mode` of `fw->feature`, with no mode where `allowed`
+    /// is false, as under `rtw_disable_lps_deep_mode`. Power gating also needs
+    /// a chip that supports it (`power_gate`, its `lps_deep_mode_supported`).
+    pub fn new(features: u32, allowed: bool, power_gate: bool) -> Self {
+        let mode = if !allowed {
+            None
+        } else if power_gate && features & POWER_GATE_FEATURE != 0 {
             Some(Mode::PowerGate)
         } else if features & LOW_CLOCK_FEATURE != 0 {
             Some(Mode::LowClock)
@@ -182,7 +186,7 @@ mod tests {
     #[test]
     fn firmware_without_either_feature_offers_nothing() {
         let mut bus = Bus::default();
-        let mut deep = Deep::new(TRANSMIT_WAKE_FEATURE);
+        let mut deep = Deep::new(TRANSMIT_WAKE_FEATURE, true, true);
         assert!(!deep.available());
         assert!(deep.enter(&mut bus).unwrap());
         assert!(!deep.active());
@@ -191,15 +195,31 @@ mod tests {
 
     #[test]
     fn power_gating_wins_over_the_low_clock() {
-        assert!(Deep::new(LOW_CLOCK_FEATURE | POWER_GATE_FEATURE).gates_power());
-        let low = Deep::new(LOW_CLOCK_FEATURE);
+        assert!(Deep::new(LOW_CLOCK_FEATURE | POWER_GATE_FEATURE, true, true).gates_power());
+        // A chip that only lowers its clock takes the low clock.
+        let chip = Deep::new(LOW_CLOCK_FEATURE | POWER_GATE_FEATURE, true, false);
+        assert!(chip.available() && !chip.gates_power());
+        let low = Deep::new(LOW_CLOCK_FEATURE, true, true);
         assert!(low.available() && !low.gates_power());
+    }
+
+    #[test]
+    fn a_system_with_deep_power_save_disabled_has_no_mode_but_keeps_transmit_wake() {
+        let mut deep = Deep::new(
+            LOW_CLOCK_FEATURE | POWER_GATE_FEATURE | TRANSMIT_WAKE_FEATURE,
+            false,
+            true,
+        );
+        assert!(!deep.available() && deep.transmit_wakes());
+        let mut bus = Bus::default();
+        assert_eq!(deep.enter(&mut bus), Ok(true));
+        assert!(!deep.active() && bus.requests.is_empty());
     }
 
     #[test]
     fn each_request_toggles_and_asks_for_an_answer() {
         let mut bus = Bus::default();
-        let mut deep = Deep::new(LOW_CLOCK_FEATURE);
+        let mut deep = Deep::new(LOW_CLOCK_FEATURE, true, true);
         assert!(deep.enter(&mut bus).unwrap());
         assert!(deep.active());
         assert!(deep.leave(&mut bus).unwrap());
@@ -214,7 +234,7 @@ mod tests {
     #[test]
     fn a_power_gate_says_so_going_in_and_not_coming_out() {
         let mut bus = Bus::default();
-        let mut deep = Deep::new(POWER_GATE_FEATURE | TRANSMIT_WAKE_FEATURE);
+        let mut deep = Deep::new(POWER_GATE_FEATURE | TRANSMIT_WAKE_FEATURE, true, true);
         deep.enter(&mut bus).unwrap();
         deep.leave(&mut bus).unwrap();
         assert_eq!(
@@ -229,7 +249,7 @@ mod tests {
     #[test]
     fn standing_in_either_state_asks_for_nothing() {
         let mut bus = Bus::default();
-        let mut deep = Deep::new(LOW_CLOCK_FEATURE);
+        let mut deep = Deep::new(LOW_CLOCK_FEATURE, true, true);
         deep.leave(&mut bus).unwrap();
         deep.enter(&mut bus).unwrap();
         deep.enter(&mut bus).unwrap();
@@ -242,7 +262,7 @@ mod tests {
             silent: true,
             ..Bus::default()
         };
-        let mut deep = Deep::new(LOW_CLOCK_FEATURE);
+        let mut deep = Deep::new(LOW_CLOCK_FEATURE, true, true);
         assert!(!deep.enter(&mut bus).unwrap());
         assert!(deep.active(), "the request stands until it is taken back");
         assert!(deep.leave(&mut bus).unwrap(), "already reported");

@@ -64,8 +64,8 @@ pub fn rtl8852ce(function: &crate::bus::pci::Identity) -> bool {
 /// and so may set Bus Master once its chip is proven quiescent:
 /// - an RTL8852CE ([`rtl8852ce`]), quiesced through its own registers;
 /// - an Intel radio `iwl_pci_probe` identifies (with `native-acpi`, which
-///   its platform configuration needs), an MT7925, or an RTL8822CE, each
-///   quiesced by a reset (`native::wifi_claim`, experimental: no such chip
+///   its platform configuration needs), an MT7921, MT7922 or MT7925, or an
+///   RTL8822CE or RTL8821CE, each quiesced by a reset (`native::wifi_claim`, experimental: no such chip
 ///   has run here yet). On a PC where no reset reaches the chip, its claim
 ///   keeps it sealed and the boot log says why.
 ///
@@ -76,10 +76,23 @@ pub fn wifi_starts(function: &crate::bus::pci::Identity) -> bool {
     let intel = cfg!(feature = "native-acpi")
         && function.vendor == 0x8086
         && crate::net::wifi::intel::identity::device(function.device).is_some();
-    let mt7925 = function.vendor == 0x14c3 && matches!(function.device, 0x7925 | 0x0717);
-    let rtl8822c = function.vendor == 0x10ec
-        && crate::net::wifi::realtek::identity::RTL8822C_DEVICES.contains(&function.device);
-    rtl8852ce(function) || (wireless && (intel || mt7925 || rtl8822c))
+    // MT7921, MT7922 (ITTIM's 0b48:7922 among them) and MT7925; an MT7920
+    // has no chip there.
+    let mt792x = crate::net::wifi::mediatek::identity::PciIdentity {
+        vendor: function.vendor,
+        device: function.device,
+        subsystem_vendor: 0,
+        subsystem_device: 0,
+        revision: 0,
+    }
+    .chip()
+    .is_some();
+    let rtw88 = function.vendor == 0x10ec
+        && (crate::net::wifi::realtek::identity::RTL8822C_DEVICES.contains(&function.device)
+            || crate::net::wifi::realtek::chip::RTL8821C
+                .devices
+                .contains(&function.device));
+    rtl8852ce(function) || (wireless && (intel || mt792x || rtw88))
 }
 
 /// A controller refusal keeps its original typed details for boot diagnostics.
@@ -406,7 +419,7 @@ impl Adapter {
             Self::Aqtion(_) => "atlantic",
             #[cfg(feature = "native-acpi")]
             Self::IntelWifi(_) => "iwlwifi",
-            Self::MediatekWifi(_) => "mt7925e",
+            Self::MediatekWifi(_) => "mt792x",
             Self::RealtekWifi(_) => "rtw88_8822ce",
             Self::Rtw89Wifi(_) => "rtw89",
             Self::UsbVendor(device) => device.driver(),
@@ -567,6 +580,15 @@ impl Link for Adapter {
             Self::MediatekWifi(device) => device.due_us(),
             Self::RealtekWifi(device) => device.due_us(),
             Self::Rtw89Wifi(device) => device.due_us(),
+            _ => None,
+        }
+    }
+    fn take_diagnostic(&mut self) -> Option<String> {
+        match self {
+            #[cfg(feature = "native-acpi")]
+            Self::IntelWifi(device) => device.take_diagnostic(),
+            Self::MediatekWifi(device) => device.take_diagnostic(),
+            Self::RealtekWifi(device) => device.take_diagnostic(),
             _ => None,
         }
     }

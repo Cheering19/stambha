@@ -90,6 +90,9 @@ pub struct SystemIdentity<'a> {
     /// The first type-2 baseboard's manufacturer, the structure Linux's
     /// `dmi_decode` saves as DMI_BOARD_VENDOR. Not observed without one.
     pub board_vendor: Observation<'a>,
+    /// Type 1's SKU number (SMBIOS 2.4), Linux's DMI_PRODUCT_SKU. Not observed
+    /// in a shorter structure.
+    pub product_sku: Observation<'a>,
     /// That baseboard's product, Linux's DMI_BOARD_NAME.
     pub board_name: Observation<'a>,
     /// The first type-3 enclosure's chassis type, bit 7 (chassis lock)
@@ -104,6 +107,7 @@ impl Default for SystemIdentity<'_> {
             product_name: Observation::NotObserved,
             product_version: Observation::NotObserved,
             board_vendor: Observation::NotObserved,
+            product_sku: Observation::NotObserved,
             board_name: Observation::NotObserved,
             chassis_type: None,
         }
@@ -289,6 +293,11 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
                 product_name: field(table[at + 5], strings)?,
                 product_version: field(table[at + 6], strings)?,
                 board_vendor: Observation::NotObserved,
+                product_sku: if length > 25 {
+                    field(table[at + 25], strings)?
+                } else {
+                    Observation::NotObserved
+                },
                 board_name: Observation::NotObserved,
                 chassis_type: None,
             });
@@ -497,6 +506,7 @@ mod tests {
                     product_name: Observation::Absent,
                     product_version: Observation::Absent,
                     board_vendor: Observation::NotObserved,
+                    product_sku: Observation::NotObserved,
                     board_name: Observation::NotObserved,
                     chassis_type: None,
                 }
@@ -545,6 +555,34 @@ mod tests {
         entry.table_bytes = enclosures.len();
         let found = identity(entry, &enclosures).unwrap();
         assert_eq!(found.chassis_type, Some(10));
+    }
+    #[test]
+    fn the_sku_and_first_board_name_are_read_only_inside_their_structures() {
+        let (raw, fixture_table) = fixture(Format::Smbios3);
+        let end = fixture_table.len() - 6;
+        // A 2.4 type 1 with its SKU (string 3) and a baseboard named by string 2.
+        let mut table = alloc::vec![0u8; 27];
+        table[..8].copy_from_slice(&[1, 27, 1, 0, 1, 0, 0, 0]);
+        table[25] = 2;
+        table.extend_from_slice(b"Maker\0Sku 1\0\0");
+        table.extend_from_slice(&[2, 8, 2, 0, 1, 2, 0, 0]);
+        table.extend_from_slice(b"Board Co\0Board 9\0\0");
+        table.extend_from_slice(&fixture_table[end..]);
+        let mut entry = entry(&raw, Format::Smbios3).unwrap();
+        entry.table_bytes = table.len();
+        let host = identity(entry, &table).unwrap();
+        assert_eq!(host.product_sku, Observation::Value(&b"Sku 1\0"[..]));
+        assert_eq!(host.board_name, Observation::Value(&b"Board 9\0"[..]));
+        // The fixture's 8-byte type 1 and a 5-byte baseboard end before both.
+        let mut short = fixture_table[..end].to_vec();
+        short.extend_from_slice(&[2, 5, 2, 0, 1]);
+        short.extend_from_slice(b"Board Co\0\0");
+        short.extend_from_slice(&fixture_table[end..]);
+        entry.table_bytes = short.len();
+        let host = identity(entry, &short).unwrap();
+        assert_eq!(host.product_sku, Observation::NotObserved);
+        assert_eq!(host.board_name, Observation::NotObserved);
+        assert_eq!(host.board_vendor, Observation::Value(&b"Board Co\0"[..]));
     }
     #[test]
     fn checked_entry_lengths_checksums_versions_and_native_bounds_refuse() {
