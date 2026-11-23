@@ -375,9 +375,16 @@ pub fn read(budget: u64) -> Option<Opened> {
 }
 
 /// Give `translator` the spare pack file by renaming it, when the store
-/// has one: the file keeps its preallocated clusters.
+/// has one: the file keeps its preallocated clusters. Without one the
+/// boot's translations stay in memory, and the log says so and how to
+/// get a spare back.
 fn claim_spare(root: &mut Directory, translator: &Digest) {
     let Some(mut file) = open(root, &format!("{DIRECTORY}\\{SPARE}"), FileMode::ReadWrite) else {
+        output::arguments(format_args!(
+            "TRANSLATIONS WARNING no pack {} and no {DIRECTORY}\\{SPARE} to take: this \
+             boot's translations are not saved; run stambha repair to prepare a spare\n",
+            pack_name(translator)
+        ));
         return;
     };
     let Ok(info) = file.get_boxed_info::<FileInfo>() else {
