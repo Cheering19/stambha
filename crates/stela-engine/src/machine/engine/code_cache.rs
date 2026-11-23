@@ -283,37 +283,52 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// [`Self::forget_spaces`] for a caller that advances the generation.
-    fn forget_contexts(&mut self, halves: core::ops::RangeInclusive<usize>, cause: usize) {
+    pub(super) fn forget_contexts(
+        &mut self,
+        halves: core::ops::RangeInclusive<usize>,
+        cause: usize,
+    ) {
         // Native switches name contexts by number.
         self.mirrors.table_switch.forget();
         let upper_stays = !halves.contains(&1);
         for half in halves {
             self.refill_after(half);
             self.statistics.lookup_forgets[cause] += 1;
+            self.forget_kept_records(half);
             self.spaces[half].clear();
             self.recent[half] = [None; RECENT];
             // The upper half's live contexts may hold lower-half global
             // pages (`itlb_context`), which TLBIs by VA must still reach
             // through what the lower half's fetches recorded.
             let keep_filter = half == 0 && upper_stays && self.spaces[1].len() != 0;
-            // Bits are inserted with a fetched size and only cleared here.
-            if !keep_filter && core::mem::take(&mut self.fetched_sizes[half]) != 0 {
-                let filter = &mut self.fetched_leaves[half];
-                match &mut self.fetched_words[half] {
-                    Some(words) => {
-                        for word in words.drain(..) {
-                            filter[word as usize] = 0;
-                        }
-                    }
-                    words @ None => {
-                        filter.fill(0);
-                        *words = Some(Vec::new());
-                    }
-                }
+            if !keep_filter {
+                self.clear_fetched_leaves(half);
             }
             self.private_fetches[half] = false;
             if half == 0 {
                 self.lower_globals = NO_GLOBALS;
+            }
+        }
+    }
+
+    /// Clear `half`'s filter of the leaves its fetches translated through
+    /// ([`Self::fetched_through`]): a TLBI by VA then reaches none of its
+    /// lookup entries until a fetch, or a kept entry's verification
+    /// (`tlbi_keep.rs`), records one again.
+    pub(super) fn clear_fetched_leaves(&mut self, half: usize) {
+        // Bits are inserted with a fetched size and only cleared here.
+        if core::mem::take(&mut self.fetched_sizes[half]) != 0 {
+            let filter = &mut self.fetched_leaves[half];
+            match &mut self.fetched_words[half] {
+                Some(words) => {
+                    for word in words.drain(..) {
+                        filter[word as usize] = 0;
+                    }
+                }
+                words @ None => {
+                    filter.fill(0);
+                    *words = Some(Vec::new());
+                }
             }
         }
     }
@@ -584,7 +599,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 let started = self.whole_tlbi_clock();
                 let live =
                     !self.fill_log.is_empty() || self.spaces.iter().any(|spaces| spaces.len() != 0);
-                self.forget_spaces(0..=1, 1);
+                if self.tlbi_keep.on {
+                    // `--tlbi-keep on`: kept, and verified before any use.
+                    self.keep_spaces();
+                } else {
+                    self.forget_spaces(0..=1, 1);
+                }
                 if !self.applying_mail {
                     whole = Some((started, live));
                 }

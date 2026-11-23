@@ -17,8 +17,8 @@ use reports::*;
 pub use reports::{
     DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
     Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES,
-    WatchHit, WholeTlbiSites, WholeTlbiTrigger,
+    Suspension, TLBI_KEEP_SAMPLES, TRACE_HITS, TlbiKeepCounts, TraceHit, WATCH_HITS,
+    WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES, WatchHit, WholeTlbiSites, WholeTlbiTrigger,
 };
 mod amx;
 pub use amx::{AmxCell, AmxCounts, AmxForms, FORMS};
@@ -62,6 +62,7 @@ mod scheduler;
 mod system_access;
 mod table_switches;
 mod timing;
+mod tlbi_keep;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
 pub use churn::ChurnCounts;
@@ -603,7 +604,7 @@ impl Successor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct FetchEntry {
     page: u64,
     physical: u64,
@@ -619,13 +620,15 @@ struct FetchEntry {
 
 /// A walk no instruction asked for ([`Machine::quiet_fetch_physical`]):
 /// the page's frame, its leaf's guarded and global bits, and the bytes the
-/// leaf maps over both stages.
+/// leaf maps over both stages; with `--tlbi-keep on`, what the walk read
+/// ([`tlbi_keep::WalkRecord`]).
 #[derive(Clone, Copy)]
 struct QuietFetch {
     physical: u64,
     guarded: bool,
     global: bool,
     size: u64,
+    record: Option<tlbi_keep::WalkRecord>,
 }
 
 /// One batch of walks no instruction asked for ([`Machine::refill_pages`]):
@@ -988,6 +991,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// issued ([`WholeTlbiTrigger`]).
     whole_tlbi_ttbr0: u64,
     whole_tlbis: u64,
+    /// Keeping the lookup contexts across a TLBI of everything, and
+    /// verifying them before use (`--tlbi-keep on`, [`tlbi_keep`]).
+    tlbi_keep: tlbi_keep::TlbiKeep,
     /// The pages forgotten contexts had taken last, by half and key: a
     /// context made anew for the key walks them again at once
     /// ([`Self::refill_pages`]).
@@ -1492,6 +1498,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             fill_next: 0,
             whole_tlbi_ttbr0: 0,
             whole_tlbis: 0,
+            tlbi_keep: tlbi_keep::TlbiKeep::default(),
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
             dropped_refills: BTreeMap::new(),

@@ -1304,6 +1304,23 @@ fn run_machine<H: Host>(
         }
     }
     machine.set_step_timing(options.profile);
+    let (tlbi_keep, tlbi_verify_check) = options.tlbi_keep();
+    machine.set_tlbi_keep(tlbi_keep, tlbi_verify_check);
+    if tlbi_keep {
+        output::arguments(format_args!(
+            "TLBI KEEP on (--tlbi-keep on): a TLBI of everything keeps the ITLB's contexts, \
+             each verified against the tables at its next fetch; verify check {}\n",
+            if tlbi_verify_check {
+                "on (--tlbi-verify-check): every kept entry is walked in full too"
+            } else {
+                "off"
+            }
+        ));
+    } else if options.tlbi_verify_check {
+        output::arguments(format_args!(
+            "TLBI KEEP off: --tlbi-verify-check does nothing without --tlbi-keep on\n"
+        ));
+    }
     let amx_model = options.amx_model();
     machine.set_amx_model(amx_model.0);
     if amx_model == stela_boot_core::options::AmxModel::ALL {

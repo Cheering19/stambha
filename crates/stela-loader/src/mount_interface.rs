@@ -57,6 +57,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// performance unasked, and no line setup writes holds the option. So
 /// does the fork's `--keep-running-on-panic`, a hand-written debugging
 /// opt-in that lets a guest whose kernel panicked run on.
+/// So do the fork's `--tlbi-keep on|off` and `--tlbi-verify-check`,
+/// hand-written opt-ins that keep the ITLB's contexts across a TLBI of
+/// everything and check what they keep: no line setup writes holds them.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

@@ -10540,6 +10540,7 @@ mod table_base;
 mod tagged;
 mod thread_switch;
 mod timer_native;
+mod tlbi_keep;
 
 #[test]
 fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {

@@ -40,6 +40,20 @@ impl ParseState<'_> {
             "--brightness-keys" => options.brightness_keys = true,
             ACPI_HARDWARE => options.acpi_hardware = true,
             KEEP_RUNNING_ON_PANIC => options.keep_running_on_panic = true,
+            TLBI_KEEP => {
+                let keep = match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::TlbiKeep),
+                };
+                if options.tlbi_keep.replace(keep).is_some() {
+                    return Err(Error::DuplicateTlbiKeep);
+                }
+            }
+            TLBI_VERIFY_CHECK => flag(
+                &mut options.tlbi_verify_check,
+                Error::DuplicateTlbiVerifyCheck,
+            )?,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

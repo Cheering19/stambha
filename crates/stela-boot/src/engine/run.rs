@@ -2809,6 +2809,43 @@ impl Heartbeat {
                 }
             }
             output::arguments(format_args!("{line}\n{sampled}"));
+            // `--tlbi-keep on`: what keeping the contexts across those TLBIs
+            // did, every PE's together and then each PE's kept/dropped, and
+            // every mismatch `--tlbi-verify-check` found.
+            if per_pe.iter().any(|counts| counts.tlbi_keep.tlbis != 0) {
+                let mut keep = stela_engine::machine::engine::TlbiKeepCounts::default();
+                let mut each = String::new();
+                for (pe, counts) in per_pe.iter().enumerate() {
+                    let counts = &counts.tlbi_keep;
+                    keep.add(counts);
+                    each.push_str(&format!(" {pe}:{}/{}", counts.kept, counts.dropped));
+                }
+                let ns_each = (u128::from(keep.ticks) * 1_000_000_000
+                    / u128::from(host::COUNTER_HZ * keep.tlbis.max(1)))
+                    as u64;
+                output::arguments(format_args!(
+                    "PES TLBI KEEP tlbis={} contexts={} verified={} forgotten={} kept={} \
+                     dropped={} checked={} mismatches(check)={} verify_ns_per_tlbi={ns_each} \
+                     kept/dropped{each}\n",
+                    keep.tlbis,
+                    keep.contexts,
+                    keep.verified,
+                    keep.forgotten,
+                    keep.kept,
+                    keep.dropped,
+                    keep.checked,
+                    keep.mismatches,
+                ));
+                for [page, context, key, frame] in keep.samples {
+                    if context != 0 {
+                        output::arguments(format_args!(
+                            "PES TLBI KEEP MISMATCH page={page:#x} context={context:#x} \
+                             kept_key={key:#x} walked_frame={frame:#x}: a kept entry's full \
+                             walk differed, so it was dropped\n"
+                        ));
+                    }
+                }
+            }
             output::arguments(format_args!("{transitions}\n"));
             let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
                 transition_misses[kind * 9..kind * 9 + 9]
