@@ -84,6 +84,15 @@ const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
 const GET_BLOB: u32 = request::<Blob>(0xac);
 const VERSION: u32 = request::<Version>(0x00);
 const PRIME_HANDLE_TO_FD: u32 = request::<PrimeHandle>(0x2d);
+/// `DRM_IOCTL_AMDGPU_GEM_CREATE`, `DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE`.
+const AMDGPU_GEM_CREATE: u32 = request::<AmdgpuGemCreate>(0x40);
+/// `AMDGPU_GEM_DOMAIN_GTT`: system memory the GPU reaches through its GART.
+const AMDGPU_DOMAIN_GTT: u64 = 0x2;
+/// `AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_CPU_GTT_USWC`:
+/// mapped by the CPU, write-combined, the flag
+/// `amdgpu_display_supported_domains` needs to scan a GTT buffer out on an
+/// APU.
+const AMDGPU_SCANOUT_FLAGS: u64 = 1 << 0 | 1 << 2;
 /// `DRM_CLOEXEC | DRM_RDWR`: a dma-buf the GPU may write.
 const PRIME_FLAGS: u32 = 0o2_000_000 | 2;
 
@@ -221,6 +230,30 @@ struct CreateDumb {
     handle: u32,
     pitch: u32,
     size: u64,
+}
+
+/// `union drm_amdgpu_gem_create`: its size, alignment, domains and flags
+/// in; the buffer's handle out, in the first word.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct AmdgpuGemCreate {
+    bytes: u64,
+    alignment: u64,
+    domains: u64,
+    flags: u64,
+}
+
+/// Whether an amdgpu display's scanout buffers are made in system memory
+/// ([`set_system_scanout`]).
+static SYSTEM_SCANOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Make an amdgpu display's scanout buffers in system memory (GTT) from
+/// here on, where another GPU can import them: amdgpu's dumb buffers lie in
+/// an APU's VRAM carve-out, which it pins there for scanout, and a GPU that
+/// is not its peer imports only a buffer it can pin in GTT. Every other
+/// driver's dumb buffers stay as they are.
+pub fn set_system_scanout(on: bool) {
+    SYSTEM_SCANOUT.store(on, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// `struct drm_mode_destroy_dumb`.
@@ -1282,7 +1315,11 @@ fn follow<D: Drm>(
 /// Whether `drm`'s driver is Linux's nouveau, whose checks of a mode
 /// against its output the boot log names ([`Listing`]).
 fn nouveau<D: Drm>(drm: &mut D) -> bool {
-    const NAME: &[u8] = b"nouveau";
+    driver_is(drm, b"nouveau")
+}
+
+/// Whether `drm`'s driver is the Linux driver named `wanted`.
+fn driver_is<D: Drm>(drm: &mut D, wanted: &[u8]) -> bool {
     let mut name = [0u8; 16];
     let mut version = Version {
         name_bytes: name.len() as u64,
@@ -1290,8 +1327,8 @@ fn nouveau<D: Drm>(drm: &mut D) -> bool {
         ..Version::default()
     };
     call(drm, VERSION, &mut version).is_ok()
-        && version.name_bytes == NAME.len() as u64
-        && name.starts_with(NAME)
+        && version.name_bytes == wanted.len() as u64
+        && name.starts_with(wanted)
 }
 
 /// Connector `id`, read as `found`, as the boot log names it: showing a
@@ -1354,13 +1391,42 @@ fn buffer<D: Drm>(drm: &mut D, width: u32, height: u32) -> Result<Buffer, Error>
         bits_per_pixel: BYTES_PER_PIXEL * 8,
         ..CreateDumb::default()
     };
-    call(drm, CREATE_DUMB, &mut dumb)?;
+    if SYSTEM_SCANOUT.load(core::sync::atomic::Ordering::Relaxed) && driver_is(drm, b"amdgpu") {
+        system_buffer(drm, &mut dumb)?;
+    } else {
+        call(drm, CREATE_DUMB, &mut dumb)?;
+    }
     let mut framebuffer = None;
     let finished = finish(drm, width, height, &dumb, &mut framebuffer);
     if finished.is_err() {
         release(drm, dumb.handle, framebuffer, None);
     }
     finished
+}
+
+/// `dumb`'s buffer made by amdgpu in GTT, write-combined, with the pitch
+/// and size `amdgpu_mode_dumb_create` gives a linear 32-bit buffer: rows of
+/// a multiple of 64 pixels, the whole a multiple of the page. amdgpu maps
+/// and frees it as a dumb buffer (`amdgpu_mode_dumb_mmap`, GEM's handle
+/// delete).
+fn system_buffer<D: Drm>(drm: &mut D, dumb: &mut CreateDumb) -> Result<(), Error> {
+    let pitch = dumb
+        .width
+        .checked_next_multiple_of(64)
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        .ok_or(Error::InvalidBuffer)?;
+    let bytes = (u64::from(pitch) * u64::from(dumb.height)).next_multiple_of(4096);
+    let mut create = AmdgpuGemCreate {
+        bytes,
+        alignment: 4096,
+        domains: AMDGPU_DOMAIN_GTT,
+        flags: AMDGPU_SCANOUT_FLAGS,
+    };
+    call(drm, AMDGPU_GEM_CREATE, &mut create)?;
+    dumb.handle = create.bytes as u32;
+    dumb.pitch = pitch;
+    dumb.size = bytes;
+    Ok(())
 }
 
 /// The framebuffer and mapping of the dumb buffer `dumb`; `framebuffer` is

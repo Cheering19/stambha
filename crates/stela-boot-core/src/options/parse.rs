@@ -50,6 +50,16 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateLaptop);
                 }
             }
+            HYBRID_SCANOUT => {
+                let on = match value().ok_or(Error::HybridScanout)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::HybridScanout),
+                };
+                if options.hybrid_scanout.replace(on).is_some() {
+                    return Err(Error::DuplicateHybridScanout);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {

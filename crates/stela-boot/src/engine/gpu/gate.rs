@@ -1696,6 +1696,19 @@ pub(super) fn service_of(name: &str) -> Option<&'static Arc<Shared>> {
     shared().get(index)
 }
 
+/// The first GPU other than `display` that serves Metal, with its service:
+/// the one that draws, which claims first, for a display whose own GPU runs
+/// no service (`--hybrid-scanout on`).
+pub(super) fn drawing_service(display: &str) -> Option<(&'static str, &'static Arc<Shared>)> {
+    // SAFETY: the names are published before the services and leaked.
+    let names: &'static Vec<String> = unsafe { SERVICE_GPUS.load(Ordering::Acquire).as_ref() }?;
+    names
+        .iter()
+        .zip(shared())
+        .find(|(gpu, _)| gpu.as_str() != display)
+        .map(|(gpu, service)| (gpu.as_str(), service))
+}
+
 pub(super) fn shared() -> &'static [Arc<Shared>] {
     // SAFETY: the published services are leaked, so they live for the boot.
     unsafe { SERVICES.load(Ordering::Acquire).as_ref() }.map_or(&[], Vec::as_slice)

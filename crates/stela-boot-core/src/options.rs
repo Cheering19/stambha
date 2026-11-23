@@ -277,6 +277,18 @@ impl Laptop {
     }
 }
 
+/// Composes the frames of a laptop panel that an integrated GPU drives on
+/// the discrete GPU that serves Metal (`--hybrid-scanout on|off`), as
+/// Linux's PRIME render offload does on a laptop without a display mux:
+/// the discrete GPU's Metal service imports the integrated GPU's three
+/// scanout buffers, composes each frame into the hidden one and the
+/// integrated GPU flips it on its vblank, where the CPU copied each frame's
+/// rows. On amdgpu the buffers are made in system memory (GTT), which
+/// another GPU can import. Off by default until proven on hardware: a
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13.
+pub const HYBRID_SCANOUT: &str = "--hybrid-scanout";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -608,6 +620,9 @@ pub struct System {
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
+    /// Whether the discrete GPU composes an integrated GPU's panel
+    /// ([`HYBRID_SCANOUT`]); off unless given ([`Self::hybrid_scanout`]).
+    pub hybrid_scanout: Option<bool>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -736,6 +751,7 @@ impl Default for System {
             lid_sleep: false,
             brightness_keys: false,
             laptop: None,
+            hybrid_scanout: None,
             amx_native: None,
             ecid: None,
             network_check: None,
@@ -902,6 +918,12 @@ impl System {
     /// else [`Laptop::Auto`].
     pub fn laptop(&self) -> Laptop {
         self.laptop.unwrap_or_default()
+    }
+
+    /// Whether the discrete GPU composes an integrated GPU's panel:
+    /// `--hybrid-scanout`, else off.
+    pub fn hybrid_scanout(&self) -> bool {
+        self.hybrid_scanout.unwrap_or(false)
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1267,6 +1289,10 @@ impl fmt::Display for System {
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
+        line.value(
+            HYBRID_SCANOUT,
+            self.hybrid_scanout.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;

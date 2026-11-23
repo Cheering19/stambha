@@ -50,6 +50,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// the fork's `--laptop auto|off`, as hand-written: a laptop's boot takes
 /// `--battery`, `--lid method`, `--brightness-keys` and `--trackpad mt2`
 /// unasked from what it reads of the PC, which the line does not hold.
+/// So does the fork's `--hybrid-scanout on|off`, a hand-written opt-in that
+/// composes an integrated GPU's panel on the discrete GPU: no line setup
+/// writes holds it.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

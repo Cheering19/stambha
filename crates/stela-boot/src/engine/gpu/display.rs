@@ -35,6 +35,7 @@ use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
 use stela_soc::scanout::{GpuPresent, GpuStats, Layer};
 
 mod composition;
+pub(in crate::engine) use composition::set_hybrid as set_hybrid_scanout;
 
 /// A GPU's primary node, the DRM master.
 struct Node(c_int);

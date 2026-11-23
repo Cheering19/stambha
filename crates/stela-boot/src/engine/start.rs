@@ -3539,6 +3539,8 @@ fn start_devices(
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
                 }
             });
+            #[cfg(feature = "nvk")]
+            gpu::display::set_hybrid_scanout(options.hybrid_scanout());
             if options.boots_macos()
                 && let Ok(work) = work
                 && let Some(mut fallback) = open_gpus(
