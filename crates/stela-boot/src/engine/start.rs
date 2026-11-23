@@ -12,17 +12,19 @@ use stela_boot_core::guest_timeouts::DEBUG_ACK_SECONDS;
 /// leading space. They assume the modeled chip's cores; a slower host's
 /// translated holders get that many times longer, by the clock this core
 /// sustains as measured against its TSC at `tsc_hz` (`guest_timeouts`):
-/// about 4 ms, before any AP or guest instruction runs.
-pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
+/// about 4 ms, before any AP or guest instruction runs. `--profile`
+/// (`profile`) widens them further (`guest_timeouts::boot_lock_scale`).
+pub(super) fn lock_timeout_arguments(tsc_hz: u64, profile: bool) -> String {
     use stela_boot_core::guest_timeouts::{
-        MODELED_CORE_HZ, lock_scale, lock_scale_arguments, measure_core_hz,
+        MODELED_CORE_HZ, boot_lock_scale, lock_scale, lock_scale_arguments, measure_core_hz,
     };
     let core_hz = measure_core_hz(tsc_hz);
     super::speed::set_single_core_hz(core_hz);
-    let scale = lock_scale(core_hz);
+    let scale = boot_lock_scale(core_hz, profile);
     output::arguments(format_args!(
-        "GUEST TIMEOUTS lock_scale={scale} core_hz={core_hz} tsc_hz={tsc_hz} \
-         modeled_hz={MODELED_CORE_HZ}\n"
+        "GUEST TIMEOUTS lock_scale={scale} host_scale={} profile={profile} core_hz={core_hz} \
+         tsc_hz={tsc_hz} modeled_hz={MODELED_CORE_HZ}\n",
+        lock_scale(core_hz)
     ));
     lock_scale_arguments(scale)
 }
@@ -76,7 +78,9 @@ fn from_disk(
                 value: 0u32.to_le_bytes().to_vec(),
             });
     }
-    defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
+    defaults
+        .boot_args
+        .push_str(&lock_timeout_arguments(tsc_hz, options.profile));
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;

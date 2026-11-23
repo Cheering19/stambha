@@ -69,6 +69,29 @@ pub fn lock_scale(core_hz: u64) -> u64 {
         .clamp(1, MAX_LOCK_SCALE)
 }
 
+/// What `--profile` multiplies the lock timeouts by: step timing makes
+/// every fetch and exit slower, so a translated holder's critical section
+/// and a stalled PE's hold both grow. A profiled cold boot on a 5.04 GHz
+/// host (scale 1) stalled PEs for 193 ms, past `ticket-lock`'s 125 ms,
+/// and the guest panicked "Ticket spinlock ... timeout"; four times gives
+/// 500 ms.
+pub const PROFILE_LOCK_FACTOR: u64 = 4;
+
+/// The largest scale a profiled boot gets: 2 s for a ticket spinlock.
+pub const MAX_PROFILED_LOCK_SCALE: u64 = MAX_LOCK_SCALE * 2;
+
+/// The scale this boot's lock timeouts get: the host's ([`lock_scale`]),
+/// times [`PROFILE_LOCK_FACTOR`] under `--profile`.
+pub fn boot_lock_scale(core_hz: u64, profile: bool) -> u64 {
+    let scale = lock_scale(core_hz);
+    match profile {
+        true => scale
+            .saturating_mul(PROFILE_LOCK_FACTOR)
+            .min(MAX_PROFILED_LOCK_SCALE),
+        false => scale,
+    }
+}
+
 /// The additions one timed run of the reference loop makes, each waiting
 /// for the one before: 2,000,000 core cycles, 0.5 ms at 4 GHz.
 pub const REFERENCE_ADDS: u64 = 2_000_000;
@@ -186,6 +209,22 @@ mod tests {
             " ml-timeout-ticket-lock-scale=2 ml-timeout-lock-scale=2 \
              ml-timeout-lock-panic-scale=2"
         );
+    }
+
+    #[test]
+    fn profiling_widens_the_lock_timeouts() {
+        // The profiled boot that panicked on a ticket spinlock: 5.04 GHz.
+        assert_eq!(lock_scale(5_040_280_837), 1);
+        assert!(boot_lock_scale(5_040_280_837, true) >= 4);
+        assert_eq!(
+            boot_lock_scale(5_040_280_837, false),
+            lock_scale(5_040_280_837)
+        );
+        // A slower host's own scale is multiplied too, up to the bound.
+        assert_eq!(boot_lock_scale(3_000_000_000, true), 8);
+        assert_eq!(boot_lock_scale(100_000_000, true), MAX_PROFILED_LOCK_SCALE);
+        assert_eq!(boot_lock_scale(0, false), 1);
+        assert!(boot_lock_scale(0, true) >= PROFILE_LOCK_FACTOR);
     }
 
     #[test]
