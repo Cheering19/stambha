@@ -39,8 +39,11 @@ const fn lane(speed: u16, width: u16) -> u16 {
 
 #[test]
 fn the_layout_is_nouveaus() {
-    // `struct nvkm_perf_report`: nine 32-bit words.
-    assert_eq!(core::mem::size_of::<Report>(), 36);
+    // `struct nvkm_perf_report`: twelve 32-bit words.
+    assert_eq!(core::mem::size_of::<Report>(), 48);
+    assert_eq!(core::mem::offset_of!(Report, tsensor), 36);
+    assert_eq!(core::mem::offset_of!(Report, temp), 40);
+    assert_eq!(core::mem::offset_of!(Report, temp_max), 44);
     assert_eq!(core::mem::offset_of!(Report, pstate_status), 16);
     assert_eq!(core::mem::offset_of!(Report, link_status), 20);
     assert_eq!(core::mem::offset_of!(Report, link_control), 24);
@@ -68,6 +71,11 @@ fn a_take_clears_the_counts_and_keeps_the_current_pstate() {
             pstates: P5 | P8,
             status: 0,
             link: Link::default(),
+            thermal: Thermal {
+                sensor: 0,
+                temp: -1,
+                max: 0
+            },
         }
     );
     assert_eq!(
@@ -145,5 +153,59 @@ fn a_link_change_alone_gives_a_line() {
         Some(
             "GPU PERF pstate=P0 seen=P0 pcie=gen5x16 pcie_seen=gen5 pcie_max=gen5x16 aspm=off rounds=10"
         )
+    );
+}
+
+/// A report whose last round read the sensor as `sensor`, giving `temp`,
+/// with `max` the beat's highest.
+fn sensed(report: Report, sensor: u32, temp: i32, max: u32) -> Report {
+    report.tsensor.store(sensor, Ordering::Relaxed);
+    report.temp.store(temp, Ordering::Relaxed);
+    report.temp_max.store(max, Ordering::Relaxed);
+    report
+}
+
+#[test]
+fn a_reading_is_said_every_beat_with_the_beats_highest() {
+    let reported = Reported::new();
+    let report = sensed(sampled(10, P0, 0), 0x2000_3400, 52, 55);
+    let taken = report.take().unwrap();
+    assert_eq!(
+        reported.thermal_line(&taken).as_deref(),
+        Some("GPU THERMAL temp=52C max=55C power=unread")
+    );
+    // The same reading again is still said, and the highest starts again.
+    report.rounds.store(10, Ordering::Relaxed);
+    let again = report.take().unwrap();
+    assert_eq!(again.thermal.max, 0);
+    assert_eq!(
+        reported.thermal_line(&again).as_deref(),
+        Some("GPU THERMAL temp=52C max=52C power=unread")
+    );
+    // The P-state line does not move with the temperature.
+    assert!(reported.line(&taken).is_some());
+    let warmer = sensed(sampled(10, P0, 0), 0x2000_3c00, 60, 60)
+        .take()
+        .unwrap();
+    assert_eq!(reported.line(&warmer), None);
+}
+
+#[test]
+fn a_sensor_without_a_reading_is_said_once_with_its_register() {
+    let reported = Reported::new();
+    let guarded = sensed(sampled(10, P0, 0), 0xbadf_1100, -1, 0)
+        .take()
+        .unwrap();
+    assert_eq!(
+        reported.thermal_line(&guarded).as_deref(),
+        Some("GPU THERMAL temp=unread sensor=badf1100 power=unread")
+    );
+    assert_eq!(reported.thermal_line(&guarded), None);
+    let gone = sensed(sampled(1, P0, 0), 0xffff_ffff, -1, 0)
+        .take()
+        .unwrap();
+    assert_eq!(
+        reported.thermal_line(&gone).as_deref(),
+        Some("GPU THERMAL temp=unread sensor=ffffffff power=unread")
     );
 }

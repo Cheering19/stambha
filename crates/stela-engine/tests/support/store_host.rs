@@ -251,6 +251,23 @@ impl NativeHost {
     pub fn lower_synchronous(&self) -> u64 {
         self.vector + 0x400
     }
+
+    /// Make the mapped pages of `[address, address + bytes)` guarded pages
+    /// (FEAT_BTI's GP, bit 50 of their stage-1 descriptors), before the
+    /// machine first fetches from them.
+    #[allow(dead_code, reason = "not every test that includes this host uses it")]
+    pub fn guard(&mut self, address: u64, bytes: usize) {
+        for page in (address..address + bytes as u64).step_by(PAGE) {
+            let mut table = self.tables.root;
+            for shift in [39, 30, 21] {
+                table = self.tables.pages[&table].0[((page >> shift) & 511) as usize] & !0xfff;
+            }
+            let entry =
+                &mut self.tables.pages.get_mut(&table).unwrap().0[((page >> 12) & 511) as usize];
+            assert!(*entry & 1 != 0, "guard a mapped page");
+            *entry |= 1 << 50;
+        }
+    }
 }
 impl Host for NativeHost {
     fn read_ram(&mut self, address: u64, out: &mut [u8]) -> bool {

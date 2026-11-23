@@ -11,8 +11,10 @@ use super::{
 };
 use core::fmt;
 
-/// Extended capability IDs: Advanced Error Reporting, LTR, L1 PM Substates.
+/// Extended capability IDs: Advanced Error Reporting, LTR, L1 PM Substates
+/// and Downstream Port Containment.
 const EXTENDED_AER: u16 = 0x01;
+const EXTENDED_DPC: u16 = 0x1d;
 const EXTENDED_LTR: u16 = 0x18;
 const EXTENDED_L1SS: u16 = 0x1e;
 
@@ -59,6 +61,10 @@ pub struct LinkEnd {
     /// AER Uncorrectable and Correctable Error Status, and Root Error Status
     /// on a root port.
     pub aer: Option<[u32; 3]>,
+    /// DPC Control, Status and Error Source ID (PCIe r6.0 7.9.14), on a
+    /// port with Downstream Port Containment: Status bit 0 says the port
+    /// contained its link, and bits 2:1 why.
+    pub dpc: Option<[u16; 3]>,
 }
 
 impl LinkEnd {
@@ -133,6 +139,13 @@ pub fn read<C: ConfigSpace + ?Sized>(config: &C) -> Result<LinkEnd, ConfigError>
                     0
                 };
                 end.aer = Some([config.read32(at + 4)?, config.read32(at + 0x10)?, root]);
+            }
+            EXTENDED_DPC if end.dpc.is_none() => {
+                end.dpc = Some([
+                    config.read16(at + 6)?,
+                    config.read16(at + 8)?,
+                    config.read16(at + 0xa)?,
+                ]);
             }
             _ => {}
         }
@@ -246,6 +259,12 @@ impl fmt::Display for LinkEnd {
                 write!(f, " root {root:08x}")?;
             }
         }
+        if let Some([control, status, source]) = self.dpc {
+            write!(
+                f,
+                "; DPC control {control:04x} status {status:04x} source {source:04x}"
+            )?;
+        }
         Ok(())
     }
 }
@@ -307,6 +326,22 @@ mod tests {
         words[0x158 / 4] = 0x4060_2804;
         words[0x15c / 4] = 0x0000_0028;
         Words(words)
+    }
+
+    #[test]
+    fn a_port_that_contained_its_link_says_so() {
+        let mut port = root_port();
+        // L1SS points on to a DPC capability whose status says triggered.
+        port.0[0x150 / 4] = 0x1801_001e;
+        port.0[0x180 / 4] = 0x0001_001d;
+        port.0[0x184 / 4] = 0x0001_0000;
+        port.0[0x188 / 4] = 0x0100_0003;
+        let end = read(&port).unwrap();
+        assert_eq!(end.dpc, Some([0x0001, 0x0003, 0x0100]));
+        assert!(
+            alloc::format!("{end}").ends_with("; DPC control 0001 status 0003 source 0100"),
+            "{end}"
+        );
     }
 
     #[test]

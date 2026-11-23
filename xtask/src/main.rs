@@ -10,6 +10,7 @@ mod cpu_reference;
 mod dist;
 mod gpu;
 mod guest;
+mod hle_signatures;
 mod oracles;
 mod pages;
 mod preflight;
@@ -72,6 +73,9 @@ enum Task {
     /// Name the functions a `--profile` boot log's `PES PC` lines sampled,
     /// from the guest's dyld shared cache or Mach-O images.
     Symbolize(symbolize::Symbolize),
+    /// Generate HLE's function signatures from a macOS dyld shared cache,
+    /// and extract the functions' bytes for the real-bytes oracle.
+    HleSignatures(hle_signatures::HleSignatures),
 }
 
 fn main() -> ExitCode {
@@ -93,6 +97,7 @@ fn main() -> ExitCode {
         Task::RestoreDryRun(task) => task.run(),
         Task::Sysregs(task) => task.run().map(|()| ExitCode::SUCCESS),
         Task::Symbolize(task) => task.run().map(|()| ExitCode::SUCCESS),
+        Task::HleSignatures(task) => task.run().map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");

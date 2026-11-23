@@ -8,6 +8,7 @@ use super::{
     tx_ring,
 };
 use crate::wifi::mediatek::identity::Chip;
+use stela_driver_base::stepped::{block_on, until};
 
 #[derive(Debug)]
 pub struct MacInitialized {
@@ -22,9 +23,9 @@ impl<I: BarIo> Control<I> {
     /// C2 normal-mode write precedes the source PCI MCU driver-own
     /// handshake. C3 first performs its source FW-own→driver-own sequence.
     /// All operations keep the existing exclusive controller and real clock.
-    pub fn prepare_firmware(&mut self, aspm_supported: bool) -> Result<(), Error> {
+    pub async fn prepare_firmware(&mut self, aspm_supported: bool) -> Result<(), Error> {
         self.guard(false)?;
-        let result = (|| {
+        let result = async {
             if self.registers.chip() != Chip::Mt7925 {
                 self.registers.write32(0x41f23c, 0)?;
                 let actual = self.read_control(0x41f23c)?;
@@ -40,19 +41,19 @@ impl<I: BarIo> Control<I> {
                 // mt7921e_driver_own uses the TOP LPCR FW-own bit, rather
                 // than substituting the common driver's bit2 sync poll.
                 self.registers.write32(0x18060010, 2)?;
-                self.poll(0x18060010, 1, 0, 500_000)?;
+                self.poll(0x18060010, 1, 0, 500_000).await?;
                 self.driver_owned = true;
             } else {
                 self.driver_owned = false;
                 for attempt in 0..10 {
                     self.registers.write32(MT_CONN_ON_LPCTL, 1)?;
-                    match self.poll(MT_CONN_ON_LPCTL, 4, 4, 50_000) {
+                    match self.poll(MT_CONN_ON_LPCTL, 4, 4, 50_000).await {
                         Ok(_) => break,
                         Err(Error::Timeout { .. }) if attempt < 9 => {}
                         Err(e) => return Err(e),
                     }
                 }
-                self.driver_own(aspm_supported)?;
+                self.driver_own(aspm_supported).await?;
             }
             self.modify(0x10194, 0, 1 << 8)?;
             let actual = self.read_control(0x10194)?;
@@ -65,7 +66,8 @@ impl<I: BarIo> Control<I> {
                 });
             }
             Ok(())
-        })();
+        }
+        .await;
         self.finish(result)
     }
     fn mac_modify(&mut self, address: u32, mask: u32, set: u32) -> Result<(), Error> {
@@ -85,7 +87,7 @@ impl<I: BarIo> Control<I> {
         self.mac_modify(0x820e9008 + stride, (3 << 30) | (3 << 24), 3 << 24)?;
         Ok(())
     }
-    fn wtbl_clear_admission(&mut self, index: u32) -> Result<Observation, Error> {
+    async fn wtbl_clear_admission(&mut self, index: u32) -> Result<Observation, Error> {
         let c3 = self.registers.chip() == Chip::Mt7925;
         let address = if c3 { 0x820d4380 } else { 0x820d4230 };
         self.mac_modify(
@@ -106,7 +108,7 @@ impl<I: BarIo> Control<I> {
                     reads,
                 });
             }
-            self.clock.delay(10);
+            until(self.clock.deadline(10)).await;
         }
         Err(Error::Timeout {
             address,
@@ -120,7 +122,9 @@ impl<I: BarIo> Control<I> {
         index: u16,
     ) -> Result<Observation, Error> {
         self.guard(true)?;
-        let result = self.wtbl_clear_admission(u32::from(index));
+        // A connected peer's clear: the same poll, at most 501 reads 10 us
+        // apart, run to completion within the caller's step.
+        let result = block_on(self.wtbl_clear_admission(u32::from(index)));
         self.finish(result)
     }
     /// # Safety
@@ -131,9 +135,9 @@ impl<I: BarIo> Control<I> {
     /// Both later firmware/per-WCID translation controls must also be disabled
     /// before claiming that a peer's payload is raw80211. This method itself
     /// establishes only the global bit and source initialization effects.
-    pub unsafe fn initialize_mac_raw(&mut self) -> Result<MacInitialized, Error> {
+    pub async unsafe fn initialize_mac_raw(&mut self) -> Result<MacInitialized, Error> {
         self.guard(true)?;
-        let result = (|| {
+        let result = async {
             let c3 = self.registers.chip() == Chip::Mt7925;
             let mdp = if c3 { 0x820cc800 } else { 0x820cd000 };
             self.mac_modify(mdp + 4, 0xfff8, 1536 << 3)?;
@@ -148,7 +152,7 @@ impl<I: BarIo> Control<I> {
                 reads: 0,
             }; 20];
             for (index, receipt) in wtbl.iter_mut().enumerate() {
-                *receipt = self.wtbl_clear_admission(index as u32)?;
+                *receipt = self.wtbl_clear_admission(index as u32).await?;
             }
             for band in 0..2 {
                 self.mac_band(band)?;
@@ -182,7 +186,8 @@ impl<I: BarIo> Control<I> {
                 wtbl,
                 fixed_rate_entries: if c3 { 12 } else { 0 },
             })
-        })();
+        }
+        .await;
         self.finish(result)
     }
 }
@@ -218,43 +223,83 @@ impl<I: BarIo> Control<I> {
             .map_err(Error::from);
         self.finish(r)
     }
-    /// Reject stale dormant queue counts before enabling this exact ordinary
-    /// source layout. No speculative queue is installed and no live foreign
-    /// queue is silently reset. Fresh namespace ownership is required.
-    pub(in crate::wifi::mediatek) fn verify_unused_queues(&mut self) -> Result<(), Error> {
+    /// Empty every ring outside this chip's layout that another owner (an
+    /// earlier OS's driver, or a reset default) left with a count, while the
+    /// engine is stopped, so none stays reachable once WFDMA is enabled.
+    /// Linux never reads these rings; refusing the device for them would be
+    /// stricter than it. Returns how many rings were emptied.
+    pub(in crate::wifi::mediatek) fn clear_unused_queues(&mut self) -> Result<u8, Error> {
         self.guard(true)?;
         let result = (|| {
             let c3 = self.chip() == Chip::Mt7925;
-            for qid in 0..=17 {
-                if qid == 0 || qid == 16 || qid == if c3 { 15 } else { 17 } {
+            let tx = (0..=17)
+                .filter(|&qid| qid != 0 && qid != 16 && qid != if c3 { 15 } else { 17 })
+                .map(tx_ring);
+            let rx = (0..=5)
+                .filter(|&qid| qid != 0 && qid != 2 && (c3 || qid != 4))
+                .map(rx_ring);
+            let mut cleared = 0;
+            for ring in tx.chain(rx) {
+                if self.read_control(ring + 4)? == 0 {
                     continue;
                 }
-                let address = tx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
+                // Base, count, then CPU index: the ring holds nothing.
+                for register in [ring, ring + 4, ring + 8] {
+                    self.registers.write32(register, 0)?;
+                }
+                let actual = self.read_control(ring + 4)?;
                 if actual != 0 {
                     return Err(Error::Readback {
-                        address,
+                        address: ring + 4,
                         mask: u32::MAX,
                         expected: 0,
                         actual,
                     });
                 }
+                cleared += 1;
             }
-            for qid in 0..=5 {
-                if qid == 0 || qid == 2 || (!c3 && qid == 4) {
-                    continue;
-                }
-                let address = rx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
-                if actual != 0 {
-                    return Err(Error::Readback {
-                        address,
-                        mask: u32::MAX,
-                        expected: 0,
-                        actual,
-                    });
-                }
-            }
+            Ok(cleared)
+        })();
+        self.finish(result)
+    }
+    /// `mt792x_mac_set_timeing` for band 0 at coverage class 0: with the
+    /// arbiter's TX and RX held, the CCK and OFDM PLCP and CCA timeouts,
+    /// the band's SIFS (10 us on 2.4 GHz, else 16) and `slot_time`, and the
+    /// CF-End rate (11 Mbps CCK only for a 2.4 GHz long slot). Connac2 only;
+    /// the MT7925's firmware takes the slot time.
+    pub(in crate::wifi::mediatek) fn set_timing(
+        &mut self,
+        two_ghz: bool,
+        slot_time: u16,
+    ) -> Result<(), Error> {
+        const ARB_SCR: u32 = 0x820e3080;
+        const TX_RX_DISABLE: u32 = (1 << 8) | (1 << 9);
+        const TMAC_CDTR: u32 = 0x820e4090;
+        const TMAC_ODTR: u32 = 0x820e4094;
+        const TMAC_ICR0: u32 = 0x820e40a4;
+        const AGG_ACR0: u32 = 0x820e2084;
+        if self.chip() == Chip::Mt7925 || slot_time > 0x7f {
+            return Err(Error::UnsupportedTiming);
+        }
+        self.guard(true)?;
+        let result = (|| {
+            self.mac_modify(ARB_SCR, 0, TX_RX_DISABLE)?;
+            block_on(until(self.clock.deadline(1)));
+            self.registers.write32(TMAC_CDTR, 231 | (48 << 16))?;
+            self.registers.write32(TMAC_ODTR, 60 | (28 << 16))?;
+            let sifs = if two_ghz { 10 } else { 16 };
+            self.registers.write32(
+                TMAC_ICR0,
+                360 | (2 << 10) | (sifs << 16) | (u32::from(slot_time) << 24),
+            )?;
+            // MT792x_CFEND_RATE_11B or MT792x_CFEND_RATE_DEFAULT (OFDM 24M).
+            let cf_end = if slot_time < 20 || !two_ghz {
+                0x49
+            } else {
+                0x03
+            };
+            self.mac_modify(AGG_ACR0, 0x3fff, cf_end)?;
+            self.mac_modify(ARB_SCR, TX_RX_DISABLE, 0)?;
             Ok(())
         })();
         self.finish(result)

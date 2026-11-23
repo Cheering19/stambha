@@ -398,10 +398,13 @@ fn keeper_forwards_the_radios_diagnostic() {
     );
 }
 
+/// A radio that names no wait of its own waits a scan, a join and the
+/// handshake, not a wired PHY's 10 s.
 #[test]
-fn other_keepers_keep_the_wired_carrier_wait() {
+fn other_keepers_wait_for_a_scan_a_join_and_the_handshake() {
     let mut keeper = kept(Wired { mac: LOCAL });
-    assert_eq!(keeper.carrier_wait_us(), crate::WIRED_CARRIER_WAIT_US);
+    assert_eq!(keeper.carrier_wait_us(), super::CARRIER_WAIT_US);
+    assert_ne!(keeper.carrier_wait_us(), crate::WIRED_CARRIER_WAIT_US);
     assert_eq!(keeper.diagnostic(), None);
 }
 
@@ -457,4 +460,382 @@ fn a_keeper_keeps_the_preferred_network_first_and_each_alternate_once() {
     assert_eq!(keeper.candidates[1].0.country, Some(*b"IN"));
     assert_eq!(keeper.network.ssid, b"home");
     assert!(keeper.network.alternates.is_empty());
+}
+
+/// A radio that is lost until its scripted recovery steps run out, each
+/// step advancing the model clock by its own cost.
+struct Recovering {
+    stage: Stage,
+    /// Each attempt's steps: the cost of each step, then how it ends.
+    attempts: VecDeque<(Vec<u64>, Result<(), String>)>,
+    steps: VecDeque<u64>,
+    end: Option<Result<(), String>>,
+    calls: Vec<u64>,
+    recoverable: bool,
+}
+
+impl Recovering {
+    fn new(recoverable: bool, attempts: Vec<(Vec<u64>, Result<(), String>)>) -> Self {
+        Self {
+            stage: Stage::Lost,
+            attempts: attempts.into(),
+            steps: VecDeque::new(),
+            end: None,
+            calls: Vec::new(),
+            recoverable,
+        }
+    }
+}
+
+impl Link for Recovering {
+    fn mac(&self) -> Mac {
+        Mac([2, 0, 0, 0, 0, 1])
+    }
+    fn carrier(&mut self) -> bool {
+        false
+    }
+    fn transmit(&mut self, _: &[u8]) -> Result<(), LinkError> {
+        Err(LinkError::Adapter(String::from("lost")))
+    }
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        match self.stage {
+            Stage::Lost => Err(LinkError::Adapter(String::from("lost"))),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Radio for Recovering {
+    type Handle = u8;
+    type Profile = ();
+    type Management = ();
+    type Error = String;
+    const NAME: &'static str = "model";
+    const LISTEN_INTERVAL: u16 = 1;
+    fn deferred(_: &String) -> bool {
+        false
+    }
+    fn service(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn recoverable(&self) -> bool {
+        self.recoverable
+    }
+    fn recover(&mut self) -> Result<Recovery, String> {
+        let start = crate::Clock::ticks();
+        self.calls.push(start);
+        if self.end.is_none() {
+            let (steps, end) = self.attempts.pop_front().expect("no attempt left");
+            self.steps = steps.into();
+            self.end = Some(end);
+        }
+        if let Some(cost) = self.steps.pop_front() {
+            crate::test_clock::advance(MODEL, cost);
+        }
+        let result = if self.steps.is_empty() {
+            match self.end.take().unwrap() {
+                Ok(()) => {
+                    self.stage = Stage::Idle;
+                    Ok(Recovery::Done)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(Recovery::Pending)
+        };
+        assert!(crate::Clock::ticks() - start <= RECOVERY_STEP_US);
+        result
+    }
+    fn take_event(&mut self) -> Option<Event> {
+        None
+    }
+    fn stage(&self) -> Stage {
+        self.stage
+    }
+    fn station(&self) -> &Station {
+        unreachable!()
+    }
+    fn channels(&self, _: Band) -> Vec<(Channel, u32)> {
+        Vec::new()
+    }
+    fn probes(&self, _: Channel) -> bool {
+        false
+    }
+    fn supported_channels(&self, _: Band) -> &'static [u8] {
+        &[]
+    }
+    fn regulated_power_dbm(&self, _: u16) -> i32 {
+        0
+    }
+    fn advertisement(&self, _: Band) -> Result<Advertisement, String> {
+        unreachable!()
+    }
+    fn profile(&self, _: Peer) -> Result<(), String> {
+        unreachable!()
+    }
+    fn begin_scan(&mut self, _: scan::Request, _: u64) -> Result<(), String> {
+        unreachable!()
+    }
+    unsafe fn retire_scan(&mut self) -> Result<(), String> {
+        unreachable!()
+    }
+    fn six_ghz_scan(
+        &self,
+        _: &scan::Request,
+        _: scan::six_ghz::Options,
+    ) -> Result<Option<scan::Request>, String> {
+        unreachable!()
+    }
+    fn bss(&self) -> Vec<(u8, &Bss)> {
+        Vec::new()
+    }
+    fn observation(&self, _: u8) -> Result<Arc<NativeBssObservation>, String> {
+        unreachable!()
+    }
+    fn join(&mut self, _: u8, _: Join, _: ()) -> Result<(), String> {
+        unreachable!()
+    }
+    fn begin_external_authentication(
+        &mut self,
+        _: u8,
+        _: (),
+        _: Option<Affiliation>,
+        _: u64,
+    ) -> Result<Arc<external::Session>, String> {
+        unreachable!()
+    }
+    fn begin_six_ghz_external_authentication(
+        &mut self,
+        _: u8,
+        _: Selection,
+        _: (),
+        _: Option<Affiliation>,
+        _: u64,
+    ) -> Result<Arc<external::Session>, String> {
+        unreachable!()
+    }
+    fn transmit_external_authentication(
+        &mut self,
+        _: &external::Session,
+        _: external::Frame<'_>,
+    ) -> Result<(), String> {
+        unreachable!()
+    }
+    fn associate_external(&mut self, _: &external::Session, _: u8, _: Join) -> Result<(), String> {
+        unreachable!()
+    }
+    fn configure(&mut self) -> Result<(), String> {
+        unreachable!()
+    }
+    fn send_control(&mut self, _: &[u8], _: Option<KeyIdentity>) -> Result<(), String> {
+        unreachable!()
+    }
+    fn install_key(
+        &mut self,
+        _: bool,
+        _: u8,
+        _: &[u8],
+        _: ReplaySeed,
+    ) -> Result<KeyIdentity, String> {
+        unreachable!()
+    }
+    fn install_link_key(&mut self, _: u8, _: u8, _: &[u8], _: ReplaySeed) -> Result<(), String> {
+        unreachable!()
+    }
+    unsafe fn install_management_key(
+        &mut self,
+        _: u64,
+        _: u8,
+        _: &[u8],
+        _: PacketNumber,
+    ) -> Result<(), String> {
+        unreachable!()
+    }
+    unsafe fn rotate_management_key(
+        &mut self,
+        _: &(),
+        _: u8,
+        _: &[u8],
+        _: PacketNumber,
+    ) -> Result<(), String> {
+        unreachable!()
+    }
+    fn authorize_port(&mut self, _: u64) -> Result<(), String> {
+        unreachable!()
+    }
+    fn deauthenticate(&mut self, _: u16) -> Result<(), String> {
+        unreachable!()
+    }
+    unsafe fn retire_peer(&mut self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+const MODEL: Clock = Clock {
+    ticks_per_microsecond: 1,
+};
+
+fn keeper(radio: Recovering) -> Keeper<Recovering> {
+    core::mem::forget(crate::test_clock::virtualize());
+    struct Zero;
+    impl Entropy for Zero {
+        fn fill(&self, output: &mut [u8]) -> Result<(), stela_driver_base::entropy::EntropyError> {
+            output.fill(0);
+            Ok(())
+        }
+    }
+    let network = Network {
+        alternates: Default::default(),
+        ssid: b"x".to_vec(),
+        secret: Secret::parse(b"correct horse battery").unwrap(),
+        country: None,
+    };
+    Keeper::keep(radio, network, Arc::new(Zero), MODEL)
+}
+
+fn notices(keeper: &mut Keeper<Recovering>) -> Vec<String> {
+    core::iter::from_fn(|| keeper.take_diagnostic()).collect()
+}
+
+/// mt7925_mac_reset_work: the chip reset runs in bounded steps, one per
+/// poll and with no pause between them, and the keeper joins again.
+#[test]
+fn a_lost_radio_recovers_in_bounded_steps_and_joins_again() {
+    let steps = vec![
+        RUNTIME_COMMAND_TIMEOUT_US,
+        10_000,
+        RUNTIME_COMMAND_TIMEOUT_US,
+        1_000,
+    ];
+    let mut keeper = keeper(Recovering::new(true, vec![(steps, Ok(()))]));
+    keeper.last_error = Some(String::from("model: command timed out"));
+    // Each receive polls once: one step each, with no pause between them.
+    for step in 1..=3 {
+        assert_eq!(keeper.receive(), Ok(None));
+        assert_eq!(keeper.radio().calls.len(), step);
+        assert!(keeper.recovering());
+        assert_eq!(keeper.transmit(&[0; 60]), Err(LinkError::NoCarrier));
+        assert!(!keeper.signals());
+    }
+    assert!(!keeper.carrier());
+    assert_eq!(keeper.radio().calls.len(), 4);
+    assert!(!keeper.recovering());
+    assert!(keeper.lost().is_none());
+    assert!(matches!(keeper.state, State::Waiting { .. }));
+    assert_eq!(
+        notices(&mut keeper),
+        [
+            "model: command timed out",
+            "model: recovered by a chip reset; joining again"
+        ]
+    );
+}
+
+/// A failed attempt waits a second before the next; ten in a row lose the
+/// radio for good, reported once.
+#[test]
+fn ten_failed_recoveries_in_a_row_lose_the_radio_for_good() {
+    let failed = |n: u32| (vec![1_000, 1_000], Err(format!("reset {n} failed")));
+    let mut keeper = keeper(Recovering::new(true, (1..=10).map(failed).collect()));
+    while keeper.lost().is_none() {
+        keeper.poll();
+        crate::test_clock::advance(MODEL, 100_000);
+    }
+    let calls = &keeper.radio().calls;
+    assert_eq!(calls.len(), 20);
+    for attempt in calls.chunks(2).collect::<Vec<_>>().windows(2) {
+        // The second step follows on the next poll; the next attempt waits.
+        assert!(attempt[0][1] - attempt[0][0] < RECOVERY_RETRY_US);
+        assert!(attempt[1][0] - attempt[0][1] >= RECOVERY_RETRY_US);
+    }
+    let lost = String::from(keeper.lost().unwrap());
+    assert_eq!(lost, "model: chip reset 10 of 10 failed: reset 10 failed");
+    let reported = notices(&mut keeper);
+    assert_eq!(reported.len(), 10);
+    assert_eq!(reported[9], lost);
+    assert_eq!(keeper.receive(), Err(LinkError::Adapter(lost.clone())));
+    assert!(keeper.radio().attempts.is_empty());
+    assert_eq!(notices(&mut keeper), Vec::<String>::new());
+}
+
+/// A failure that a later attempt cures resets the count: a radio that
+/// cannot recover is lost at once.
+#[test]
+fn a_recovery_resets_the_failure_count_and_an_unrecoverable_radio_is_lost_at_once() {
+    let attempts = vec![
+        (vec![1_000], Err(String::from("first"))),
+        (vec![1_000], Ok(())),
+    ];
+    let mut keeper = keeper(Recovering::new(true, attempts));
+    keeper.poll();
+    assert_eq!(keeper.recovery_failures, 1);
+    crate::test_clock::advance(MODEL, RECOVERY_RETRY_US);
+    keeper.poll();
+    assert_eq!(keeper.recovery_failures, 0);
+    assert!(keeper.lost().is_none());
+
+    let mut keeper = keeper_lost();
+    keeper.poll();
+    assert_eq!(keeper.lost(), Some("model: the radio stopped for good"));
+    assert!(keeper.radio().calls.is_empty());
+}
+
+fn keeper_lost() -> Keeper<Recovering> {
+    keeper(Recovering::new(false, Vec::new()))
+}
+
+/// pmksa_cache_add and pmksa_cache_get: an SAE exchange's PMKSA per AP,
+/// replaced by a newer one, gone after its 12 hours or a failed resumption.
+#[test]
+fn a_cached_pmksa_lasts_its_lifetime_and_goes_when_its_resumption_fails() {
+    let mut radio = Recovering::new(false, Vec::new());
+    radio.stage = Stage::Idle;
+    let mut keeper = keeper(radio);
+    let ap = Mac([2, 0, 0, 0, 0, 7]);
+    let other = Mac([2, 0, 0, 0, 0, 8]);
+    keeper.remember(ap, Zeroizing::new([1; 32]), [1; 16], false, 0);
+    keeper.remember(other, Zeroizing::new([2; 32]), [2; 16], true, 0);
+    keeper.remember(ap, Zeroizing::new([3; 32]), [3; 16], true, 100);
+    let (pmk, pmkid, h2e) = keeper.cached(ap, 1_000).unwrap();
+    assert_eq!((*pmk, pmkid, h2e), ([3; 32], [3; 16], true));
+    assert_eq!(keeper.pmksa.len(), 2);
+    // The first entry's 12 hours pass; the newer one's have not.
+    assert!(keeper.cached(other, PMK_LIFETIME_US).is_none());
+    assert!(keeper.cached(ap, PMK_LIFETIME_US).is_some());
+    // A resumption that fails drops its entry, so the next runs SAE.
+    keeper.resuming = Some(ap);
+    keeper.failed(PMK_LIFETIME_US, String::from("model: association failed"));
+    assert!(keeper.cached(ap, PMK_LIFETIME_US).is_none());
+    // The cache keeps at most its 32 newest entries.
+    for n in 0..=PMKSA_ENTRIES as u8 {
+        keeper.remember(
+            Mac([2, 1, 0, 0, 0, n]),
+            Zeroizing::new([n; 32]),
+            [n; 16],
+            false,
+            0,
+        );
+    }
+    assert_eq!(keeper.pmksa.len(), PMKSA_ENTRIES);
+    assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 0]), 0).is_none());
+    assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 1]), 0).is_some());
+}
+
+/// key_mgmt=NONE matches a BSS without privacy, RSN or WPA; a WMM element
+/// is no WPA element.
+#[test]
+fn an_open_network_takes_only_a_bss_without_privacy_rsn_or_wpa() {
+    let mut bss = ap(1, 2, CHANNEL_1, AP_MLD, &[]);
+    bss.elements.clear();
+    bss.capabilities = 0x01;
+    assert!(!protected(&bss));
+    bss.capabilities |= 0x10;
+    assert!(protected(&bss));
+    bss.capabilities = 0x01;
+    bss.elements = vec![48, 2, 1, 0];
+    assert!(protected(&bss));
+    bss.elements = vec![221, 4, 0, 0x50, 0xf2, 1];
+    assert!(protected(&bss));
+    bss.elements = vec![221, 4, 0, 0x50, 0xf2, 2];
+    assert!(!protected(&bss));
 }

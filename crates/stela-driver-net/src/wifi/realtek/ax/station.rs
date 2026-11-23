@@ -1993,12 +1993,24 @@ impl<C: Chip> Rtl8852c<C> {
     /// Ack limits: `max_rx_agg_num` and A-MSDUs in A-MPDUs
     /// (`SUPPORTS_AMSDU_IN_AMPDU`, `core.c:7500`). No TX agreement is
     /// configured (spec S1.13).
+    ///
+    /// While the chip's association waits for its own time
+    /// ([`chip::Chip::associate`]) this is [`Error::Pending`] with the
+    /// admission kept, so the keeper asks again at a later poll.
     fn configure_admitted(&mut self) -> Result<(), Error> {
+        let (_, context) = self
+            .admitted
+            .as_ref()
+            .ok_or(Error::Refused("configuration"))?;
+        let programmed = self.chip.associate(&association(context));
+        if let Ok(false) = programmed {
+            return Err(Error::Pending);
+        }
         let (ticket, context) = self
             .admitted
             .take()
             .ok_or(Error::Refused("configuration"))?;
-        Self::chip(self.chip.associate(&association(&context)))?;
+        Self::chip(programmed)?;
         let ht = context.negotiated().ht.is_some();
         self.context = Some(context);
         self.station
@@ -2294,6 +2306,12 @@ impl<C: Chip> Radio for Rtl8852c<C> {
     const NAME: &'static str = "rtw89";
     /// rtw89 leaves `max_listen_interval` at mac80211's default, as rtw88.
     const LISTEN_INTERVAL: u16 = 5;
+    /// Every RTL8852CE join runs the whole SAE exchange, the path its
+    /// hardware runs proved; resuming a PMKSA has not run on it.
+    const RESUMES_PMKSA: bool = false;
+    /// The boot reports an RTL8852CE keeper's failures from its receive
+    /// errors, as its hardware runs proved.
+    const FAILS_THROUGH_RECEIVE: bool = true;
 
     fn deferred(error: &Error) -> bool {
         matches!(error, Error::Pending)

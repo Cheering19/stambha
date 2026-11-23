@@ -4,7 +4,9 @@
 use super::*;
 use stela_drivers::{
     block::BlockError,
-    bus::pci::{ConfigSpace, Function, bus_reset, capability, power::Timer, substates},
+    bus::pci::{
+        self as pci, ConfigSpace, Function, bus_reset, capability, power::Timer, substates,
+    },
 };
 
 /// PCI Express device/port types whose link carries a single device: a
@@ -233,6 +235,51 @@ impl Source {
             return Err("the bridge above the PCI function does not forward".to_string());
         };
         substates::configure(config, function.config(), path)
+            .map_err(|error| alloc::format!("{error:?}"))
+    }
+
+    /// Turn the power management of the link above the cold requester at
+    /// `address` off at both ends ([`pci::disable_link_power`]): its L1 PM
+    /// Substates, then ASPM L0s and L1, the device's end first. Only the
+    /// bridge directly above is written, and only its Link Control and L1
+    /// PM Substates Control 1, as [`Self::configure_link_substates`] writes.
+    ///
+    /// # Safety
+    /// As [`Self::configure_link_substates`].
+    pub(crate) unsafe fn disable_link_power(
+        &self,
+        address: Address,
+        function: &mut Function<OwnedConfig>,
+    ) -> Result<pci::LinkPowerOff, alloc::string::String> {
+        use alloc::string::ToString;
+        if function.address != address || function.config().address() != address {
+            return Err("the PCI function's owner does not match".to_string());
+        }
+        let mut cohort = self
+            .pci_slots
+            .0
+            .try_borrow_mut()
+            .map_err(|_| "the PCI fabric is busy".to_string())?;
+        let Cohort::Parked(fabric) = &mut *cohort else {
+            return Err("the PCI fabric is not contained".to_string());
+        };
+        let slot_of = |fabric: &Fabric, address: Address| {
+            fabric
+                .slots
+                .binary_search_by_key(&address, |slot| slot.address)
+                .ok()
+        };
+        let at = slot_of(fabric, address)
+            .ok_or_else(|| "the PCI function is outside the contained fabric".to_string())?;
+        let topology::Parent::Bridge(bridge) = fabric.slots[at].route else {
+            return Err("the PCI function sits on a root bus, with no link above it".to_string());
+        };
+        let parent = slot_of(fabric, bridge)
+            .ok_or_else(|| "the bridge above is outside the contained fabric".to_string())?;
+        let Some(Forwarding::Open { config, .. }) = &mut fabric.slots[parent].forwarding else {
+            return Err("the bridge above the PCI function does not forward".to_string());
+        };
+        pci::disable_link_power(function.config(), Some(config))
             .map_err(|error| alloc::format!("{error:?}"))
     }
 

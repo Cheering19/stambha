@@ -22,6 +22,18 @@ pub(super) const UPPER_CONTEXTS: usize = 256;
 const SLOT_BITS: u32 = 12;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 const _: () = assert!(LOWER_CONTEXTS <= 1 << SLOT_BITS && UPPER_CONTEXTS <= 1 << SLOT_BITS);
+/// The context native code runs in between a TLBI of everything that keeps
+/// the contexts and the next fetch, which verifies the one it runs in
+/// ([`super::tlbi_keep`]): made 0th (the first context made is the 1st, so
+/// no context has this number), in a slot past every half's capacity (so
+/// none is live), it names no ITLB entry, stamp or jump cache entry, and the
+/// engine puts none in it.
+pub(super) const VOID: u64 = SLOT_MASK << chain::LOOKUP_SALT_BITS;
+const _: () = assert!(max(LOWER_CONTEXTS, UPPER_CONTEXTS) < SLOT_MASK as usize);
+/// The larger of `a` and `b`, in a constant.
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
 /// No slot, in the recency list.
 const NONE: u32 = u32::MAX;
 
@@ -51,6 +63,12 @@ pub(super) struct Space {
     /// The ASID of its non-global translations ([`mmu::current_asid`]).
     pub(super) asid: u16,
     pub(super) regime: mmu::Regime,
+    /// Kept across a TLBI of everything (`--tlbi-keep on`) and not verified
+    /// since ([`super::tlbi_keep`]): its number names ITLB entries no lookup
+    /// may use until each is checked against the tables again, so
+    /// [`Contexts::find`] does not give it, nor do the native paths, which
+    /// take their numbers from `find` alone.
+    pub(super) kept: bool,
 }
 
 /// A half's contexts.
@@ -100,11 +118,51 @@ impl Contexts {
     }
 
     /// The number of the context of `key`, which becomes the most recently
-    /// used.
+    /// used; none for a context kept across a TLBI of everything and not
+    /// verified since ([`Space::kept`], [`Self::kept`]).
     pub(super) fn find(&mut self, key: &Key) -> Option<u64> {
         let slot = *self.keys.get(key)?;
+        if self.spaces[slot as usize].kept {
+            return None;
+        }
         self.touch(slot);
         Some(self.spaces[slot as usize].number)
+    }
+
+    /// The number of the context of `key` while it is kept and unverified
+    /// ([`Space::kept`]).
+    pub(super) fn kept(&self, key: &Key) -> Option<u64> {
+        let slot = *self.keys.get(key)?;
+        let space = &self.spaces[slot as usize];
+        space.kept.then_some(space.number)
+    }
+
+    /// Mark every context kept and unverified, at a TLBI of everything that
+    /// keeps them: how many there are.
+    pub(super) fn keep_all(&mut self) -> usize {
+        for &slot in self.keys.values() {
+            self.spaces[slot as usize].kept = true;
+        }
+        self.keys.len()
+    }
+
+    /// The kept context `number` was verified: [`Self::find`] gives it
+    /// again, and it becomes the most recently used.
+    pub(super) fn confirm(&mut self, number: u64) {
+        let slot = number_slot(number);
+        if self.live(number).is_some() {
+            self.spaces[slot].kept = false;
+            self.touch(slot as u32);
+        }
+    }
+
+    /// Remove the context `number`: whether it was live.
+    pub(super) fn remove_number(&mut self, number: u64) -> bool {
+        let live = self.live(number).is_some();
+        if live {
+            self.remove(number_slot(number) as u32);
+        }
+        live
     }
 
     /// Make a context of `key`, numbered by `number` from its slot: the
@@ -132,6 +190,7 @@ impl Contexts {
                     number: 0,
                     asid,
                     regime,
+                    kept: false,
                 });
                 self.older.push(NONE);
                 self.newer.push(NONE);
@@ -145,6 +204,7 @@ impl Contexts {
             number,
             asid,
             regime,
+            kept: false,
         };
         self.keys.insert(key, slot);
         self.link_newest(slot);
@@ -179,6 +239,7 @@ impl Contexts {
         let space = &mut self.spaces[slot as usize];
         self.keys.remove(&space.key);
         space.number = 0;
+        space.kept = false;
         self.unlink(slot);
         self.free.push(slot);
     }
@@ -270,5 +331,29 @@ mod tests {
         assert_eq!(contexts.len(), 0);
         assert!(contexts.live(fourth).is_none());
         assert!(contexts.live(0).is_none());
+    }
+
+    /// A kept context stays live, but `find` does not give it until it is
+    /// confirmed; a removed one is gone, and its key is made again anew.
+    #[test]
+    fn a_kept_context_is_found_only_once_confirmed() {
+        let mut contexts = Contexts::new(4);
+        let mut made = 0;
+        let (one, _) = insert(&mut contexts, 1, &mut made);
+        let (two, _) = insert(&mut contexts, 2, &mut made);
+        assert_eq!(contexts.keep_all(), 2);
+        assert_eq!(contexts.find(&key(1)), None);
+        assert_eq!(contexts.kept(&key(1)), Some(one));
+        assert!(contexts.live(one).is_some_and(|space| space.kept));
+        contexts.confirm(one);
+        assert_eq!(contexts.find(&key(1)), Some(one));
+        assert_eq!(contexts.kept(&key(1)), None);
+        assert!(contexts.remove_number(two));
+        assert!(!contexts.remove_number(two));
+        assert_eq!(contexts.kept(&key(2)), None);
+        assert_eq!(contexts.find(&key(2)), None);
+        let (again, _) = insert(&mut contexts, 2, &mut made);
+        assert_ne!(again, two);
+        assert_eq!(contexts.find(&key(2)), Some(again));
     }
 }

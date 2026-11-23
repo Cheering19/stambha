@@ -16,6 +16,11 @@
 //! is read with DSTS and set with DEVS to `0x80 | level`, its levels 0 to
 //! 3, and its keys (0xC4 up, 0xC5 down, 0xC7 toggle) step it as
 //! `asus_wmi_handle_event_code` does.
+//!
+//! The firmware's thermal policy (`throttle_thermal_policy`, device
+//! 0x00120075 or the Vivobook's 0x00110019) is found by its DSTS presence
+//! bit and set with DEVS, as asus-wmi sets its default at probe; the
+//! package power limits it names (`ASUS_WMI_DEVID_PPT_*`) are only read.
 use super::acpi::{self, Argument, Handle, Session, Value};
 use alloc::{string::String, vec::Vec};
 
@@ -43,6 +48,21 @@ const DCTS: u32 = 0x5354_4344;
 const DEVS: u32 = 0x5356_4544;
 /// `ASUS_WMI_DEVID_KBD_BACKLIGHT`.
 const KEYBOARD_BACKLIGHT: u32 = 0x0005_0021;
+/// `ASUS_WMI_DEVID_THROTTLE_THERMAL_POLICY` and its Vivobook form
+/// `ASUS_WMI_DEVID_THROTTLE_THERMAL_POLICY_VIVO`, which swaps silent and
+/// overboost; asus-wmi takes the first that is present.
+pub const THERMAL_POLICY: u32 = 0x0012_0075;
+pub const THERMAL_POLICY_VIVO: u32 = 0x0011_0019;
+/// The package power limits asus-wmi names (`ASUS_WMI_DEVID_PPT_*` and
+/// `ASUS_WMI_DEVID_NV_DYN_BOOST`), read only.
+pub const POWER_LIMITS: [(u32, &str); 6] = [
+    (0x0012_00a3, "pl1_spl"),
+    (0x0012_00a0, "pl2_sppt"),
+    (0x0012_00c1, "pl3_fppt"),
+    (0x0012_00b0, "apu_sppt"),
+    (0x0012_00b1, "platform_sppt"),
+    (0x0012_00c0, "nv_dynamic_boost"),
+];
 /// `ASUS_WMI_DSTS_PRESENCE_BIT` and `ASUS_WMI_UNSUPPORTED_METHOD`.
 const PRESENCE: u32 = 0x0001_0000;
 const UNSUPPORTED: u32 = 0xffff_fffe;
@@ -92,6 +112,79 @@ pub enum Error {
     Unsupported,
     /// `_WED` answered no integer.
     Malformed,
+    /// A DEVS answered this, not 1 (`throttle_thermal_policy_write`'s
+    /// `-EIO`).
+    Refused(u32),
+}
+
+/// The firmware's thermal policies, as asus-wmi names them
+/// (`ASUS_THROTTLE_THERMAL_POLICY_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThermalMode {
+    /// `_DEFAULT`: performance, the policy asus-wmi sets at probe.
+    Default,
+    /// `_OVERBOOST`: turbo.
+    Overboost,
+    /// `_SILENT`.
+    Silent,
+}
+
+impl ThermalMode {
+    /// The value DEVS takes for this policy on `device`: 0, 1, 2 for
+    /// default, overboost and silent, with overboost and silent swapped on
+    /// [`THERMAL_POLICY_VIVO`].
+    pub fn value(self, device: u32) -> u32 {
+        let vivo = device == THERMAL_POLICY_VIVO;
+        match self {
+            Self::Default => 0,
+            Self::Overboost if vivo => 2,
+            Self::Overboost => 1,
+            Self::Silent if vivo => 1,
+            Self::Silent => 2,
+        }
+    }
+
+    /// The policy `value` stands for on `device`.
+    pub fn from_value(value: u32, device: u32) -> Option<Self> {
+        [Self::Default, Self::Overboost, Self::Silent]
+            .into_iter()
+            .find(|mode| mode.value(device) == value)
+    }
+
+    /// Its name in the boot's lines: performance, turbo or silent.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "performance",
+            Self::Overboost => "turbo",
+            Self::Silent => "silent",
+        }
+    }
+}
+
+/// Where an ASUS AMD notebook's firmware keeps the thermal policy in
+/// effect: the EC RAM field the FA608PP's DEVS of [`THERMAL_POLICY`]
+/// writes, whose DSTS answers a constant (0x00010003) and no mode.
+pub const EC_MODE: &str = "\\_SB.PCI0.SBRG.EC0.FTBL";
+
+/// The policy in effect as [`EC_MODE`] holds it, for [`THERMAL_POLICY`]
+/// alone: its raw value where the field exists and reads (asus-wmi reads
+/// no mode back). Reading changes nothing.
+pub fn mode_in_effect(session: &Session, policy: &ThermalPolicy) -> Option<u64> {
+    if policy.device != THERMAL_POLICY {
+        return None;
+    }
+    match session.handle(EC_MODE).ok()?.evaluate(None, &[]) {
+        Ok(Some(Value::Integer(value))) => Some(value),
+        _ => None,
+    }
+}
+
+/// The thermal policy device the firmware has: its ID and the status DSTS
+/// answered for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThermalPolicy {
+    pub device: u32,
+    pub status: u32,
 }
 
 impl From<acpi::Error> for Error {
@@ -220,6 +313,59 @@ impl<'a> AsusWmi<'a> {
         };
         self.keyboard = Some((bits & 0x7f) as u8);
         Ok(self.keyboard)
+    }
+
+    /// `asus_wmi_get_devstate`: what the device-status method answers for
+    /// `device`; `None` where it answers all ones or that the method is
+    /// unsupported.
+    pub fn device_status(&self, device: u32) -> Result<Option<u32>, Error> {
+        match self.evaluate(self.status, device, 0) {
+            Ok(u32::MAX) | Err(Error::Unsupported) => Ok(None),
+            Ok(status) => Ok(Some(status)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The thermal policy device, as asus-wmi probes it: the first of
+    /// [`THERMAL_POLICY`] and [`THERMAL_POLICY_VIVO`] whose status has the
+    /// presence bit (`asus_wmi_dev_is_present`); `None` without one.
+    pub fn thermal_policy(&self) -> Result<Option<ThermalPolicy>, Error> {
+        for device in [THERMAL_POLICY, THERMAL_POLICY_VIVO] {
+            if let Some(status) = self.device_status(device)?
+                && status & PRESENCE != 0
+            {
+                return Ok(Some(ThermalPolicy { device, status }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `throttle_thermal_policy_write`: DEVS of `mode`'s value on the
+    /// policy's device, which must answer 1; the value written.
+    pub fn set_thermal_policy(
+        &self,
+        policy: &ThermalPolicy,
+        mode: ThermalMode,
+    ) -> Result<u32, Error> {
+        let value = mode.value(policy.device);
+        match self.evaluate(DEVS, policy.device, value)? {
+            1 => Ok(value),
+            answer => Err(Error::Refused(answer)),
+        }
+    }
+
+    /// The [`POWER_LIMITS`] the firmware has, read with DSTS: each one's
+    /// name and status, presence bit set, in their order. Reading changes
+    /// nothing.
+    pub fn power_limits(&self) -> Vec<(&'static str, Result<u32, Error>)> {
+        POWER_LIMITS
+            .iter()
+            .filter_map(|&(device, name)| match self.device_status(device) {
+                Ok(Some(status)) if status & PRESENCE != 0 => Some((name, Ok(status))),
+                Ok(_) => None,
+                Err(error) => Some((name, Err(error))),
+            })
+            .collect()
     }
 
     /// The keyboard backlight's level as last read or set.
@@ -562,6 +708,201 @@ mod tests {
         assert!(wmi.drain(32).is_empty());
         assert_eq!(wmi.keyboard_key(KEYBOARD_DOWN), Ok(Some((1, 0))));
         drop(notification);
+        session.shutdown().unwrap();
+    }
+
+    /// An ATK device whose DSTS answers `status` for the thermal policy
+    /// `device` and that it does not know for any other, has one power
+    /// limit (PL1, 45) and one limit it does not have (PL2, status 0), and
+    /// whose DEVS of the policy keeps its value in `MODE` and answers
+    /// `answer`, as the FA608PP's keeps it in its EC's FTBL.
+    fn policy_namespace(device: u32, status: u32, answer: u64) -> Vec<u8> {
+        let unsupported = aml::ret(&aml::integer(u64::from(UNSUPPORTED)));
+        let policy = aml::integer(u64::from(device));
+        let wmnb = [
+            dword_field(aml::ARG2, 0, "IIA0"),
+            dword_field(aml::ARG2, 4, "IIA1"),
+            aml::if_equal(
+                &[aml::ARG1],
+                &aml::integer(u64::from(DSTS)),
+                &[
+                    aml::if_equal(
+                        &aml::name("IIA0"),
+                        &policy,
+                        &aml::ret(&aml::integer(u64::from(status))),
+                    ),
+                    aml::if_equal(
+                        &aml::name("IIA0"),
+                        &aml::integer(0x0012_00a3),
+                        &aml::ret(&aml::integer(0x0001_002d)),
+                    ),
+                    aml::if_equal(
+                        &aml::name("IIA0"),
+                        &aml::integer(0x0012_00a0),
+                        &aml::ret(&aml::integer(0)),
+                    ),
+                    unsupported.clone(),
+                ]
+                .concat(),
+            ),
+            aml::if_equal(
+                &[aml::ARG1],
+                &aml::integer(u64::from(DEVS)),
+                &[
+                    aml::if_equal(
+                        &aml::name("IIA0"),
+                        &policy,
+                        &[
+                            aml::store(&aml::name("IIA1"), &aml::name("MODE")),
+                            aml::ret(&aml::integer(answer)),
+                        ]
+                        .concat(),
+                    ),
+                    unsupported.clone(),
+                ]
+                .concat(),
+            ),
+            unsupported,
+        ]
+        .concat();
+        aml::scope(
+            "\\_SB_",
+            &aml::device(
+                "ATKD",
+                &[
+                    aml::named("_HID", &aml::string(WMI)),
+                    aml::named("_UID", &aml::string("ATK")),
+                    aml::named("_WDG", &aml::buffer(&wdg())),
+                    aml::named("MODE", &aml::integer(0x55)),
+                    aml::method("WMNB", 3, &wmnb),
+                ]
+                .concat(),
+            ),
+        )
+    }
+
+    #[test]
+    fn thermal_policy_values_follow_asus_wmi_with_vivo_swapped() {
+        use ThermalMode::*;
+        for (mode, plain, vivo) in [(Default, 0, 0), (Overboost, 1, 2), (Silent, 2, 1)] {
+            assert_eq!(mode.value(THERMAL_POLICY), plain);
+            assert_eq!(mode.value(THERMAL_POLICY_VIVO), vivo);
+            assert_eq!(ThermalMode::from_value(plain, THERMAL_POLICY), Some(mode));
+            assert_eq!(
+                ThermalMode::from_value(vivo, THERMAL_POLICY_VIVO),
+                Some(mode)
+            );
+        }
+        assert_eq!(ThermalMode::from_value(3, THERMAL_POLICY), None);
+        assert_eq!(
+            [Default, Overboost, Silent].map(ThermalMode::name),
+            ["performance", "turbo", "silent"]
+        );
+    }
+
+    /// The policy is found by its presence bit, set with DEVS, and its
+    /// value reaches the firmware; the Vivobook device takes the swapped
+    /// values; a DEVS that does not answer 1 is refused; a firmware without
+    /// either device has none. The power limits read are those present.
+    #[test]
+    fn the_thermal_policy_is_found_set_and_refused_as_asus_wmi_does() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        for (device, mode, written) in [
+            (THERMAL_POLICY, ThermalMode::Default, 0),
+            (THERMAL_POLICY, ThermalMode::Silent, 2),
+            (THERMAL_POLICY_VIVO, ThermalMode::Silent, 1),
+            (THERMAL_POLICY_VIVO, ThermalMode::Overboost, 2),
+        ] {
+            // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+            let session = unsafe {
+                Session::start(
+                    test_support::dsdt_fixture(&policy_namespace(device, 0x0001_0003, 1)),
+                    Mode::InterpreterOnly,
+                )
+            }
+            .unwrap();
+            let wmi = AsusWmi::find(&session).unwrap().unwrap();
+            let policy = wmi.thermal_policy().unwrap().unwrap();
+            assert_eq!(
+                policy,
+                ThermalPolicy {
+                    device,
+                    status: 0x0001_0003
+                }
+            );
+            assert_eq!(wmi.set_thermal_policy(&policy, mode), Ok(written));
+            assert_eq!(integer(&session, "\\_SB.ATKD.MODE"), u64::from(written));
+            let limits = wmi.power_limits();
+            assert_eq!(limits, [("pl1_spl", Ok(0x0001_002d))]);
+            session.shutdown().unwrap();
+        }
+        // DEVS answering 0: refused, as Linux's -EIO.
+        // SAFETY: as above.
+        let session = unsafe {
+            Session::start(
+                test_support::dsdt_fixture(&policy_namespace(THERMAL_POLICY, 0x0001_0000, 0)),
+                Mode::InterpreterOnly,
+            )
+        }
+        .unwrap();
+        let wmi = AsusWmi::find(&session).unwrap().unwrap();
+        let policy = wmi.thermal_policy().unwrap().unwrap();
+        assert_eq!(
+            wmi.set_thermal_policy(&policy, ThermalMode::Default),
+            Err(Error::Refused(0))
+        );
+        session.shutdown().unwrap();
+        // A status without the presence bit is no device.
+        // SAFETY: as above.
+        let session = unsafe {
+            Session::start(
+                test_support::dsdt_fixture(&policy_namespace(THERMAL_POLICY, 0x0000_0003, 1)),
+                Mode::InterpreterOnly,
+            )
+        }
+        .unwrap();
+        let wmi = AsusWmi::find(&session).unwrap().unwrap();
+        assert_eq!(wmi.thermal_policy(), Ok(None));
+        session.shutdown().unwrap();
+    }
+
+    /// `STELA_TEST_DSDT`'s FA608PP: its thermal policy is 0x00120075, whose
+    /// DSTS answers a constant 0x00010003 (present, no mode), and its DEVS
+    /// answers 1; its power limits answer present with no value.
+    #[test]
+    fn the_fa608pps_thermal_policy() {
+        let Some(services) = test_support::named_dsdt_fixture() else {
+            return;
+        };
+        let _serial = TEST_SERIAL.lock().unwrap();
+        // SAFETY: the fixture owns every ACPICA service; serialized singleton.
+        let session = unsafe { Session::start(services, Mode::InterpreterOnly) }.unwrap();
+        let wmi = AsusWmi::find(&session).unwrap().unwrap();
+        let policy = wmi.thermal_policy().unwrap().unwrap();
+        assert_eq!(
+            policy,
+            ThermalPolicy {
+                device: THERMAL_POLICY,
+                status: 0x0001_0003
+            }
+        );
+        // Its EC RAM, which the fixture reads as zero: FTBL 0, performance.
+        assert_eq!(mode_in_effect(&session, &policy), Some(0));
+        assert_eq!(wmi.set_thermal_policy(&policy, ThermalMode::Default), Ok(0));
+        let vivo = ThermalPolicy {
+            device: THERMAL_POLICY_VIVO,
+            ..policy
+        };
+        assert_eq!(mode_in_effect(&session, &vivo), None);
+        assert_eq!(
+            wmi.power_limits(),
+            [
+                ("pl1_spl", Ok(0x0001_0000)),
+                ("pl2_sppt", Ok(0x0001_0000)),
+                ("pl3_fppt", Ok(0x0001_0000)),
+                ("nv_dynamic_boost", Ok(0x0001_0000)),
+            ]
+        );
         session.shutdown().unwrap();
     }
 

@@ -15,6 +15,7 @@ pub type Result<T, E = Refusal> = core::result::Result<T, E>;
 pub mod machine;
 mod platform;
 pub mod restore;
+pub mod translation_bulk;
 pub mod translation_store;
 /// Native network protocols over a raw Ethernet link.
 pub use platform::net;

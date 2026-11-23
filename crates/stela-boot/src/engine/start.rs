@@ -12,17 +12,19 @@ use stela_boot_core::guest_timeouts::DEBUG_ACK_SECONDS;
 /// leading space. They assume the modeled chip's cores; a slower host's
 /// translated holders get that many times longer, by the clock this core
 /// sustains as measured against its TSC at `tsc_hz` (`guest_timeouts`):
-/// about 4 ms, before any AP or guest instruction runs.
-pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
+/// about 4 ms, before any AP or guest instruction runs. `--profile`
+/// (`profile`) widens them further (`guest_timeouts::boot_lock_scale`).
+pub(super) fn lock_timeout_arguments(tsc_hz: u64, profile: bool) -> String {
     use stela_boot_core::guest_timeouts::{
-        MODELED_CORE_HZ, lock_scale, lock_scale_arguments, measure_core_hz,
+        MODELED_CORE_HZ, boot_lock_scale, lock_scale, lock_scale_arguments, measure_core_hz,
     };
     let core_hz = measure_core_hz(tsc_hz);
     super::speed::set_single_core_hz(core_hz);
-    let scale = lock_scale(core_hz);
+    let scale = boot_lock_scale(core_hz, profile);
     output::arguments(format_args!(
-        "GUEST TIMEOUTS lock_scale={scale} core_hz={core_hz} tsc_hz={tsc_hz} \
-         modeled_hz={MODELED_CORE_HZ}\n"
+        "GUEST TIMEOUTS lock_scale={scale} host_scale={} profile={profile} core_hz={core_hz} \
+         tsc_hz={tsc_hz} modeled_hz={MODELED_CORE_HZ}\n",
+        lock_scale(core_hz)
     ));
     lock_scale_arguments(scale)
 }
@@ -76,7 +78,9 @@ fn from_disk(
                 value: 0u32.to_le_bytes().to_vec(),
             });
     }
-    defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
+    defaults
+        .boot_args
+        .push_str(&lock_timeout_arguments(tsc_hz, options.profile));
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;
@@ -819,7 +823,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
     // SAFETY: the physical inventory and loader-owned reservations
     // were validated before any SIPI; the BSP Host is installed, guest entry
     // is excluded, and APs remain parked until canonical worker publication.
-    let executors = unsafe {
+    let mut executors = unsafe {
         crate::native_smp::executor::start(
             handoff,
             native_processors.expect("validated native roster"),
@@ -847,6 +851,26 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
             ));
         }
         None => crate::status::done(""),
+    }
+    // `--host-core on`: the reservation's last processor runs no PE. Unless
+    // every reserved processor started, they all run PEs, as without it.
+    if handoff.native_resources.host_core == 1 {
+        let reserved = handoff.native_resources.cores as usize;
+        match executors.set_aside_host_core(reserved) {
+            Ok(()) => {
+                let host_core = executors.host_core().expect("set aside");
+                output::arguments(format_args!(
+                    "HOST CORE set aside: slot={} apic={:#x}; {} PEs on the others\n",
+                    host_core.slot(),
+                    host_core.apic_id(),
+                    executors.started(),
+                ));
+            }
+            Err(why) => output::arguments(format_args!(
+                "HOST CORE off: {why}; {} PEs, as without --host-core\n",
+                executors.started(),
+            )),
+        }
     }
     let sender = crate::apic::Apic::new(
         handoff.apic_base,
@@ -1444,6 +1468,9 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         watches: options.watches.clone(),
         step_timing: options.profile,
         amx_model: options.amx_model().0,
+        tlbi_keep: options.tlbi_keep(),
+        hle: stela_engine::hle::Config::boot(options.hle, &options.hle_off),
+        tier2: super::tier2_options(options),
     };
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.
@@ -1499,6 +1526,9 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
             &settings,
         )
         .unwrap_or_else(|error| output::fatal(error));
+        // `--host-core on`: its loop, and the ping it must answer before
+        // the guest starts, else PE 0 keeps everything.
+        host_core::start(&executors, &sender, handoff.tsc_hz, worker_bindings.len());
     }
     // The run's driver calls keep the engine's TLB entries; the serialized
     // workers' validations require PCIDE clear.
@@ -2938,6 +2968,7 @@ fn start_platform(
         native_mmio,
         handoff.tsc_hz,
         work.as_ref().ok().copied(),
+        options.acpi_hardware,
     );
     if let Some(acpi) = host_acpi {
         // As an operating system does before it looks for any device.
@@ -3089,6 +3120,9 @@ fn start_platform(
     };
     if let Some(acpi) = host_acpi {
         acpi.activate(prepared_sci);
+        // After hardware mode, where it runs, so an EC whose RAM is reached
+        // through its operation region is installed; it needs none.
+        acpi.set_asus_thermal_policy(options.asus_mode());
     }
     super::step_watchdog::clear_stage();
     super::step_watchdog::leave();
@@ -3541,6 +3575,7 @@ fn start_devices(
             });
             #[cfg(feature = "nvk")]
             gpu::display::set_hybrid_scanout(options.hybrid_scanout());
+            gpu::link::choose(options.gpu_aspm());
             if options.boots_macos()
                 && let Ok(work) = work
                 && let Some(mut fallback) = open_gpus(

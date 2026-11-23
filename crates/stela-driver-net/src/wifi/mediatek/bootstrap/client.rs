@@ -218,7 +218,9 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     controller: Controller<I, Q, C>,
     interface: Interface<Arc<C>>,
     station: Station,
-    pmf_observations: Vec<Arc<PmfBssObservation>>,
+    /// Each scan observation with the time it was seen, kept for
+    /// [`policy::BSS_EXPIRE_US`] as cfg80211 keeps its BSS table.
+    pmf_observations: Vec<(u64, Arc<PmfBssObservation>)>,
     fragments: station::fragments::Fragments,
     txs: txs::State,
     pmf_selected: Option<Arc<PmfBssObservation>>,
@@ -244,6 +246,8 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     transport_facts: Vec<mailbox::init::Fact>,
     asynchronous: Vec<crate::wifi::mediatek::ring::rx::Frame>,
     pending_rx: VecDeque<receive::ReceivedFrame>,
+    /// Events of a pass that a later frame failed, for the next pass.
+    carried_events: Vec<Event>,
     /// The last look at the receive rings found them empty.
     rings_empty: bool,
     receive_groups: receive::Groups<C>,
@@ -313,12 +317,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
     /// new OS key exchange must supply fresh TX material for a new owner.
     /// Hardware stop/drain alone never proves old material was unused.
     pub unsafe fn new(
-        controller: Controller<I, Q, C>,
+        mut controller: Controller<I, Q, C>,
         interface: Interface<Arc<C>>,
     ) -> Result<Self, Error> {
-        if controller.phase() != ControllerPhase::StartFacts
-            || controller.state().identity.chip != Chip::Mt7925
-        {
+        if controller.phase() != ControllerPhase::StartFacts {
             return Err(Error::WrongDevice);
         }
         let m = controller.state().mailbox.as_ref().unwrap();
@@ -328,8 +330,16 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         {
             return Err(Error::WrongDevice);
         }
+        let chip = controller.state().identity.chip;
         let station = Station::new(context.address).map_err(Error::Station)?;
         let scanner = scan::Scanner::new(context.address).map_err(Error::Scan)?;
+        // The attach is complete: the station's commands run from its polls.
+        controller
+            .state_mut()
+            .mailbox
+            .as_mut()
+            .unwrap()
+            .enter_runtime();
         Ok(Self {
             owned: Some(Box::new(Owned {
                 controller,
@@ -337,7 +347,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 station,
                 pmf_observations: Vec::new(),
                 fragments: Default::default(),
-                txs: txs::State::default(),
+                txs: txs::State::of(chip),
                 pmf_selected: None,
                 pmf_authentication: None,
                 scanner,
@@ -360,6 +370,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 transport_facts: Vec::new(),
                 asynchronous: Vec::new(),
                 pending_rx: VecDeque::new(),
+                carried_events: Vec::new(),
                 rings_empty: true,
                 receive_groups: receive::Groups::new(),
                 receive_ba: core::array::from_fn(|_| None),
@@ -390,6 +401,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 link_taken: false,
             })),
         })
+    }
+    /// The station command layouts of the controller's chip.
+    fn codec(s: &Owned<I, Q, C>) -> wire::Codec {
+        wire::Codec::of(s.controller.state().identity.chip)
     }
     fn state(&self) -> &Owned<I, Q, C> {
         self.owned.as_deref().unwrap()
@@ -442,6 +457,43 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     replies.push(r.clone());
                 }
                 Err(Error::Transport(e))
+            }
+        }
+    }
+    /// Send one station command from an owned state, as [`Self::command`].
+    fn send(s: &mut Owned<I, Q, C>, outgoing: &wire::Outgoing) -> Result<(), Error> {
+        s.phase = Phase::Quarantined;
+        Self::deliver(
+            &mut s.controller,
+            &mut s.replies,
+            &mut s.transport_facts,
+            outgoing,
+        )
+    }
+    /// Send one station command: a UNI command whose status result is kept
+    /// in `replies`, or a mailbox request whose transport fact is kept in
+    /// `facts`.
+    fn deliver(
+        controller: &mut Controller<I, Q, C>,
+        replies: &mut Vec<mailbox::UnifiedReply>,
+        facts: &mut Vec<mailbox::init::Fact>,
+        outgoing: &wire::Outgoing,
+    ) -> Result<(), Error> {
+        match outgoing {
+            wire::Outgoing::Uni(command, body) => {
+                Self::command_parts(controller, replies, *command, body)
+            }
+            wire::Outgoing::Mailbox(request) => {
+                facts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                let fact = controller
+                    .state_mut()
+                    .mailbox
+                    .as_mut()
+                    .unwrap()
+                    .initial(request)
+                    .map_err(Error::Transport)?;
+                facts.push(fact);
+                Ok(())
             }
         }
     }
@@ -518,29 +570,31 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 if p.supported_rates & !supported != 0 {
                     return Err(Error::WrongProfile);
                 }
-                let bss = p.bss_request(true).map_err(Error::Codec)?;
-                let peer = p.peer_request(true, true).map_err(Error::Codec)?;
-                Self::command(s, Command::BssInfo, &bss)?;
+                let codec = Self::codec(s);
+                let bss = codec.bss(p, None, true).map_err(Error::Codec)?;
+                let peer = codec.peer(p, None, true, true).map_err(Error::Codec)?;
+                let broadcast = codec.broadcast(p, None).map_err(Error::Codec)?;
+                for body in &bss {
+                    Self::command(s, Command::BssInfo, body)?;
+                }
                 s.controller
                     .state_mut()
                     .control
                     .clear_peer_admission(p.wcid)
                     .map_err(|e| Error::Bootstrap(super::Error::Control(e)))?;
                 Self::command(s, Command::StationRecord, &peer)?;
-                Self::command(
-                    s,
-                    Command::StationRecord,
-                    &p.broadcast_request().map_err(Error::Codec)?,
-                )?;
-                Self::command(
-                    s,
-                    Command::BssInfo,
-                    &p.beacon_filter().map_err(Error::Codec)?,
-                )?;
+                // BSS_CHANGED_ERP_SLOT: connac2's MAC timing
+                // (mt7921_bss_info_changed); the MT7925 keeps its own.
+                if s.controller.state().identity.chip != Chip::Mt7925 {
+                    Self::set_timing(&mut s.controller, p)?;
+                }
+                Self::command(s, Command::StationRecord, &broadcast)?;
+                let beacon_filter = codec.beacon_filter(p).map_err(Error::Codec)?;
+                Self::send(s, &beacon_filter)?;
                 s.transport_facts
                     .try_reserve(1)
                     .map_err(|_| Error::NoMemory)?;
-                let filter = p.filter_request(true).map_err(Error::Codec)?;
+                let filter = codec.filter(p, true).map_err(Error::Codec)?;
                 let fact = s
                     .controller
                     .state_mut()

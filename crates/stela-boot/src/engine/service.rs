@@ -39,7 +39,8 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_boot_core::{
-    service_watch::{Late, SlowParts, Turn, blame},
+    host_core::Taker,
+    service_watch::{Budget, Late, LongSteps, SlowParts, Split, Turn, blame},
     shutdown::{Mode as Shutdown, Requests as ShutdownRequests},
 };
 use stela_engine::machine::engine::{GuestWatch, Pending};
@@ -78,6 +79,21 @@ const REQUESTED_MILLIS: u64 = 2;
 /// about what a slice that ran no blocks takes from its guest code. A part
 /// that takes longer still ends.
 const STEP_MICROS: u64 = 1000;
+
+/// How long a part made of pieces it can stop between (the network's
+/// frames each way) starts new ones in one turn (`service_watch::Budget`):
+/// the rest waits for the next turn, which follows at the next slice. One
+/// piece that runs longer still ends; the Wi-Fi association's 101 ms wait
+/// is no longer one (`rtw89 ax::live::Live::begin_association`).
+const PIECE_MICROS: u64 = 2000;
+
+/// The Wi-Fi keeper steps of [`PIECE_MICROS`] or more inside a service
+/// turn, each a `HOST SERVICE KEEPER` line: the first few of a boot, then
+/// only one twice the longest so far.
+static KEEPER_STEPS: LongSteps = LongSteps::new();
+
+/// The network part's pieces, as its slow line names them.
+const NETWORK_PIECES: [&str; 5] = ["carrier", "queued", "transmit", "receive", "deliver"];
 
 /// Seconds between the service's own reports.
 const REPORT_SECONDS: u64 = 10;
@@ -291,6 +307,8 @@ impl Service {
             boot,
             ..InputTurn::default()
         };
+        // The network part stopped at its budget with frames left.
+        let mut network_cut = false;
         let inputs_due = due(INPUTS, false, &mut turn);
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
             let arrived = usb.poll();
@@ -370,14 +388,33 @@ impl Service {
         if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
+            let mut split = Split::new(NETWORK_PIECES);
+            let started = host::rdtsc();
             let carrier = network.carrier();
+            let queued = host::rdtsc();
+            split.add(0, started, queued);
             let (frames, status, room) = devices.with(|devices| {
                 let frames = network.queued(devices);
                 (frames, devices.network_status(), devices.network_room())
             });
             network.status(status);
-            let reusable = network.transmit(frames);
-            network.receive(room);
+            let sending = host::rdtsc();
+            split.add(1, queued, sending);
+            // The part's own time (`PIECE_MICROS`): frames past it wait in
+            // the guest's queue and the adapter's ring for the next turn.
+            let mut budget = Budget::new(started, *tsc_hz / 1_000_000 * PIECE_MICROS);
+            let (to_send, mut sent) = (frames.len(), 0usize);
+            let reusable = network.transmit(frames, &mut || {
+                let more = budget.allows(host::rdtsc());
+                sent += usize::from(more);
+                more
+            });
+            let receiving = host::rdtsc();
+            split.add(2, sending, receiving);
+            let read = network.receive(room, &mut || budget.allows(host::rdtsc()));
+            let delivering = host::rdtsc();
+            split.add(3, receiving, delivering);
+            network_cut = budget.cut();
             // Served, as a received frame is: a carrier change is a
             // notification the guest's controller must pick up.
             devices.serve(|devices| {
@@ -389,7 +426,30 @@ impl Service {
                 }
                 network.deliver(devices);
             });
-            lap.part(Part::Network);
+            split.add(4, delivering, host::rdtsc());
+            // The Wi-Fi keeper's slowest step inside the adapter's calls:
+            // a slow part names it (`HOST SERVICE SLOW ... keeper=`).
+            let slowest = network.slowest_step();
+            if let Some((step, us)) = slowest
+                && KEEPER_STEPS.worth(us, PIECE_MICROS)
+            {
+                output::arguments(format_args!(
+                    "HOST SERVICE KEEPER keeper={} us={us} boot={boot} step={} pe={}\n",
+                    step.replace(' ', "_"),
+                    lap.step,
+                    watch.pe(),
+                ));
+            }
+            let (hz, cut) = (*tsc_hz, network_cut);
+            lap.part_of(Part::Network, |took| {
+                let keeper = slowest.map_or(String::from("-"), |(step, us)| {
+                    format!("{}:{us}", step.replace(' ', "_"))
+                });
+                format!(
+                    "{} sent={sent}/{to_send} read={read} cut={cut} keeper={keeper}",
+                    split.line(took, hz)
+                )
+            });
         }
         if let Some(bluetooth) = bluetooth
             .as_mut()
@@ -486,6 +546,13 @@ impl Service {
         match turn.ended() {
             Some((part, _)) => {
                 *next = part;
+                false
+            }
+            // Frames the budget left: the next turn starts at the network,
+            // and the host stays starved so that it follows at the next
+            // slice, as a step that left parts does.
+            None if network_cut => {
+                *next = NETWORK;
                 false
             }
             None => true,
@@ -824,12 +891,24 @@ pub(super) fn serve(boot: bool, step: bool, watch: &GuestWatch) {
     if !boot {
         host::clear_interrupted();
     }
+    let started = host::rdtsc();
     let served = hold(|slot| {
         let Some(service) = slot else {
             return false;
         };
         service.serve(boot, step, watch)
     });
+    // Who served, for each one's share in the beat's line (`report`).
+    if served.is_some() {
+        let taker = if boot {
+            Taker::Boot
+        } else if super::host_core::here() {
+            Taker::HostCore
+        } else {
+            Taker::Waiting
+        };
+        super::host_core::SHARES.add(taker, host::rdtsc().wrapping_sub(started));
+    }
     // A step that left parts for the next keeps the host starved, so the
     // next step follows at the next slice.
     if served == Some(true) {
@@ -898,6 +977,9 @@ pub(super) fn report(tsc_hz: u64) -> String {
             u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1))
         ));
     }
+    // Each taker's share of the time served, PE 0's among them, and the
+    // host core's state and passes (`host_core`).
+    line.push_str(&super::host_core::report(tsc_hz));
     // An in-flight service keeps its sample for the next report. Reporting
     // never waits for the owner or holds it while formatting.
     #[cfg(feature = "diagnostics")]

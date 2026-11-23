@@ -3,15 +3,23 @@
 //! RTL8822C read-only physical efuse transport, logical map and raw board data.
 //! Raw OTP/regulatory/calibration fields do not attest calibrated radio policy.
 use super::{
+    chip::{EfuseSize, RTL8822C},
     identity::{Chip, Profile},
-    io::{self, Io},
+    io::{self, Io, sleep},
     registers::*,
 };
+use stela_driver_base::stepped::yield_now;
+/// The physical efuse every rtw88 chip here has.
 const PHYSICAL: usize = 512;
-const PROTECTED: usize = 124;
+/// The largest logical map, whose tail a smaller chip leaves unprogrammed.
 const LOGICAL: usize = 768;
-const USABLE: usize = PHYSICAL - PROTECTED;
+#[cfg(test)]
+const USABLE: usize = PHYSICAL - 124;
 const POLLS: usize = 1_000_000;
+/// Looks at one byte's read that wait in place, about a millisecond, before
+/// each further look ends the step; and the bytes read a step.
+const INLINE_POLLS: usize = 1000;
+const BYTES_A_STEP: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Hardware(io::Error),
@@ -61,13 +69,20 @@ impl Physical {
     pub fn logical(&self) -> Result<Logical, Error> {
         Ok(Logical {
             profile: self.profile,
-            bytes: logical_map(&self.bytes)?,
+            bytes: logical_map_sized(&self.bytes, efuse_size(self.profile)?)?,
         })
     }
 }
 pub struct Logical {
     profile: Profile,
     bytes: [u8; LOGICAL],
+}
+#[cfg(test)]
+impl Logical {
+    /// A map of `profile`'s chip from its bytes, for tests of later phases.
+    pub(crate) fn of(profile: Profile, bytes: [u8; LOGICAL]) -> Self {
+        Self { profile, bytes }
+    }
 }
 impl Logical {
     pub fn profile(&self) -> Profile {
@@ -76,29 +91,77 @@ impl Logical {
     pub fn bytes(&self) -> &[u8; LOGICAL] {
         &self.bytes
     }
+    /// The chip's `read_efuse`.
     pub fn board(&self) -> Board {
-        let b = &self.bytes;
+        let raw = match self.profile.chip() {
+            Chip::Rtl8821C => self.board_8821c(),
+            _ => self.board_8822c(),
+        };
         Board {
             profile: self.profile,
-            raw: BoardData {
-                usb_mode_switch_raw: b[6] & 0x80 != 0,
-                rtl_id: u16::from_le_bytes([b[0], b[1]]),
-                mac: b[0x120..0x126].try_into().unwrap(),
-                rfe_raw: b[0xca],
-                rf_board_raw: b[0xc1],
-                crystal_cap_raw: b[0xb9] & 0x7f,
-                channel_plan_raw: b[0xb8],
-                country_raw: [b[0xcb], b[0xcc]],
-                bt_raw: b[0xc3],
-                regulatory_raw: b[0xc1] & 7,
-                thermal_raw: [b[0xd0], b[0xd1]],
-                thermal_average: ((u16::from(b[0xd0]) + u16::from(b[0xd1])) >> 1) as u8,
-                power_track_raw: b[0xc8] >> 4,
-                power_tables: b[0x10..0xb8].try_into().unwrap(),
-            },
+            raw,
+        }
+    }
+    /// `rtw8822c_read_efuse`.
+    fn board_8822c(&self) -> BoardData {
+        let b = &self.bytes;
+        BoardData {
+            usb_mode_switch_raw: b[6] & 0x80 != 0,
+            rtl_id: u16::from_le_bytes([b[0], b[1]]),
+            mac: b[0x120..0x126].try_into().unwrap(),
+            rfe_raw: b[0xca],
+            rf_board_raw: b[0xc1],
+            crystal_cap_raw: b[0xb9] & 0x7f,
+            channel_plan_raw: b[0xb8],
+            country_raw: [b[0xcb], b[0xcc]],
+            bt_raw: b[0xc3],
+            regulatory_raw: b[0xc1] & 7,
+            thermal_raw: [b[0xd0], b[0xd1]],
+            thermal_average: ((u16::from(b[0xd0]) + u16::from(b[0xd1])) >> 1) as u8,
+            power_track_raw: b[0xc8] >> 4,
+            power_tables: b[0x10..0xb8].try_into().unwrap(),
+            package: 0,
+            tx_bb_swing: [0; 2],
+            rfe_btg: false,
+        }
+    }
+    /// `rtw8821c_read_efuse` and `rtw8821ce_efuse_parsing`: one thermal
+    /// meter, the PCIe MAC address at 0xd0, and on RFE 2 and 4 path A's
+    /// 2.4 GHz indices taken from path B's.
+    fn board_8821c(&self) -> BoardData {
+        let b = &self.bytes;
+        let mut power_tables: [u8; 168] = b[0x10..0xb8].try_into().unwrap();
+        let rfe = b[0xca] & 0x1f;
+        if rfe == 2 || rfe == 4 {
+            power_tables.copy_within(TXPWR_IDX..TXPWR_IDX + TXPWR_IDX_2G, 0);
+        }
+        BoardData {
+            usb_mode_switch_raw: false,
+            rtl_id: u16::from_le_bytes([b[0], b[1]]),
+            mac: b[0xd0..0xd6].try_into().unwrap(),
+            rfe_raw: rfe,
+            rf_board_raw: b[0xc1],
+            crystal_cap_raw: b[0xb9],
+            channel_plan_raw: b[0xb8],
+            country_raw: [b[0xcb], b[0xcc]],
+            bt_raw: b[0xc3],
+            regulatory_raw: b[0xc1] & 7,
+            // Path A alone.
+            thermal_raw: [b[0xba], 0xff],
+            thermal_average: b[0xba],
+            // rtw88 tracks the RTL8821C by its type 0 table always.
+            power_track_raw: 0,
+            power_tables,
+            package: (b[0xca] >> 5) & 1,
+            tx_bb_swing: [b[0xc6], b[0xc7]],
+            rfe_btg: matches!(rfe, 0x2 | 0x4 | 0x7 | 0xa | 0xc | 0xf),
         }
     }
 }
+/// `struct rtw_txpwr_idx` and its `rtw_2g_txpwr_idx` head: six CCK and
+/// five BW40 bases, the one-byte 1S difference and three two-byte NS ones.
+const TXPWR_IDX: usize = 42;
+const TXPWR_IDX_2G: usize = 6 + 5 + 1 + 3 * 2;
 /// Source-decoded raw board identity and all four 42-byte power tables. No
 /// country byte, power entry, CAM flag or RFE selector authorizes transmission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +185,12 @@ pub struct BoardData {
     pub thermal_average: u8,
     pub power_track_raw: u8,
     pub power_tables: [u8; 168],
+    /// `hal->pkg_type`, which the RTL8821C's tables match on.
+    pub package: u8,
+    /// `tx_bb_swing_setting_2g` and `_5g`.
+    pub tx_bb_swing: [u8; 2],
+    /// `hal->rfe_btg`: 2.4 GHz shares Bluetooth's antenna path.
+    pub rfe_btg: bool,
 }
 impl Board {
     pub fn profile(&self) -> Profile {
@@ -133,7 +202,11 @@ impl Board {
     /// Source's seven declared RFE tables, without inventing a fallback for
     /// unknown/unprogrammed boards. Source PHY tables remain separate.
     pub fn source_rfe(&self) -> Result<u8, Error> {
-        if self.raw.rfe_raw <= 6 {
+        let known = self
+            .profile
+            .rtw88()
+            .map_or(&[][..], |spec| spec.rfe_options);
+        if known.contains(&self.raw.rfe_raw) {
             Ok(self.raw.rfe_raw)
         } else {
             Err(Error::UnsupportedRfe(self.raw.rfe_raw))
@@ -159,11 +232,10 @@ impl Board {
 /// Unknown hardware, timeout/removal or uncertain I/O quarantines the real
 /// owner. This does not perform the separate firmware hardware-feature report,
 /// source PHY power-policy defaults, calibration, channel or station setup.
-pub unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
+pub async unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C {
-        return Err(Error::WrongChip);
-    }
+    let spec = profile.rtw88().ok_or(Error::WrongChip)?;
+    efuse_size(profile)?;
     let mut a = Attempt { io, done: false };
     verify(a.io, profile)?;
     let ready = a.io.read16(REG_MCUFW_CTRL)?;
@@ -175,16 +247,25 @@ pub unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     }
     let bank = a.io.read32(REG_LDO_EFUSE_CTRL)?;
     a.io.write32(REG_LDO_EFUSE_CTRL, bank & !0x300)?;
-    let ldo = a.io.read8(REG_ANAPARLDO_POW_MAC)?;
-    a.io.write8(REG_ANAPARLDO_POW_MAC, ldo & !BIT_LDOE25_PON)?;
+    // The chip's cfg_ldo25(false).
+    let (register, bit) = spec.ldo25;
+    let ldo = a.io.read8(register)?;
+    a.io.write8(register, ldo & !bit)?;
     let mut control = a.io.read32(REG_EFUSE_CTRL)?;
     let mut bytes = [0; PHYSICAL];
     for (address, byte) in bytes.iter_mut().enumerate() {
+        if address % BYTES_A_STEP == 0 {
+            yield_now().await;
+        }
         control = (control & !0x3ffff) | ((address as u32) << 8);
         a.io.write32(REG_EFUSE_CTRL, control & !BIT_EF_FLAG)?;
         let mut ready = false;
         for poll in 0..POLLS {
-            a.io.delay_us(1);
+            if poll < INLINE_POLLS {
+                a.io.delay_us(1);
+            } else {
+                sleep(a.io, 1).await;
+            }
             control = a.io.read32(REG_EFUSE_CTRL)?;
             // Source decrements/tests the bound before accepting completion,
             // so even ready on the final millionth observation times out.
@@ -235,15 +316,30 @@ fn verify<I: Io>(io: &mut I, profile: Profile) -> Result<(), Error> {
 /// Unlike the donor's permissive final-byte check, every header/word must fit
 /// completely before that protected tail. Malformed maps are explicit errors.
 pub fn logical_map(physical: &[u8; PHYSICAL]) -> Result<[u8; LOGICAL], Error> {
+    let size = RTL8822C.rtw88.as_ref().map(|spec| spec.efuse);
+    logical_map_sized(physical, size.ok_or(Error::WrongChip)?)
+}
+/// The chip's efuse sizes, which must fit the buffers here.
+fn efuse_size(profile: Profile) -> Result<EfuseSize, Error> {
+    let size = profile.rtw88().ok_or(Error::WrongChip)?.efuse;
+    if size.physical != PHYSICAL || size.logical > LOGICAL || size.protected >= PHYSICAL {
+        return Err(Error::WrongChip);
+    }
+    Ok(size)
+}
+/// [`logical_map`] for a chip of `size`: bytes past its logical map stay
+/// unprogrammed.
+fn logical_map_sized(physical: &[u8; PHYSICAL], size: EfuseSize) -> Result<[u8; LOGICAL], Error> {
+    let usable = PHYSICAL - size.protected;
     let mut logical = [255; LOGICAL];
     let mut cursor = 0;
-    while cursor < USABLE {
+    while cursor < usable {
         let first = physical[cursor];
         if first == 255 {
             break;
         }
         let (block, enabled) = if first & 0x1f == 0xf {
-            if cursor + 2 > USABLE {
+            if cursor + 2 > usable {
                 return Err(Error::Header { offset: cursor });
             }
             let second = physical[cursor + 1];
@@ -260,11 +356,11 @@ pub fn logical_map(physical: &[u8; PHYSICAL]) -> Result<[u8; LOGICAL], Error> {
             if enabled & (1 << word) != 0 {
                 continue;
             }
-            if cursor + 2 > USABLE {
+            if cursor + 2 > usable {
                 return Err(Error::Payload { offset: cursor });
             }
             let offset = usize::from(block) * 8 + word * 2;
-            if offset + 2 > LOGICAL {
+            if offset + 2 > size.logical {
                 return Err(Error::Logical { offset });
             }
             logical[offset..offset + 2].copy_from_slice(&physical[cursor..cursor + 2]);

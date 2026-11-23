@@ -447,6 +447,9 @@ impl HostInput {
                 }
             }
             controller_change(&*device, reported);
+            for notice in device.take_notices() {
+                output::arguments(format_args!("INPUT {}: {notice}\n", device.name()));
+            }
             if let Err(error) = polled {
                 let error = alloc::format!("{error}");
                 if !core::mem::replace(&mut reported.failed, true) {

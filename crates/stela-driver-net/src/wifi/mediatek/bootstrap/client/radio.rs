@@ -33,13 +33,18 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // Complete fallible codec/capacity checks before Scanner owns the
         // request. A refused RNR list must leave this same owner reusable.
         let mut elements = [Vec::new(), Vec::new(), Vec::new()];
+        let mut connac2_elements = Vec::new();
         // A 6 GHz probe carries the HE 6 GHz capability, as mac80211 builds it.
+        // mt76_connac_mcu_hw_scan copies mac80211's elements into every
+        // active connac2 scan.
+        let connac2 = s.controller.state().identity.chip != Chip::Mt7925;
         let prepared = !request.extra_elements().is_empty()
             || (request.active()
-                && request
-                    .channels()
-                    .iter()
-                    .any(|ch| ch.band == wifi::Band::Ghz6));
+                && (connac2
+                    || request
+                        .channels()
+                        .iter()
+                        .any(|ch| ch.band == wifi::Band::Ghz6)));
         if prepared {
             let he6 = if actual_policy.capabilities().observed().six_ghz() == Some(true) {
                 local::current(s, wifi::Band::Ghz6)
@@ -50,36 +55,56 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             } else {
                 0
             };
+            let mut parts = Vec::new();
             for (index, band) in [wifi::Band::Ghz2, wifi::Band::Ghz5, wifi::Band::Ghz6]
                 .into_iter()
                 .enumerate()
             {
                 if request.channels().iter().any(|ch| ch.band == band) {
                     let actual = local::current(s, band).map_err(Error::Local)?;
-                    let domain = actual_policy
-                        .programmed_mt7925()
-                        .ok_or(Error::WrongProfile)?
-                        .0;
+                    let domain = actual_policy.programmed().ok_or(Error::WrongProfile)?.0;
                     let selection = local::scan::Selection::programmed(domain, band, he6);
-                    elements[index] =
-                        local::scan::with_extra(&actual, selection, request.extra_elements())
-                            .map_err(Error::Local)?;
+                    if connac2 {
+                        parts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                        parts.push((actual, selection));
+                    } else {
+                        elements[index] =
+                            local::scan::with_extra(&actual, selection, request.extra_elements())
+                                .map_err(Error::Local)?;
+                    }
                 }
             }
+            // A connac2 scan carries mac80211's one buffer: each band's
+            // part, then the common elements once.
+            if connac2 {
+                connac2_elements = local::scan::with_extra_bands(&parts, request.extra_elements())
+                    .map_err(Error::Local)?;
+            }
         }
-        let encoded = wire::scan_with_elements(
-            s.interface.registered_context().unwrap(),
-            sequence,
-            &request,
-            prepared.then_some(&elements),
-        )
+        let context = s.interface.registered_context().unwrap();
+        let chip = s.controller.state().identity.chip;
+        let encoded = if chip == Chip::Mt7925 {
+            wire::scan_with_elements(context, sequence, &request, prepared.then_some(&elements))
+        } else {
+            // A connac2 scan carries one element list for every band, as
+            // mac80211 fills a single all-band scan request's.
+            let elements = if prepared {
+                connac2_elements
+            } else {
+                request.extra_elements().to_vec()
+            };
+            wire::connac2::scan(chip, context, sequence, &request, &elements)
+        }
         .map_err(Error::Codec)?;
         let ticket = s
             .scanner
             .begin(request, now, budget, policy)
             .map_err(Error::Scan)?;
         s.scan_ticket = Some(ticket);
-        s.pmf_observations.clear();
+        // A new scan keeps what earlier ones saw until it expires, so a
+        // join may take the BSS from the cache as cfg80211's does.
+        s.pmf_observations
+            .retain(|(seen, _)| now.saturating_sub(*seen) <= super::policy::BSS_EXPIRE_US);
         // From request ownership through transport, any unexpected failure
         // keeps an explicit non-Idle owner. A policy refusal before handoff
         // can withdraw only the never-submitted Starting generation.
@@ -113,7 +138,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let s = self.state_mut();
         let t = s.scan_ticket.ok_or(Error::WrongPhase)?;
         s.scanner.cancel(t).map_err(Error::Scan)?;
-        let request = wire::cancel_scan(s.interface.registered_context().unwrap(), s.scan_sequence);
+        let chip = s.controller.state().identity.chip;
+        let request = if chip == Chip::Mt7925 {
+            wire::cancel_scan(s.interface.registered_context().unwrap(), s.scan_sequence)
+        } else {
+            wire::connac2::cancel_scan(chip, s.scan_sequence).map_err(Error::Codec)?
+        };
         s.transport_facts
             .try_reserve(1)
             .map_err(|_| Error::NoMemory)?;
@@ -166,7 +196,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let req = match s.six_ghz.as_ref() {
             Some(six) => six.codec().abort_roc(s.roc_token),
-            None => s.profile.ok_or(Error::WrongProfile)?.abort_roc(s.roc_token),
+            None => Self::codec(s).abort_roc(s.profile.ok_or(Error::WrongProfile)?, s.roc_token),
         }
         .map_err(Error::Codec)?;
         s.transport_facts
@@ -193,8 +223,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // one in this owner while an old notification could still exist.
         let token = s.roc_token.checked_add(1).ok_or(Error::NeedsDrain)?;
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        let req = p.roc(token, 1000).map_err(Error::Codec)?;
-        let abort = p.abort_roc(token).map_err(Error::Codec)?;
+        let codec = Self::codec(s);
+        let req = codec.roc(p, token, 1000).map_err(Error::Codec)?;
+        let abort = codec.abort_roc(p, token).map_err(Error::Codec)?;
         Self::await_grant(s, p, token, &req, &abort)
     }
     /// Publish one ROC request and wait for its matching grant, which assigns
@@ -266,6 +297,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .map_err(Error::Transport)?;
         s.transport_facts.push(fact);
         let clock = s.controller.state().control.clock;
+        let chip = s.controller.state().identity.chip;
         let deadline = clock.deadline(4_000_000);
         loop {
             let frames = s
@@ -282,8 +314,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 s.asynchronous.push(f);
                 let retained = s.asynchronous.last().unwrap();
                 if !retained.drop
-                    && let Ok(e) =
-                        crate::wifi::mediatek::mcu::Event::parse(Chip::Mt7925, &retained.bytes)
+                    && let Ok(e) = crate::wifi::mediatek::mcu::Event::parse(chip, &retained.bytes)
                     && e.is_unsolicited()
                     && e.event_id == 0x27
                 {
@@ -361,6 +392,7 @@ mod tests {
     use crate::wifi::mediatek::ring::rx::tests::device_receive;
     use crate::wifi::mediatek::ring::tests::Source;
     use crate::wifi::{Band, Channel};
+    use stela_driver_base::stepped::block_on;
 
     const SIX: Channel = Channel {
         band: Band::Ghz6,
@@ -466,12 +498,13 @@ mod tests {
         f.policy_bands(Chip::Mt7925, [true; 3]);
         // SAFETY: this fixture owns the real modeled controller, programmed
         // policy and firmware. No unrelated/caller-copied receipt enables it.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         // SAFETY: source-checked modeled 5GHz initial radio ownership; the
         // hardware scan command will select the independently programmed 6GHz.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         // SAFETY: exact fixture-owned interface and controller resource.
-        let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+        let interface =
+            unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
         f.model.lock().unwrap().client_execution = true;
         let NativeFixture {
             controller,
@@ -488,6 +521,7 @@ mod tests {
             queues,
             memory,
             drops,
+            chip: Chip::Mt7925,
         };
         // SAFETY: the just-registered matching interface and native controller.
         let mut driver = unsafe { Client::new(controller, interface) }.unwrap();

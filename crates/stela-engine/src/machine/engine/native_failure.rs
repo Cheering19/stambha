@@ -153,6 +153,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         use stela_compiler::block::{
             FaultRecovery, HostFaultSnapshot, RecoverySiteKind, RetirementPhase,
         };
+        if let Some(step) = self.hle_fault(index, &fault, chained_retired, chained_btype) {
+            return step;
+        }
         // Source maps locate diagnostics; only a checked exact
         // operand/check site can authorize architectural fault projection.
         let Some(block) = self.code.blocks.get(index) else {

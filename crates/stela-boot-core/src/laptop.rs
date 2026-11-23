@@ -16,7 +16,10 @@
 //! `--trackpad builtin`. `--laptop off` takes nothing, so each feature stays
 //! the opt-in it was ([`crate::options::Laptop`]). `--lid-sleep` is never
 //! taken: it puts macOS to sleep each time the lid darkens the panel, which
-//! is the user's to ask for. The guards of each option hold as they did: the battery is not
+//! is the user's to ask for. Nor is `--acpi-hardware`
+//! ([`crate::acpi_hardware`]) until a laptop has proven it; it starts before
+//! the power probe this decision reads, so a laptop could take it only from
+//! the FADT's profile. The guards of each option hold as they did: the battery is not
 //! taken for a boot that withholds it ([`System::battery_withheld`]), and
 //! the battery's own refusal of an empty reading is the engine's, after
 //! this. None of this is in the option line, whose meaning setup and

@@ -424,6 +424,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
     // partition.
     #[cfg(feature = "nvk")]
     if files.len() < MAX_FILES
+        && !system.core_trial
         && let Some(store) = crate::engine::pipelines::read()
     {
         files.push((String::from(crate::engine::pipelines::FILE), store));
@@ -723,12 +724,15 @@ pub(crate) fn boot(
 /// left, within what this PC's free RAM leaves after Stela's parts and the
 /// guest's floor (`host_memory::pack_budget`), less `pending` bytes the
 /// loader allocates before it reserves the parts: a cache, it never stops
-/// the boot. Rewriting its pack needs the storage drivers.
+/// the boot. Rewriting its pack needs the storage drivers. With
+/// `background` (`--pack-preload`, on unless `off`) a pack read on demand
+/// also gets the memory its budget leaves, to be read into once macOS runs.
 fn translation_store(
     mut files: BundleFiles,
     mut storage: Option<stela_drivers::Handoff>,
     cores: usize,
     pending: u64,
+    background: bool,
 ) -> (BundleFiles, Option<stela_drivers::Handoff>) {
     use crate::engine::translations::PackRead;
     crate::status::begin("Opening the translation cache");
@@ -737,7 +741,7 @@ fn translation_store(
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
     let budget =
         stela_boot_core::host_memory::pack_budget(free, cores, cores, crate::storage::gpu_plan());
-    let Some(store) = crate::engine::translations::read(budget) else {
+    let Some(store) = crate::engine::translations::read(budget, background) else {
         crate::status::done("none on this USB");
         return (files, storage);
     };
@@ -752,9 +756,35 @@ fn translation_store(
             mb(read),
             mb(held)
         )),
-        PackRead::OnDisk { held, .. } => {
-            crate::status::done(&format!("{} MB, read as macOS asks for it", mb(held)))
-        }
+        PackRead::OnDisk {
+            held,
+            preloaded: 0,
+            background: 1..,
+            ..
+        } => crate::status::done(&format!(
+            "{} MB, read into memory once macOS runs",
+            mb(held)
+        )),
+        PackRead::OnDisk {
+            held,
+            preloaded,
+            background: 1..,
+            ..
+        } => crate::status::done(&format!(
+            "{} MB, its first {} MB read ahead, the rest read into memory once macOS runs",
+            mb(held),
+            mb(preloaded)
+        )),
+        PackRead::OnDisk {
+            held, preloaded: 0, ..
+        } => crate::status::done(&format!("{} MB, read as macOS asks for it", mb(held))),
+        PackRead::OnDisk {
+            held, preloaded, ..
+        } => crate::status::done(&format!(
+            "{} MB, its first {} MB read ahead, the rest as macOS asks for it",
+            mb(held),
+            mb(preloaded)
+        )),
         PackRead::Whole(bytes) if store.writable => {
             crate::status::done(&format!("{} MB", mb(bytes)));
         }
@@ -810,6 +840,14 @@ fn load(
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
+    // A read-only trial applies no disk plan and writes no firmware
+    // variable: the options already refuse every disk it could reach.
+    if system.core_trial && !pending.is_empty() {
+        return Err(refuse!(
+            "--core-trial writes nothing, but this boot carries a pending disk plan or \
+             firmware write; start the trial without choosing a disk"
+        ));
+    }
     // The engine's drivers apply the plan to the `--storage` partition's
     // disk and no other.
     if let Some(plan) = &pending.plan
@@ -836,15 +874,52 @@ fn load(
     };
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
-    let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
+    let pes = system.assigned_native_cores(available_cores, bundle_pes)?;
+    // `--host-core on`: one more processor, the last, for the host's own
+    // work. Anything that rules it out boots exactly as without it.
+    let host_core = stela_boot_core::host_core::plan(
+        system.host_core(),
+        system.parallel,
+        pes,
+        available_cores.min(crate::native_smp::topology::MAX_CORES),
+    );
+    match host_core {
+        stela_boot_core::host_core::Plan::Off => {}
+        stela_boot_core::host_core::Plan::Refused(why) => output::arguments(format_args!(
+            "HOST CORE off: {why}; {pes} PEs, as without --host-core\n"
+        )),
+        stela_boot_core::host_core::Plan::Reserve { executors } => output::arguments(format_args!(
+            "HOST CORE plan: {executors} processors reserved, {pes} PEs and the host core last\n"
+        )),
+    }
+    let cores = host_core.executors(pes);
     // The translation cache takes only what the parts and the guest leave,
     // so it is read last before they are reserved: only the engine image's
     // copy comes between.
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
-    let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
+    // A trial's translations stay in memory: another Mac's kernel would
+    // only crowd the installed one's out of the USB's store.
+    let (bundle, storage) = if system.core_trial {
+        output::arguments(format_args!(
+            "CORE TRIAL read-only: {cores} PEs on the USB's bundle; guest disks are engine memory, \
+             and no host disk, NOR store or translation store is opened or written\n"
+        ));
+        (bundle, storage)
+    } else {
+        translation_store(bundle, storage, cores, image_bytes, system.pack_preload())
+    };
     crate::status::begin("Setting up Stambha's memory");
     let image = memory::prepare_image(&snapshot)?;
     let mut memory = memory::reserve(cores, &image.ram, system.code_window)?;
+    if let stela_boot_core::host_core::Plan::Reserve { executors } = host_core {
+        let reserved = memory.native_resources.cores as usize;
+        match stela_boot_core::host_core::confirm(executors, reserved, reserved) {
+            Ok(()) => memory.native_resources.host_core = 1,
+            Err(why) => output::arguments(format_args!(
+                "HOST CORE off: {why} ({reserved} of {executors}); the PEs run as reserved\n"
+            )),
+        }
+    }
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(

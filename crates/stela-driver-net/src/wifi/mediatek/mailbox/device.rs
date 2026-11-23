@@ -11,6 +11,7 @@ use crate::wifi::mediatek::{
     },
 };
 use alloc::{boxed::Box, vec::Vec};
+use stela_driver_base::stepped::yield_now;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Step {
@@ -208,7 +209,8 @@ impl<C: 'static> Interface<C> {
             }
         }
     }
-    pub fn activate<W: QueueIo, F: QueueIo, R: QueueIo>(
+    /// The two registration commands, a step each.
+    pub async fn activate<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -221,9 +223,13 @@ impl<C: 'static> Interface<C> {
         // Publication may partially install real resources even without ACK.
         state.phase = Phase::Quarantined;
         let (command, body) = request.first();
-        Self::send(state, mailbox, Step::ActivateDevice, command, body)?;
+        let sent = Self::send(state, mailbox, Step::ActivateDevice, command, body);
+        yield_now().await;
+        sent?;
         let (command, body) = request.second();
-        Self::send(state, mailbox, Step::ActivateBss, command, body)?;
+        let sent = Self::send(state, mailbox, Step::ActivateBss, command, body);
+        yield_now().await;
+        sent?;
         state.phase = Phase::Registered;
         Ok(())
     }
@@ -316,6 +322,16 @@ impl<C: 'static> Interface<C> {
         }
         state.phase = Phase::Retired;
         Ok(())
+    }
+}
+impl<C: 'static> Interface<C> {
+    /// Forget the registration after the firmware that held it was reset.
+    ///
+    /// # Safety
+    /// The whole WLAN subsystem holding this interface was reset; no command
+    /// may still name it.
+    pub(in crate::wifi::mediatek) unsafe fn retire_after_reset(&mut self) {
+        self.owned_mut().phase = Phase::Retired;
     }
 }
 impl<C: 'static> Drop for Interface<C> {

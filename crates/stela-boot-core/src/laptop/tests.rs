@@ -121,6 +121,10 @@ fn a_laptop_takes_every_feature_but_lid_sleep() {
     assert!(options.brightness_keys);
     assert_eq!(options.guest_trackpad(), Some(GuestTrackpad::Mt2));
     assert!(!options.lid_sleep);
+    assert!(
+        !options.acpi_hardware,
+        "ACPI hardware mode stays the line's to ask for"
+    );
     // The record stays one the parser accepts.
     assert_eq!(options.check(), Ok(()));
     assert_eq!(
@@ -312,4 +316,118 @@ fn the_tuf_a16_is_a_laptop_with_every_feature() {
         "LAPTOP detected (FADT mobile, battery, lid): battery on, lid method, brightness keys, \
          trackpad mt2\n"
     );
+}
+
+/// The engine's AML host and boot, whose laptop path these tests follow
+/// into the firmware calls.
+static AML: &str = include_str!("../../../stela-boot/src/engine/aml.rs");
+static START: &str = include_str!("../../../stela-boot/src/engine/start.rs");
+
+/// The body of `fn name` in `source`, braces included.
+fn body<'a>(source: &'a str, name: &str) -> &'a str {
+    let at = source
+        .find(&alloc::format!("fn {name}("))
+        .unwrap_or_else(|| panic!("no fn {name}"));
+    let open = at + source[at..].find('{').unwrap();
+    let mut depth = 0;
+    for (offset, character) in source[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[open..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("fn {name} does not end")
+}
+
+/// `code` without its `firmware(...)` calls, which run their closure in
+/// the work owner's continuation (`HostAcpi::firmware`).
+fn outside_firmware(code: &str) -> alloc::string::String {
+    let mut kept = alloc::string::String::new();
+    let mut rest = code;
+    while let Some(at) = rest.find(".firmware(") {
+        kept.push_str(&rest[..at]);
+        let mut depth = 0;
+        let mut end = rest.len();
+        for (offset, character) in rest[at..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = at + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &rest[end..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// What reaches ACPICA, whose namespace guard and mutexes take the
+/// continuation's identity and stop the boot outside it.
+const ACPICA: [&str; 9] = [
+    ".path(",
+    ".notify(",
+    ".notify_all(",
+    ".evaluate(",
+    ".refresh(",
+    ".devices(",
+    ".child(",
+    "session.",
+    ".initialize_all(",
+];
+
+fn assert_no_acpica(what: &str, code: &str) {
+    let outside = outside_firmware(code);
+    for call in ACPICA {
+        assert!(
+            !outside.contains(call),
+            "{what} calls ACPICA ({call}) outside its owned native continuation:\n{outside}"
+        );
+    }
+}
+
+/// The FA608PP stopped with "ACPICA called outside its owned native
+/// continuation" right after the laptop line, `--laptop off` too: the
+/// devices' start returns to the dispatcher's stack, where the lid's path
+/// and notify handler were installed directly. Everything the boot does
+/// with the laptop's ACPI devices once that start has returned (the
+/// decision, the brightness keys it takes and the batteries and lid it
+/// keeps) reads the probe's readings or runs in a firmware call.
+#[test]
+fn the_laptop_path_calls_acpica_only_in_its_continuation() {
+    let decision = body(START, "take_laptop_features");
+    assert_no_acpica("take_laptop_features", decision);
+    // The decision's ACPI reaches the engine only through these.
+    for call in decision
+        .match_indices("acpi.")
+        .map(|(at, _)| &decision[at..])
+    {
+        assert!(
+            call.starts_with("acpi.attach_brightness_keys()"),
+            "take_laptop_features reaches the AML host unchecked: {}",
+            &call[..call.find('\n').unwrap_or(call.len())]
+        );
+    }
+    // What start_devices calls on the AML host after the devices' owned start.
+    let devices = body(START, "start_devices");
+    let after = &devices[devices.find(".call_owned(DEVICES_START_US").unwrap()..];
+    assert!(after.contains("acpi.retain_power(power)"));
+    for method in ["retain_power", "attach_brightness_keys"] {
+        assert_no_acpica(method, body(AML, method));
+    }
+    // The lid's handler is installed in the firmware call retain_power makes.
+    let kept = body(AML, "retain_power");
+    assert!(kept.contains(".firmware(") && kept.contains("self.follow_lid(lid)"));
+    assert!(body(AML, "follow_lid").contains(".notify("));
 }

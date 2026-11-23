@@ -554,6 +554,21 @@ fn hide_incomplete_external_outputs(tree: &mut DeviceTree, hidden: &mut Vec<Stri
     for profile in board::EXTERNAL_OUTPUTS {
         let paths = [profile.controller, profile.expert, profile.pipe]
             .map(|name| format!("/arm-io/{name}"));
+        // Profiles that share these paths (`DCPEXT0` on the T6000 and the
+        // T602x) are told apart by the pipe: a profile whose pipe is another
+        // admitted profile's at the same paths leaves the graph to that one.
+        let claimed_by_other = tree.node(&paths[2]).is_some_and(|pipe| {
+            !named(pipe, profile.compatible)
+                && board::EXTERNAL_OUTPUTS.iter().any(|other| {
+                    other.admitted
+                        && other.controller == profile.controller
+                        && other.pipe == profile.pipe
+                        && named(pipe, other.compatible)
+                })
+        });
+        if claimed_by_other {
+            continue;
+        }
         if tree.node(&paths[0]).is_none()
             && tree.node(&paths[1]).is_none()
             && tree

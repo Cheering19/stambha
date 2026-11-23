@@ -711,6 +711,43 @@ pub fn translate_from(
     limited(controls, access, requester, outcome)
 }
 
+/// The last table a batch of walks read, for the batch's next walk to start
+/// there while it holds that walk's address ([`translate_from`]): what a
+/// walk cache gives a run of sorted addresses under one set of controls.
+/// Every walk of a batch must use the same controls, and a batch keeps it
+/// only while no descriptor its walks read can change under it: a batch
+/// that runs no guest code and ends at the first walk that forgets
+/// translations, made anew for each batch, so a TLBI between two batches
+/// finds none.
+#[derive(Debug, Default)]
+pub struct WalkMemo {
+    table: Option<WalkTable>,
+    /// Walks from the translation table base, and from the kept table.
+    pub walks: [u64; 2],
+}
+
+impl WalkMemo {
+    /// [`translate`]'s outcome for `address`: from the kept table when it
+    /// holds `address`, else in full, keeping the table that walk read.
+    pub fn translate(
+        &mut self,
+        controls: &Controls,
+        address: u64,
+        access: Access,
+        requester: Requester,
+        memory: &mut dyn TableMemory,
+    ) -> Outcome {
+        if let Some(table) = self.table.filter(|table| table.holds(address)) {
+            self.walks[1] += 1;
+            return translate_from(controls, &table, address, access, requester, memory);
+        }
+        self.walks[0] += 1;
+        let (outcome, table) = translate_noting(controls, address, access, requester, memory);
+        self.table = table;
+        outcome
+    }
+}
+
 /// [`translate`] as the translation tables alone decide it, for AT: CTRR
 /// limits accesses, not the address translation AT reports.
 pub fn translate_tables(

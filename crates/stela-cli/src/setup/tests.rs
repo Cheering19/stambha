@@ -1640,6 +1640,7 @@ fn no_system_option_reads_as_install_mode(line: &str) {
         "--native-shared-check",
         "--native-bootstrap-check",
         "--restore-study",
+        options::CORE_TRIAL,
         "--survey",
         options::VERIFY_ON_READ,
         options::UPDATE_RESTORE,

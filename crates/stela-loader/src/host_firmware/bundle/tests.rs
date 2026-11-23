@@ -1,8 +1,9 @@
 use super::*;
 
-/// The bundle without the ports: 92 files, 179.7 MiB (upstream's 88 files
-/// and 177.0 MiB, and the fork's Realtek Bluetooth files).
-const BASE: (usize, usize) = (92, 188_455_525);
+/// The bundle without the ports: 93 files, 179.9 MiB (upstream's 88 files
+/// and 177.0 MiB, the fork's Realtek Bluetooth files and rtw88's RTL8821C
+/// firmware).
+const BASE: (usize, usize) = (93, 188_594_997);
 /// What each port adds to the bundle, as files and bytes, and how many of
 /// its recipes hold another's bytes. amdgpu: 349 files, 60.6 MiB; `mec2`
 /// and `mec` of most families and a revision's files that did not change

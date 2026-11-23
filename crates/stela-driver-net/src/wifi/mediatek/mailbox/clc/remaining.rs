@@ -8,6 +8,7 @@ use crate::wifi::mediatek::{
     mcu::{Event, domain, power},
 };
 use alloc::vec::Vec;
+use stela_driver_base::stepped::yield_now;
 
 pub struct Inputs<'a> {
     /// `clc_chan_conf` once MTCL masked it: within the UNII flags of the
@@ -181,13 +182,14 @@ impl<C: 'static> Execution<C> {
     /// power/PSE exactly once under the same permission. CLC is never
     /// restarted/replayed. Return means raw protocol facts, including source
     /// one-way boundaries, never an admitted radio or policy.
-    pub fn execute_all<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub async fn execute_all<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
-        self.execute_all_timed(mailbox, PCI_TIMEOUT_US)
+        self.execute_all_timed(mailbox, PCI_TIMEOUT_US).await
     }
-    pub(in super::super) fn execute_all_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
+    /// A step per request.
+    pub(in super::super) async fn execute_all_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
         timeout_us: u64,
@@ -229,7 +231,9 @@ impl<C: 'static> Execution<C> {
                 )
             };
             let sequence = packet.sequence();
-            if let Err(failure) = mailbox.execute(&packet, timeout_us) {
+            let executed = mailbox.execute(&packet, timeout_us);
+            yield_now().await;
+            if let Err(failure) = executed {
                 chain.interrupted = mailbox.interrupted_regulatory_reply.take();
                 return Err(Error::Transport { step, failure });
             }
@@ -284,7 +288,7 @@ impl<C: 'static> Execution<C> {
     }
     /// Vendor initial lifecycle only: source repeats the same resolved domain
     /// at first start. This does not replay CLC or manufacture new permission.
-    pub(in crate::wifi::mediatek) fn start_domain<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub(in crate::wifi::mediatek) async fn start_domain<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -304,11 +308,13 @@ impl<C: 'static> Execution<C> {
             .map_err(|_| Error::NoMemory)?;
         s.phase = Phase::StartUncertain;
         let packet = Packet::Domain(mailbox.encoder.encode_domain(&chain.domain));
-        Self::start_exchange(mailbox, chain, Step::Domain, packet)?;
+        let exchanged = Self::start_exchange(mailbox, chain, Step::Domain, packet);
+        yield_now().await;
+        exchanged?;
         s.phase = Phase::StartDomainFacts;
         Ok(())
     }
-    pub(in crate::wifi::mediatek) fn start_power<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub(in crate::wifi::mediatek) async fn start_power<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -330,7 +336,9 @@ impl<C: 'static> Execution<C> {
                 kind: body.kind(),
             };
             let packet = Packet::Power(mailbox.encoder.encode_power(body));
-            Self::start_exchange(mailbox, chain, step, packet)?;
+            let exchanged = Self::start_exchange(mailbox, chain, step, packet);
+            yield_now().await;
+            exchanged?;
         }
         s.phase = Phase::StartPowerFacts;
         Ok(())
@@ -387,17 +395,21 @@ impl<C: 'static> Execution<C> {
 }
 
 impl<C: 'static> Execution<C> {
-    /// Private view of this owner's completed MT7925 chain.
+    /// Private view of this owner's completed chain: MT7925 repeats only the
+    /// domain at first start, MT7921 and MT7922 the rate power too.
     /// No public copied receipt can manufacture a programmed policy.
-    pub(in crate::wifi::mediatek) fn programmed_mt7925(
-        &self,
-    ) -> Option<(&domain::Request, &power::Plan)> {
+    pub(in crate::wifi::mediatek) fn programmed(&self) -> Option<(&domain::Request, &power::Plan)> {
         let state = self.owned();
         let chain = state.remaining.as_ref()?;
-        (state.phase == Phase::StartDomainFacts
-            && chain.domain.chip() == Chip::Mt7925
-            && chain.facts.len() == 1 + chain.power.requests().len()
-            && chain.start_facts.len() == 1
+        let powers = chain.power.requests().len();
+        let (phase, started) = if chain.domain.chip() == Chip::Mt7925 {
+            (Phase::StartDomainFacts, 1)
+        } else {
+            (Phase::StartPowerFacts, 1 + powers)
+        };
+        (state.phase == phase
+            && chain.facts.len() == 1 + powers
+            && chain.start_facts.len() == started
             && chain.interrupted.is_none())
         .then_some((&chain.domain, &chain.power))
     }
@@ -409,24 +421,14 @@ impl<C: 'static> Execution<C> {
         let Some(c) = self.owned().remaining.as_ref() else {
             return false;
         };
-        let counts = c.domain.counts();
         let index = match band {
             crate::wifi::Band::Ghz2 => 0,
             crate::wifi::Band::Ghz5 => 1,
             crate::wifi::Band::Ghz6 => 2,
         };
-        let first: usize = counts[..index].iter().map(|&n| usize::from(n)).sum();
-        let header = if c.domain.chip() == Chip::Mt7925 {
-            16
-        } else {
-            12
-        };
-        c.domain.body()[header..]
-            .as_chunks::<8>()
-            .0
+        c.domain
+            .rows(index)
             .iter()
-            .skip(first)
-            .take(counts[index] as usize)
             .any(|e| u16::from_le_bytes([e[0], e[1]]) == u16::from(channel))
     }
 }

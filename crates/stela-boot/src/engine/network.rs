@@ -826,6 +826,9 @@ pub struct GuestNetwork {
     carrier: Option<bool>,
     /// When the carrier was last looked at (`output::now`).
     carrier_checked: u64,
+    /// The host adapter's longest step of its own since the last carrier
+    /// change ([`Self::slowest_step`]).
+    longest_step: Option<(&'static str, u64)>,
     /// Counts of the guest's lookups, HTTPS and TLS traffic and clock,
     /// for Apple's services apart ([`Self::report`]).
     facts: stela_runtime::net::facts::Facts,
@@ -950,6 +953,7 @@ impl GuestNetwork {
             silent_reports: 0,
             carrier: None,
             carrier_checked: 0,
+            longest_step: None,
             facts: Default::default(),
             facts_reports: 0,
             dhcp: Default::default(),
@@ -975,8 +979,17 @@ impl GuestNetwork {
         let carrier = self.link.carrier_now()?;
         self.carrier_checked = output::now();
         if self.carrier.replace(carrier) != Some(carrier) {
+            // What the adapter's own work took at most on the way to the
+            // change: a Wi-Fi keeper's association, which held PE 0 for
+            // 101 ms in boot 23, now waits across turns.
+            let longest = self
+                .longest_step
+                .take()
+                .map_or(String::from("-"), |(step, us)| {
+                    format!("{}:{us}us", step.replace(' ', "_"))
+                });
             output::arguments(format_args!(
-                "GUEST NETWORK host adapter {} link {}\n",
+                "GUEST NETWORK host adapter {} link {} keeper_longest={longest}\n",
                 self.link.device.location(),
                 if carrier { "up" } else { "down" }
             ));
@@ -1092,12 +1105,15 @@ impl GuestNetwork {
     /// While another processor is inside the host drivers the frames wait
     /// in the adapter's ring for the next turn: a turn does not wait for
     /// the drivers' lock, which can be held for longer than a PE's exit
-    /// may take.
-    pub fn receive(&mut self, room: bool) {
+    /// may take. Each frame is read only while `more` allows it (the
+    /// part's own time, `service_watch::Budget`): a Wi-Fi adapter's read
+    /// also polls its connection keeper, so a burst of reads is cut short
+    /// and the rest waits in the ring. The frames read.
+    pub fn receive(&mut self, room: bool, more: &mut dyn FnMut() -> bool) -> usize {
         if !room || !self.received.is_empty() {
-            return;
+            return 0;
         }
-        while self.received.len() < RECEIVE_BURST {
+        while self.received.len() < RECEIVE_BURST && more() {
             let Some(received) = self.link.receive_now() else {
                 break;
             };
@@ -1114,6 +1130,7 @@ impl GuestNetwork {
                 }
             }
         }
+        self.received.len()
     }
 
     /// Give the guest the frames read so far while its receive queue has
@@ -1145,8 +1162,14 @@ impl GuestNetwork {
     /// does another processor inside the host drivers, whose lock a turn
     /// does not wait for. A frame sent while the host link has no carrier
     /// is dropped, as a NIC without a cable drops it: the guest sees the
-    /// link down ([`Self::carrier`]), and that is no refusal.
-    pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    /// link down ([`Self::carrier`]), and that is no refusal. Each frame is
+    /// sent only while `more` allows it (the part's own time): the rest
+    /// wait as a full ring's do.
+    pub fn transmit(
+        &mut self,
+        frames: Vec<Vec<u8>>,
+        more: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<u8>> {
         let now = output::millis_since(self.opened);
         for frame in &frames {
             self.facts.outbound(frame);
@@ -1155,6 +1178,9 @@ impl GuestNetwork {
         self.unsent.extend(frames);
         let mut reusable = None;
         while let Some(frame) = self.unsent.front() {
+            if !more() {
+                break;
+            }
             match self.link.transmit_now(frame) {
                 Some(Ok(())) => {}
                 None | Some(Err(LinkError::Busy)) => break,
@@ -1164,6 +1190,21 @@ impl GuestNetwork {
             reusable = self.unsent.pop_front();
         }
         reusable
+    }
+
+    /// The host adapter's slowest step of its own since the last call
+    /// (`Link::slowest_step`): a Wi-Fi adapter's connection keeper names
+    /// its scan, join, configuration or keys. Memory only, no register. The
+    /// longest since the last carrier change goes on that change's line
+    /// ([`Self::carrier`]).
+    pub fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
+        let slowest = self.link.device.slowest_step();
+        if let Some((_, us)) = slowest
+            && self.longest_step.is_none_or(|(_, longest)| us > longest)
+        {
+            self.longest_step = slowest;
+        }
+        slowest
     }
 
     fn refuse(&mut self, error: NetError) {

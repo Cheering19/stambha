@@ -3,17 +3,22 @@
 //! The station against a model of the chip, which plays the AP over the frames
 //! it is handed.
 use super::*;
+use crate::wifi::connection::keeper::RECOVERY_STEP_US;
 use crate::wifi::connection::security::Security;
 use crate::wifi::intel::policy::tests::regdb;
 use crate::wifi::network::{Network, Secret};
+use crate::wifi::realtek::{hardware::Hardware, phy::tests::chip::OnChip};
 use crate::wifi::supplicant::tests::Authenticator;
 use alloc::{rc::Rc, vec};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 use stela_driver_base::entropy::EntropyError;
+extern crate std;
 
+/// Host speed: a clock read costs what it would, so the chip beneath the
+/// air keeps its delays.
 const CLOCK: Clock = Clock {
-    ticks_per_microsecond: 1,
+    ticks_per_microsecond: 1_000,
 };
 const LOCAL: [u8; 6] = [2, 0x12, 0x34, 0x56, 0x78, 0x9a];
 const AP: [u8; 6] = [2, 3, 4, 5, 6, 7];
@@ -88,6 +93,41 @@ struct Air {
     tkip: bool,
     /// The SSID of each probe.
     probe_names: Vec<Vec<u8>>,
+    /// The device quarantined itself, and each look for frames since.
+    lost: bool,
+    looks: usize,
+    /// The looks a calibration takes, those it has left, and the frames
+    /// offered while it ran.
+    calibration_looks: usize,
+    calibrating: usize,
+    offered_while_calibrating: usize,
+    /// The RTL8821C the station's calls also reach, register for register,
+    /// with its rings carrying the frames.
+    chip: Option<OnChip>,
+    /// Chip resets that ran to their end.
+    recoveries: usize,
+}
+
+std::thread_local! {
+    /// The journeys run on an RTL8821C's registers and rings too.
+    static ON_CHIP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// `journey` with each station on an RTL8821C beneath the air.
+fn on_chip(journey: fn()) {
+    ON_CHIP.with(|on| on.set(true));
+    journey();
+}
+
+/// `work` on the chip beneath the air, if any, timed against the step bound.
+fn chip<T>(
+    air: &mut Air,
+    work: impl FnOnce(&mut Hardware) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    match air.chip.as_mut() {
+        Some(chip) => chip.step(work).map(Some),
+        None => Ok(None),
+    }
 }
 
 impl Air {
@@ -157,6 +197,7 @@ impl Device for Model {
         eirp_mbm: i32,
     ) -> Result<(), String> {
         let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.tune(definition, scanning, eirp_mbm))?;
         let number = definition.control.number;
         assert_eq!(eirp_mbm, 2000);
         air.tuned.push((number, scanning));
@@ -171,62 +212,123 @@ impl Device for Model {
         Ok(())
     }
     fn prepare_transmit(&mut self) -> Result<(), String> {
-        self.0.borrow_mut().prepared += 1;
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.prepare_transmit())?;
+        air.prepared += 1;
+        air.calibrating = air.calibration_looks;
         Ok(())
     }
     fn transmit(&mut self, queue: Queue, packet: &Packet, mpdu: &[u8]) -> Result<bool, String> {
         let mut air = self.0.borrow_mut();
+        if air.calibrating > 0 {
+            air.offered_while_calibrating += 1;
+            return Ok(false);
+        }
         if air.full {
             return Ok(false);
+        }
+        if let Some(chip) = air.chip.as_mut() {
+            if !chip.step(|hw| hw.transmit(queue, packet, mpdu))? {
+                return Ok(false);
+            }
+            // The frame the DMA engine took is the one handed down.
+            let sent = chip.sent();
+            assert_eq!(sent.last().map(|(_, bytes)| &bytes[..]), Some(mpdu));
         }
         air.sent.push((queue, *packet, mpdu.to_vec()));
         Ok(true)
     }
     fn receive(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String> {
         let mut air = self.0.borrow_mut();
+        air.looks += 1;
+        air.calibrating = air.calibrating.saturating_sub(1);
+        if air.lost {
+            return Err(String::from("receive ring: Quarantined"));
+        }
         if !air.quiet && air.tuned.last() == Some(&(air.channel, false)) {
             let beacon = advertised(&air, air.channel as u8);
             air.hear(beacon, false);
         }
-        air.incoming.drain(..).for_each(sink);
+        let items: Vec<_> = air.incoming.drain(..).collect();
+        if let Some(chip) = air.chip.as_mut() {
+            // Through the receive ring, each frame with its PHY status.
+            chip.deliver(items);
+            return chip.step(|hw| hw.receive(sink));
+        }
+        items.into_iter().for_each(sink);
         Ok(())
     }
     fn command(&mut self, command: (u32, u32)) -> Result<(), String> {
-        self.0.borrow_mut().commands.push(command);
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.command(command))?;
+        air.commands.push(command);
         Ok(())
     }
     fn set_port(&mut self, bssid: Mac, aid: u16, linked: bool) -> Result<(), String> {
-        self.0.borrow_mut().ports.push((bssid, aid, linked));
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.set_port(bssid, aid, linked))?;
+        air.ports.push((bssid, aid, linked));
         Ok(())
     }
     fn filter_beacons(&mut self, own_only: bool) -> Result<(), String> {
-        self.0.borrow_mut().beacon_filters.push(own_only);
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.filter_beacons(own_only))?;
+        air.beacon_filters.push(own_only);
         Ok(())
     }
     fn set_edca(&mut self, edca: &[AccessCategory; 4], short_slot: bool) -> Result<(), String> {
-        self.0.borrow_mut().edca.push((*edca, short_slot));
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.set_edca(edca, short_slot))?;
+        air.edca.push((*edca, short_slot));
         Ok(())
     }
     fn write_key(&mut self, key: &CamKey<'_>) -> Result<(), String> {
-        self.0
-            .borrow_mut()
-            .keys
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.write_key(key))?;
+        air.keys
             .push((key.entry, key.index, key.kind, key.group, *key.material));
         Ok(())
     }
     fn clear_key(&mut self, entry: u8) -> Result<(), String> {
-        self.0.borrow_mut().cleared.push(entry);
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.clear_key(entry))?;
+        air.cleared.push(entry);
         Ok(())
+    }
+    fn set_beacon(&mut self, interval_tu: u16, dtim_period: u8) -> Result<(), String> {
+        chip(&mut self.0.borrow_mut(), |hw| {
+            hw.set_beacon(interval_tu, dtim_period)
+        })?;
+        Ok(())
+    }
+    fn coexist(&mut self, now: u64) -> Result<(), String> {
+        chip(&mut self.0.borrow_mut(), |hw| hw.coexist(now))?;
+        Ok(())
+    }
+    fn recoverable(&self) -> bool {
+        self.0.borrow().chip.is_some()
+    }
+    fn recover(&mut self) -> Result<Recovery, String> {
+        let mut air = self.0.borrow_mut();
+        let recovery = chip(&mut air, |hw| hw.recover())?;
+        if recovery == Some(Recovery::Done) {
+            air.chip.as_mut().unwrap().rings_reset();
+            air.recoveries += 1;
+        }
+        recovery.ok_or_else(|| String::from("no chip to reset"))
     }
     fn stream_change(&mut self) -> Option<bool> {
         self.0.borrow_mut().stream_changes.pop()
     }
     fn set_templates(&mut self, templates: &templates::Templates) -> Result<(), String> {
-        self.0.borrow_mut().templates.push(templates.clone());
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.set_templates(templates))?;
+        air.templates.push(templates.clone());
         Ok(())
     }
     fn set_power_save(&mut self, on: bool) -> Result<(), String> {
         let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.set_power_save(on))?;
         if air.sleeps.last().copied().unwrap_or(false) != on {
             air.sleeps.push(on);
         }
@@ -234,6 +336,7 @@ impl Device for Model {
     }
     fn watchdog(&mut self, scanning: bool, stbc: bool) -> Result<Watched, String> {
         let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.watchdog(scanning, stbc))?;
         if !scanning {
             air.watchdogs.push(stbc);
         }
@@ -243,8 +346,18 @@ impl Device for Model {
         })
     }
     fn scanning(&mut self, scanning: bool) -> Result<(), String> {
-        self.0.borrow_mut().scans.push(scanning);
+        let mut air = self.0.borrow_mut();
+        chip(&mut air, |hw| hw.scanning(scanning))?;
+        air.scans.push(scanning);
         Ok(())
+    }
+    fn lost(&self) -> bool {
+        let air = self.0.borrow();
+        air.lost || air.chip.as_ref().is_some_and(OnChip::lost)
+    }
+    fn ready(&self) -> bool {
+        let air = self.0.borrow();
+        air.calibrating == 0 && air.chip.as_ref().is_none_or(OnChip::ready)
     }
 }
 
@@ -350,6 +463,9 @@ fn wifi(rules: &[(u32, u32, u8, u16)], channel: u16) -> (Wifi<Model>, Model) {
     let database = regdb(&[(*b"US", rules)]);
     let model = Model(Rc::new(RefCell::new(Air {
         channel,
+        chip: ON_CHIP
+            .with(core::cell::Cell::get)
+            .then(|| OnChip::rtl8821c(CLOCK)),
         ..Air::default()
     })));
     let country = database.select(*b"US").unwrap();
@@ -766,6 +882,84 @@ fn received_data_passes_its_replay_and_integrity_checks() {
     model.0.borrow_mut().hear(group, true);
     wifi.carrier();
     assert_eq!(delivered(&mut wifi), [0x45]);
+}
+
+#[test]
+fn a_refused_frame_between_good_ones_is_dropped_and_counted_and_the_rest_arrive() {
+    let (mut wifi, model) = connected();
+    let body = [0x45; 46];
+    let frame = |sequence, key| data(LOCAL, sequence, [8, 0], &body, Some(key));
+    let before = wifi.radio().dropped();
+    {
+        let mut air = model.0.borrow_mut();
+        air.hear(frame(20, (0, 1)), true);
+        // Too short for any 802.11 header, and a version mac80211 drops.
+        air.hear(vec![0x88, 0x02, 0], false);
+        let mut version = frame(21, (0, 2));
+        version[0] |= 1;
+        air.hear(version, true);
+        // An authentication frame the associated station has no use for.
+        air.hear(management(0xb0, &[0, 0, 9, 0, 1, 0]), false);
+        air.hear(frame(22, (0, 3)), true);
+    }
+    // One look takes all of them: the link reports no error, and both good
+    // frames reach the network.
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        while let Some(ethernet) = wifi.receive().expect("a refused frame is no link error") {
+            values.push(ethernet[14]);
+        }
+    }
+    assert_eq!(values, [0x45, 0x45]);
+    assert!(wifi.radio().dropped() > before);
+    assert!(wifi.carrier());
+}
+
+#[test]
+fn authentication_starts_once_the_join_calibration_has_ended() {
+    let (mut wifi, model) = wifi(&OPEN, 1);
+    // 150 looks, 5 ms apart: longer than an authentication's whole wait.
+    model.0.borrow_mut().calibration_looks = 150;
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert!(air.prepared >= 1);
+    assert_eq!(air.offered_while_calibrating, 0, "nothing was sent early");
+    let authentications = air
+        .sent
+        .iter()
+        .filter(|(_, _, bytes)| bytes[0] == 0xb0)
+        .count();
+    assert_eq!(
+        authentications, 1,
+        "its timer started after the calibration"
+    );
+}
+
+#[test]
+fn a_quarantined_device_is_reported_once_and_the_keeper_stops() {
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().lost = true;
+    let error = wifi.receive().expect_err("the link is gone");
+    assert!(matches!(&error, LinkError::Adapter(reason) if reason.contains("Quarantined")));
+    let looks = model.0.borrow().looks;
+    assert!(!wifi.carrier());
+    assert_eq!(wifi.receive(), Err(error.clone()));
+    assert_eq!(wifi.transmit(&[0; 60]), Err(error));
+    assert_eq!(
+        model.0.borrow().looks,
+        looks,
+        "nothing reaches the device again"
+    );
+    let notices = core::iter::from_fn(|| wifi.take_diagnostic()).collect::<Vec<_>>();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("Quarantined"))
+            .count(),
+        1
+    );
 }
 
 /// Fragment `number` of frame `sequence` under the pairwise key at packet
@@ -1198,4 +1392,70 @@ fn a_deauthentication_clears_the_port_and_the_cam() {
     assert_eq!(air.ports.last(), Some(&(Mac([0; 6]), 0, false)));
     assert!(air.cleared.contains(&PAIRWISE_CAM) && air.cleared.contains(&1));
     assert!(air.commands.contains(&commands::media_status(0, false)));
+}
+
+// The journeys above on an RTL8821C: each of the station's calls also runs
+// on the chip's registers, its frames go out through the transmit rings and
+// come in through the receive ring with the RTL8821C's PHY status, and each
+// runtime step stays within the step bound.
+
+#[test]
+fn on_an_rtl8821c_a_scan_probes_where_it_may_and_only_listens_where_it_may_not() {
+    on_chip(a_scan_probes_where_it_may_and_only_listens_where_it_may_not);
+}
+
+#[test]
+fn on_an_rtl8821c_a_join_programs_the_port_and_the_handshake_fills_the_cam() {
+    on_chip(a_join_programs_the_port_and_the_handshake_fills_the_cam);
+}
+
+#[test]
+fn on_an_rtl8821c_a_lost_authentication_goes_again() {
+    on_chip(a_lost_authentication_goes_again);
+}
+
+#[test]
+fn on_an_rtl8821c_protected_management_frames_are_taken_once_under_their_key() {
+    on_chip(a_protected_management_frame_is_taken_once_under_its_packet_number);
+    on_chip(a_protected_management_frame_hardware_left_sealed_opens_under_the_key);
+}
+
+#[test]
+fn on_an_rtl8821c_data_leaves_with_its_packet_number_and_waits_out_a_full_queue() {
+    on_chip(data_leaves_with_its_packet_number_and_waits_out_a_full_queue);
+}
+
+#[test]
+fn on_an_rtl8821c_received_data_passes_its_replay_and_integrity_checks() {
+    on_chip(received_data_passes_its_replay_and_integrity_checks);
+}
+
+#[test]
+fn on_an_rtl8821c_an_ap_gone_silent_is_probed_and_given_up_on() {
+    on_chip(an_ap_gone_silent_is_probed_and_given_up_on);
+}
+
+#[test]
+fn on_an_rtl8821c_a_quiet_link_sleeps_between_watchdogs_and_wakes_for_each() {
+    on_chip(a_quiet_link_sleeps_between_watchdogs_and_wakes_for_each);
+}
+
+#[test]
+fn on_an_rtl8821c_crashed_firmware_quarantines_and_a_stepped_chip_reset_brings_the_link_back() {
+    ON_CHIP.with(|on| on.set(true));
+    let (mut wifi, model) = connected();
+    let joins = model.0.borrow().ports.len();
+    model.0.borrow_mut().chip.as_mut().unwrap().crash_firmware();
+    // The next firmware command finds it gone, its owner is quarantined,
+    // the keeper resets the chip a step at a time, and the station joins
+    // the AP again on the fresh chip.
+    let mut lost = false;
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        lost |= air.chip.as_ref().unwrap().lost();
+        air.recoveries == 1 && wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert!(lost, "the crash quarantined the chip");
+    assert!(air.ports.len() > joins, "the port was programmed again");
+    assert!(air.chip.as_ref().unwrap().longest() <= RECOVERY_STEP_US);
 }

@@ -53,6 +53,26 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So does the fork's `--hybrid-scanout on|off`, a hand-written opt-in that
 /// composes an integrated GPU's panel on the discrete GPU: no line setup
 /// writes holds it.
+/// So does the fork's `--acpi-hardware`, a hand-written opt-in that turns
+/// on the host's ACPI hardware mode: no line setup writes holds it.
+/// So does the fork's `--asus-mode performance|turbo|silent|off`, as
+/// hand-written: an ASUS laptop's firmware thermal policy is set to
+/// performance unasked, and no line setup writes holds the option. So
+/// does the fork's `--keep-running-on-panic`, a hand-written debugging
+/// opt-in that lets a guest whose kernel panicked run on.
+/// So do the fork's `--tlbi-keep on|off` and `--tlbi-verify-check`,
+/// hand-written opt-ins that keep the ITLB's contexts across a TLBI of
+/// everything and check what they keep: no line setup writes holds them.
+/// So does the fork's `--gpu-aspm off|firmware`, a hand-written opt-in that
+/// turns the GPU links' ASPM off at the claim: no line setup writes holds it.
+/// So does the fork's `--core-trial`, a hand-written read-only boot of a
+/// USB bundle on RAM-backed disks: no line setup writes holds it.
+/// So do the fork's `--hle` and `--hle-off ID[,ID...]`, hand-written
+/// opt-ins that replace signed guest functions with native routines: no
+/// line setup writes holds them.
+/// So do the fork's `--tier2 on|off` and `--tier2-check`, hand-written
+/// opt-ins that run (and check) the engine's second compilation tier: no
+/// line setup writes holds them.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

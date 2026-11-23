@@ -115,6 +115,8 @@ struct Mode {
     id: u8,
     bytes: usize,
     values: Vec<(usize, usize, i64)>,
+    /// The Input Mode field's (bit offset, size), when the report holds it.
+    input_mode: Option<(usize, usize)>,
 }
 
 /// What a descriptor describes of a precision touchpad.
@@ -166,6 +168,7 @@ impl Profile {
             .filter(|report| report.kind == ReportType::Feature)
         {
             let mut values = Vec::new();
+            let mut input_mode = None;
             for field in &report.fields {
                 if !is(field.collection, CONFIGURATION) && !is(field.collection, TOUCH_PAD) {
                     continue;
@@ -178,7 +181,11 @@ impl Profile {
                         _ => continue,
                     };
                     if (field.minimum..=field.maximum).contains(&value) {
-                        values.push((field.offset + element * field.size, field.size, value));
+                        let offset = field.offset + element * field.size;
+                        if *usage == INPUT_MODE && input_mode.is_none() {
+                            input_mode = Some((offset, field.size));
+                        }
+                        values.push((offset, field.size, value));
                     }
                 }
             }
@@ -187,6 +194,7 @@ impl Profile {
                     id: report.id,
                     bytes: report.bits.div_ceil(8),
                     values,
+                    input_mode,
                 });
             }
         }
@@ -216,20 +224,52 @@ impl Profile {
     pub fn mode_reports(&self) -> Vec<(u8, Vec<u8>)> {
         self.modes
             .iter()
-            .map(|Mode { id, bytes, values }| {
-                let mut payload = alloc::vec![0u8; *bytes];
-                for &(offset, size, value) in values {
-                    for bit in 0..size.min(64) {
-                        if value >> bit & 1 != 0
-                            && let Some(byte) = payload.get_mut((offset + bit) / 8)
-                        {
-                            *byte |= 1 << ((offset + bit) % 8);
+            .map(
+                |Mode {
+                     id, bytes, values, ..
+                 }| {
+                    let mut payload = alloc::vec![0u8; *bytes];
+                    for &(offset, size, value) in values {
+                        for bit in 0..size.min(64) {
+                            if value >> bit & 1 != 0
+                                && let Some(byte) = payload.get_mut((offset + bit) / 8)
+                            {
+                                *byte |= 1 << ((offset + bit) % 8);
+                            }
                         }
                     }
-                }
-                (*id, payload)
-            })
+                    (*id, payload)
+                },
+            )
             .collect()
+    }
+
+    /// The feature report that holds Input Mode, as (report ID, its bytes
+    /// after the ID), for reading the mode back.
+    pub fn input_mode_report(&self) -> Option<(u8, usize)> {
+        self.modes
+            .iter()
+            .find(|mode| mode.input_mode.is_some())
+            .map(|mode| (mode.id, mode.bytes))
+    }
+
+    /// Whether `payload`, the Input Mode report read back without its ID,
+    /// holds touchpad mode. A pad that reset itself is back in mouse mode.
+    pub fn holds_touchpad_mode(&self, payload: &[u8]) -> bool {
+        let Some((offset, size)) = self.modes.iter().find_map(|mode| mode.input_mode) else {
+            return false;
+        };
+        let mut value = 0i64;
+        for bit in 0..size.min(63) {
+            let at = offset + bit;
+            let Some(byte) = payload.get(at / 8) else {
+                return false;
+            };
+            if byte >> (at % 8) & 1 != 0 {
+                value |= 1 << bit;
+            }
+        }
+        value == MODE_TOUCHPAD
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -268,6 +308,11 @@ impl Ptp {
     /// place of the translator's motion, scrolling and taps, never both.
     pub fn set_frames(&mut self, on: bool) {
         self.frames = on.then(ptp_frames::Clock::default);
+    }
+
+    /// What the descriptor describes of the pad.
+    pub fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     /// The surface the frames' positions span.

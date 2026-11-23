@@ -27,7 +27,16 @@ pub enum Kind {
     MacEnable(bool),
     RxPath,
     RadioLed(u8),
-    RawTranslation { wcid: u16 },
+    RawTranslation {
+        wcid: u16,
+    },
+    ChipConfig,
+    /// connac2's CE SET_EDCA_PARMS.
+    Edca,
+    /// connac2's CE SET_BSS_ABORT.
+    BssAbort,
+    /// connac2's CE RSSI_MONITOR.
+    RssiMonitor,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -127,6 +136,36 @@ impl Request {
                 true,
             )
         }
+    }
+    /// `mt7925_mcu_chip_config`: a firmware configuration string, sent
+    /// without an acknowledgement as `mt7925_mcu_fill_message` sends
+    /// CHIP_CONFIG. `None` for another chip or a string longer than the
+    /// command's 320 bytes with its NUL.
+    pub fn chip_config(chip: Chip, text: &str) -> Option<Self> {
+        if chip != Chip::Mt7925 || text.len() >= 320 || text.as_bytes().contains(&0) {
+            return None;
+        }
+        // _rsv[4], tag UNI_CHIP_CONFIG_CHIP_CFG, len, then
+        // mt76_connac_config: id, type, resp_type, data_size, resv, data[320].
+        let mut body = vec![0; 336];
+        body[4..6].copy_from_slice(&2u16.to_le_bytes());
+        body[6..8].copy_from_slice(&332u16.to_le_bytes());
+        body[12..14].copy_from_slice(&(text.len() as u16 + 1).to_le_bytes());
+        body[16..16 + text.len()].copy_from_slice(text.as_bytes());
+        Some(Self::new(
+            chip,
+            Kind::ChipConfig,
+            (1 << 17) | 0x0e,
+            body,
+            false,
+        ))
+    }
+    /// `mt7925_mcu_set_thermal_protect`'s two settings, 2.4 GHz then 5 GHz.
+    pub fn thermal_protection(chip: Chip) -> Option<[Self; 2]> {
+        Some([
+            Self::chip_config(chip, "ThermalProtGband 0 100 90 80 30 1 1 115 105 5")?,
+            Self::chip_config(chip, "ThermalProtAband 1 100 90 80 30 1 1 115 105 5")?,
+        ])
     }
     pub fn rts(chip: Chip) -> Self {
         if chip == Chip::Mt7925 {
@@ -248,6 +287,16 @@ impl Request {
     }
     /// MT7925 scan uses the generic source response path, unlike plain
     /// DEV/BSS/STA commands with a status record. An ACK is not scan done.
+    /// A connac2 chip's CE scan request or cancellation, which the firmware
+    /// does not acknowledge.
+    pub(in crate::wifi::mediatek) fn connac2_scan(chip: Chip, command: u32, body: Vec<u8>) -> Self {
+        let kind = if command & 0xff == 0x1b {
+            Kind::CancelScan
+        } else {
+            Kind::Scan
+        };
+        Self::new(chip, kind, command, body, false)
+    }
     pub(in crate::wifi::mediatek) fn scan(body: Vec<u8>, cancel: bool) -> Self {
         Self::new(
             Chip::Mt7925,
@@ -262,6 +311,16 @@ impl Request {
     }
     pub(in crate::wifi::mediatek) fn roc(body: Vec<u8>) -> Self {
         Self::new(Chip::Mt7925, Kind::Roc, (1 << 17) | 0x27, body, true)
+    }
+    /// A connac2 chip's station command the firmware does not acknowledge:
+    /// UNI ROC as `mt7921_mcu_set_roc` sends it, or a CE command.
+    pub(in crate::wifi::mediatek) fn connac2_client(
+        chip: Chip,
+        kind: Kind,
+        command: u32,
+        body: Vec<u8>,
+    ) -> Self {
+        Self::new(chip, kind, command, body, false)
     }
     pub fn chip(&self) -> Chip {
         self.chip
@@ -342,7 +401,12 @@ impl Encoder {
             bytes[39] = sequence;
             if uni {
                 bytes[34..36].copy_from_slice(&((request.command & 0xff) as u16).to_le_bytes());
-                bytes[43] = 7;
+                // MCU_CMD_UNI_EXT_ACK, less MCU_CMD_ACK for CHIP_CONFIG.
+                bytes[43] = if request.kind == Kind::ChipConfig {
+                    6
+                } else {
+                    7
+                };
             } else {
                 bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
                 bytes[36] = request.command as u8;
@@ -554,5 +618,34 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod chip_config_tests {
+    use super::*;
+
+    #[test]
+    fn thermal_protection_is_two_unacknowledged_chip_config_strings() {
+        let [gband, aband] = Request::thermal_protection(Chip::Mt7925).unwrap();
+        let text = b"ThermalProtGband 0 100 90 80 30 1 1 115 105 5";
+        assert!(!gband.expects_response());
+        assert_eq!(gband.body().len(), 336);
+        assert_eq!(gband.body()[4..8], [2, 0, 76, 1]);
+        assert_eq!(
+            gband.body()[12..14],
+            ((text.len() + 1) as u16).to_le_bytes()
+        );
+        assert_eq!(&gband.body()[16..16 + text.len()], text);
+        assert!(gband.body()[16 + text.len()..].iter().all(|&b| b == 0));
+        assert_eq!(aband.body()[16..32], *b"ThermalProtAband");
+        let packet = Encoder::default().encode_bootstrap(&gband);
+        let bytes = packet.bytes();
+        assert_eq!(bytes.len(), 48 + 336);
+        assert_eq!(bytes[34..36], [0x0e, 0]);
+        // MCU_CMD_UNI | MCU_CMD_SET, without MCU_CMD_ACK.
+        assert_eq!(bytes[43], 6);
+        assert!(Request::thermal_protection(Chip::Mt7921).is_none());
+        assert!(Request::chip_config(Chip::Mt7925, &"x".repeat(320)).is_none());
     }
 }

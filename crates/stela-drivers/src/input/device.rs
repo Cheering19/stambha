@@ -130,6 +130,20 @@ impl InputDevice {
         }
     }
 
+    /// What the device did on its own since the last call, for the log: an
+    /// I²C-HID device's dropped reset response, its touchpad mode restored
+    /// after a reset, or its touchpad read as a mouse.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        match self {
+            Self::I2cHid(device) => device
+                .take_notices()
+                .into_iter()
+                .map(|notice| format!("{notice}"))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The surface an I²C-HID precision touchpad's frames span.
     pub fn touch_surface(&self) -> Option<super::multitouch::Surface> {
         match self {

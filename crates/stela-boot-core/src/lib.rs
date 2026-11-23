@@ -10,6 +10,7 @@ pub use stela_contracts::Refusal;
 /// A refused request names the values that decided it.
 pub type Result<T, E = Refusal> = core::result::Result<T, E>;
 
+pub mod acpi_hardware;
 pub mod amd_discovery;
 pub mod aperture;
 #[cfg(target_arch = "x86_64")]
@@ -64,10 +65,12 @@ pub mod guest_bluetooth;
 pub mod guest_screen;
 pub mod guest_session;
 pub mod guest_timeouts;
+pub mod guest_watch;
 pub mod handoff_records;
 pub mod heap;
 #[cfg(target_arch = "x86_64")]
 pub mod host_clock;
+pub mod host_core;
 pub mod host_identity;
 pub mod host_memory;
 #[cfg(target_arch = "x86_64")]
@@ -132,6 +135,7 @@ pub mod running_record;
 pub mod screen;
 pub mod service_watch;
 pub mod shadow_fills;
+pub mod shadow_leaf;
 pub mod shutdown;
 pub mod smi;
 pub mod source_health;

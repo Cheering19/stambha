@@ -289,6 +289,158 @@ impl Laptop {
 /// 13.
 pub const HYBRID_SCANOUT: &str = "--hybrid-scanout";
 
+/// The thermal policy an ASUS laptop's firmware is set to before macOS
+/// starts (`--asus-mode performance|turbo|silent|off`), as Linux's
+/// asus-wmi sets `throttle_thermal_policy`: a hand-written option setup
+/// never writes, so the options revision stays 13. Without it an ASUS
+/// laptop runs in performance (asus-wmi's default), whatever Windows last
+/// chose; any other PC is left alone.
+pub const ASUS_MODE: &str = "--asus-mode";
+
+/// `--asus-mode`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AsusMode {
+    /// The default: the firmware's performance (balanced) policy, Linux's
+    /// `ASUS_THROTTLE_THERMAL_POLICY_DEFAULT`.
+    #[default]
+    Performance,
+    /// The firmware's turbo (overboost) policy: the loudest fans.
+    Turbo,
+    /// The firmware's silent policy.
+    Silent,
+    /// Leave the policy as the firmware has it.
+    Off,
+}
+
+impl AsusMode {
+    const NAMES: [(&'static str, Self); 4] = [
+        ("performance", Self::Performance),
+        ("turbo", Self::Turbo),
+        ("silent", Self::Silent),
+        ("off", Self::Off),
+    ];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, mode)| *mode)
+            .ok_or(Error::AsusMode)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, mode)| *mode == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
+/// The power management of each GPU's PCI Express link
+/// (`--gpu-aspm off|firmware`): `off` turns ASPM L0s and L1 and every L1 PM
+/// Substate off at both ends of the link at the GPU's claim, as Linux's
+/// `pcie_aspm.policy=performance` does, a test for GPUs that drop off the
+/// bus while the firmware left L1 on. A hand-written opt-in setup never
+/// writes, so the options revision stays 13; without it the link keeps
+/// what the firmware set.
+pub const GPU_ASPM: &str = "--gpu-aspm";
+
+/// `--gpu-aspm`'s value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuAspm {
+    /// The default: the link's ASPM as the firmware left it, its L1 PM
+    /// Substates set as Linux leaves them.
+    #[default]
+    Firmware,
+    /// ASPM and the L1 PM Substates off at both ends.
+    Off,
+}
+
+impl GpuAspm {
+    const NAMES: [(&'static str, Self); 2] = [("firmware", Self::Firmware), ("off", Self::Off)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, aspm)| *aspm)
+            .ok_or(Error::GpuAspm)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, aspm)| *aspm == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
+/// Runs the host's ACPI in hardware mode (`--acpi-hardware`): the SCI,
+/// fixed events and GPEs, the embedded controller's queries and the
+/// notifications they send ([`crate::acpi_hardware`]). A hand-written
+/// opt-in setup never writes, so the options revision stays 13, and a
+/// laptop does not take it unasked until it is proven on hardware.
+pub const ACPI_HARDWARE: &str = "--acpi-hardware";
+
+/// One host processor beyond the guest's PEs for the host's own work
+/// (`--host-core on|off`, [`crate::host_core`]): the service turns and the
+/// GPUs' pump leave PE 0's core. A hand-written opt-in, in a startup
+/// choice of its own, that setup never writes, so the options revision
+/// stays 13; off unless given. Any step that cannot be checked boots as
+/// without it.
+pub const HOST_CORE: &str = "--host-core";
+
+/// Lets a guest whose kernel panicked run on (`--keep-running-on-panic`):
+/// without it the run stops `guest_watch::PANIC_HOLD_MILLIS` after the
+/// panic's first line when no reset follows (`crate::guest_watch`). A
+/// hand-written opt-in for debugging that setup never writes, so the
+/// options revision stays 13.
+pub const KEEP_RUNNING_ON_PANIC: &str = "--keep-running-on-panic";
+/// Keep the ITLB's lookup contexts across a TLBI of everything and verify
+/// each entry against the tables before any lookup uses it again, instead
+/// of forgetting them all (`--tlbi-keep on|off`, off unless given). A
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13; it stays off by default until a boot has proven it.
+pub const TLBI_KEEP: &str = "--tlbi-keep";
+
+/// With `--tlbi-keep on`, also walk every entry verification keeps in full
+/// and drop it, counted as a mismatch, where the walk differs
+/// (`--tlbi-verify-check`): a debug safety mode, hand-written like
+/// `--acpi-hardware`, so the options revision stays 13.
+pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
+
+/// A read-only bring-up boot (`--core-trial`): runs a prepared `--bundle`
+/// from the USB on an explicit `--native-cores` count, its disks backed by
+/// engine memory (`--storage-ram`), so nothing it does persists. It is for
+/// trying a many-core Mac's restore ramdisk, such as the M2 Ultra Mac
+/// Studio's (Mac14,14) on 16 PEs, without installing it. Every option that
+/// can reach a disk is refused ([`Constraint::CoreTrial`]), and the boot
+/// opens no translation store and applies no pending disk plan. A
+/// hand-written opt-in setup never writes, so the options revision stays 13.
+pub const CORE_TRIAL: &str = "--core-trial";
+/// Runs tier 2 (`--tier2 on|off`, off unless given): blocks the engine
+/// finds hot are compiled again as superblocks (`stela_engine`'s
+/// `machine::engine::tier2`), which no translation store keeps. A
+/// hand-written opt-in setup never writes, so the options revision stays 13.
+pub const TIER2: &str = "--tier2";
+
+/// Checks tier 2 (`--tier2-check`, which runs tier 2): one entry in 64 into
+/// a tier-2 block that only reads memory runs again as tier 1 from the same
+/// start, and a block whose end differs goes for good, tier 1's end
+/// standing. A debug mode, hand-written as [`TIER2`] is.
+pub const TIER2_CHECK: &str = "--tier2-check";
+
+/// Reads the rest of a translation pack read on demand into memory in the
+/// background once the guest runs (`--pack-preload on|off`, on unless
+/// given): large sequential reads of the USB on idle time, never ahead of a
+/// lookup's own read, within the memory the pack's budget leaves
+/// (`host_memory::bulk_bound`). `off` leaves the records to be read as
+/// lookups ask for them, as before. A hand-written opt-out setup never
+/// writes, so the options revision stays 13.
+pub const PACK_PRELOAD: &str = "--pack-preload";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -617,15 +769,49 @@ pub struct System {
     /// tell. A laptop takes it unasked, as it takes `--battery` and
     /// `--lid method` ([`crate::laptop`]).
     pub brightness_keys: bool,
+    /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
+    pub acpi_hardware: bool,
+    /// [`HOST_CORE`]'s value, unset where the line has none
+    /// ([`Self::host_core`]).
+    pub host_core: Option<bool>,
+    /// Run on after a guest kernel panic ([`KEEP_RUNNING_ON_PANIC`]).
+    pub keep_running_on_panic: bool,
+    /// [`TLBI_KEEP`]'s value, unset where the line has none
+    /// ([`Self::tlbi_keep`]).
+    pub tlbi_keep: Option<bool>,
+    /// Walk every entry a kept context's verification keeps in full as
+    /// well ([`TLBI_VERIFY_CHECK`]).
+    pub tlbi_verify_check: bool,
+    /// A read-only bring-up boot ([`CORE_TRIAL`]).
+    pub core_trial: bool,
+    /// Run tier 2 ([`TIER2`]): `Some(true)` for `on`, `Some(false)` for
+    /// `off`, `None` unless given (off).
+    pub tier2: Option<bool>,
+    /// Check tier 2 ([`TIER2_CHECK`]), which runs it.
+    pub tier2_check: bool,
+    /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
+    /// `None` unless given, which preloads ([`Self::pack_preload`]).
+    pub pack_preload: Option<bool>,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
     /// Whether the discrete GPU composes an integrated GPU's panel
     /// ([`HYBRID_SCANOUT`]); off unless given ([`Self::hybrid_scanout`]).
     pub hybrid_scanout: Option<bool>,
+    /// The ASUS thermal policy set before macOS starts ([`ASUS_MODE`]);
+    /// [`AsusMode::Performance`] unless given ([`Self::asus_mode`]).
+    pub asus_mode: Option<AsusMode>,
+    /// The GPU links' power management ([`GPU_ASPM`]);
+    /// [`GpuAspm::Firmware`] unless given ([`Self::gpu_aspm`]).
+    pub gpu_aspm: Option<GpuAspm>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
+    /// Replace the guest functions HLE has signatures for with native
+    /// routines (`--hle`); off by default.
+    pub hle: bool,
+    /// The routines `--hle` leaves translated (`--hle-off ID[,ID...]`).
+    pub hle_off: Vec<stela_engine::hle::Id>,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -750,9 +936,22 @@ impl Default for System {
             lid: None,
             lid_sleep: false,
             brightness_keys: false,
+            acpi_hardware: false,
+            host_core: None,
+            keep_running_on_panic: false,
+            tlbi_keep: None,
+            tlbi_verify_check: false,
+            core_trial: false,
+            tier2: None,
+            tier2_check: false,
+            pack_preload: None,
             laptop: None,
             hybrid_scanout: None,
+            asus_mode: None,
+            gpu_aspm: None,
             amx_native: None,
+            hle: false,
+            hle_off: Vec::new(),
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -901,6 +1100,34 @@ impl fmt::Display for Ssid<'_> {
     }
 }
 
+/// A `--hle-off` word: distinct routine names separated by commas.
+fn hle_routines(word: &str) -> Result<Vec<stela_engine::hle::Id>, Error> {
+    let mut routines = Vec::new();
+    for name in word.split(',') {
+        let routine = stela_engine::hle::Id::from_name(name).ok_or(Error::HleId)?;
+        if routines.contains(&routine) {
+            return Err(Error::HleId);
+        }
+        routines.push(routine);
+    }
+    Ok(routines)
+}
+
+/// Routines as one `--hle-off` word.
+struct Routines<'a>(&'a [stela_engine::hle::Id]);
+
+impl fmt::Display for Routines<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, routine) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(",")?;
+            }
+            f.write_str(routine.name())?;
+        }
+        Ok(())
+    }
+}
+
 fn flag(set: &mut bool, duplicate: Error) -> Result<(), Error> {
     if core::mem::replace(set, true) {
         return Err(duplicate);
@@ -924,6 +1151,38 @@ impl System {
     /// `--hybrid-scanout`, else off.
     pub fn hybrid_scanout(&self) -> bool {
         self.hybrid_scanout.unwrap_or(false)
+    }
+
+    /// The ASUS thermal policy set before macOS starts: `--asus-mode`,
+    /// else [`AsusMode::Performance`].
+    pub fn asus_mode(&self) -> AsusMode {
+        self.asus_mode.unwrap_or_default()
+    }
+
+    /// Whether the ITLB keeps its contexts across a TLBI of everything and
+    /// verifies them ([`TLBI_KEEP`]), and whether every entry it keeps is
+    /// walked in full as well ([`TLBI_VERIFY_CHECK`], only with the first):
+    /// off unless `--tlbi-keep on`.
+    pub fn tlbi_keep(&self) -> (bool, bool) {
+        let keep = self.tlbi_keep.unwrap_or(false);
+        (keep, keep && self.tlbi_verify_check)
+    }
+
+    /// The GPU links' power management: `--gpu-aspm`, else
+    /// [`GpuAspm::Firmware`].
+    pub fn gpu_aspm(&self) -> GpuAspm {
+        self.gpu_aspm.unwrap_or_default()
+    }
+
+    /// Whether the translation pack is preloaded in the background:
+    /// unless `--pack-preload off`.
+    pub fn pack_preload(&self) -> bool {
+        self.pack_preload != Some(false)
+    }
+
+    /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
+    pub fn tier2_runs(&self) -> bool {
+        self.tier2 == Some(true) || self.tier2_check
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1001,6 +1260,12 @@ impl System {
         } else {
             None
         }
+    }
+
+    /// Whether the line asks for a host core ([`HOST_CORE`] `on`); off
+    /// unless given.
+    pub fn host_core(&self) -> bool {
+        self.host_core == Some(true)
     }
 
     /// Select the exact number of host processors the loader reserves.
@@ -1288,12 +1553,37 @@ impl fmt::Display for System {
         line.value("--lid", self.lid.map(Lid::name))?;
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
+        line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
+        line.value(
+            HOST_CORE,
+            self.host_core.map(|on| if on { "on" } else { "off" }),
+        )?;
+        line.flag(KEEP_RUNNING_ON_PANIC, self.keep_running_on_panic)?;
+        line.value(
+            TLBI_KEEP,
+            self.tlbi_keep.map(|keep| if keep { "on" } else { "off" }),
+        )?;
+        line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
+        line.flag(CORE_TRIAL, self.core_trial)?;
+        line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
+        line.flag(TIER2_CHECK, self.tier2_check)?;
+        line.value(
+            PACK_PRELOAD,
+            self.pack_preload.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(
             HYBRID_SCANOUT,
             self.hybrid_scanout.map(|on| if on { "on" } else { "off" }),
         )?;
+        line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
+        line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
+        line.flag("--hle", self.hle)?;
+        line.value(
+            "--hle-off",
+            (!self.hle_off.is_empty()).then(|| Routines(&self.hle_off)),
+        )?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

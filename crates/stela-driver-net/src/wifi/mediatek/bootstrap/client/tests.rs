@@ -35,6 +35,7 @@ use alloc::collections::BTreeMap;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use stela_driver_base::stepped::block_on;
 
 pub(crate) const LOCAL: Mac = Mac([2, 1, 2, 3, 4, 5]);
 pub(crate) const AP: Mac = Mac([2, 6, 7, 8, 9, 10]);
@@ -125,6 +126,38 @@ pub(crate) struct Model {
     pub(crate) queues: BTreeMap<u32, ModelState>,
     pub(crate) memory: Arc<Mutex<Memory>>,
     pub(crate) drops: Arc<AtomicUsize>,
+    /// The modeled chip, whose descriptor and event layouts the helpers use.
+    pub(crate) chip: Chip,
+}
+impl Model {
+    /// The MCU command ring: TX ring 15 on the MT7925, 17 on connac2.
+    pub(crate) fn mcu_queue(&self) -> u32 {
+        if self.chip == Chip::Mt7925 {
+            0xd43f0
+        } else {
+            0xd4410
+        }
+    }
+    /// The receive descriptor's base length: connac2's six words or the
+    /// MT7925's eight.
+    pub(crate) fn rxd(&self) -> usize {
+        rxd(self.chip)
+    }
+    /// An unsolicited firmware event `id` with `payload`: connac2's CE event
+    /// after its 24-byte RXD, or with `unified` a UNI event (option 6).
+    pub(crate) fn event(&self, id: u8, unified: bool, payload: &[u8]) -> Vec<u8> {
+        let base = self.rxd();
+        let mut event = vec![0; base + 12];
+        event[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
+        event[base + 4] = id;
+        event[base + 6] = if unified { 6 } else { 4 };
+        event.extend_from_slice(payload);
+        event
+    }
+}
+/// [`Model::rxd`] of `chip`.
+pub(crate) fn rxd(chip: Chip) -> usize {
+    if chip == Chip::Mt7925 { 32 } else { 24 }
 }
 pub(crate) fn setup() -> (Client<Bar, Q, NativeGuard>, Model) {
     let mut f = NativeFixture::new(Chip::Mt7925);
@@ -133,13 +166,14 @@ pub(crate) fn setup() -> (Client<Bar, Q, NativeGuard>, Model) {
     f.policy(Chip::Mt7925);
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     f.model.lock().unwrap().key_execution = true;
     let NativeFixture {
@@ -162,6 +196,7 @@ pub(crate) fn setup() -> (Client<Bar, Q, NativeGuard>, Model) {
             queues,
             memory,
             drops,
+            chip: Chip::Mt7925,
         },
     )
 }
@@ -222,7 +257,9 @@ pub(crate) fn finish_tx_on(model: &Model, channel: u8) -> Vec<Vec<u8>> {
         // nothing accesses it concurrently.
         let txwi = unsafe { core::slice::from_raw_parts(pointer(&memory, address, 64), 64) };
         let token = u16::from_le_bytes(txwi[32..34].try_into().unwrap()) & 0x7fff;
-        let wcid = u32::from_le_bytes(txwi[4..8].try_into().unwrap()) & 0xfff;
+        let connac2 = model.chip != Chip::Mt7925;
+        let wcid = u32::from_le_bytes(txwi[4..8].try_into().unwrap())
+            & if connac2 { 0x3ff } else { 0xfff };
         assert!(
             model
                 .response
@@ -244,15 +281,27 @@ pub(crate) fn finish_tx_on(model: &Model, channel: u8) -> Vec<Vec<u8>> {
         }
         .to_vec();
         out.push(payload);
-        let words = [
-            (6u32 << 27) | (1 << 16),
-            4 << 16,
-            (1 << 31) | (wcid << 12),
-            (1 << 30) | (3 << 24),
-            u32::from(token) | (0x7fff << 15),
-        ];
+        // mt7921_mac_tx_free's pair and MSDU words, or the MT7925's pair,
+        // accounting and packed tokens.
+        let words: &[u32] = if connac2 {
+            &[
+                (6u32 << 27) | (1 << 16),
+                0,
+                (1 << 31) | (wcid << 14),
+                u32::from(token) << 16,
+            ]
+        } else {
+            &[
+                (6u32 << 27) | (1 << 16),
+                4 << 16,
+                (1 << 31) | (wcid << 12),
+                (1 << 30) | (3 << 24),
+                u32::from(token) | (0x7fff << 15),
+            ]
+        };
         let free = words
-            .into_iter()
+            .iter()
+            .copied()
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<_>>();
         drop(memory);
@@ -266,17 +315,34 @@ pub(crate) fn incoming_bytes(
     protected: Option<(u16, u8, u64)>,
     translated: bool,
 ) -> Vec<u8> {
-    let mut b = vec![0; 32 + if protected.is_some() { 16 } else { 0 }];
+    incoming_bytes_on(Chip::Mt7925, mpdu, protected, translated)
+}
+/// [`incoming_bytes`] in `chip`'s receive descriptor: connac2 keeps its
+/// group bits from RXD1 bit 11 and the cipher in RXD1 after six words.
+pub(crate) fn incoming_bytes_on(
+    chip: Chip,
+    mpdu: &[u8],
+    protected: Option<(u16, u8, u64)>,
+    translated: bool,
+) -> Vec<u8> {
+    let connac2 = chip != Chip::Mt7925;
+    let base = rxd(chip);
+    let mut b = vec![0; base + if protected.is_some() { 16 } else { 0 }];
     let mut r1 = 0u32;
     let mut r2 = 1u32 << 30;
     if translated {
-        r2 |= 1 << 7;
+        r2 |= 1 << if connac2 { 13 } else { 7 };
     }
     if let Some((slot, index, pn)) = protected {
-        r1 = u32::from(slot) | (u32::from(index) << 21) | (1 << 16) | (1 << 31);
-        r2 |= 4 << 16;
+        r1 = u32::from(slot) | (u32::from(index) << 21) | (1 << 31);
+        if connac2 {
+            r1 |= (1 << 11) | (4 << 16);
+        } else {
+            r1 |= 1 << 16;
+            r2 |= 4 << 16;
+        }
         for i in 0..6 {
-            b[32 + i] = (pn >> (i * 8)) as u8;
+            b[base + i] = (pn >> (i * 8)) as u8;
         }
     }
     b[4..8].copy_from_slice(&r1.to_le_bytes());
@@ -295,7 +361,7 @@ pub(crate) fn incoming(
     protected: Option<(u16, u8, u64)>,
     translated: bool,
 ) {
-    let bytes = incoming_bytes(mpdu, protected, translated);
+    let bytes = incoming_bytes_on(model.chip, mpdu, protected, translated);
     device_receive(&model.queues[&0xd4520], &bytes, true, 0);
 }
 pub(crate) fn response(subtype: u16, body: &[u8]) -> Vec<u8> {
@@ -396,17 +462,20 @@ fn rssi_events_report_crossings_like_mt7925_mcu_rssi_monitor_event() {
     assert!(super::rssi_events(&payload[..6], -70).is_empty());
 }
 #[test]
-fn late_legacy_configuration_ack_cannot_reuse_cached_poll_time() {
+fn late_legacy_configuration_ack_is_a_runtime_command_timeout() {
     if crate::test_process::isolate_model() {
         return;
     }
     let (mut driver, model) = setup();
-    assert!(matches!(
-        associated_with_configuration_delay(&mut driver, &model, 0, 600_000),
-        Err(ClientError::Station(station::Error::Timeout))
-    ));
+    // An ACK past the configuration lifetime is past the runtime command
+    // bound long before: the command ends as a timeout.
+    let result = associated_with_configuration_delay(&mut driver, &model, 0, 600_000);
+    assert!(
+        matches!(result, Err(ClientError::Transport(_))),
+        "{result:?}"
+    );
     assert_eq!(driver.phase(), ClientPhase::Quarantined);
-    assert_eq!(driver.station().phase(), station::Phase::Quarantined);
+    assert_eq!(driver.station().phase(), station::Phase::Configuring);
     drop(driver);
     assert_eq!(model.drops.load(Ordering::Relaxed), 0);
     assert!(!model.memory.lock().unwrap().mappings.is_empty());
@@ -610,11 +679,11 @@ fn combo_initial_boot_is_consumed_once_on_success_or_uncertainty() {
         let requests = Requests::new(&identity(Chip::Mt7925));
         let provider = catalog(&requests, patch_bytes(), ram(&clc_bytes(Chip::Mt7925)));
         let prepared = requests.load(&provider).unwrap();
-        assert_eq!(f.controller.boot(&prepared).is_err(), failed);
+        assert_eq!(block_on(f.controller.boot(&prepared)).is_err(), failed);
         let count = f.model.lock().unwrap().initial_commands.len();
         assert_eq!(count, 1);
         assert!(matches!(
-            f.controller.boot(&prepared),
+            block_on(f.controller.boot(&prepared)),
             Err(BootError::WrongPhase)
         ));
         assert_eq!(f.model.lock().unwrap().initial_commands.len(), count);

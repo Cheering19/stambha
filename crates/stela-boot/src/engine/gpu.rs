@@ -1849,7 +1849,7 @@ fn claim(
     // SAFETY: the cold owner of `address` its fabric promoted, in D0 since
     // `enable_decode`, Bus Master sealed by its preparation; the fabric
     // keeps every other configuration writer out.
-    unsafe { link::set_substates(address, function, port.as_ref()) };
+    unsafe { link::set_link_power(address, function, port.as_ref()) };
     let config = function
         .config()
         .retain_epoch()
@@ -5140,6 +5140,13 @@ pub(super) fn pump_due(calm: Calm) -> bool {
         unmasked: gpu.tsc_after(DEFER_UNMASKED_NS),
         longest: gpu.tsc_after(DEFER_LONGEST_NS),
     };
+    // A serving host core with a fresh beat takes the work in its next
+    // pass (`host_core`); PE 0 pumps only what waited [`DEFER_LONGEST_NS`]
+    // anyway, or once the host core stops beating.
+    if waited < limits.longest && super::host_core::takes_pump() {
+        PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let Some(why) = boot_decision(calm, waited, limits) else {
         PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
         // A Linux timer that came due raised no event, so nothing woke a
@@ -5209,12 +5216,25 @@ pub(super) fn pump() {
 /// guest has work (`guest_work`). Nothing with no work ready, or while the
 /// GPUs stop.
 pub(super) fn pump_waiting_pe(guest_work: &dyn Fn() -> bool) {
+    pump_off_boot_cpu(guest_work);
+}
+
+/// Run what is ready from the host core (`--host-core on`, `host_core`), as
+/// a waiting PE does whose guest never has work: whether work was ready.
+pub(super) fn pump_host_core() -> bool {
+    pump_off_boot_cpu(&|| false)
+}
+
+/// [`pump_waiting_pe`]'s body: whether work was ready, and so pumped.
+fn pump_off_boot_cpu(guest_work: &dyn Fn() -> bool) -> bool {
     if on_boot_cpu() || !may_move() {
-        return;
+        return false;
     }
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         pump_as(Taker::Waiting, guest_work);
+        return true;
     }
+    false
 }
 
 /// One pump by `taker` on this processor, under the [`TURN`]: what was
@@ -5764,7 +5784,9 @@ fn nvkm_report() -> String {
 /// `\nGPU PERF pstate=… seen=… pcie=… rounds=…`: the GPU's P-state as GSP-RM
 /// reported it and its PCIe link since the last report
 /// (`stela_drivers::gpu::gsp_perf`), at the first report after GSP starts and
-/// then when they changed. Empty otherwise.
+/// then when they changed; then `\nGPU THERMAL temp=… max=… power=unread`
+/// every report whose rounds read the GPU's temperature, or once for a
+/// sensor that gives none. Empty otherwise.
 #[cfg(feature = "nvk")]
 fn perf_report() -> String {
     use stela_drivers::gpu::gsp_perf::{Report, Reported};
@@ -5776,11 +5798,14 @@ fn perf_report() -> String {
     static REPORTED: Reported = Reported::new();
     // SAFETY: nouveau's static report, which it only updates atomically.
     let report = unsafe { &nvkm_perf };
-    report
-        .take()
-        .and_then(|taken| REPORTED.line(&taken))
+    let Some(taken) = report.take() else {
+        return String::new();
+    };
+    [REPORTED.line(&taken), REPORTED.thermal_line(&taken)]
+        .into_iter()
+        .flatten()
         .map(|line| format!("\n{line}"))
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The function of the timer-list timer due first when Linux last looked,

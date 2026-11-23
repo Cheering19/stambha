@@ -28,6 +28,7 @@ pub(crate) mod fdr;
 mod firmware_requests;
 mod gpu;
 pub(crate) mod host;
+mod host_core;
 mod ident;
 mod input;
 pub(crate) mod install;
@@ -75,7 +76,7 @@ use core::{
 };
 use host::{Config, RamRange};
 use stela_boot_core::{
-    console_lines,
+    console_lines, guest_watch,
     options::{Base, System},
     ram,
     screen::Exclusive,
@@ -1007,6 +1008,7 @@ fn guest_line(fragment: &console_lines::Line) {
 /// `more` always true, everything left. The guest session's line reads
 /// each line written and follows once a minute ([`session`]).
 pub(super) fn write_guest_output(taken: console_lines::Queued, more: impl FnMut() -> bool) {
+    let now = watch_millis();
     GUEST_WRITING.try_with(|writing| {
         writing.append(taken);
         let skipped = GUEST_SKIPPED.swap(0, Ordering::Relaxed);
@@ -1016,9 +1018,98 @@ pub(super) fn write_guest_output(taken: console_lines::Queued, more: impl FnMut(
         writing.write(guest_dropped, more, |fragment| {
             guest_line(fragment);
             session::console_line(&fragment.text);
+            GUEST_WATCH.try_with(|watch| watch.line(now, &fragment.text, fragment.beginning));
         });
     });
     session::minute();
+}
+
+/// The guest console's panic and quiet watch (`guest_watch`), fed the lines
+/// the home PE writes and polled by it between slices ([`watch_guest`]).
+static GUEST_WATCH: Exclusive<guest_watch::Watch> = Exclusive::new(guest_watch::Watch::new());
+
+/// The run stops for a panic that never reset the machine
+/// ([`watch_guest`]): the reason of the halt it returns, which [`finish`]
+/// tells from a halt the guest asked for.
+const PANIC_STOP: &str = "stela: macOS panicked and did not reset the Mac";
+
+/// A panic stop is coming: the screen keeps the panic, not the count.
+static PANIC_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the screen shows a panic the run is about to stop for.
+pub(super) fn panic_shown() -> bool {
+    PANIC_SHOWN.load(Ordering::Relaxed)
+}
+
+/// The counter in milliseconds, for the watch: 0 before its rate is known.
+fn watch_millis() -> u64 {
+    match output::counter_hz() {
+        0 => 0,
+        hz => output::now() / (hz / 1000).max(1),
+    }
+}
+
+/// Run on after a guest panic (`--keep-running-on-panic`).
+fn keep_running_on_panic(keep: bool) {
+    GUEST_WATCH.try_with(|watch| watch.keep_running(keep));
+}
+
+/// What the guest console watch found, on the home PE between slices: a
+/// panic's first line is logged, stored to the USB within a second and
+/// shown; [`guest_watch::PANIC_HOLD_MILLIS`] later, with no reset, the
+/// run stops as a halt with [`PANIC_STOP`]. A console quiet before the
+/// guest's first frame is named once a stretch.
+pub(super) fn watch_guest() -> Option<Stop> {
+    use guest_watch::Event;
+    let now = watch_millis();
+    let event = GUEST_WATCH.try_with(|watch| watch.poll(now, display::guest_shown()))??;
+    match event {
+        Event::Panicked { line, keep_running } => {
+            let line = stela_contracts::masked::mask_line(&line);
+            if keep_running {
+                output::arguments(format_args!(
+                    "GUEST PANIC seen: {line}; --keep-running-on-panic: the run goes on\n"
+                ));
+            } else {
+                output::arguments(format_args!(
+                    "GUEST PANIC seen: {line}; the run stops in {} s unless macOS resets the Mac \
+                     first (--keep-running-on-panic keeps it running)\n",
+                    guest_watch::PANIC_HOLD_MILLIS / 1000
+                ));
+                PANIC_SHOWN.store(true, Ordering::Relaxed);
+                crate::status::progress(&format!(
+                    "macOS panicked: {}",
+                    guest_panic().unwrap_or_else(|| String::from(&*line))
+                ));
+            }
+            output::store_soon();
+            None
+        }
+        Event::Stop(panic) => {
+            output::arguments(format_args!(
+                "GUEST PANIC no reset {} s after it, {} lines of panic log after its first: \
+                 stopping the run\n",
+                now.saturating_sub(panic.at) / 1000,
+                panic.lines
+            ));
+            Some(Stop::Reset(Reset {
+                transition: Transition::Halt,
+                reason: String::from(PANIC_STOP),
+            }))
+        }
+        Event::Stalled { seconds, last } => {
+            match last {
+                Some(last) => output::arguments(format_args!(
+                    "BOOT STALLED? no guest output for {seconds} s since: {}\n",
+                    stela_contracts::masked::mask_line(&last)
+                )),
+                None => output::arguments(format_args!(
+                    "BOOT STALLED? no guest output for {seconds} s since macOS started\n"
+                )),
+            }
+            None
+        }
+    }
 }
 
 /// At a stop, on any processor and before its reason, record and screen:
@@ -1214,6 +1305,31 @@ fn run_machine<H: Host>(
         }
     }
     machine.set_step_timing(options.profile);
+    let (tlbi_keep, tlbi_verify_check) = options.tlbi_keep();
+    machine.set_tlbi_keep(tlbi_keep, tlbi_verify_check);
+    if tlbi_keep {
+        output::arguments(format_args!(
+            "TLBI KEEP on (--tlbi-keep on): a TLBI of everything keeps the ITLB's contexts, \
+             each verified against the tables at its next fetch; verify check {}\n",
+            if tlbi_verify_check {
+                "on (--tlbi-verify-check): every kept entry is walked in full too"
+            } else {
+                "off"
+            }
+        ));
+    } else if options.tlbi_verify_check {
+        output::arguments(format_args!(
+            "TLBI KEEP off: --tlbi-verify-check does nothing without --tlbi-keep on\n"
+        ));
+    }
+    let hle = stela_engine::hle::Config::boot(options.hle, &options.hle_off);
+    if options.hle {
+        output::arguments(format_args!("HLE {}\n", hle.describe(&options.hle_off)));
+    }
+    machine.set_hle(hle);
+    let tier2 = tier2_options(options);
+    machine.set_tier2(tier2);
+    output::arguments(format_args!("{}", tier2_line(tier2)));
     let amx_model = options.amx_model();
     machine.set_amx_model(amx_model.0);
     if amx_model == stela_boot_core::options::AmxModel::ALL {
@@ -1294,6 +1410,7 @@ fn run_machine<H: Host>(
         install_progress::begin();
     }
     session::begin();
+    keep_running_on_panic(options.keep_running_on_panic);
     service::install(service::Service::new(
         machine.devices.worker(),
         restore,
@@ -1334,6 +1451,8 @@ fn run_machine<H: Host>(
     {
         profile_lifetime_maxima(timing, handoff.tsc_hz, "guest-stop");
     }
+    // The host core serves nothing from here on (`--host-core on`).
+    host_core::stop(handoff.tsc_hz);
     let mut service = service::take().expect("the run's service");
     if options.profile {
         service.power().disks().report_callbacks(handoff.tsc_hz);
@@ -1428,7 +1547,23 @@ fn finish<H: Host>(
             )
         }
         Stop::Reset(reset) => {
-            if let Some(message) = guest_panic() {
+            // A panic that never reset the Mac, which the watch stopped
+            // (`watch_guest`): named as a fatal, as its screen is.
+            let panicked = (reset.reason == PANIC_STOP).then(|| {
+                guest_panic()
+                    .or_else(|| {
+                        GUEST_WATCH
+                            .try_with(|watch| watch.panic().map(|panic| panic.line.clone()))
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| String::from("its panic text is in the guest log"))
+            });
+            if let Some(message) = &panicked {
+                output::arguments(format_args!(
+                    "STELA FATAL macOS panicked: {}\n",
+                    stela_contracts::masked::mask_line(message)
+                ));
+            } else if let Some(message) = guest_panic() {
                 output::arguments(format_args!("STOP macOS crashed: {message}\n"));
                 output::arguments(format_args!("RESET after panic: {reset}\n"));
             } else {
@@ -1477,6 +1612,10 @@ fn finish<H: Host>(
                 }
                 // A model's refusal is the machine's stop, not a halt macOS
                 // asked for; a panic macOS printed still names it first.
+                Transition::Halt if panicked.is_some() => stop_here(
+                    &format!("macOS panicked: {}", panicked.unwrap_or_default()),
+                    power::RESTART_CODE,
+                ),
                 Transition::Halt => stop_here(
                     &guest_down(if stela_soc::machine::model_refused(&reset.reason) {
                         format!("Stambha stopped the Mac: {}", reset.reason)
@@ -1634,4 +1773,35 @@ pub(crate) fn stop_gpus_for_fatal() {
 /// claim holds it and nothing ended its picture ([`gpu::picture_at_stop`]).
 pub(crate) fn firmware_picture_at_stop() {
     gpu::picture_at_stop();
+}
+
+/// What `--tier2` and `--tier2-check` ask of every PE's machine.
+pub(crate) fn tier2_options(
+    options: &stela_boot_core::options::System,
+) -> Option<stela_engine::machine::engine::tier2::Tier2Options> {
+    options
+        .tier2_runs()
+        .then(|| stela_engine::machine::engine::tier2::Tier2Options::on(options.tier2_check))
+}
+
+/// The boot's line saying whether tier 2 runs.
+fn tier2_line(tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>) -> String {
+    match tier2 {
+        None => {
+            String::from("TIER2 off: hot blocks keep their tier-1 code (--tier2 on runs tier 2)\n")
+        }
+        Some(options) => format!(
+            "TIER2 on (--tier2): blocks at heat {} are compiled again as superblocks, never stored; \
+             check {}\n",
+            options.threshold,
+            if options.check {
+                format!(
+                    "on (--tier2-check), one tier-2 entry in {}",
+                    options.check_every
+                )
+            } else {
+                String::from("off")
+            }
+        ),
+    }
 }

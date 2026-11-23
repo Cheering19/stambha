@@ -1406,7 +1406,7 @@ impl Source {
     /// One register of a bridge whose forwarding is restored, read through
     /// the configuration owner that keeps its page, beside which no other
     /// map may open; `None` for any other function.
-    pub(in crate::native_mmio) fn read_forwarding_bridge(
+    pub(crate) fn read_forwarding_bridge(
         &self,
         address: Address,
         offset: u16,

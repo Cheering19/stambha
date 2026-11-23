@@ -569,7 +569,9 @@ pub unsafe fn set_bssid<I: AxIo + ?Sized>(
 /// resumed when paused with spatial reuse off (`total_sta_assoc` counts
 /// this station only after `rtw89_core_sta_link_assoc` returns,
 /// `mac80211.c:569-575`); the INFRA port update; with the short slot, the
-/// EDCA parameters again.
+/// EDCA parameters again. The port update's `beacon_int + 1` ms wait
+/// ([`vif::quiet_us`]) is a busy wait here; [`associate_begin`] and
+/// [`associate_end`] are the same steps with that wait left to the caller.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -581,6 +583,30 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
     dig: &mut Dig,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
+    // SAFETY: the caller's contract is `associate_begin`'s, word for word.
+    let on = unsafe { associate_begin(io, session, assoc, features, dig, sink) }?;
+    if on {
+        io.delay_us(vif::quiet_us(assoc.beacon_int));
+    }
+    // SAFETY: as above, `associate_end`'s.
+    unsafe { associate_end(io, session, assoc, on, sink) }
+}
+
+/// [`associate`] up to the INFRA port update's check: every step before
+/// it, then whether the port function is on ([`vif::port_function_on`]),
+/// in which case [`vif::quiet_us`] of `assoc`'s beacon interval must pass,
+/// with nothing of the port changed, before [`associate_end`].
+///
+/// # Safety
+/// As [`set_bssid`].
+pub unsafe fn associate_begin<I: AxIo + ?Sized>(
+    io: &mut I,
+    session: &mut Session<'_>,
+    assoc: &AssocInputs,
+    features: Features,
+    dig: &mut Dig,
+    sink: &mut dyn FnMut(Event<'_>),
+) -> Result<bool, AxError> {
     let band = assoc.band;
     let edca = assoc.params();
     // SAFETY: the caller's contract is `conf_tx`'s, word for word.
@@ -607,10 +633,27 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
         unsafe { session.send(io, packet, sink) }?;
     }
     dig.resume(io, false)?;
-    vif::port_update(io, &PortConfig::infra(assoc.beacon_int, assoc.dtim))?;
+    vif::port_function_on(io)
+}
+
+/// [`associate`] after [`associate_begin`], which found the port function
+/// `on`, and its wait: the INFRA port update past its check
+/// ([`vif::port_update_after`]), then, with the short slot, the EDCA
+/// parameters again.
+///
+/// # Safety
+/// As [`set_bssid`].
+pub unsafe fn associate_end<I: AxIo + ?Sized>(
+    io: &mut I,
+    session: &mut Session<'_>,
+    assoc: &AssocInputs,
+    on: bool,
+    sink: &mut dyn FnMut(Event<'_>),
+) -> Result<(), AxError> {
+    vif::port_update_after(io, &PortConfig::infra(assoc.beacon_int, assoc.dtim), on)?;
     if assoc.short_slot() {
-        // SAFETY: as above, `conf_tx`'s.
-        unsafe { conf_tx(io, session, &edca, true, band, sink) }?;
+        // SAFETY: the caller's contract is `conf_tx`'s, word for word.
+        unsafe { conf_tx(io, session, &assoc.params(), true, assoc.band, sink) }?;
     }
     Ok(())
 }

@@ -56,6 +56,27 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
     ] {
         assert_eq!(System::parse(text).err(), Some(error), "{text}");
     }
+    // `--host-core`: off unless given, each value kept as written.
+    assert!(!plain.host_core());
+    assert_eq!(plain.host_core, None);
+    for (text, on) in [
+        ("--system --host-core on", true),
+        ("--system --host-core off", false),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.host_core(), on);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --host-core", Error::HostCore),
+        ("--system --host-core yes", Error::HostCore),
+        (
+            "--system --host-core on --host-core off",
+            Error::DuplicateHostCore,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
     // `off` beside the opt-ins it leaves: each still parses as before.
     let given =
         System::parse("--system --laptop off --battery --lid method --brightness-keys").unwrap();
@@ -84,6 +105,97 @@ fn a_hybrid_laptops_panel_is_copied_by_the_cpu_unless_hybrid_scanout_is_on() {
         (
             "--system --hybrid-scanout on --hybrid-scanout off",
             Error::DuplicateHybridScanout,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
+fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
+    // The default is performance, and writes nothing.
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.asus_mode(), AsusMode::Performance);
+    assert_eq!(plain.asus_mode, None);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, mode) in [
+        ("--system --asus-mode performance", AsusMode::Performance),
+        ("--system --asus-mode turbo", AsusMode::Turbo),
+        ("--system --asus-mode silent", AsusMode::Silent),
+        ("--system --asus-mode off", AsusMode::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.asus_mode(), mode);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --asus-mode", Error::AsusMode),
+        ("--system --asus-mode balanced", Error::AsusMode),
+        (
+            "--system --asus-mode off --asus-mode turbo",
+            Error::DuplicateAsusMode,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
+fn the_tlbi_keep_is_off_unless_asked_for_and_its_check_needs_it() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.tlbi_keep(), (false, false));
+    assert_eq!(plain.to_string(), "--system");
+    for (text, keep) in [
+        ("--system --tlbi-keep on", (true, false)),
+        ("--system --tlbi-keep off", (false, false)),
+        ("--system --tlbi-keep on --tlbi-verify-check", (true, true)),
+        (
+            "--system --tlbi-keep off --tlbi-verify-check",
+            (false, false),
+        ),
+        ("--system --tlbi-verify-check", (false, false)),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.tlbi_keep(), keep, "{text}");
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --tlbi-keep", Error::TlbiKeep),
+        ("--system --tlbi-keep yes", Error::TlbiKeep),
+        (
+            "--system --tlbi-keep on --tlbi-keep off",
+            Error::DuplicateTlbiKeep,
+        ),
+        (
+            "--system --tlbi-verify-check --tlbi-verify-check",
+            Error::DuplicateTlbiVerifyCheck,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
+fn a_gpu_link_keeps_the_firmwares_aspm_unless_gpu_aspm_turns_it_off() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.gpu_aspm(), GpuAspm::Firmware);
+    assert_eq!(plain.gpu_aspm, None);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, aspm) in [
+        ("--system --gpu-aspm off", GpuAspm::Off),
+        ("--system --gpu-aspm firmware", GpuAspm::Firmware),
+        ("--system --acpi-hardware --gpu-aspm off", GpuAspm::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.gpu_aspm(), aspm);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --gpu-aspm", Error::GpuAspm),
+        ("--system --gpu-aspm on", Error::GpuAspm),
+        (
+            "--system --gpu-aspm off --gpu-aspm off",
+            Error::DuplicateGpuAspm,
         ),
     ] {
         assert_eq!(System::parse(text).err(), Some(error), "{text}");
@@ -439,8 +551,7 @@ fn every_option_survives_a_round_trip() {
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
          --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
-         --amx-native off \
-         --monitor-trace \
+         --acpi-hardware --keep-running-on-panic --tier2 on --tier2-check --amx-native off \n         --hle --hle-off bzero \n         --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
          --load 0x10000004000 --entry 0x10000008000 --x0 7 --budget 99 --break 0x10 \
@@ -456,8 +567,16 @@ fn every_option_survives_a_round_trip() {
     assert_eq!(options.lid(), Lid::Method);
     assert!(options.brightness_keys);
     assert!(!System::default().brightness_keys);
+    assert!(options.acpi_hardware);
+    assert!(!System::default().acpi_hardware);
+    assert!(options.keep_running_on_panic);
+    assert!(!System::default().keep_running_on_panic);
+    assert_eq!(options.tier2, Some(true));
+    assert!(options.tier2_check && options.tier2_runs());
     assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
+    assert!(options.hle);
+    assert_eq!(options.hle_off, [stela_engine::hle::Id::Bzero]);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(
         "--system --bundle b --storage {DISK} --restore-study --restore-source {DISK} \
@@ -489,6 +608,40 @@ fn the_bluetooth_lend_round_trips_and_is_off_by_default() {
     let options = round_trip(&line);
     assert!(options.bluetooth_lend && options.bluetooth_trace);
     assert_eq!(options.to_string(), line);
+}
+
+#[test]
+fn hle_flags_round_trip_and_refuse_unknown_ids() {
+    use stela_engine::hle::Id;
+    let off = round_trip("--system");
+    assert!(!off.hle);
+    assert!(off.hle_off.is_empty());
+    assert!(round_trip("--system --hle").hle);
+    let some = round_trip("--system --hle --hle-off memmove,strlen");
+    assert!(some.hle);
+    assert_eq!(some.hle_off, [Id::Memmove, Id::Strlen]);
+    assert_eq!(some.to_string(), "--system --hle --hle-off memmove,strlen");
+    // Without --hle the list is kept, and turns nothing off.
+    let alone = round_trip("--system --hle-off bzero,memset,memcmp");
+    assert!(!alone.hle);
+    assert_eq!(alone.hle_off, [Id::Bzero, Id::Memset, Id::Memcmp]);
+    for text in [
+        "--system --hle-off nosuch",
+        "--system --hle-off",
+        "--system --hle-off memmove,",
+        "--system --hle-off ,memmove",
+        "--system --hle-off memmove,memmove",
+        "--system --hle-off bail",
+        "--system --hle-off Memmove",
+    ] {
+        assert_eq!(System::parse(text), Err(Error::HleId), "{text}");
+    }
+    for text in [
+        "--system --hle --hle",
+        "--system --hle-off memmove --hle-off strlen",
+    ] {
+        assert_eq!(System::parse(text), Err(Error::DuplicateHle), "{text}");
+    }
 }
 
 #[test]
@@ -873,6 +1026,7 @@ fn amx_native_is_on_unless_turned_off() {
 }
 
 mod constraints;
+mod fork_lines;
 mod grammar;
 
 #[test]
@@ -905,4 +1059,133 @@ fn host_check_bluetooth_check_is_off_unless_named_and_round_trips() {
             .to_string(),
         "--host-check --key-seconds 5"
     );
+}
+
+#[test]
+fn a_core_trial_reaches_no_disk() {
+    const TRIAL: &str =
+        "--system --bundle m2u --storage-ram 0x200000000 --native-cores 16 --core-trial";
+    let options = round_trip(TRIAL);
+    assert!(options.core_trial);
+    assert!(!System::default().core_trial);
+    assert_eq!(options.native_cores, Some(16));
+    assert!(options.storage.is_none() && options.nor.is_none() && options.preboot.is_none());
+    // Its order in the canonical line does not matter to the grammar.
+    assert_eq!(
+        System::parse(
+            "--system --core-trial --native-cores 16 --storage-ram 0x200000000 --bundle m2u"
+        ),
+        Ok(options.clone())
+    );
+    // Without the flag nothing changes, and the line has no word for it.
+    let plain = System::parse("--system --bundle m2u --storage-ram 0x200000000").unwrap();
+    assert!(!plain.core_trial);
+    assert!(!plain.to_string().contains(CORE_TRIAL));
+    let refused = Error::Constraint(Constraint::CoreTrial);
+    // What it needs: a bundle, RAM-backed disks and an explicit PE count.
+    for missing in [
+        "--system --storage-ram 0x200000000 --native-cores 16 --core-trial",
+        "--system --bundle m2u --native-cores 16 --core-trial",
+        "--system --bundle m2u --storage-ram 0x200000000 --core-trial",
+    ] {
+        assert_eq!(System::parse(missing).err(), Some(refused), "{missing}");
+    }
+    // Every option that can reach a disk is refused beside it.
+    for added in [
+        format!("--nor {DISK}"),
+        format!("--preboot {DISK}"),
+        "--external-disks".to_string(),
+        "--usb-storage A".to_string(),
+        "--wifi home".to_string(),
+    ] {
+        let text = format!("{TRIAL} {added}");
+        assert_eq!(System::parse(&text).err(), Some(refused), "{text}");
+    }
+    // `--storage` cannot stand beside `--storage-ram` at all; on its own
+    // it is refused as the trial's.
+    let storage = format!("--system --bundle m2u --storage {DISK} --native-cores 16 --core-trial");
+    assert_eq!(System::parse(&storage).err(), Some(refused), "{storage}");
+    // An install or a restore study needs `--storage`, so either refusal
+    // stops it before anything opens.
+    for text in [
+        format!(
+            "--system --bundle m2u --storage {DISK} --nor {DISK} --install p.json \
+             --native-cores 16 --core-trial"
+        ),
+        format!(
+            "--system --bundle m2u --storage {DISK} --restore-study --restore-source {DISK} \
+             --restore-manifest m.plist --restore-identity 2 --native-cores 16 --core-trial"
+        ),
+    ] {
+        assert_eq!(System::parse(&text).err(), Some(refused), "{text}");
+    }
+    assert!(refused.message().contains("--core-trial writes nothing"));
+}
+
+/// The scaling test's boots: a Mac mini M2 disk boot (setup's line, with
+/// `--guest-pes 8`) on a 16-core, 32-thread PC, given `--native-cores` 4, 6
+/// and 8. Each reserves that many host cores before the Preboot is read,
+/// passes the live check against the disk's 8 CPUs, and skips the CPU-count
+/// check the count stands in for. Past the board's 8 the boot stops at that
+/// check, before any AP starts.
+#[test]
+fn a_disk_boot_runs_on_four_six_or_eight_native_cores() {
+    const LAPTOP_THREADS: usize = 32;
+    const MAC_MINI_CPUS: usize = 8;
+    let line = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK} --guest-pes 8");
+    let plain = System::parse(&line).unwrap();
+    assert_eq!(plain.assigned_native_cores(LAPTOP_THREADS, None), Ok(8));
+    for count in [4, 6, 8] {
+        let options = round_trip(&format!("{line} --native-cores {count}"));
+        assert_eq!(options.guest_pes, Some(8));
+        assert_eq!(
+            options.assigned_native_cores(LAPTOP_THREADS, None),
+            Ok(count),
+            "{count}"
+        );
+        assert_eq!(
+            options.validate_native_cores(LAPTOP_THREADS, count, MAC_MINI_CPUS),
+            Ok(()),
+            "{count}"
+        );
+    }
+    let over = System::parse(&format!("{line} --native-cores 9")).unwrap();
+    assert_eq!(over.assigned_native_cores(LAPTOP_THREADS, None), Ok(9));
+    assert!(
+        over.validate_native_cores(LAPTOP_THREADS, 9, MAC_MINI_CPUS)
+            .is_err()
+    );
+}
+
+/// Tier 2 is off unless `--tier2 on` or `--tier2-check` asks for it, and
+/// both are hand-written: a line without them parses as it did.
+#[test]
+fn tier2_runs_only_when_asked() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(
+        (plain.tier2, plain.tier2_check, plain.tier2_runs()),
+        (None, false, false)
+    );
+    for (line, tier2, check, runs) in [
+        ("--system --tier2 on", Some(true), false, true),
+        ("--system --tier2 off", Some(false), false, false),
+        ("--system --tier2-check", None, true, true),
+        ("--system --tier2 on --tier2-check", Some(true), true, true),
+    ] {
+        let options = System::parse(line).unwrap();
+        assert_eq!(
+            (options.tier2, options.tier2_check, options.tier2_runs()),
+            (tier2, check, runs),
+            "{line}"
+        );
+        assert_eq!(round_trip(line).tier2, tier2, "{line}");
+    }
+    for (line, error) in [
+        ("--system --tier2", Error::Tier2),
+        ("--system --tier2 yes", Error::Tier2),
+        ("--system --tier2 on --tier2 off", Error::DuplicateTier2),
+        ("--system --tier2 off --tier2-check", Error::Tier2CheckOff),
+    ] {
+        assert_eq!(System::parse(line).err(), Some(error), "{line}");
+    }
 }

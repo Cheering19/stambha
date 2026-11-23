@@ -37,14 +37,17 @@ use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
 /// reach 2.5 % more with 1.35 times the jobs, 94 % of those never run.
 pub const DEPTH: u8 = 1;
 /// Jobs a queue holds for blocks in their naming block's page; when full,
-/// the oldest go.
-pub const CAPACITY: usize = 4096;
+/// the oldest go. A launch offers jobs while no PE waits, and the PEs
+/// that wait after it take the newest: 4096 dropped 24.0 M of 37.3 M jobs
+/// in a desktop boot (`TRANSLATIONS ahead`, 2026-11-23). Four times that
+/// keeps the last 16 thousand of a burst, about 2 MB of jobs.
+pub const CAPACITY: usize = 16384;
 /// Jobs a queue holds for blocks in other pages, served when none of the
 /// others wait: a tenth of a block's successors lie in other pages (the
 /// model's 115 thousand to 994 thousand).
-pub const ELSEWHERE_CAPACITY: usize = 1024;
-/// Slots of the queue's filter of recent jobs.
-const SEEN: usize = 1 << 14;
+pub const ELSEWHERE_CAPACITY: usize = 4096;
+/// Slots of the queue's filter of recent jobs: four for each job held.
+const SEEN: usize = 1 << 16;
 
 /// A block to prepare: the page key (none for a page the naming block did
 /// not read: its bytes give it), guest page and frame of its fetch page,

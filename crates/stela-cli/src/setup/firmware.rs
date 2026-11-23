@@ -417,10 +417,10 @@ pub(super) fn bundle_summary() -> String {
 #[cfg(test)]
 pub(super) const BUILT_BUNDLE: (usize, &str) =
     match (cfg!(feature = "amdgpu-port"), cfg!(feature = "intel-port")) {
-        (true, true) => (468, "245.8"),
-        (true, false) => (441, "240.3"),
-        (false, true) => (119, "185.2"),
-        (false, false) => (92, "179.7"),
+        (true, true) => (469, "245.9"),
+        (true, false) => (442, "240.4"),
+        (false, true) => (120, "185.3"),
+        (false, false) => (93, "179.9"),
     };
 
 /// Download every file of the complete bundle that neither the cache nor

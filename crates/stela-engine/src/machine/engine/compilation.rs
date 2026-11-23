@@ -308,7 +308,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let walk = self.cached_fetch(pc);
         let global = walk.is_none_or(|walk| walk.global);
         let shared = walk.is_some_and(|walk| walk.global);
-        self.take_page(pc, key, Taken::Fetch, global, shared);
+        let record = self.fetch_record(pc);
+        self.take_page(pc, key, Taken::Fetch, global, shared, record);
     }
 
     /// [`Self::translate_page`] for the fetch at `pc` of the frame
@@ -318,7 +319,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn translate_leaf(&mut self, pc: u64, key: u64, physical: u64, current: Variant) {
         self.translate_page(pc, key);
         if let Some(walk) = self.cached_fetch(pc) {
-            self.take_leaf_pages(pc, physical, walk.size, current, walk.global);
+            let record = self.fetch_record(pc);
+            self.take_leaf_pages(pc, physical, walk.size, current, walk.global, record);
         }
     }
 
@@ -332,7 +334,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the ITLB holds already are left to their own fetch. A TLBI by VA of
     /// any of them reaches all: the fetch recorded the whole leaf
     /// (`fetched_through`). `current` is the fetch's variant before each
-    /// page's own (`page_variant`).
+    /// page's own (`page_variant`). `record` is the walk's, which each
+    /// page's entry is kept with (`tlbi_keep.rs`).
     fn take_leaf_pages(
         &mut self,
         pc: u64,
@@ -340,6 +343,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         size: u64,
         current: Variant,
         global: bool,
+        record: Option<tlbi_keep::WalkRecord>,
     ) {
         let span = size.min(LEAF_FILL);
         if span <= FETCH_PAGE {
@@ -361,7 +365,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             let key = self.block_key(other_frame, id);
-            self.take_page(other, key, Taken::Leaf, global, global);
+            self.take_page(other, key, Taken::Leaf, global, global, record);
         }
     }
 
@@ -369,11 +373,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// was `taken` ([`Taken`]). `global` marks a page whose walk ended in
     /// a global leaf ([`chain::LookupEntry::global_page`]), or may have;
     /// `shared` puts a lower-half page whose walk did in the context every
-    /// address space shares ([`Self::itlb_context`]).
-    fn take_page(&mut self, pc: u64, key: u64, taken: Taken, global: bool, shared: bool) {
+    /// address space shares ([`Self::itlb_context`]). With `--tlbi-keep on`
+    /// the entry is kept with `record`, the walk it came from, or its
+    /// context marked unverifiable without one (`tlbi_keep.rs`).
+    fn take_page(
+        &mut self,
+        pc: u64,
+        key: u64,
+        taken: Taken,
+        global: bool,
+        shared: bool,
+        record: Option<tlbi_keep::WalkRecord>,
+    ) {
         debug_assert!(global || !shared, "only a global page is shared");
         let half = chain::half(pc);
         let context = self.itlb_context(pc, shared);
+        // No context until a fetch takes its own (`keep_spaces`): an entry
+        // there would be found by every later run in it.
+        if context == contexts::VOID {
+            return;
+        }
         let page = pc & !(FETCH_PAGE - 1);
         let slot = self.itlb.page_slot(pc, context);
         let entry = match global {
@@ -382,6 +401,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let held = self.itlb.find(slot, page, context);
         if held == entry {
+            if self.tlbi_keep.on && record.is_some() {
+                self.note_kept_fill(page, context, record);
+            }
             return;
         }
         let held_page = held.pc == page && held.key == context;
@@ -440,6 +462,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 note_itlb_ghost(&mut self.itlb_ghosts, &lost, ItlbMiss::Evicted);
             }
             self.itlb.insert_over(slot, entry, &dead);
+        }
+        if self.tlbi_keep.on {
+            self.note_kept_fill(page, context, record);
         }
     }
 
@@ -699,15 +724,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// faults or that the host refuses is left to its fetch. `el` (with
     /// the guarded level) and `context` are what the fetch runs in. A walk
     /// that forgets contexts ends it, and the fetch takes its contexts
-    /// anew.
+    /// anew. The pages are sorted, so runs of them share a leaf table: each
+    /// walk starts at the table the one before it read, when that holds its
+    /// page, as a walk cache lets hardware walk ([`mmu::WalkMemo`]). Nothing
+    /// in the batch runs guest code or changes the controls, and the walks
+    /// make no descriptor updates; the table is dropped with the batch.
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
         let generation = self.translation_generation;
+        let mut quiet = QuietWalk::new(&self.cpu);
         for pc in core::mem::take(&mut self.refills) {
             // Taken already, with its leaf's other pages.
             if self.current_key(pc).is_some() {
                 continue;
             }
-            let Some(walk) = self.quiet_fetch_physical(pc) else {
+            let Some(walk) = self.quiet_fetch_physical(pc, &mut quiet) else {
                 continue;
             };
             if self.translation_generation != generation {
@@ -722,9 +752,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let variant = self.page_variant(current, walk.physical);
             if let Some(id) = self.known_variant(variant) {
                 let key = self.block_key(walk.physical, id);
-                self.take_page(pc, key, Taken::Refill, walk.global, walk.global);
+                self.take_page(
+                    pc,
+                    key,
+                    Taken::Refill,
+                    walk.global,
+                    walk.global,
+                    walk.record,
+                );
             }
-            self.take_leaf_pages(pc, walk.physical, walk.size, current, walk.global);
+            self.take_leaf_pages(
+                pc,
+                walk.physical,
+                walk.size,
+                current,
+                walk.global,
+                walk.record,
+            );
         }
     }
 
@@ -787,6 +831,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         variant: Variant,
         available: usize,
     ) -> Result<Option<Fetched>, Stop> {
+        // Only tier 1 compiles here, and only what compiles here reaches the
+        // translation store: tier 2 ([`super::tier2`]) installs its own.
+        debug_assert!(!variant.system.traces, "tier-2 code is never stored");
         let whole = available == source_window(pc, variant);
         let page = pc & !(FETCH_PAGE - 1);
         let offset = (pc - page) as usize;
@@ -809,6 +856,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Blocks end before a device site, which no entry context names:
         // the store neither gives nor takes its page's blocks.
         let sited = !variant.single && self.page_has_device_sites(physical);
+        if let Some(fetched) = self.hle_compile(pc, physical, variant, source)? {
+            return Ok(Some(fetched));
+        }
         let reading = self.host.counter();
         let stored = match variant.single || sited {
             true => None,
@@ -1372,6 +1422,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installer: self.current as u8,
             part: shared_part(&self.code, code),
             device_stub: self.installing_stub,
+            hle: self.hle.installing,
+            tier2: self.installing_tier2,
         };
         let shared = Arc::clone(&self.code);
         shared.blocks.fill(slot, block);
@@ -1384,7 +1436,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.census_installed(pc, physical, variant, installed_bytes, instructions);
         // Another PE installed the block meanwhile: the first install wins,
         // and this one's code stays unreachable until its part goes.
-        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
+        // A tier-2 block takes a tier-1 block's place instead ([`super::tier2`]):
+        // the index replaces it below, and detaches it. It loses only to
+        // another tier-2 block, or to an HLE composite ([`super::hle`]),
+        // which nothing of tier 2 replaces.
+        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id)
+            && !(self.installing_tier2
+                && !shared.blocks[held].tier2
+                && shared.blocks[held].hle.is_none())
+        {
             shared.blocks.record(slot).mark_lost();
             // Its rows go: nothing faults in a block never reached.
             shared.blocks.recovery().remove(&slot);

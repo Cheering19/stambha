@@ -17,7 +17,8 @@
 //! region's own branches and fallthroughs, and takes the region only when
 //! one of them branches back inside it: a loop. Anything else stays the
 //! block it would have been, as does a block that already runs as a
-//! self-loop (`x86_64::block::SelfLoop`).
+//! self-loop (`x86_64::block::SelfLoop`). Tier 2 ([`NativeSystem::traces`])
+//! takes the region without a loop as well: a superblock.
 use super::{MAX_BLOCK_INSTRUCTIONS, Terminator, analysis::ParsedBlock};
 use crate::{
     GuestAddress,
@@ -92,6 +93,9 @@ pub(super) fn form(
     let mut reached = vec![false; count];
     let mut work = vec![0];
     let mut loops = false;
+    // For tier 2: a branch that lands ahead inside, and one that leaves
+    // backward.
+    let (mut joins, mut leaves_back) = (false, false);
     while let Some(at) = work.pop() {
         if reached[at] {
             continue;
@@ -104,16 +108,25 @@ pub(super) fn form(
         let mut falls = true;
         if let Some((target, conditional)) = branch_target(&instruction.operation) {
             falls = conditional;
-            if let Some(to) = internal(target) {
-                loops |= to <= at;
-                work.push(to);
+            match internal(target) {
+                Some(to) => {
+                    loops |= to <= at;
+                    joins |= to > at;
+                    work.push(to);
+                }
+                None => leaves_back |= target.0 < instruction.pc.0,
             }
         }
         if falls && at + 1 < count {
             work.push(at + 1);
         }
     }
-    if !loops {
+    // Tier 2 takes a region without a loop too, a superblock, where it
+    // pays: a branch of it lands ahead inside it, so both its paths stay,
+    // and none leaves backward, which is a loop's edge and mostly taken: a
+    // superblock would leave there through a side exit, out of line.
+    let superblock = native.traces && joins && !leaves_back;
+    if !loops && !superblock {
         return block(parsed);
     }
     let last = reached.iter().rposition(|&reached| reached).unwrap_or(0);

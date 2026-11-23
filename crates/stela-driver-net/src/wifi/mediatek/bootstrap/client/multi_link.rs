@@ -64,7 +64,7 @@ pub(super) struct Link<C: 'static> {
     pub(super) channel_change: Option<Option<ChannelDefinition>>,
     pub(super) applied_edca: Option<edca::AppliedEdca>,
     prepared_edca: [station::phy::AccessCategory; 4],
-    interface: Interface<Arc<C>>,
+    pub(super) interface: Interface<Arc<C>>,
     /// The MLDs' PTK, kept on this link's AP WCID as on every link's.
     pub(super) ptk: HardwareKey<Arc<C>>,
     /// The GTK of this link's AP.
@@ -294,9 +294,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(interface.broadcast_wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        link.interface
-            .activate(roc.controller.state_mut().mailbox.as_mut().unwrap())
-            .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?;
+        // A link's registration while associating: both commands now.
+        stela_driver_base::stepped::block_on(
+            link.interface
+                .activate(roc.controller.state_mut().mailbox.as_mut().unwrap()),
+        )
+        .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?;
         // mt7925_set_mlo_roc takes the channels while no other request holds
         // them: the association's own request ends first.
         if roc.roc_deadline.take().is_some() {
@@ -524,13 +527,18 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
     /// block ack session on every link's AP WCID.
     pub(super) fn on_every_link(
         s: &Owned<I, Q, C>,
-        record: impl Fn(Profile) -> Result<Vec<u8>, wire::Error>,
+        record: impl Fn(wire::Codec, Profile) -> Result<Vec<Vec<u8>>, wire::Error>,
     ) -> Result<Vec<Vec<u8>>, Error> {
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        [p].into_iter()
+        let codec = Self::codec(s);
+        let mut bodies = Vec::new();
+        for p in [p]
+            .into_iter()
             .chain(s.links.iter().map(|link| link.profile))
-            .map(|p| record(p).map_err(Error::Codec))
-            .collect()
+        {
+            bodies.extend(record(codec, p).map_err(Error::Codec)?);
+        }
+        Ok(bodies)
     }
 
     /// The AP's WCID on each link of the association whose setup link `p`

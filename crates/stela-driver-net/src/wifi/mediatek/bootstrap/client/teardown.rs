@@ -43,52 +43,36 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 );
             }
         }
-        Self::command(
-            s,
-            Command::BssInfo,
-            &match &six {
-                Some(codec) => codec.disable_beacon_pm(),
-                None => p.disable_beacon_pm(),
-            }
-            .map_err(Error::Codec)?,
-        )?;
-        s.transport_facts
-            .try_reserve(1)
-            .map_err(|_| Error::NoMemory)?;
-        let fact = s
-            .controller
-            .state_mut()
-            .mailbox
-            .as_mut()
-            .unwrap()
-            .initial(
-                &match &six {
-                    Some(codec) => codec.filter_request(false),
-                    None => p.filter_request(false),
-                }
-                .map_err(Error::Codec)?,
-            )
-            .map_err(Error::Transport)?;
-        s.transport_facts.push(fact);
-        Self::command(
-            s,
-            Command::StationRecord,
-            &match &six {
-                Some(codec) => codec.peer_request(false),
-                None => p.peer_request(false, false),
-            }
-            .map_err(Error::Codec)?,
-        )?;
+        let disable = match &six {
+            Some(codec) => codec.disable_beacon_pm(),
+            None => Self::codec(s).disable_beacon_pm(p),
+        }
+        .map_err(Error::Codec)?;
+        Self::send(s, &disable)?;
+        let filter = match &six {
+            Some(codec) => codec.filter_request(false),
+            None => Self::codec(s).filter(p, false),
+        }
+        .map_err(Error::Codec)?;
+        Self::send(s, &wire::Outgoing::Mailbox(filter))?;
+        let peer = match &six {
+            Some(codec) => codec.peer_request(false),
+            None => Self::codec(s).peer(p, None, false, false),
+        }
+        .map_err(Error::Codec)?;
+        Self::command(s, Command::StationRecord, &peer)?;
         s.controller
             .state_mut()
             .control
             .clear_peer_admission(p.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         let bss = match &six {
-            Some(codec) => codec.bss_request().map_err(Error::Codec)?,
+            Some(codec) => codec.bss_requests().map_err(Error::Codec)?,
             None => Self::bss_request(s, p, false)?,
         };
-        Self::command(s, Command::BssInfo, &bss)?;
+        for body in &bss {
+            Self::command(s, Command::BssInfo, body)?;
+        }
         Self::remove_links(s)?;
         s.phase = Phase::NeedsDrain;
         Ok(())
@@ -199,12 +183,44 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 .deactivate(s.controller.state_mut().mailbox.as_mut().unwrap())
                 .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?,
         );
-        s.controller
-            .state_mut()
-            .control
-            .stop_dma(false)
+        // The same stop as the bring-up's, run to completion: one 100 ms
+        // poll at most.
+        stela_driver_base::stepped::block_on(s.controller.state_mut().control.stop_dma(false))
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         s.phase = Phase::ControllerDrain;
+        Ok(())
+    }
+
+    /// Release everything the client holds once its hardware was reset, as
+    /// `mt7925e_mac_reset` frees its tokens and queues: the controller's rings
+    /// and mappings, and the interfaces and keys the reset firmware forgot,
+    /// in whatever phase the failure left them.
+    ///
+    /// # Safety
+    /// The WLAN subsystem was reset (WFSYS) with its WFDMA stopped and every
+    /// ring base reprogrammed by a later owner, so neither the old firmware
+    /// nor its DMA reaches this client's memory; no interrupt or deferred user
+    /// of this client remains.
+    pub unsafe fn release_after_reset(&mut self) -> Result<(), Error> {
+        let s = self.state_mut();
+        s.phase = Phase::Quarantined;
+        // SAFETY: the reset is this function's contract.
+        unsafe { s.controller.retire_after_quiesce() }.map_err(Error::Bootstrap)?;
+        for link in &mut s.links {
+            // SAFETY: as above: the reset firmware holds none of them.
+            unsafe {
+                link.ptk.retire_after_reset();
+                link.gtk.retire_after_reset();
+                link.interface.retire_after_reset();
+            }
+        }
+        for key in [&mut s.ptk, &mut s.gtk].into_iter().flatten() {
+            // SAFETY: as above.
+            unsafe { key.retire_after_reset() };
+        }
+        // SAFETY: as above.
+        unsafe { s.interface.retire_after_reset() };
+        s.phase = Phase::Stopped;
         Ok(())
     }
 

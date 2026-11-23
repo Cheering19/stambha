@@ -4,7 +4,7 @@
 //! (`stela_drivers::probe::wifi_starts`), found in the firmware's PCI census
 //! before ExitBootServices. A PC whose census lists every function and none
 //! is one, such as a desktop with no Wi-Fi card or one whose card no driver
-//! here starts (an MT7921 or an Intel 9000-series radio), is offered none. A census that
+//! here starts (an MT7920 or an Intel 9000-series radio), is offered none. A census that
 //! is unavailable or could not read every function offers Wi-Fi as the
 //! configuration alone did, so a firmware quirk never hides a Wi-Fi option
 //! that works.
@@ -214,12 +214,12 @@ mod tests {
 
     #[test]
     fn unsupported_wifi_chips_hide_wifi() {
-        // An Intel 9560, an MT7921 and an RTL8852BE have no driver that
+        // An Intel 9560, an MT7920 and an RTL8852BE have no driver that
         // starts them.
         let ac9560 = function(2, 0x8086, 0x9df0, WIFI);
-        let mt7921 = function(3, 0x14c3, 0x7961, WIFI);
+        let mt7920 = function(3, 0x14c3, 0x7920, WIFI);
         let rtl8852be = function(6, 0x10ec, 0xb852, WIFI);
-        for chip in [ac9560, mt7921, rtl8852be] {
+        for chip in [ac9560, mt7920, rtl8852be] {
             let mut functions = others();
             functions.push(chip);
             let hardware = decide(census(&functions, 0));
@@ -227,17 +227,22 @@ mod tests {
             assert!(!hardware.offered());
         }
         let mut functions = others();
-        functions.extend([ac9560, mt7921]);
+        functions.extend([ac9560, mt7920]);
         assert_eq!(
             decide(census(&functions, 0)).line(),
             "CHOICE Wi-Fi hidden: no PCI function is a Wi-Fi chip the driver starts; not \
-             started yet: 0000:02:00.0 (8086:9df0), 0000:03:00.0 (14c3:7961)\n"
+             started yet: 0000:02:00.0 (8086:9df0), 0000:03:00.0 (14c3:7920)\n"
         );
-        // An MT7925 and an RTL8822CE start, their claims quiesced by a
-        // reset.
+        // An MT7921, an MT7922, an MT7925, an RTL8822CE and an RTL8821CE
+        // start, their claims quiesced by a reset.
         for chip in [
+            function(3, 0x14c3, 0x7961, WIFI),
+            function(3, 0x14c3, 0x0616, WIFI),
+            function(3, 0x0b48, 0x7922, WIFI),
             function(3, 0x14c3, 0x7925, WIFI),
             function(6, 0x10ec, 0xc822, WIFI),
+            function(6, 0x10ec, 0xc821, WIFI),
+            function(6, 0x10ec, 0xb821, WIFI),
         ] {
             let mut functions = others();
             functions.push(chip);

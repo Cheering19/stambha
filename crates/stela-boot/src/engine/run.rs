@@ -1122,6 +1122,10 @@ pub(super) fn run<H: Host>(
                 // this PE's guest waits.
                 if idle {
                     super::translations::step();
+                } else if quiet && !super::host_core::takes_pump() {
+                    // Its background preload goes on from EL0, where this
+                    // PE holds no kernel lock, unless a host core serves.
+                    super::translations::background();
                 }
                 service.parts.lap(ServiceParts::DISK, host::rdtsc());
             });
@@ -1142,7 +1146,12 @@ pub(super) fn run<H: Host>(
         // A wall-time service yield may precede even the final block limit.
         // Only the executed count can establish budget completion.
         let budget_reached = budget != 0 && machine.statistics.blocks >= budget;
-        let sliced = waiting || matches!(stop, Stop::Budget) && !budget_reached;
+        // A guest panic that never reset the Mac ends the run as a stop of
+        // its own (`super::watch_guest`).
+        // A stop the machine made itself, a reset among them, goes first.
+        let slice_ended = waiting || matches!(stop, Stop::Budget) && !budget_reached;
+        let panicked = super::watch_guest().filter(|_| slice_ended);
+        let sliced = slice_ended && panicked.is_none();
         let now = host::rdtsc();
         if !sliced {
             // Every guest line, the last ones before the stop first of all.
@@ -1163,7 +1172,7 @@ pub(super) fn run<H: Host>(
                 ));
             }
             output::report_log_stores();
-            return stop;
+            return panicked.unwrap_or(stop);
         }
         cursor.look(now);
         heartbeat.sample(machine, now, tsc_hz);
@@ -1379,7 +1388,10 @@ pub(super) fn report_drained<H: Host>(
                     machine.statistics.blocks,
                 ));
             }
-            crate::status::progress(&update.detail);
+            // A panic the run stops for keeps its line as the detail.
+            if !super::panic_shown() {
+                crate::status::progress(&update.detail);
+            }
         }
     }
     crate::status::stream(lines.iter().map(String::as_str));
@@ -1766,6 +1778,9 @@ impl Heartbeat {
         let next = Beat::at(machine, now);
         let elapsed = now - self.beat.at;
         beat_report(machine, &self.beat, &next, elapsed);
+        if machine.step_timing().is_some() && machine.hle_enabled() {
+            hle_report(machine);
+        }
         mark(&mut cost, "position");
         service.report(tsc_hz);
         mark(&mut cost, "service");
@@ -2756,6 +2771,14 @@ impl Heartbeat {
             output::arguments(format_args!("{paths}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
+            // What tier 2 did over the whole run, on every PE (`--tier2`).
+            let mut tier2 = stela_engine::machine::engine::tier2::Tier2Counts::default();
+            for counts in per_pe.iter() {
+                tier2 += counts.tier2;
+            }
+            if tier2 != Default::default() {
+                output::arguments(format_args!("{}\n", tier2_report(&tier2)));
+            }
             // Where TLBIs of everything came from, over the whole run: the
             // guest PCs that issued the most, merged over the PEs.
             let mut sites = stela_engine::machine::engine::WholeTlbiSites::default();
@@ -2782,6 +2805,62 @@ impl Heartbeat {
                 line.push_str(&format!(" {pc:#x}={count}"));
             }
             output::arguments(format_args!("{line}\n"));
+            // What came before them: an address-space switch since the PE's
+            // previous one or none, and under --profile a sample of where
+            // they were called from.
+            let mut line = String::from("PES WHOLE TLBI TRIGGER same_ttbr0/new_ttbr0");
+            let mut sampled = String::new();
+            for (pe, counts) in per_pe.iter().enumerate() {
+                let trigger = &counts.whole_tlbi_trigger;
+                let [same, new] = trigger.switched;
+                line.push_str(&format!(" {pe}:{same}/{new}"));
+                for [pc, x16, x30, from, to] in trigger.samples {
+                    if pc != 0 {
+                        sampled.push_str(&format!(
+                            "PES WHOLE TLBI SAMPLE pe={pe} pc={pc:#x} x16={x16:#x} x30={x30:#x} \
+                             ttbr0={from:#x}->{to:#x}\n"
+                        ));
+                    }
+                }
+            }
+            output::arguments(format_args!("{line}\n{sampled}"));
+            // `--tlbi-keep on`: what keeping the contexts across those TLBIs
+            // did, every PE's together and then each PE's kept/dropped, and
+            // every mismatch `--tlbi-verify-check` found.
+            if per_pe.iter().any(|counts| counts.tlbi_keep.tlbis != 0) {
+                let mut keep = stela_engine::machine::engine::TlbiKeepCounts::default();
+                let mut each = String::new();
+                for (pe, counts) in per_pe.iter().enumerate() {
+                    let counts = &counts.tlbi_keep;
+                    keep.add(counts);
+                    each.push_str(&format!(" {pe}:{}/{}", counts.kept, counts.dropped));
+                }
+                let ns_each = (u128::from(keep.ticks) * 1_000_000_000
+                    / u128::from(host::COUNTER_HZ * keep.tlbis.max(1)))
+                    as u64;
+                output::arguments(format_args!(
+                    "PES TLBI KEEP tlbis={} contexts={} verified={} forgotten={} kept={} \
+                     dropped={} checked={} mismatches(check)={} verify_ns_per_tlbi={ns_each} \
+                     kept/dropped{each}\n",
+                    keep.tlbis,
+                    keep.contexts,
+                    keep.verified,
+                    keep.forgotten,
+                    keep.kept,
+                    keep.dropped,
+                    keep.checked,
+                    keep.mismatches,
+                ));
+                for [page, context, key, frame] in keep.samples {
+                    if context != 0 {
+                        output::arguments(format_args!(
+                            "PES TLBI KEEP MISMATCH page={page:#x} context={context:#x} \
+                             kept_key={key:#x} walked_frame={frame:#x}: a kept entry's full \
+                             walk differed, so it was dropped\n"
+                        ));
+                    }
+                }
+            }
             output::arguments(format_args!("{transitions}\n"));
             let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
                 transition_misses[kind * 9..kind * 9 + 9]
@@ -3178,6 +3257,20 @@ pub(super) fn beat_report<H: Host>(
     ));
 }
 
+/// `PES HLE pe=N matched=K/T installed= bypassed= refused=...`: what this
+/// PE's HLE matched, installed, bypassed and refused since it started
+/// (`stela_engine::hle::Statistics::line`), once a beat under `--profile`
+/// when `--hle` enabled a routine.
+pub(super) fn hle_report<H: Host, D: stela_engine::machine::Devices>(machine: &Machine<H, D>) {
+    let line = machine
+        .hle_statistics()
+        .line(machine.processor(), machine.hle_signatures());
+    output::arguments(format_args!(
+        "{line}
+"
+    ));
+}
+
 /// `BEAT SHORT …`: the fields of the `BEAT` line that say the guest runs,
 /// with the same names, over the interval since the last beat line.
 pub(super) fn short_report<H: Host>(
@@ -3502,4 +3595,29 @@ impl BeatCost {
         ));
         output::arguments(format_args!("{line}\n"));
     }
+}
+
+/// `PES TIER2`: what tier 2 did over the run, summed over the PEs: blocks
+/// promoted (their heat reached the threshold), installed in their tier-1
+/// blocks' places, left as tier 1 compiled them, and refused; the exits to
+/// the engine from tier-2 blocks and of those the side exits; the tier-2
+/// blocks taken away after a check found them wrong; and the checks
+/// `--tier2-check` made, the mismatches it found, the entries it could not
+/// check, and the entry PC of the last mismatch.
+pub(super) fn tier2_report(tier2: &stela_engine::machine::engine::tier2::Tier2Counts) -> String {
+    format!(
+        "PES TIER2 promoted={} installed={} unchanged={} refused={} exits={} exits_side={} \
+         deopts={} checks={} check_mismatches={} check_skipped={} mismatch_pc={:#x}",
+        tier2.promoted,
+        tier2.installed,
+        tier2.unchanged,
+        tier2.refused,
+        tier2.exits,
+        tier2.exits_side,
+        tier2.deopts,
+        tier2.checks,
+        tier2.check_mismatches,
+        tier2.check_skipped,
+        tier2.mismatch_pc,
+    )
 }

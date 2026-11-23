@@ -473,6 +473,97 @@ fn a_16_gb_pc_keeps_about_a_gigabyte_for_the_pack() {
     assert_eq!(pack_budget(free(16), 8, 8, GpuMemory::Own), 992 * MIB);
 }
 
+/// The bytes a second of a USB 2 stick and of a USB 3 one read under the
+/// firmware.
+const USB_2: u64 = 35_000_000;
+const USB_3: u64 = 100_000_000;
+/// The pack of boot 23 (`Opening the translation cache (498 MB, ...)`).
+const PACK_23: u64 = 498_000_000;
+
+#[test]
+fn a_16_gb_pc_reads_the_first_quarter_gigabyte_of_its_pack_ahead() {
+    // The budget less a 498 MB pack's indexes (about 6 MiB).
+    let room = pack_budget(free(16), 8, 8, GpuMemory::Own) - 6 * MIB;
+    let bound = preload_bound(room);
+    assert_eq!(bound, 246 * MIB);
+    // Three quarters of the room still grows the window and the guest.
+    assert!(room - bound >= 3 * room / 4 - ALIGNMENT);
+    // An 8 GB PC reads ahead a fourth of its smaller room.
+    assert_eq!(
+        preload_bound(pack_budget(free(8), 8, 8, GpuMemory::Own) - 6 * MIB),
+        122 * MIB
+    );
+    // A larger PC reads no more than the most.
+    assert_eq!(
+        preload_bound(pack_budget(free(128), 16, 16, GpuMemory::Own)),
+        PRELOAD_MOST
+    );
+    // A room that holds little reads nothing ahead.
+    assert_eq!(preload_bound(PRELOAD_FLOOR * PRELOAD_SHARE - 1), 0);
+    assert_eq!(preload_bound(0), 0);
+}
+
+/// The pack of the 2026-11-23 boots on the 16 GB laptop: 533 MB in five
+/// segments, 1.7 MB of indexes, the first 72 MiB read ahead by the loader.
+const PACK_1123: u64 = 533_202_872;
+const INDEXES_1123: u64 = 1_703_824;
+const AHEAD_1123: u64 = 72 * MIB;
+
+#[test]
+fn a_16_gb_pc_holds_its_whole_pack_in_the_background_and_still_grows_its_window() {
+    let host = free(16);
+    let budget = pack_budget(host, 8, 8, GpuMemory::Own);
+    let room = budget - INDEXES_1123 - AHEAD_1123;
+    let left = PACK_1123 - AHEAD_1123;
+    let bulk = bulk_bound(room, left);
+    // All of it: the pack fits the room the budget leaves.
+    assert_eq!(bulk, left);
+    assert!(bulk < BULK_MOST);
+    // The parts as the loader leaves them: without the preload all the room
+    // goes to the window and the guest; with it what the pack leaves does.
+    let held = INDEXES_1123 + AHEAD_1123;
+    let without = sizes_with_room(host - held, 8, 8, room, GpuMemory::Own).unwrap();
+    let with = sizes_with_room(host - held - bulk, 8, 8, room - bulk, GpuMemory::Own).unwrap();
+    // The heap moves with the window alone (its block records).
+    assert_eq!(with.pool, without.pool);
+    assert_eq!(
+        with.heap - with.code.window,
+        without.heap - without.code.window
+    );
+    assert!(with.code.window <= without.code.window);
+    assert!(with.code.window >= without.code.window - bulk / 2);
+    assert!(with.guest >= without.guest - bulk);
+    assert!(with.guest > 2 * GUEST_FLOOR);
+    // An 8 GB PC holds as much as its room, the records used first.
+    let small = pack_budget(free(8), 8, 8, GpuMemory::Own) - INDEXES_1123 - AHEAD_1123;
+    assert_eq!(bulk_bound(small, left), small.min(left));
+    let sizes = sizes_with_room(free(8) - held - small, 8, 8, 0, GpuMemory::Own).unwrap();
+    assert!(sizes.guest >= GUEST_FLOOR);
+    // No room, or one below the floor, holds nothing; a huge one the most.
+    assert_eq!(bulk_bound(0, left), 0);
+    assert_eq!(bulk_bound(PRELOAD_FLOOR - 1, left), 0);
+    assert_eq!(bulk_bound(16 * GIB, 4 * GIB), BULK_MOST);
+}
+
+#[test]
+fn a_preload_holds_the_boot_two_seconds_at_most_whatever_the_stick() {
+    let bound = 246 * MIB;
+    // Reading the whole pack before the guest would cost 14 s on USB 2 and
+    // 5 s on USB 3: the reason the read stops at a time bound.
+    assert_eq!(PACK_23 * 1000 / USB_2, 14_228);
+    assert_eq!(PACK_23 * 1000 / USB_3, 4_980);
+    // USB 2: the first 70 MB, in the two seconds.
+    assert_eq!(preload_reads(bound, USB_2), (70_000_000, PRELOAD_MILLIS));
+    // USB 3: 200 MB in two seconds, within the bound.
+    assert_eq!(preload_reads(bound, USB_3), (200_000_000, PRELOAD_MILLIS));
+    // A fast stick or an NVMe reads the bound and stops early.
+    let (bytes, millis) = preload_reads(bound, 400_000_000);
+    assert_eq!(bytes, bound);
+    assert!(millis < 700, "{millis}");
+    // A reader that reads nothing holds the boot no time.
+    assert_eq!(preload_reads(0, USB_2), (0, 0));
+}
+
 #[test]
 fn a_128_gb_pc_keeps_more_for_the_pack() {
     let budget = pack_budget(free(128), 16, 16, GpuMemory::Own);
@@ -1445,4 +1536,49 @@ fn the_plans_line_names_the_room_for_an_integrated_gpu() {
         plan.describe(&roomy)
             .ends_with("Linux's pages then held to 1976M")
     );
+}
+
+/// What a many-core boot costs the guest: the board's code window and the
+/// heap follow the host's RAM, not its PEs, so each PE past 8 takes only
+/// its own 2 MiB of code and its share of the pool. A 16 GiB PC keeps
+/// macOS 9538 MiB on 8 PEs, 9522 MiB on 16 and 9488 MiB on 24; an 8 GiB PC
+/// keeps it above its floor on 24. A host too small for macOS's floor is
+/// refused whatever its PE count, by the same shortfall.
+#[test]
+fn more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused() {
+    for (installed, runners, guest) in [
+        (16, 8, 9538),
+        (16, 12, 9530),
+        (16, 16, 9522),
+        (16, 24, 9488),
+        (8, 16, 4096),
+        (8, 24, 3824),
+    ] {
+        let sizes = sizes(free(installed), runners, runners).unwrap();
+        assert_eq!(sizes.guest, guest * MIB, "{installed} GiB, {runners} PEs");
+        assert!(sizes.guest >= GUEST_FLOOR);
+        assert_eq!(
+            sizes.code.window,
+            sizes_of_window(installed),
+            "{installed} GiB, {runners} PEs"
+        );
+    }
+    for runners in [8, 16, 24] {
+        let refusal = sizes(free(6), runners, runners).unwrap_err().to_string();
+        assert!(
+            refusal.contains("Stambha needs at least"),
+            "{runners}: {refusal}"
+        );
+        assert!(refusal.contains("3 GB for macOS"), "{runners}: {refusal}");
+    }
+}
+
+/// The window [`more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused`]
+/// finds at every PE count of an `installed` GiB host.
+fn sizes_of_window(installed: u64) -> u64 {
+    match installed {
+        8 => 624 * MIB,
+        16 => 1200 * MIB,
+        _ => unreachable!(),
+    }
 }

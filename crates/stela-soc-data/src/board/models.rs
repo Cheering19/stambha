@@ -1,10 +1,11 @@
 //! Compatible and role matching for the native models exposed in the DeviceTree.
 use super::{
-    AES, AICS, ASC, BOOT_FIRMWARE, BUTTONS, CLPC, DCP_EXPERT, DCPEXT_ROLE, DISPEXT, DISPEXT_T6000,
-    DOCK_PORT, GFX_MAPPER, GPIO, GPIO_S5L, GPIO_T6000, HPM, HPM_MANAGER, IOMMU_MAPPER, MCC, NOR,
-    NVRAM, PMGR2_IMPLEMENTATION, PMU, RTBUDDY, SEP, SEP_NUB, SMC_PMU, SOCS, SPI, SPMI, SYSCFG,
-    T6000_EXTERNAL_OUTPUT_ADMITTED, UART, WATCHDOG, admitted_gpu, atc_phy_compatible,
-    dart_topology, gpio_profile, i2c_compatible, memory_resources, usb_controller_compatible,
+    AES, AICS, ASC, BOOT_FIRMWARE, BUTTONS, CLPC, DCP_EXPERT, DCPEXT_ROLE, DISPEXT, DISPEXT_T602X,
+    DISPEXT_T6000, DOCK_PORT, GFX_MAPPER, GPIO, GPIO_S5L, GPIO_T6000, HPM, HPM_MANAGER,
+    IOMMU_MAPPER, MCC, NOR, NVRAM, PMGR2_IMPLEMENTATION, PMU, RTBUDDY, SEP, SEP_NUB, SMC_PMU, SOCS,
+    SPI, SPMI, SYSCFG, T602X_EXTERNAL_OUTPUT_ADMITTED, T6000_EXTERNAL_OUTPUT_ADMITTED, UART,
+    WATCHDOG, admitted_gpu, atc_phy_compatible, dart_topology, gpio_profile, i2c_compatible,
+    memory_resources, usb_controller_compatible,
 };
 
 /// A compatible may require a distinguishing property and may own children
@@ -212,6 +213,11 @@ pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bo
         // Direct MCC has a native cold owner. Its descriptor must still pass
         // full source validation and mount requires that owner.
         memory_resources::COMPATIBLE,
+        // The T602x MCC (`mcc,t6020`, every M2 Pro, Max and Ultra board)
+        // has Tyler's cold owner (`memory_resources::t6020`); a plan it
+        // refuses at boot is reported as `UNMODELED T602x memory cache`.
+        // No M2 Mac mini tree names it.
+        memory_resources::t6020::COMPATIBLE,
         SPI,
         NOR,
         BOOT_FIRMWARE,
@@ -231,6 +237,7 @@ pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bo
         || i2c_compatible(name, property("compatible"))
         || usb_controller_compatible(name, property("compatible"))
         || T6000_EXTERNAL_OUTPUT_ADMITTED && name == DISPEXT_T6000
+        || T602X_EXTERNAL_OUTPUT_ADMITTED && name == DISPEXT_T602X
         || [GPIO_T6000, GPIO_S5L].contains(&name)
             && gpio_profile(&property) == Some(crate::gpio::Profile::S5l8960x)
         || crate::dart::Profile::from_compatible(name.as_bytes()).is_some_and(|profile| {

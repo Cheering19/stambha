@@ -626,12 +626,19 @@ pub struct Statistics {
     /// the counter ticks of all of them in the engine's forgetting and in
     /// the host's shadow, those two under step timing only.
     pub whole_tlbi_times: [u64; 3],
+    /// What came before those TLBIs ([`WholeTlbiTrigger`]).
+    pub whole_tlbi_trigger: WholeTlbiTrigger,
+    /// What keeping the contexts across those TLBIs did (`--tlbi-keep on`,
+    /// [`TlbiKeepCounts`]).
+    pub tlbi_keep: TlbiKeepCounts,
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
     pub self_loops: u64,
     /// Of `compiled`, the regions (`CompiledBlock::region`).
     pub regions: u64,
+    /// What tier 2 did (`--tier2`, [`super::tier2`]).
+    pub tier2: super::tier2::Tier2Counts,
     /// Counter ticks spent analyzing and compiling `compiled`.
     pub compile_ticks: u64,
     /// Blocks taken from the persistent translation store instead of
@@ -827,6 +834,122 @@ impl WholeTlbiSites {
     }
 }
 
+/// The samples a [`WholeTlbiTrigger`] keeps.
+pub const WHOLE_TLBI_SAMPLES: usize = 4;
+/// One TLBI of everything in this many is sampled, under step timing.
+pub const WHOLE_TLBI_SAMPLE_EVERY: u64 = 4096;
+
+/// What came before a PE's own TLBIs of everything, to find what makes a
+/// guest flush everything at context-switch rate: whether TTBR0_EL1
+/// changed since the PE's previous one (an address-space switch between
+/// the two, natively or not), and, under step timing (`--profile`), a
+/// rate-limited sample of where it was called from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(feature = "std", feature = "native-profile"),
+    derive(serde::Serialize)
+)]
+pub struct WholeTlbiTrigger {
+    /// Those that found TTBR0_EL1 as the PE's previous one left it, and
+    /// those that found it changed.
+    pub switched: [u64; 2],
+    /// One in [`WHOLE_TLBI_SAMPLE_EVERY`] under step timing: its PC, X16,
+    /// X30, and TTBR0_EL1 at the PE's previous one and now; the latest
+    /// first, `[0; 5]` none.
+    pub samples: [[u64; 5]; WHOLE_TLBI_SAMPLES],
+}
+
+impl WholeTlbiTrigger {
+    /// Count one with TTBR0_EL1 `switched` or not, and keep `sample`.
+    pub fn note(&mut self, switched: bool, sample: Option<[u64; 5]>) {
+        self.switched[usize::from(switched)] += 1;
+        if let Some(sample) = sample {
+            self.samples.copy_within(..WHOLE_TLBI_SAMPLES - 1, 1);
+            self.samples[0] = sample;
+        }
+    }
+
+    /// Add `other`'s counts; its samples go first.
+    pub fn add(&mut self, other: &Self) {
+        self.switched[0] += other.switched[0];
+        self.switched[1] += other.switched[1];
+        let mut samples = [[0; 5]; WHOLE_TLBI_SAMPLES];
+        let kept = other
+            .samples
+            .iter()
+            .chain(&self.samples)
+            .filter(|sample| **sample != [0; 5]);
+        for (into, sample) in samples.iter_mut().zip(kept) {
+            *into = *sample;
+        }
+        self.samples = samples;
+    }
+}
+
+/// The mismatches a [`TlbiKeepCounts`] keeps.
+pub const TLBI_KEEP_SAMPLES: usize = 4;
+
+/// What one PE's keeping of its lookup contexts across TLBIs of everything
+/// did (`--tlbi-keep on`, `tlbi_keep.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(feature = "std", feature = "native-profile"),
+    derive(serde::Serialize)
+)]
+pub struct TlbiKeepCounts {
+    /// TLBIs of everything that kept the contexts, and the contexts they
+    /// marked unverified.
+    pub tlbis: u64,
+    pub contexts: u64,
+    /// Kept contexts verified at their next fetch, and those forgotten
+    /// instead: an ITLB entry of theirs had no walk record, or the fetch
+    /// ran in another state than their key's.
+    pub verified: u64,
+    pub forgotten: u64,
+    /// ITLB entries verification kept, and those it dropped (a descriptor,
+    /// the TTBR0 of a lower-half page, the host's fetch permission or the
+    /// entry's block key no longer what the walk recorded).
+    pub kept: u64,
+    pub dropped: u64,
+    /// Under `--tlbi-verify-check`: the kept entries walked again in full,
+    /// and those whose walk gave something else, which were dropped.
+    pub checked: u64,
+    pub mismatches: u64,
+    /// Counter ticks spent verifying.
+    pub ticks: u64,
+    /// The first mismatches: the page, the context, the ITLB entry's block
+    /// key and the frame the walk gave (`u64::MAX` for none); `[0; 4]` none.
+    pub samples: [[u64; 4]; TLBI_KEEP_SAMPLES],
+}
+
+impl TlbiKeepCounts {
+    /// Count a mismatch, keeping the first few.
+    pub fn mismatch(&mut self, sample: [u64; 4]) {
+        if let Some(free) = self.samples.iter_mut().find(|held| **held == [0; 4]) {
+            *free = sample;
+        }
+        self.mismatches += 1;
+    }
+
+    /// Add `other`'s counts, and its samples where room is left.
+    pub fn add(&mut self, other: &Self) {
+        self.tlbis += other.tlbis;
+        self.contexts += other.contexts;
+        self.verified += other.verified;
+        self.forgotten += other.forgotten;
+        self.kept += other.kept;
+        self.dropped += other.dropped;
+        self.checked += other.checked;
+        self.mismatches += other.mismatches;
+        self.ticks += other.ticks;
+        for &sample in other.samples.iter().filter(|sample| **sample != [0; 4]) {
+            if let Some(free) = self.samples.iter_mut().find(|held| **held == [0; 4]) {
+                *free = sample;
+            }
+        }
+    }
+}
+
 /// [`MailWait`]'s parts.
 pub const MAIL_WAITS: usize = MailWait::LongestNative as usize + 1;
 
@@ -835,6 +958,7 @@ impl core::ops::AddAssign for Statistics {
         let Self {
             blocks,
             replaced_retired,
+            tier2,
             chained,
             links,
             stamped_tails,
@@ -861,6 +985,8 @@ impl core::ops::AddAssign for Statistics {
             itlb_sources,
             whole_tlbi_sites,
             whole_tlbi_times,
+            whole_tlbi_trigger,
+            tlbi_keep,
             compiled,
             self_loops,
             regions,
@@ -1019,6 +1145,9 @@ impl core::ops::AddAssign for Statistics {
         for (total, count) in self.whole_tlbi_times.iter_mut().zip(whole_tlbi_times) {
             *total += count;
         }
+        self.whole_tlbi_trigger.add(&whole_tlbi_trigger);
+        self.tlbi_keep.add(&tlbi_keep);
+        self.tier2 += tier2;
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
         }

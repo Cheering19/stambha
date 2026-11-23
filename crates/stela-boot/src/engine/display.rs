@@ -335,6 +335,11 @@ impl Staged {
     }
 }
 
+/// Whether the guest's first frame took the screen from Stela's console.
+pub(super) fn guest_shown() -> bool {
+    DCP_PRESENTED.load(Ordering::Relaxed)
+}
+
 /// Take the screen from Stela's console for the DCP's first frame.
 fn take_screen() -> bool {
     if !DCP_PRESENTED.load(Ordering::Relaxed) {

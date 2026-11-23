@@ -164,11 +164,6 @@ impl<C: 'static> HardwareKey<C> {
         receive: PacketNumber,
     ) -> Result<Identity, super::Error> {
         self.check(mailbox)?;
-        if mailbox.identity.chip != Chip::Mt7925 {
-            return Err(super::Error::Request(
-                crate::wifi::mediatek::mcu::key::Error::UnsupportedBip,
-            ));
-        }
         let s = self.owned_mut();
         if s.phase != Phase::Installed {
             return Err(super::Error::Bip(Error::DataKeyRequired));
@@ -287,8 +282,9 @@ fn hardware_request<C>(
     .map_err(super::Error::Request)
 }
 
-/// Management-material history survives removal/rebind: a new key index
-/// must not revive retired temporal material with a reset replay namespace.
+/// Management-material history survives removal within an association: a
+/// new key index must not revive retired temporal material with a reset
+/// replay namespace. A rebind to a new association clears it.
 fn reserve_material<C>(s: &Owned<C>, digest: [u8; 32]) -> Result<usize, super::Error> {
     let mut empty = None;
     let mut reused = false;

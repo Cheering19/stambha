@@ -727,6 +727,227 @@ fn a_whole_tlbi_refills_a_leaf_through_the_page_its_fetch_took() {
     assert_eq!(machine.statistics.itlb[0], misses);
 }
 
+/// After a TLBI of everything, the refill of the pages the forgotten context
+/// took walks each from the leaf table the walk before it read, not from
+/// the table base: one descriptor a page past the first. It takes what a
+/// full walk of each now gives, as before the memo: the pages that still
+/// translate come back with their keys, a page moved to another frame comes
+/// back with that frame's, and a page unmapped or made non-executable
+/// between the fills and the TLBI is not taken.
+#[test]
+fn a_whole_tlbi_refill_walks_from_the_leaf_table_and_takes_what_full_walks_give() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 48;
+    const FRAMES: u64 = 8;
+    let mut words = vec![0u32; (FRAMES * 0x1000 / 4) as usize];
+    for frame in 0..FRAMES as usize {
+        words[frame * 0x400] = RET;
+    }
+    let pc = |page: u64| BASE + page * 0x1000;
+    let frame = |page: u64| BASE + (page % FRAMES) * 0x1000;
+    let mut machine = machine(&words);
+    let frames: Vec<u64> = (0..PAGES).map(frame).collect();
+    paged_space(&mut machine, 0, &frames);
+    let fetch = |machine: &mut Machine<FakeHost, NoDevices>, page| {
+        assert!(matches!(
+            machine.fetch_block(pc(page), false),
+            Ok(Fetched::Block(_))
+        ));
+    };
+    for page in 0..PAGES {
+        fetch(&mut machine, page);
+    }
+    let keys: Vec<u64> = (0..PAGES)
+        .map(|page| machine.current_key(pc(page)).expect("taken"))
+        .collect();
+    // Between the fills and the TLBI: page 5 unmapped, page 6 moved to the
+    // frame page 7 maps, page 7 made privileged-execute-never.
+    let [_, _, l3] = SPACES_TABLES[0];
+    write_entry(&mut machine, l3 + 5 * 8, 0);
+    write_entry(&mut machine, l3 + 6 * 8, page_descriptor(frame(7), false));
+    write_entry(&mut machine, l3 + 7 * 8, page_descriptor(frame(7), true));
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    let context = machine.chain.contexts()[1];
+    let reads = machine.host.descriptor_reads;
+    fetch(&mut machine, 0);
+    let reads = machine.host.descriptor_reads - reads;
+    // The fetch runs in a context made anew.
+    assert_ne!(machine.chain.contexts()[1], context);
+    for page in 0..PAGES {
+        let expected = match page {
+            5 | 7 => None,
+            6 => Some(keys[7]),
+            _ => Some(keys[page as usize]),
+        };
+        assert_eq!(machine.current_key(pc(page)), expected, "page {page}");
+    }
+    // A full walk reads three descriptors (levels 1 to 3); the batch reads
+    // them for its first page and the leaf alone for each one after.
+    assert!(reads < 2 * PAGES as usize, "{reads} descriptor reads");
+    assert!(reads >= PAGES as usize - 1, "{reads} descriptor reads");
+}
+
+/// The acceptance set for any change to what a TLBI of everything keeps
+/// (the deep dive's "verify instead of forget", #1(c)): after the guest
+/// rewrites its tables and issues one, every fetch runs what its walk now
+/// gives, whatever the ITLB, the block table and the contexts held before.
+/// Each scenario runs on a machine of its own, whose space 0 maps pages 0
+/// to 3 at frames 0 to 3, private (nG) to ASID 1, each page fetched once:
+///
+/// - a page remapped to another frame runs that frame;
+/// - a page unmapped faults;
+/// - a page made privileged-execute-never faults;
+/// - an address space whose TTBR0 value (table base and ASID) a new
+///   process reuses, with other mappings, runs the new process's frame;
+/// - of one VA in two address spaces, the one whose mapping changed runs
+///   its new frame and the other keeps its own;
+///
+/// and in each the pages it did not change still run their frames. Every
+/// scenario fails where the TLBI keeps a context's entries without checking
+/// them, as removing its forgetting from `tlb_maintained` shows (all five).
+/// With `--tlbi-keep on` (`tlbi_keep.rs`) they run in `tests/tlbi_keep.rs`,
+/// with the check and under the mutation that keeps without verifying.
+#[test]
+fn after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives() {
+    let (failed, _) = whole_tlbi_acceptance(&|_| {});
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The scenarios of [`after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives`],
+/// each on a machine `configure` sets up before its first fetch: what failed,
+/// and what keeping the contexts did on all of them.
+pub(super) fn whole_tlbi_acceptance(
+    configure: &dyn Fn(&mut Machine<FakeHost, NoDevices>),
+) -> (Vec<String>, TlbiKeepCounts) {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    const NG: u64 = 1 << 11;
+    const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
+    const FRAMES: u64 = 4;
+    type M = Machine<FakeHost, NoDevices>;
+    let frame = |n: u64| BASE + n * 0x1000;
+    let pc = |page: u64| BASE + page * 0x1000;
+    let [_, _, l3] = SPACES_TABLES[0];
+    let [_, _, l3_other] = SPACES_TABLES[1];
+    let map = |machine: &mut M, l3: u64, page: u64, frame: u64| {
+        write_entry(machine, l3 + page * 8, page_descriptor(frame, false) | NG);
+    };
+    let select = |machine: &mut M, space: usize, asid: u64| {
+        let [l1, _, _] = SPACES_TABLES[space];
+        machine.cpu.state.x[0] = (BASE + l1) | asid << 48;
+        machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+    };
+    // What a fetch of `pc` runs: its page's key, or None for a fault.
+    let run = |machine: &mut M, pc: u64| -> Option<u64> {
+        match machine.fetch_block(pc, false) {
+            Ok(Fetched::Block(_)) => Some(machine.current_key(pc).expect("taken")),
+            Ok(Fetched::Exception(_)) => None,
+            _ => panic!("{pc:#x}: neither a block nor an exception"),
+        }
+    };
+    let all = |machine: &mut M| machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    // A machine with space 0 set up and run, and each frame's key.
+    let start = || -> (M, Vec<u64>) {
+        let mut words = vec![0u32; (FRAMES * 0x1000 / 4) as usize];
+        for frame in 0..FRAMES as usize {
+            words[frame * 0x400] = RET;
+        }
+        let mut machine = machine(&words);
+        configure(&mut machine);
+        paged_space(&mut machine, 0, &(0..FRAMES).map(frame).collect::<Vec<_>>());
+        for page in 0..FRAMES {
+            map(&mut machine, l3, page, frame(page));
+        }
+        select(&mut machine, 0, 1);
+        let keys: Vec<u64> = (0..FRAMES)
+            .map(|page| run(&mut machine, pc(page)).expect("mapped"))
+            .collect();
+        assert_eq!(
+            keys.iter()
+                .collect::<alloc::collections::BTreeSet<_>>()
+                .len(),
+            FRAMES as usize,
+            "one key a frame"
+        );
+        (machine, keys)
+    };
+    // Each scenario: what each fetch it makes after the TLBI ran, and what
+    // the walk then gives.
+    type Check = (&'static str, Option<u64>, Option<u64>);
+    type Scenario<'a> = &'a dyn Fn(&mut M, &[u64]) -> Vec<Check>;
+    let scenarios: [(&str, Scenario); 5] = [
+        ("remapped page", &|machine, keys| {
+            map(machine, l3, 0, frame(1));
+            all(machine);
+            vec![
+                ("page 0", run(machine, pc(0)), Some(keys[1])),
+                ("page 3", run(machine, pc(3)), Some(keys[3])),
+            ]
+        }),
+        ("unmapped page", &|machine, keys| {
+            write_entry(machine, l3 + 8, 0);
+            all(machine);
+            vec![
+                ("page 1", run(machine, pc(1)), None),
+                ("page 3", run(machine, pc(3)), Some(keys[3])),
+            ]
+        }),
+        ("execute-never page", &|machine, keys| {
+            write_entry(machine, l3 + 2 * 8, page_descriptor(frame(2), true) | NG);
+            all(machine);
+            vec![
+                ("page 2", run(machine, pc(2)), None),
+                ("page 3", run(machine, pc(3)), Some(keys[3])),
+            ]
+        }),
+        ("reused TTBR0 and ASID", &|machine, keys| {
+            // The process goes; another runs (ASID 2); a new process takes
+            // the first one's table base and ASID with page 3 at frame 0,
+            // and the kernel flushes before it runs.
+            select(machine, 0, 2);
+            map(machine, l3, 3, frame(0));
+            all(machine);
+            select(machine, 0, 1);
+            vec![
+                ("page 3", run(machine, pc(3)), Some(keys[0])),
+                ("page 1", run(machine, pc(1)), Some(keys[1])),
+            ]
+        }),
+        ("one VA in two spaces", &|machine, keys| {
+            // Space 1 (ASID 3) maps page 0 at frame 2, and runs it.
+            paged_space(machine, 1, &[frame(2)]);
+            map(machine, l3_other, 0, frame(2));
+            select(machine, 1, 3);
+            let before = run(machine, pc(0));
+            // Then maps it at frame 3, and flushes.
+            map(machine, l3_other, 0, frame(3));
+            all(machine);
+            let changed = run(machine, pc(0));
+            select(machine, 0, 1);
+            vec![
+                ("space 1 before", before, Some(keys[2])),
+                ("space 1 after", changed, Some(keys[3])),
+                ("space 0", run(machine, pc(0)), Some(keys[0])),
+            ]
+        }),
+    ];
+    let mut failed = Vec::new();
+    let mut kept = TlbiKeepCounts::default();
+    for (name, scenario) in scenarios {
+        let (mut machine, keys) = start();
+        for (what, ran, expected) in scenario(&mut machine, &keys) {
+            if ran != expected {
+                failed.push(alloc::format!(
+                    "{name}, {what}: ran {ran:x?}, its walk gives {expected:x?}"
+                ));
+            }
+        }
+        kept.add(&machine.statistics.tlbi_keep);
+    }
+    (failed, kept)
+}
+
 /// A machine running `words` at BASE through 4 KiB pages of address
 /// space 0, page `n` at frame `BASE + n * 4 KiB`.
 fn machine_with_pages(words: &[u32]) -> Machine<FakeHost, NoDevices> {

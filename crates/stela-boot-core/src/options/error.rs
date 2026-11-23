@@ -84,6 +84,20 @@ pub enum Error {
     DuplicateLaptop,
     HybridScanout,
     DuplicateHybridScanout,
+    AsusMode,
+    DuplicateAsusMode,
+    TlbiKeep,
+    DuplicateTlbiKeep,
+    DuplicateTlbiVerifyCheck,
+    HostCore,
+    DuplicateHostCore,
+    GpuAspm,
+    DuplicateGpuAspm,
+    Tier2,
+    DuplicateTier2,
+    Tier2CheckOff,
+    PackPreload,
+    DuplicatePackPreload,
     DuplicateAudioHpet,
     DuplicateNativePciIoapic,
     MissingAudioMode,
@@ -119,6 +133,8 @@ pub enum Error {
     DuplicateNativeBootstrap,
     AmxNative,
     DuplicateAmxNative,
+    DuplicateHle,
+    HleId,
     Constraint(Constraint),
     Target {
         argument: TargetArgument,
@@ -157,6 +173,7 @@ pub enum Constraint {
     NativePciIoapicExclusive,
     LidSleepDependency,
     TrackpadDependency,
+    CoreTrial,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -233,6 +250,20 @@ impl Error {
             Self::DuplicateLaptop => "duplicate --laptop",
             Self::HybridScanout => "--hybrid-scanout takes on or off",
             Self::DuplicateHybridScanout => "duplicate --hybrid-scanout",
+            Self::AsusMode => "--asus-mode takes performance, turbo, silent or off",
+            Self::DuplicateAsusMode => "duplicate --asus-mode",
+            Self::TlbiKeep => "--tlbi-keep takes on or off",
+            Self::DuplicateTlbiKeep => "duplicate --tlbi-keep",
+            Self::DuplicateTlbiVerifyCheck => "duplicate --tlbi-verify-check",
+            Self::HostCore => "--host-core takes on or off",
+            Self::DuplicateHostCore => "duplicate --host-core",
+            Self::GpuAspm => "--gpu-aspm takes off or firmware",
+            Self::DuplicateGpuAspm => "duplicate --gpu-aspm",
+            Self::Tier2 => "--tier2 takes on or off",
+            Self::DuplicateTier2 => "duplicate --tier2",
+            Self::Tier2CheckOff => "--tier2-check runs tier 2, which --tier2 off turns off",
+            Self::PackPreload => "--pack-preload takes on or off",
+            Self::DuplicatePackPreload => "duplicate --pack-preload",
             Self::DuplicateAudioHpet => "duplicate audio HPET handoff",
             Self::DuplicateNativePciIoapic => "duplicate native PCI IOAPIC handoff",
             Self::MissingAudioMode => "missing audio check mode",
@@ -272,6 +303,10 @@ impl Error {
                 "--amx-native takes on, off, or off: and AMX register operations such as fma32,vecfp"
             }
             Self::DuplicateAmxNative => "duplicate --amx-native",
+            Self::DuplicateHle => "--hle and --hle-off each occur once",
+            Self::HleId => {
+                "--hle-off needs distinct routines separated by commas: memmove, bzero, memset, memcmp or strlen"
+            }
             Self::Constraint(rule) => rule.message(),
             Self::Target { source, .. } | Self::Guid { source, .. } => source,
             Self::BootCommandOrigin { source, .. } => source,
@@ -319,6 +354,11 @@ impl Constraint {
             Self::LidSleepDependency => "--lid-sleep requires --lid method",
             Self::TrackpadDependency => {
                 "--trackpad needs --input: the trackpad sits on the native keyboard and pointer's hub"
+            }
+            Self::CoreTrial => {
+                "--core-trial writes nothing: it needs --bundle, --storage-ram and --native-cores, and \
+                 refuses --storage, --nor, --preboot, --install, --restore-study, --external-disks, \
+                 --usb-storage and --wifi, each of which can write a disk"
             }
         }
     }

@@ -38,6 +38,54 @@ impl ParseState<'_> {
             "--profile" => options.profile = true,
             "--lid-sleep" => options.lid_sleep = true,
             "--brightness-keys" => options.brightness_keys = true,
+            ACPI_HARDWARE => options.acpi_hardware = true,
+            HOST_CORE => {
+                let on = match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::HostCore),
+                };
+                if options.host_core.replace(on).is_some() {
+                    return Err(Error::DuplicateHostCore);
+                }
+            }
+            KEEP_RUNNING_ON_PANIC => options.keep_running_on_panic = true,
+            TLBI_KEEP => {
+                let keep = match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::TlbiKeep),
+                };
+                if options.tlbi_keep.replace(keep).is_some() {
+                    return Err(Error::DuplicateTlbiKeep);
+                }
+            }
+            TLBI_VERIFY_CHECK => flag(
+                &mut options.tlbi_verify_check,
+                Error::DuplicateTlbiVerifyCheck,
+            )?,
+            CORE_TRIAL => options.core_trial = true,
+            TIER2 => {
+                let on = match value().ok_or(Error::Tier2)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::Tier2),
+                };
+                if options.tier2.replace(on).is_some() {
+                    return Err(Error::DuplicateTier2);
+                }
+            }
+            TIER2_CHECK => options.tier2_check = true,
+            PACK_PRELOAD => {
+                let on = match value().ok_or(Error::PackPreload)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::PackPreload),
+                };
+                if options.pack_preload.replace(on).is_some() {
+                    return Err(Error::DuplicatePackPreload);
+                }
+            }
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);
@@ -60,11 +108,31 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateHybridScanout);
                 }
             }
+            ASUS_MODE => {
+                let mode = AsusMode::parse(value().ok_or(Error::AsusMode)?)?;
+                if options.asus_mode.replace(mode).is_some() {
+                    return Err(Error::DuplicateAsusMode);
+                }
+            }
+            GPU_ASPM => {
+                let aspm = GpuAspm::parse(value().ok_or(Error::GpuAspm)?)?;
+                if options.gpu_aspm.replace(aspm).is_some() {
+                    return Err(Error::DuplicateGpuAspm);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {
                     return Err(Error::DuplicateAmxNative);
                 }
+            }
+            "--hle" => flag(&mut options.hle, Error::DuplicateHle)?,
+            "--hle-off" => {
+                // A list is never empty, so an empty one is none yet.
+                if !options.hle_off.is_empty() {
+                    return Err(Error::DuplicateHle);
+                }
+                options.hle_off = hle_routines(value().ok_or(Error::HleId)?)?;
             }
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
@@ -417,6 +485,9 @@ impl ParseState<'_> {
         let options = &mut self.options;
         if options.native_rounds || options.native_shared_check || options.native_bootstrap_check {
             options.parallel = false;
+        }
+        if options.tier2_check && options.tier2 == Some(false) {
+            return Err(Error::Tier2CheckOff);
         }
         if options.ssid.is_some() && options.wifi_key.is_none() {
             options.wifi_key = Some(String::from(DEFAULT_WIFI_KEY));

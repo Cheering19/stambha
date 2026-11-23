@@ -225,7 +225,7 @@ fn claimed(result: Result<Claimed, Failure>) -> Claimed {
 #[test]
 fn a_reset_radio_is_bound_and_may_master() {
     let (mount, root) = mount(0x8086, 0x2725, 1 << 28);
-    let mut claimed = claimed(claim_quiesced(&mount, ADDRESS, Chip::Intel, |_| Ok(())));
+    let mut claimed = claimed(claim_quiesced(&mount, ADDRESS, |_| Ok(Chip::Intel)));
     assert_eq!(claimed.quiesced.reset, super::Reset::FunctionLevel);
     assert_eq!(*root.events.lock().unwrap(), ["drain", "bind"]);
     let command = claimed.function.config().read16(regs::COMMAND).unwrap();
@@ -250,7 +250,7 @@ fn kept(failure: Failure) -> (Error, PreparingRequester) {
 #[test]
 fn an_unprovable_radio_keeps_its_seal() {
     let (mount, root) = mount(0x14c3, 0x7925, 1 << 28);
-    let Err(failure) = claim_quiesced(&mount, ADDRESS, Chip::Mt7925, |_| Ok(())) else {
+    let Err(failure) = claim_quiesced(&mount, ADDRESS, |_| Ok(Chip::Mt7925)) else {
         panic!("an MT7925 without a bus reset was claimed");
     };
     let (error, mut requester) = kept(failure);
@@ -280,7 +280,7 @@ fn an_unprovable_radio_keeps_its_seal() {
 #[test]
 fn a_refused_radio_is_not_reset() {
     let (mount, root) = mount(0x8086, 0x9df0, 1 << 28);
-    let Err(failure) = claim_quiesced(&mount, ADDRESS, Chip::Intel, |_| {
+    let Err(failure) = claim_quiesced(&mount, ADDRESS, |_| {
         Err(Error::Native(ServiceError::Refused("not this radio")))
     }) else {
         panic!("a refused radio was claimed");

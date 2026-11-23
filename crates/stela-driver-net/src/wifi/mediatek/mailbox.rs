@@ -29,6 +29,9 @@ static NEXT_OWNER: crate::wifi::Identities = crate::wifi::Identities::new();
 // PCI send callbacks override the generic fill helper's 20*HZ with
 // 3*HZ before the common MCU owner computes its response expiry.
 const PCI_TIMEOUT_US: u64 = 3_000_000;
+/// Once the station runs, a command past the keeper's bound is a command
+/// timeout, as one past [`PCI_TIMEOUT_US`] is during the attach.
+pub use crate::wifi::connection::keeper::RUNTIME_COMMAND_TIMEOUT_US as RUNTIME_TIMEOUT_US;
 const MAX_EVENTS: usize = 64;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,6 +250,9 @@ pub struct Mailbox<W: QueueIo, F: QueueIo, R: QueueIo> {
     last_failure: Option<Failure>,
     events: Vec<Frame>,
     event_bytes: usize,
+    /// Frames dropped as mt76 drops them: marked dropped by the hardware,
+    /// or arriving while the held events were full.
+    dropped_events: u64,
     replies: Vec<Reply>,
     interrupted_unified_reply: Option<UnifiedReply>,
     interrupted_capability_reply: Option<CapabilityReply>,
@@ -256,8 +262,15 @@ pub struct Mailbox<W: QueueIo, F: QueueIo, R: QueueIo> {
     download_binding: Option<firmware::Binding>,
     source_restart_cookie: Option<u64>,
     interrupted_initial_reply: Option<init::Reply>,
+    /// The station runs: each command waits at most [`RUNTIME_TIMEOUT_US`].
+    runtime: bool,
 }
 impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
+    /// Bound every later command by [`RUNTIME_TIMEOUT_US`]; the attach's
+    /// longer waits are over.
+    pub(in crate::wifi::mediatek) fn enter_runtime(&mut self) {
+        self.runtime = true;
+    }
     /// # Safety
     /// All three queues must belong exclusively to this one
     /// observed identity/requester and the same coherent native DMA attachment.
@@ -300,6 +313,7 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             last_failure: None,
             events: Vec::new(),
             event_bytes: 0,
+            dropped_events: 0,
             replies: Vec::new(),
             interrupted_unified_reply: None,
             interrupted_capability_reply: None,
@@ -309,6 +323,7 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             download_binding: None,
             source_restart_cookie: None,
             interrupted_initial_reply: None,
+            runtime: false,
         })
     }
     /// # Safety
@@ -349,6 +364,10 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
     /// Transfer kept asynchronous/unmatched frames to the owning
     /// controller for bounded dispatch. Their descriptor/drop evidence remains
     /// attached; removing them does not repair or reopen a poisoned epoch.
+    /// How many frames were dropped instead of held.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
     pub fn take_events(&mut self) -> Vec<Frame> {
         self.event_bytes = 0;
         core::mem::take(&mut self.events)
@@ -365,9 +384,11 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
                 let Some(frame) = self.next_frame().map_err(Cause::Ring)? else {
                     break;
                 };
-                let core = Event::parse(self.identity.chip, &frame.bytes)
-                    .is_ok_and(|e| e.event_id == 0xf0 || (e.option & 2 != 0 && e.event_id == 0x0a));
-                self.retain(frame)?;
+                let core = !frame.drop
+                    && Event::parse(self.identity.chip, &frame.bytes).is_ok_and(|e| {
+                        e.event_id == 0xf0 || (e.option & 2 != 0 && e.event_id == 0x0a)
+                    });
+                self.retain(frame);
                 if core {
                     return Err(Cause::CoreDump);
                 }
@@ -463,14 +484,20 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             port: PortState::Uncertain,
         }
     }
-    fn retain(&mut self, frame: Frame) -> Result<(), Cause> {
-        if self.events.len() == MAX_EVENTS || self.event_bytes + frame.bytes.len() > MAX_EVENT_BYTES
+    /// Hold an asynchronous frame for the controller. As mt76's receive path
+    /// frees a frame it cannot take and goes on, a frame the hardware marked
+    /// dropped, or one beyond the held bounds, is counted and dropped; the
+    /// mailbox stays usable.
+    fn retain(&mut self, frame: Frame) {
+        if frame.drop
+            || self.events.len() == MAX_EVENTS
+            || self.event_bytes + frame.bytes.len() > MAX_EVENT_BYTES
         {
-            return Err(Cause::EventLimit);
+            self.dropped_events = self.dropped_events.saturating_add(1);
+            return;
         }
         self.event_bytes += frame.bytes.len();
         self.events.push(frame);
-        Ok(())
     }
     fn next_frame(&mut self) -> Result<Option<Frame>, ring::Error> {
         if let Some(runtime) = self.runtime_rx.as_mut() {
@@ -611,6 +638,11 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             Queue::FirmwareDownload => self.fwdl.submit(cookie, packet.bytes()),
         };
         submit.map_err(|e| self.failure(command, sequence, false, Cause::Ring(e)))?;
+        let timeout_us = if self.runtime {
+            timeout_us.min(RUNTIME_TIMEOUT_US)
+        } else {
+            timeout_us
+        };
         let deadline = self.clock.deadline(timeout_us);
         let mut dma_released = false;
         let mut reply: Option<(u32, ReplySlot)> = None;
@@ -636,14 +668,13 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
                 .map_err(|e| self.failure(command, sequence, dma_released, Cause::Ring(e)))?
             {
                 if frame.drop {
-                    self.retain(frame)
-                        .map_err(|e| self.failure(command, sequence, dma_released, e))?;
-                    return Err(self.failure(
-                        command,
-                        sequence,
-                        dma_released,
-                        Cause::Message(mcu::Error::NotResponse),
-                    ));
+                    // mt76_dma_rx_process frees it and waits on: the reply
+                    // may still come.
+                    self.retain(frame);
+                    if deadline.passed() {
+                        return Err(self.failure(command, sequence, dma_released, Cause::Timeout));
+                    }
+                    continue;
                 }
                 let event = Event::parse(self.identity.chip, &frame.bytes);
                 match event {
@@ -651,8 +682,7 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
                         if event.event_id == 0xf0
                             || (event.option & 2 != 0 && event.event_id == 0x0a) =>
                     {
-                        self.retain(frame)
-                            .map_err(|e| self.failure(command, sequence, dma_released, e))?;
+                        self.retain(frame);
                         return Err(self.failure(command, sequence, dma_released, Cause::CoreDump));
                     }
                     Ok(event) => match packet.result(&event) {
@@ -731,13 +761,9 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
                             };
                             reply = Some((result, index));
                         }
-                        _ => self
-                            .retain(frame)
-                            .map_err(|e| self.failure(command, sequence, dma_released, e))?,
+                        _ => self.retain(frame),
                     },
-                    Err(_) => self
-                        .retain(frame)
-                        .map_err(|e| self.failure(command, sequence, dma_released, e))?,
+                    Err(_) => self.retain(frame),
                 }
             }
             if dma_released && (!packet.expects_response() || reply.is_some()) {

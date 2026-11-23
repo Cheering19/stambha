@@ -17,7 +17,8 @@ use reports::*;
 pub use reports::{
     DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
     Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit, WholeTlbiSites,
+    Suspension, TLBI_KEEP_SAMPLES, TRACE_HITS, TlbiKeepCounts, TraceHit, WATCH_HITS,
+    WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES, WatchHit, WholeTlbiSites, WholeTlbiTrigger,
 };
 mod amx;
 pub use amx::{AmxCell, AmxCounts, AmxForms, FORMS};
@@ -43,6 +44,7 @@ mod fetch;
 #[cfg(all(feature = "std", feature = "native-profile"))]
 pub mod floating_profile;
 mod guarded;
+mod hle;
 mod install_census;
 pub mod installed_code;
 mod interrupts;
@@ -61,6 +63,7 @@ mod scheduler;
 mod system_access;
 mod table_switches;
 mod timing;
+mod tlbi_keep;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
 pub use churn::ChurnCounts;
@@ -96,6 +99,8 @@ pub mod step_timing;
 mod stored;
 mod system;
 mod tags;
+pub mod tier2;
+mod tier2_check;
 mod unprivileged;
 mod watch;
 pub use budget::RunBudget;
@@ -478,6 +483,11 @@ struct Block {
     /// exit is the site's access, on whichever PE runs it, whether or not
     /// that PE learnt the site.
     device_stub: bool,
+    /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
+    /// ends, which a fault inside it is taken back from.
+    hle: Option<hle::Mark>,
+    /// A tier-2 block ([`tier2`]), installed in its tier-1 block's place.
+    tier2: bool,
 }
 
 // The board keeps one per block, millions in all.
@@ -602,7 +612,7 @@ impl Successor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct FetchEntry {
     page: u64,
     physical: u64,
@@ -618,13 +628,34 @@ struct FetchEntry {
 
 /// A walk no instruction asked for ([`Machine::quiet_fetch_physical`]):
 /// the page's frame, its leaf's guarded and global bits, and the bytes the
-/// leaf maps over both stages.
+/// leaf maps over both stages; with `--tlbi-keep on`, what the walk read
+/// ([`tlbi_keep::WalkRecord`]).
 #[derive(Clone, Copy)]
 struct QuietFetch {
     physical: u64,
     guarded: bool,
     global: bool,
     size: u64,
+    record: Option<tlbi_keep::WalkRecord>,
+}
+
+/// One batch of walks no instruction asked for ([`Machine::refill_pages`]):
+/// the controls and requester the fetch runs under, which no walk of the
+/// batch changes, and the table the last walk read ([`mmu::WalkMemo`]).
+struct QuietWalk {
+    controls: mmu::Controls,
+    requester: mmu::Requester,
+    memo: mmu::WalkMemo,
+}
+
+impl QuietWalk {
+    fn new(cpu: &Cpu) -> Self {
+        Self {
+            controls: cpu.controls(cpu.regime()),
+            requester: cpu.requester(),
+            memo: mmu::WalkMemo::default(),
+        }
+    }
 }
 
 /// What a half's cached fetches and lookup contexts last as long as: the
@@ -742,6 +773,8 @@ pub struct Machine<H: Host, D: Devices> {
     pub devices: D,
     pub profile: CpuProfile,
     pub statistics: Statistics,
+    /// The native routines it replaces signed functions with (`hle`).
+    hle: hle::State,
     /// `--profile`'s phase timing, while it is on.
     step_timing: Option<step_timing::StepTiming>,
     /// Exits to the engine from compiled code (System, FP, PAC and AMX), by
@@ -964,6 +997,13 @@ pub struct Machine<H: Host, D: Devices> {
     /// in a ring ([`Self::refill_after`]), and the next place.
     fill_log: Vec<(u64, u64)>,
     fill_next: usize,
+    /// TTBR0_EL1 at this PE's last TLBI of everything, and how many it
+    /// issued ([`WholeTlbiTrigger`]).
+    whole_tlbi_ttbr0: u64,
+    whole_tlbis: u64,
+    /// Keeping the lookup contexts across a TLBI of everything, and
+    /// verifying them before use (`--tlbi-keep on`, [`tlbi_keep`]).
+    tlbi_keep: tlbi_keep::TlbiKeep,
     /// The pages forgotten contexts had taken last, by half and key: a
     /// context made anew for the key walks them again at once
     /// ([`Self::refill_pages`]).
@@ -1173,6 +1213,13 @@ pub struct Machine<H: Host, D: Devices> {
     known_sites: Box<[Option<device_access::KnownSite>; device_access::KNOWN_SITES]>,
     /// The block being installed is a device site's stub.
     installing_stub: bool,
+    /// The block being installed is a tier-2 block ([`tier2`]), which takes
+    /// its tier-1 block's place.
+    installing_tier2: bool,
+    /// Tier 2 (`--tier2`), when it runs.
+    tier2: Option<Box<tier2::Tier2>>,
+    /// A `--tier2-check` replay runs: no run in it starts another check.
+    tier2_checking: bool,
     /// A System exit at a word that is not System was reported
     /// ([`Self::report_exit_mismatch`]).
     exit_mismatch_reported: bool,
@@ -1378,6 +1425,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             devices,
             profile,
             statistics: Statistics::default(),
+            hle: Default::default(),
             step_timing: None,
             exit_words: BTreeMap::new(),
             exit_pending: [PendingExits::default(); PENDING_EXITS],
@@ -1466,6 +1514,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb_seen_bits: 0,
             fill_log: Vec::new(),
             fill_next: 0,
+            whole_tlbi_ttbr0: 0,
+            whole_tlbis: 0,
+            tlbi_keep: tlbi_keep::TlbiKeep::default(),
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
             dropped_refills: BTreeMap::new(),
@@ -1542,6 +1593,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             device_sites: BTreeMap::new(),
             known_sites: Box::new([const { None }; device_access::KNOWN_SITES]),
             installing_stub: false,
+            installing_tier2: false,
+            tier2: None,
+            tier2_checking: false,
             exit_mismatch_reported: false,
             first_translated: None,
             survey: None,

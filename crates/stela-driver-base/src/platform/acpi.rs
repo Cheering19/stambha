@@ -1566,13 +1566,22 @@ unsafe extern "C" fn flag_event(context: *mut c_void) -> u32 {
 /// A raw GPE handler keeps a disabled device source until its owner drains
 /// deferred transactions and explicitly resumes it. This permits the parent
 /// SCI to service FACS/global-lock events while a device worker waits.
-unsafe extern "C" fn flag_gpe(block: *mut c_void, number: u32, context: *mut c_void) -> u32 {
+///
+/// ACPICA passes the GPE's block device, which for the FADT's blocks is its
+/// `\_GPE` node. That node has no GPE block attached, so
+/// `acpi_disable_gpe` and `acpi_clear_gpe` refuse it (`AE_BAD_PARAMETER`):
+/// a handler that passed it on never disabled, cleared or flagged its GPE,
+/// and its status kept the SCI asserted. [`Session::flag_gpe`] installs
+/// only on the FADT's blocks, so the handler names them as Linux's EC
+/// handler does, with no device (`acpi_disable_gpe(NULL, ec->gpe)`).
+unsafe extern "C" fn flag_gpe(_block: *mut c_void, number: u32, context: *mut c_void) -> u32 {
+    let fadt = ptr::null_mut();
     // SAFETY: ACPICA dispatches its own GPE, its GPE lock released; this raw
     // registration owns its sole runtime enable reference until resumption.
-    let disabled = unsafe { acpi_disable_gpe(block, number) };
+    let disabled = unsafe { acpi_disable_gpe(fadt, number) };
     // SAFETY: the same live GPE registration owns its status register; clear
     // only after its runtime enable reference was successfully removed.
-    if disabled != 0 || unsafe { acpi_clear_gpe(block, number) } != 0 {
+    if disabled != 0 || unsafe { acpi_clear_gpe(fadt, number) } != 0 {
         return 0;
     }
     // SAFETY: `flag_gpe` passed a flag that lives for good.
