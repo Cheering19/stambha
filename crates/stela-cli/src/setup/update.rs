@@ -145,7 +145,7 @@ pub(super) fn update_stela(
     ready(&record, usb)?;
     // A dry run asks nothing; it only says what would change.
     if !dry_run {
-        super::release::allow_older(environment, &record, yes, "put the older Stela on it")?;
+        super::release::allow_older(environment, &record, yes, "put the older Stambha on it")?;
     }
     let from_generation = record.generation();
     // Restore bundles of the new generation for every machine of the active
@@ -189,7 +189,7 @@ pub(super) fn update_stela(
     let from = fs::read(esp.join(LOADER_PATH)).map_or("none".into(), |image| version_id(&image));
     let current = super::release::CURRENT;
     let mut text = String::new();
-    writeln!(text, "Stela update:")?;
+    writeln!(text, "Stambha update:")?;
     if skips {
         text.push_str(&super::doctor::device_skips(&esp, dry_run)?);
     }
@@ -212,7 +212,7 @@ pub(super) fn update_stela(
         {
             writeln!(
                 text,
-                "  Stela          {current} is on the stick; this finishes its update"
+                "  Stambha        {current} is on the stick; this finishes its update"
             )?;
             if dry_run {
                 text.push_str("Dry run: nothing was changed.\n");
@@ -232,7 +232,7 @@ pub(super) fn update_stela(
             text.push_str("Done.\n");
             return Ok(text);
         }
-        writeln!(text, "  Stela          {current} is already on the stick")?;
+        writeln!(text, "  Stambha        {current} is already on the stick")?;
         if bundle_incomplete {
             writeln!(text, "  firmware       add the missing files")?;
             if !dry_run {
@@ -267,11 +267,11 @@ pub(super) fn update_stela(
     }
     let previous = record.release.as_deref().unwrap_or("0.3 or older");
     if from == to {
-        writeln!(text, "  Stela          {current} stays")?;
+        writeln!(text, "  Stambha        {current} stays")?;
     } else if previous == current {
-        writeln!(text, "  Stela          {current}, replaced with this build")?;
+        writeln!(text, "  Stambha        {current}, replaced with this build")?;
     } else {
-        writeln!(text, "  Stela          {previous} -> {current}")?;
+        writeln!(text, "  Stambha        {previous} -> {current}")?;
     }
     if let Some(source) = &source {
         writeln!(
@@ -442,7 +442,7 @@ fn room_for_new_copy(
     let question = format!(
         "This stick has room for one copy of macOS only. Switching to macOS {name} first removes \
          macOS {older}'s copy ({size}). Until the new copy is complete, this stick cannot install \
-         macOS; a macOS already installed keeps starting, and `stela repair` continues the \
+         macOS; a macOS already installed keeps starting, and `stambha repair` continues the \
          switch. Remove macOS {older}'s copy and continue?"
     );
     super::consent(
@@ -507,7 +507,7 @@ pub(super) fn update_os(
                 .map_err(|error| anyhow::anyhow!("macOS {build}: {error}"))?;
             ensure!(
                 entry.build == build,
-                "macOS {build} is not a build Stela was tested with; pass its image with --ipsw \
+                "macOS {build} is not a build Stambha was tested with; pass its image with --ipsw \
                  to use it"
             );
             build.to_owned()

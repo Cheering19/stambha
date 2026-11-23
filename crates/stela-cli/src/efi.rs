@@ -186,7 +186,7 @@ pub(crate) fn loader_is_stela(esp: &Path) -> Result<Option<bool>> {
 pub(crate) fn check_loader(esp: &Path) -> Result<()> {
     ensure!(
         loader_is_stela(esp)? != Some(false),
-        "{} already boots another loader ({}). Stela boots the stick itself, as its only boot \
+        "{} already boots another loader ({}). Stambha boots the stick itself, as its only boot \
          loader, and does not replace another one: use a stick whose EFI partition has no \
          {LOADER}, or erase the stick first.",
         esp.display(),
@@ -377,7 +377,7 @@ impl LogFile {
                 size(*bytes)
             ),
             Self::Unreadable(bytes) => format!(
-                "left as it is ({}): it does not read as a log; stela log still shows its lines",
+                "left as it is ({}): it does not read as a log; stambha log still shows its lines",
                 size(*bytes)
             ),
             Self::Failed { bytes: 0, error } => {
@@ -868,7 +868,7 @@ mod tests {
         );
         assert_eq!(
             said(LogFile::Unreadable(boot_log::LOG_BYTES)).unwrap(),
-            "left as it is (4.2 MB): it does not read as a log; stela log still shows its lines"
+            "left as it is (4.2 MB): it does not read as a log; stambha log still shows its lines"
         );
     }
 

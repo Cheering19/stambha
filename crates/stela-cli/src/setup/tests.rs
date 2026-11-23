@@ -471,7 +471,9 @@ fn other_mac_models_are_refused_naming_the_supported_one() {
         let error = request.dispatch(&environment).unwrap_err().to_string();
         assert_eq!(
             error,
-            format!("Mac model {model} is not supported yet; Stela supports Mac14,3 (Mac mini M2)")
+            format!(
+                "Mac model {model} is not supported yet; Stambha supports Mac14,3 (Mac mini M2)"
+            )
         );
     }
     assert_eq!(PINNED_MODEL, "Mac14,3");
@@ -578,7 +580,10 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     );
 
     let report = setup(&environment(host), command(&f, &f.esp)).unwrap();
-    assert!(report.contains("Check it with `stela status`"), "{report}");
+    assert!(
+        report.contains("Check it with `stambha status`"),
+        "{report}"
+    );
     assert!(!report.contains("uninstall"), "{report}");
     assert!(report.contains("pick the PC disk"), "{report}");
     let record = record(&f);
@@ -619,7 +624,10 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     // A second setup is refused until the first is undone.
     let again = setup(&environment(host), command(&f, &f.esp));
     let again = again.unwrap_err().to_string();
-    assert!(again.contains("start over with `stela create`"), "{again}");
+    assert!(
+        again.contains("start over with `stambha create`"),
+        "{again}"
+    );
     assert!(!again.contains("uninstall"), "{again}");
     // The only install is not removed alone.
     let error = rerun(&f, |c| {
@@ -840,7 +848,10 @@ fn older_setups_are_still_read_and_undone() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("too old for this one to read"), "{error}");
-    assert!(error.contains("Start over with `stela create`"), "{error}");
+    assert!(
+        error.contains("Start over with `stambha create`"),
+        "{error}"
+    );
     let error = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
@@ -1442,7 +1453,10 @@ fn install_and_repair_unmount_target_filesystems() {
         .to_string();
     assert!(error.contains("holds another file system"), "{error}");
     let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
-    assert!(report.contains("`stela repair --erase-target`"), "{report}");
+    assert!(
+        report.contains("`stambha repair --erase-target`"),
+        "{report}"
+    );
     assert!(!erased(&f));
     rerun(&f, |c| {
         c.action = Action::Repair;
@@ -1900,7 +1914,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
         error.contains("is not connected to this computer"),
         "{error}"
     );
-    assert!(error.contains("run stela on the PC itself"), "{error}");
+    assert!(error.contains("run stambha on the PC itself"), "{error}");
     assert_eq!(partition_bytes(&f, NOR), nor);
     f.host.partitions.get_mut(NOR).unwrap().0.guid = NOR_GUID.to_ascii_lowercase();
 
@@ -2416,7 +2430,7 @@ fn stela_update_replaces_the_loader_and_keeps_the_newest_pack() {
     fs::write(packs.join(translations::pack_name(&[0xab; 32])), b"STLT").unwrap();
     // The report names no translation pack: they are the cache's own.
     let report = update(false).unwrap();
-    assert!(report.contains("Stela          "), "{report}");
+    assert!(report.contains("Stambha        "), "{report}");
     assert!(
         !report.contains(&written[0].display().to_string()),
         "{report}"
@@ -2553,12 +2567,12 @@ fn revision_update_rebuilds_bundles() {
     };
     let status = run(&|c| c.action = Action::Status).unwrap_err().to_string();
     assert!(
-        status.contains("boot files were prepared by an older stela"),
+        status.contains("boot files were prepared by an older stambha"),
         "{status}"
     );
     assert!(!status.contains("revision"), "{status}");
     assert!(!status.contains("--fetch"), "{status}");
-    assert!(status.contains("`stela update`"), "{status}");
+    assert!(status.contains("`stambha update`"), "{status}");
     // A repair prepares them again first, as the update does; a dry run
     // says so and changes nothing.
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
@@ -2830,7 +2844,7 @@ fn repair_puts_a_damaged_bundle_back_from_the_usbs_own_image() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha repair`"), "{problems}");
     assert!(!problems.contains("--fetch"), "{problems}");
     // No image, no network: the stick holds the image.
     let plan = rerun(&f, |c| {
@@ -2888,8 +2902,8 @@ fn status_advises_update_stela_while_bundles_are_of_another_revision() {
     let mut status = update_request(&f, &f._dir.path().join("cache"));
     status.action = Action::Status;
     let problems = status.dispatch(&environment).unwrap_err().to_string();
-    assert!(problems.contains("`stela update`"), "{problems}");
-    assert!(!problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha update`"), "{problems}");
+    assert!(!problems.contains("`stambha repair`"), "{problems}");
     // Repair prepares the bundles again first, as the update does, and
     // names what else it needs before downloading anything (downloads
     // panic here).
@@ -3052,7 +3066,7 @@ fn a_piece_an_install_found_damaged_is_named_by_status_and_put_right_by_repair()
         problems.contains("1 part of macOS on the stick failed its check during an install"),
         "{problems}"
     );
-    assert!(problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha repair`"), "{problems}");
     // Repair finds it by itself, and writes it again from the image.
     let done = repair(false, false);
     assert!(done.contains("1 part damaged: written again"), "{done}");
@@ -3699,7 +3713,7 @@ fn interrupted_first_setup_resumes_keeping_intact_files() {
     let again = setup(&environment(&f.host), installed_command(&f))
         .unwrap_err()
         .to_string();
-    assert!(again.contains("already holds Stela"), "{again}");
+    assert!(again.contains("already holds Stambha"), "{again}");
     uninstall(&environment(&f.host), &f.esp, false).unwrap();
     assert_eq!(snapshot(&f.esp), before);
     assert!(!stela_volume(&f).join("stela").exists());
@@ -3726,7 +3740,10 @@ fn interrupted_first_setup_of_another_build_or_target_is_refused() {
     );
     assert!(error.contains("this one STELA2"), "{error}");
     assert!(error.contains("target"), "{error}");
-    assert!(error.contains("start over with `stela create`"), "{error}");
+    assert!(
+        error.contains("start over with `stambha create`"),
+        "{error}"
+    );
     let mut renamed = installed_command(&f);
     renamed.install = Some("Other".into());
     let error = setup(&environment(&f.host), renamed)
@@ -3912,7 +3929,7 @@ fn an_older_stelas_interrupted_setup_is_resumed_with_new_bundles_and_its_pieces(
     let report = setup(&new, again).unwrap();
     assert!(report.contains("Done."), "{report}");
     assert!(
-        report.contains("an older stela wrote the boot files"),
+        report.contains("an older stambha wrote the boot files"),
         "{report}"
     );
     let resumed = record(&f);
@@ -4042,11 +4059,11 @@ fn interrupted_disk_add_is_finished_by_repair_initialize_nor() {
     let problems = status().unwrap_err().to_string();
     assert!(problems.contains("never booted"), "{problems}");
     assert!(
-        problems.contains("`stela repair --initialize-nor`"),
+        problems.contains("`stambha repair --initialize-nor`"),
         "{problems}"
     );
     assert!(!problems.contains("state restore"), "{problems}");
-    assert!(problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha repair`"), "{problems}");
     // Without the flag, repair names it and leaves the partition alone.
     let repair = |initialize: bool, dry_run: bool| {
         rerun(&f, |c| {
@@ -4058,7 +4075,7 @@ fn interrupted_disk_add_is_finished_by_repair_initialize_nor() {
     };
     let report = repair(false, false).unwrap();
     assert!(
-        report.contains("`stela repair --initialize-nor`"),
+        report.contains("`stambha repair --initialize-nor`"),
         "{report}"
     );
     assert_eq!(state()[..], foreign[..]);
@@ -4109,7 +4126,7 @@ fn records_with_the_retired_signing_opt_in_are_still_read() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha repair`"), "{problems}");
     rerun(&f, |c| {
         c.action = Action::Repair;
         c.ipsw = Some(f.ipsw.clone());
@@ -4468,7 +4485,7 @@ fn repair_restores_recorded_state() {
     let error = status().unwrap_err().to_string();
     assert!(error.contains("needs new boot files"), "{error}");
     assert!(!error.contains("ECID"), "{error}");
-    assert!(error.contains("`stela repair`"), "{error}");
+    assert!(error.contains("`stambha repair`"), "{error}");
     assert!(!error.contains("--fetch"), "{error}");
     rerun(&f, |c| {
         c.action = Action::Repair;
@@ -5537,12 +5554,12 @@ fn host_firmware_publication_preserves_guest_bundles() {
 fn assert_hints_name_the_usb(text: &str) {
     let several = SEVERAL.get();
     let mut hints = 0;
-    for hint in text.split("`stela ").skip(1) {
+    for hint in text.split("`stambha ").skip(1) {
         let hint = hint.split('`').next().unwrap();
         hints += 1;
         assert!(
             !hint.starts_with("setup") && !hint.contains("--usb"),
-            "`stela {hint}` in:\n{text}"
+            "`stambha {hint}` in:\n{text}"
         );
         let first = hint.split(' ').next().unwrap();
         assert!(
@@ -5550,12 +5567,12 @@ fn assert_hints_name_the_usb(text: &str) {
                 "create", "update", "repair", "status", "settings", "log", "nvram", "state"
             ]
             .contains(&first),
-            "`stela {hint}` in:\n{text}"
+            "`stambha {hint}` in:\n{text}"
         );
         assert_eq!(
             hint.contains("ESP"),
             several && hint != "create",
-            "`stela {hint}` in:\n{text}"
+            "`stambha {hint}` in:\n{text}"
         );
     }
     assert!(hints > 0, "no command in:\n{text}");
@@ -5626,7 +5643,7 @@ fn every_maintenance_hint_names_the_usb() {
     let problems = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(problems.contains("`stela repair`"), "{problems}");
+    assert!(problems.contains("`stambha repair`"), "{problems}");
     assert_hints_name_the_usb(&problems);
     let report = rerun(&f, |c| {
         c.action = Action::Repair;
@@ -5642,7 +5659,7 @@ fn every_maintenance_hint_names_the_usb() {
         .to_string();
     SEVERAL.set(false);
     assert!(
-        problems.contains(&format!("`stela repair {}`", f.esp.display())),
+        problems.contains(&format!("`stambha repair {}`", f.esp.display())),
         "{problems}"
     );
     SEVERAL.set(true);
@@ -5654,7 +5671,7 @@ fn every_maintenance_hint_names_the_usb() {
         .to_string();
     NAMED.set(None);
     SEVERAL.set(false);
-    assert!(problems.contains("`stela repair /dev/sdb`"), "{problems}");
+    assert!(problems.contains("`stambha repair /dev/sdb`"), "{problems}");
     assert!(
         !problems.contains(&format!("repair {}", f.esp.display())),
         "{problems}"
@@ -5891,7 +5908,7 @@ fn status_and_repair_name_the_firmware_the_last_boot_asked_for() {
     );
     let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
     assert!(
-        report.contains("asked for brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stela has no pinned source for"),
+        report.contains("asked for brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stambha has no pinned source for"),
         "{report}"
     );
     assert!(!f.esp.join(DIRECTORY).exists());
@@ -5910,7 +5927,7 @@ fn status_and_repair_name_the_firmware_the_last_boot_asked_for() {
         error.contains("asked for firmware rtl_nic/rtl8168d-1.fw (realtek 10ec:8168 xid-281)"),
         "{error}"
     );
-    assert!(error.contains("`stela repair`"), "{error}");
+    assert!(error.contains("`stambha repair`"), "{error}");
     let before = snapshot(&f.esp);
     let report = rerun(&f, |c| {
         c.action = Action::Repair;
@@ -6262,7 +6279,7 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
     fs::write(host.image("disk0s1").unwrap(), vec![0u8; 4096]).unwrap();
     let error = format!("{:#}", crate::boot_log::scan(&host).unwrap_err());
     assert!(
-        error.starts_with("no Stela boot log on this computer's disks."),
+        error.starts_with("no Stambha boot log on this computer's disks."),
         "{error}"
     );
     assert!(
@@ -6275,7 +6292,7 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
     );
     assert!(
         error.ends_with(&format!(
-            "Plug in the stick Stela booted from and run this again {} {}.",
+            "Plug in the stick Stambha booted from and run this again {} {}.",
             if cfg!(windows) { "from" } else { "with" },
             host::ADMIN
         )),
@@ -6326,7 +6343,7 @@ fn setup_boot_log_reads_the_usb_raw_when_its_folder_cannot_be_read() {
         "{:#}",
         rerun(&f, |c| c.action = Action::BootLog).unwrap_err()
     );
-    assert!(error.contains("holds no Stela setup"), "{error}");
+    assert!(error.contains("holds no Stambha setup"), "{error}");
     assert!(error.contains("nor does Disk disk5"), "{error}");
 }
 
@@ -6359,7 +6376,7 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
     .unwrap_err()
     .to_string();
     assert!(error.contains("no mounted volume"), "{error}");
-    assert!(error.contains("`stela create`"), "{error}");
+    assert!(error.contains("`stambha create`"), "{error}");
     // One: its EFI partition, which holds the record, over its data volume.
     let one = host(vec![
         disk("disk0", &[("Linux", Some(&system))]),
@@ -6381,7 +6398,7 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
         disk("disk6", &[("Microsoft Basic Data", Some(&other))]),
     ]);
     let error = choose_setup(&two, "settings").unwrap_err().to_string();
-    assert!(error.starts_with("2 sticks hold Stela"), "{error}");
+    assert!(error.starts_with("2 sticks hold Stambha"), "{error}");
     // Each is named by its whole disk, never by a volume path, which may
     // hold the user's name.
     assert!(error.contains("disk5 (Disk disk5)"), "{error}");
@@ -6389,7 +6406,7 @@ fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() 
     assert!(!error.contains(&esp.display().to_string()), "{error}");
     assert!(
         error.contains(&format!(
-            "such as `stela settings {}disk5`",
+            "such as `stambha settings {}disk5`",
             host::DISK_PREFIX
         )),
         "{error}"
@@ -6437,7 +6454,7 @@ fn a_stick_named_by_its_whole_disk_is_read_through_its_stela_volume() {
     let error = stick_volume(&f.host, Path::new("disk0"))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("`stela create disk0`"), "{error}");
+    assert!(error.contains("`stambha create disk0`"), "{error}");
 }
 
 /// A setup whose record says Stela `release` (none before 0.4) made it.
@@ -6468,14 +6485,14 @@ fn a_stick_records_its_stela_version_and_an_update_brings_an_older_one_to_this_o
     let f = made_by(None);
     let status = rerun(&f, |c| c.action = Action::Status).unwrap();
     assert!(
-        status.contains("Stela          0.3 or older; this stela is"),
+        status.contains("Stambha        0.3 or older; this stambha is"),
         "{status}"
     );
     rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
     assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
     let status = rerun(&f, |c| c.action = Action::Status).unwrap();
     assert!(
-        status.contains(&format!("Stela          {}\n", release::CURRENT)),
+        status.contains(&format!("Stambha        {}\n", release::CURRENT)),
         "{status}"
     );
 }
@@ -6485,7 +6502,7 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
     let f = made_by(Some("99.0.0"));
     let status = rerun(&f, |c| c.action = Action::Status).unwrap();
     assert!(
-        status.contains("Stela          99.0.0, newer than this stela"),
+        status.contains("Stambha        99.0.0, newer than this stambha"),
         "{status}"
     );
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
@@ -6511,7 +6528,7 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("newer than this stela") && error.contains("Add --yes"),
+            error.contains("newer than this stambha") && error.contains("Add --yes"),
             "{error}"
         );
         unchanged();
@@ -6528,7 +6545,7 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
         assert_eq!(error, "nothing was changed");
         assert!(
             no.transcript()
-                .contains("Stela 99.0.0, newer than this stela")
+                .contains("Stambha 99.0.0, newer than this stambha")
         );
         unchanged();
     }
@@ -6541,7 +6558,7 @@ fn an_older_stela_asks_before_it_changes_a_newer_stick_and_a_no_changes_nothing(
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("newer than this stela") && error.contains("Add --yes"),
+        error.contains("newer than this stambha") && error.contains("Add --yes"),
         "{error}"
     );
     assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
@@ -7009,7 +7026,7 @@ fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
     assert!(done, "{shown}");
     assert!(!shown.contains("? Installer"), "{shown}");
     assert!(
-        shown.contains(&format!("● Stela {} · Offline · macOS", release::CURRENT)),
+        shown.contains(&format!("● Stambha {} · Offline · macOS", release::CURRENT)),
         "{shown}"
     );
     assert!(shown.contains("This stick is ready."), "{shown}");
@@ -7032,7 +7049,7 @@ fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
     result.unwrap();
     assert!(done, "{shown}");
     assert!(
-        shown.contains("▲ This stick holds Stela with macOS"),
+        shown.contains("▲ This stick holds Stambha with macOS"),
         "{shown}"
     );
     assert_eq!(stick_files(&f), before);
@@ -7043,7 +7060,7 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
     let keep = |shown: &str| {
         shown
             .lines()
-            .find(|line| line.starts_with("▲ This stick holds Stela"))
+            .find(|line| line.starts_with("▲ This stick holds Stambha"))
             .unwrap_or_else(|| panic!("no warning:\n{shown}"))
             .split("To keep it, ")
             .nth(1)
@@ -7073,7 +7090,7 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
     );
     result.unwrap();
     let update = format!(
-        "choose Quit and run `stela update {}disk5`.",
+        "choose Quit and run `stambha update {}disk5`.",
         host::DISK_PREFIX
     );
     assert_eq!(keep(&shown), update);
@@ -7085,7 +7102,7 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
     let (shown, result, _) = plain_stela(&f, &["Start over", "Offline", "Quit"], &[]);
     result.unwrap();
     let repair = format!(
-        "choose Quit and run `stela repair {}disk5`.",
+        "choose Quit and run `stambha repair {}disk5`.",
         host::DISK_PREFIX
     );
     assert_eq!(keep(&shown), repair);
@@ -7095,13 +7112,16 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
 fn journey_c_an_older_stick_offers_the_update_and_quit_changes_nothing() {
     let f = made_by(None);
     let before = stick_files(&f);
-    let question = format!("? Update this stick to Stela {}?", release::CURRENT);
+    let question = format!("? Update this stick to Stambha {}?", release::CURRENT);
     let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
     result.unwrap();
     assert!(done, "{shown}");
     assert!(shown.contains(&question), "{shown}");
-    assert!(shown.contains("● Stela 0.3 or older · Offline"), "{shown}");
-    assert!(shown.contains("● Updates Stela on the stick"), "{shown}");
+    assert!(
+        shown.contains("● Stambha 0.3 or older · Offline"),
+        "{shown}"
+    );
+    assert!(shown.contains("● Updates Stambha on the stick"), "{shown}");
     assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
     assert_eq!(stick_files(&f), before);
     // Update brings it to this Stela.
@@ -7119,7 +7139,7 @@ fn journey_d_a_newer_stick_is_left_alone() {
     result.unwrap();
     assert!(done, "{shown}");
     assert!(
-        shown.contains("▲ This stick has Stela 99.0.0, newer than this stela"),
+        shown.contains("▲ This stick has Stambha 99.0.0, newer than this stambha"),
         "{shown}"
     );
     assert!(shown.ends_with("└ No problems found."), "{shown}");
@@ -7127,7 +7147,7 @@ fn journey_d_a_newer_stick_is_left_alone() {
     // says otherwise.
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
     assert!(!due, "{text}");
-    assert!(text.contains("Download stela 99.0.0 or newer"), "{text}");
+    assert!(text.contains("Download stambha 99.0.0 or newer"), "{text}");
     assert!(!text.contains("Nothing to do"), "{text}");
     // Nothing that changes the stick is offered.
     assert!(!shown.contains("Update"), "{shown}");
@@ -7243,7 +7263,7 @@ fn repair_puts_back_a_missing_or_replaced_stela_efi_and_the_menu_offer_succeeds(
     result.unwrap();
     assert!(done, "{shown}");
     assert!(
-        shown.ends_with("└ Done. Check it any time with `stela status`."),
+        shown.ends_with("└ Done. Check it any time with `stambha status`."),
         "{shown}"
     );
     assert_eq!(fs::read(f.esp.join(LOADER_PATH)).unwrap(), installed);
@@ -7289,8 +7309,8 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
     assert!(error.is::<home::Due>());
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
     assert!(due);
-    assert!(text.contains("Stela 0.3 or older · Offline"), "{text}");
-    assert!(text.contains("Next: stela update\n"), "{text}");
+    assert!(text.contains("Stambha 0.3 or older · Offline"), "{text}");
+    assert!(text.contains("Next: stambha update\n"), "{text}");
     assert_eq!(stick_files(&f), before);
     // A healthy stick: nothing is due.
     let f = made_by(Some(release::CURRENT));
@@ -7309,7 +7329,7 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
     // It is a command that runs without a terminal: the stick is typed back,
     // in words that confirm it.
     let command = format!(
-        "Next: stela create {}disk5 --confirm-disk ",
+        "Next: stambha create {}disk5 --confirm-disk ",
         host::DISK_PREFIX
     );
     let line = text
@@ -7418,7 +7438,7 @@ fn every_state_asks_with_other_choices_that_list_the_same_rows_where_they_apply(
     // An older stick: Update and Repair are there as well.
     let f = made_by(None);
     let rows = other(&f);
-    let update = format!("Update to Stela {}", release::CURRENT);
+    let update = format!("Update to Stambha {}", release::CURRENT);
     assert_eq!(rows[..2], [update.as_str(), "Repair"], "{rows:?}");
     ends_with(&rows, &common);
     // An Offline stick installs without a network: no network settings,
@@ -7542,7 +7562,7 @@ fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
     assert!(done, "{shown}");
     // The change closes as every change does.
     assert!(
-        shown.ends_with("└ Done. Check it any time with `stela status`."),
+        shown.ends_with("└ Done. Check it any time with `stambha status`."),
         "{shown}"
     );
     let saved = record(&f);
@@ -7563,7 +7583,7 @@ fn settings_without_a_terminal_and_without_a_setting_change_nothing() {
         error.starts_with("name a setting to change, such as --wifi SSID"),
         "{error}"
     );
-    assert!(error.contains("`stela settings` asks"), "{error}");
+    assert!(error.contains("`stambha settings` asks"), "{error}");
     assert_eq!(stick_files(&f), before);
 }
 
@@ -7806,7 +7826,7 @@ fn a_data_partition_out_of_reach_is_named_and_never_offered_a_repair() {
     assert!(done, "{shown}");
     assert!(!shown.contains("needs repair"), "{shown}");
     assert!(
-        shown.contains("▲ This stick may hold Stela, but stela cannot read it"),
+        shown.contains("▲ This stick may hold Stambha, but stambha cannot read it"),
         "{shown}"
     );
     assert!(
@@ -7822,7 +7842,7 @@ fn a_data_partition_out_of_reach_is_named_and_never_offered_a_repair() {
         };
         let error = format!("{:#}", rerun(&f, |c| c.action = action()).unwrap_err());
         assert!(
-            error.contains("is not mounted, and stela could not mount it"),
+            error.contains("is not mounted, and stambha could not mount it"),
             "{error}"
         );
         assert!(error.contains(STELA_PARTITION), "{error}");
@@ -7888,7 +7908,7 @@ fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
         (
             "newer schema",
             newer_schema,
-            "a newer stela may have made it",
+            "a newer stambha may have made it",
         ),
         ("schema 8", schema_8, "too old for this one to read"),
     ] {
@@ -7899,7 +7919,7 @@ fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
         result.unwrap();
         assert!(done, "{what}:\n{shown}");
         assert!(
-            shown.contains("▲ This stick may hold Stela, but stela cannot read it"),
+            shown.contains("▲ This stick may hold Stambha, but stambha cannot read it"),
             "{what}:\n{shown}"
         );
         assert!(shown.contains(reason), "{what}:\n{shown}");
@@ -7924,7 +7944,7 @@ fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
         let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
         assert!(!due, "{what}:\n{text}");
         assert!(
-            text.contains("may hold Stela: its record cannot be read"),
+            text.contains("may hold Stambha: its record cannot be read"),
             "{what}:\n{text}"
         );
         assert!(text.contains(reason), "{what}:\n{text}");
@@ -7955,12 +7975,12 @@ fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
     let (shown, result, _) = plain_stela(&f, &["Quit"], &[]);
     result.unwrap();
     assert!(
-        shown.contains("Stela 9.0.0, newer than this stela"),
+        shown.contains("Stambha 9.0.0, newer than this stambha"),
         "{shown}"
     );
     assert!(!shown.contains("Erase"), "{shown}");
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
-    assert!(!due && text.contains("Download stela 9.0.0"), "{text}");
+    assert!(!due && text.contains("Download stambha 9.0.0"), "{text}");
     // An EFI partition that cannot be mounted to look for a record.
     let mut f = fixture(64 * GIB, false);
     let usb = f
@@ -7973,7 +7993,7 @@ fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
     let sticks = home::sticks(&environment(&f.host)).unwrap();
     let (text, _) = home::report(&sticks);
     assert!(text.contains("could not be mounted"), "{text}");
-    assert!(!text.contains("stela create"), "{text}");
+    assert!(!text.contains("stambha create"), "{text}");
 }
 
 #[test]
@@ -8079,7 +8099,7 @@ fn command_of_choice(label: &str) -> Option<&'static str> {
         "Finish it" | "Finish the create" | "Repair" => "repair",
         label if label.starts_with("Finish the switch to macOS") => "repair",
         "Update" => "update",
-        label if label.starts_with("Update to Stela") => "update",
+        label if label.starts_with("Update to Stambha") => "update",
         label if label.starts_with("Use macOS") => "update --macos",
         "Change Wi-Fi or network settings" => "settings",
         "Check every file" | "Show status" => "status",
@@ -8117,8 +8137,8 @@ fn every_stick_state() -> Vec<(&'static str, Fixture)> {
     };
     vec![
         ("blank", fixture(64 * GIB, false)),
-        ("Stela current", made_by(Some(release::CURRENT))),
-        ("Stela current, Online", made_online()),
+        ("Stambha current", made_by(Some(release::CURRENT))),
+        ("Stambha current, Online", made_online()),
         ("older", made_by(None)),
         ("newer", made_by(Some("99.0.0"))),
         ("interrupted create", interrupted()),
@@ -8304,7 +8324,7 @@ fn an_older_stick_s_log_is_made_longer_with_every_boot_it_held() {
         let said = "\n  boot log       made longer, 33.6 MB from 4.2 MB, with every boot it held\n";
         assert!(report.contains(said), "{kind}: {report}");
         assert_eq!(
-            report.starts_with("Stela repair:"),
+            report.starts_with("Stambha repair:"),
             kind == "repair",
             "{kind}: {report}"
         );
@@ -8319,7 +8339,7 @@ fn an_older_stick_s_log_is_made_longer_with_every_boot_it_held() {
         assert_eq!(
             stick_log_text(&grown),
             text,
-            "{kind}: stela log reads the same"
+            "{kind}: stambha log reads the same"
         );
         assert_eq!(
             fs::read(f.esp.join(efi::LOADER)).unwrap(),
@@ -8383,7 +8403,7 @@ fn an_older_stick_s_log_that_cannot_be_made_longer_stays_readable() {
     let report = rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
     assert!(
         report.contains(
-            "\n  boot log       left as it is (4.2 MB): it does not read as a log; stela log \
+            "\n  boot log       left as it is (4.2 MB): it does not read as a log; stambha log \
              still shows its lines\n"
         ),
         "{report}"

@@ -325,7 +325,7 @@ fn main() -> Status {
         connected.connected, connected.handles, connected.network, connected.slow
     ));
     status::done("");
-    status::begin("Reading Stela's settings");
+    status::begin("Reading Stambha's settings");
     let (mut volume, mut firmware_root) = firmware::volume().unwrap_or_else(|e| output::fatal(e));
     let host_firmware =
         host_firmware::read(&mut firmware_root).unwrap_or_else(|e| output::fatal(e));

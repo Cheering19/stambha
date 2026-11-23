@@ -350,8 +350,8 @@ fn download_slice(
         artifact.member,
         answers.join("; "),
         if all_gone {
-            ". The file has moved or changed where it is published, so this Stela cannot get \
-             it; a newer Stela can"
+            ". The file has moved or changed where it is published, so this Stambha cannot get \
+             it; a newer Stambha can"
         } else {
             ""
         }
@@ -844,7 +844,7 @@ impl Requested {
         }
         for request in &self.unpinned {
             lines.push(format!(
-                "the last boot asked for {}, which Stela has no pinned source for; the device \
+                "the last boot asked for {}, which Stambha has no pinned source for; the device \
                  stays off",
                 describe(request)
             ));
@@ -1735,7 +1735,7 @@ mod tests {
         );
         assert!(error.contains("answered 404 Not Found"), "{error}");
         assert!(
-            error.ends_with("The file has moved or changed where it is published, so this Stela cannot get it; a newer Stela can"),
+            error.ends_with("The file has moved or changed where it is published, so this Stambha cannot get it; a newer Stambha can"),
             "{error}"
         );
         // Neither is asked again.
@@ -1981,7 +1981,7 @@ mod tests {
             "{lines}"
         );
         assert!(
-            lines.contains("brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stela has no pinned source for"),
+            lines.contains("brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stambha has no pinned source for"),
             "{lines}"
         );
         // The plan keeps what the stick holds and downloads nothing in a dry run.

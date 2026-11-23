@@ -153,7 +153,7 @@ impl fmt::Display for Unsupported {
         let majors: Vec<String> = self.majors.iter().map(|m| alloc::format!("{m}")).collect();
         write!(
             f,
-            "; Stela supports macOS {} (tested: {})",
+            "; Stambha supports macOS {} (tested: {})",
             majors.join(", "),
             self.tested.join(", ")
         )
@@ -207,12 +207,12 @@ mod tests {
         }
         assert_eq!(
             find("25A354").unwrap_err().to_string(),
-            "macOS build 25A354 is not supported (macOS 26); Stela supports macOS 27 \
+            "macOS build 25A354 is not supported (macOS 26); Stambha supports macOS 27 \
              (tested: 26B123, 26A434)"
         );
         assert_eq!(
             find("27A100").unwrap_err().to_string(),
-            "macOS build 27A100 is not supported (macOS 28); Stela supports macOS 27 \
+            "macOS build 27A100 is not supported (macOS 28); Stambha supports macOS 27 \
              (tested: 26B123, 26A434)"
         );
     }

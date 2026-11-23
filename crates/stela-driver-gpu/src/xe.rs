@@ -30,7 +30,7 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     match mask_bits(adapter.device) {
         Some(_) => Ok(()),
         None => Err(
-            "xe's PCI ID table does not hold this Intel GPU (Ice Lake and older need i915, which is not ported to Stela)",
+            "xe's PCI ID table does not hold this Intel GPU (Ice Lake and older need i915, which is not ported to Stambha)",
         ),
     }
 }

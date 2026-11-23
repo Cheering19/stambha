@@ -111,7 +111,7 @@ pub(super) fn relaunch() -> Result<()> {
         .arg(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .exec();
-    Err(error).context("stela writes disks as root, and sudo could not start")
+    Err(error).context("stambha writes disks as root, and sudo could not start")
 }
 
 /// The proxy settings that stela's downloads need behind a proxy, as
@@ -253,7 +253,7 @@ pub(crate) fn hold_window(success: bool) {
     let prompt = if success {
         "Press any key to close this window."
     } else {
-        "Stela stopped with an error. Press any key to close this window."
+        "Stambha stopped with an error. Press any key to close this window."
     };
     eprintln!("\n{}", console::style(prompt).for_stderr().dim());
     let _ = console::Term::stderr().read_key();

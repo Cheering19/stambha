@@ -1,6 +1,6 @@
-# One self-contained `stela` per platform. `stela` embeds stela.efi, which
+# One self-contained `stambha` per platform. `stambha` embeds stela.efi, which
 # carries the StelaGPU kext; the kext carries the Metal bundle and Stela.app.
-# So the chain runs: Stela.app (macOS) -> stela.efi (Linux) -> stela for
+# So the chain runs: Stela.app (macOS) -> stela.efi (Linux) -> stambha for
 # Linux, Windows and macOS -> release.
 #
 # Runs only for a pushed `v*` tag, and publishes that tag's release.
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
-      SOURCE: stela-v${{ needs.version.outputs.version }}-source
+      SOURCE: stambha-v${{ needs.version.outputs.version }}-source
     steps:
       - uses: actions/checkout@v5
 
@@ -255,7 +255,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      ARCHIVE: stela-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
+      ARCHIVE: stambha-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
 
@@ -304,7 +304,7 @@ jobs:
           name: stela-efi
           path: efi
 
-      - name: Build stela
+      - name: Build stambha
         run: |
           export STELA_EFI="$PWD/efi/stela.efi"
           for target in ${{ matrix.targets }}; do
@@ -312,20 +312,20 @@ jobs:
           done
           mkdir -p "$ARCHIVE"
           case "$RUNNER_OS" in
-            Windows) cp target/x86_64-pc-windows-msvc/release/stela.exe "$ARCHIVE/" ;;
+            Windows) cp target/x86_64-pc-windows-msvc/release/stambha.exe "$ARCHIVE/" ;;
             macOS)
-              lipo -create -output "$ARCHIVE/stela" \
-                target/aarch64-apple-darwin/release/stela target/x86_64-apple-darwin/release/stela
-              codesign --force --sign - "$ARCHIVE/stela"
-              lipo -info "$ARCHIVE/stela"
+              lipo -create -output "$ARCHIVE/stambha" \
+                target/aarch64-apple-darwin/release/stambha target/x86_64-apple-darwin/release/stambha
+              codesign --force --sign - "$ARCHIVE/stambha"
+              lipo -info "$ARCHIVE/stambha"
               ;;
-            *) cp target/x86_64-unknown-linux-gnu/release/stela "$ARCHIVE/" ;;
+            *) cp target/x86_64-unknown-linux-gnu/release/stambha "$ARCHIVE/" ;;
           esac
 
-      - name: Check stela
+      - name: Check stambha
         run: |
-          binary="$(ls "$ARCHIVE"/stela*)"
-          expected="stela ${{ needs.version.outputs.version }}"
+          binary="$(ls "$ARCHIVE"/stambha*)"
+          expected="Stambha ${{ needs.version.outputs.version }}"
           actual="$("$binary" --version)"
           [[ "$actual" == "$expected" ]] || { echo "::error::$binary --version printed '$actual', not '$expected'"; exit 1; }
           python=python3
@@ -366,7 +366,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: stela-v*
+          pattern: stambha-v*
           path: dist
           merge-multiple: true
 

@@ -275,7 +275,7 @@ pub(super) fn raw_boot_log(host: &dyn Host, usb: &Path, why: &anyhow::Error) -> 
         .all();
     ensure!(
         !logs.is_empty(),
-        "{why:#}; nor does {} hold a Stela boot log",
+        "{why:#}; nor does {} hold a Stambha boot log",
         crate::boot_log::describe(&disk)
     );
     Ok(format!(
@@ -386,7 +386,7 @@ fn read_backup(path: &Path) -> Result<(Header, Vec<u8>)> {
     reader.read_line(&mut magic)?;
     ensure!(
         magic.trim_end() == MAGIC,
-        "{} is not a Stela machine-state backup",
+        "{} is not a Stambha machine-state backup",
         path.display()
     );
     let mut line = String::new();
@@ -399,7 +399,7 @@ fn read_backup(path: &Path) -> Result<(Header, Vec<u8>)> {
         header.nor_bytes == CAPACITY
             && header.sep_bytes == stela_formats::machine_state::SEP_BYTES as usize
             && bytes.len() == STATE_BYTES,
-        "{} holds a machine-state layout this stela does not write",
+        "{} holds a machine-state layout this stambha does not write",
         path.display()
     );
     ensure!(

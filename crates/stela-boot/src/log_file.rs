@@ -242,19 +242,19 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
     let device = shared::<LoadedImage>(boot::image_handle())
         .ok_or(refuse!("no loaded image"))?
         .device()
-        .ok_or(refuse!("Stela was not loaded from a volume"))?;
+        .ok_or(refuse!("Stambha was not loaded from a volume"))?;
     let mut volume =
-        shared::<SimpleFileSystem>(device).ok_or(refuse!("Stela's volume has no file system"))?;
+        shared::<SimpleFileSystem>(device).ok_or(refuse!("Stambha's volume has no file system"))?;
     let mut root = volume
         .open_volume()
-        .map_err(|_| refuse!("Stela's volume cannot be opened"))?;
+        .map_err(|_| refuse!("Stambha's volume cannot be opened"))?;
     let path =
         CString16::try_from(BOOT_LOG_FILE).map_err(|_| refuse!("the log's path is not UCS-2"))?;
     let mut file = root
         .open(&path, FileMode::ReadWrite, FileAttribute::empty())
         .ok()
         .and_then(|file| crate::file_kind::regular(file).ok())
-        .ok_or(refuse!("Stela's volume has no \\EFI\\stela\\boot.log"))?;
+        .ok_or(refuse!("Stambha's volume has no \\EFI\\stela\\boot.log"))?;
     let size = file
         .get_boxed_info::<FileInfo>()
         .map_err(|_| refuse!("the log file's size cannot be read"))?

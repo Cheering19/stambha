@@ -74,7 +74,7 @@ impl MountLimits {
         for length in lengths {
             if length == 0 || length > self.max_image_bytes {
                 return Err(Error(format!(
-                    "stela.efi host firmware image limit is {} bytes; update Stela before installing this package",
+                    "stela.efi host firmware image limit is {} bytes; update Stambha before installing this package",
                     self.max_image_bytes
                 )));
             }

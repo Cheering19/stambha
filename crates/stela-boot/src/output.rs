@@ -1278,7 +1278,7 @@ pub(crate) fn early_fatal(message: &str) -> ! {
     }
     crate::engine::write_guest_output_at_stop();
     arguments(format_args!("\nSTELA FATAL {message}\n"));
-    firmware_console("\nStela stopped: ");
+    firmware_console("\nStambha stopped: ");
     firmware_console(message);
     firmware_console("\n");
     crate::stop_record::arm(crate::stop_record::Services::capture_without_heap(), None);
@@ -1400,7 +1400,7 @@ fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
         crate::status::fail(message);
         crate::status::info(next());
     } else if FIRMWARE_CONSOLE.load(Ordering::Relaxed) {
-        firmware_console("\nStela stopped: ");
+        firmware_console("\nStambha stopped: ");
         firmware_console(message);
         firmware_console("\n");
     }
@@ -1408,23 +1408,23 @@ fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
 
 /// What a stopped boot tells the user to do next: where its log is, and how
 /// to read it on any computer with stela.
-pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on any computer with stela, \
-    plug in this USB and run `stela log`, which saves it to log.txt; include that file in a \
+pub const STOPPED: &str = "Stambha stopped. Its log is on this USB: on any computer with stambha, \
+    plug in this USB and run `stambha log`, which saves it to log.txt; include that file in a \
     report. Turn the PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// What a stop whose last lines the USB's log does not hold, as one before
 /// the engine writes the log again, tells the user once the PC's firmware
 /// holds them ([`keep_stop_record`]): another start of Stela on this PC
 /// moves them into the log.
-pub const STOPPED_RECORDED: &str = "Stela stopped before it could write this part of its log \
-    to the USB. This PC keeps its last lines: start Stela on this PC once more, which copies them \
-    into the log on this USB. Then, on any computer with stela, plug in this USB and run `stela \
+pub const STOPPED_RECORDED: &str = "Stambha stopped before it could write this part of its log \
+    to the USB. This PC keeps its last lines: start Stambha on this PC once more, which copies them \
+    into the log on this USB. Then, on any computer with stambha, plug in this USB and run `stambha \
     log`, which saves it to log.txt; include that file in a report. Turn the PC off to try again; \
     Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// What such a stop tells the user when the firmware did not take the
 /// lines: the screen is all that is kept of this part of the run.
-pub const STOPPED_UNLOGGED: &str = "Stela stopped before it could write this part of its log \
+pub const STOPPED_UNLOGGED: &str = "Stambha stopped before it could write this part of its log \
     to the USB: this screen is the only record of it. Take a photo of it for a report. Turn the \
     PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
@@ -1504,5 +1504,5 @@ pub fn stopping(message: &str) {
     crate::engine::write_guest_output_at_stop();
     arguments(format_args!("\nSTELA STOP {message}\n"));
     unqueue_serial();
-    stopped(message, &|| "Stela stopped. The PC turns off.");
+    stopped(message, &|| "Stambha stopped. The PC turns off.");
 }

@@ -67,11 +67,11 @@ pub(super) fn uninstall(
     } else {
         writeln!(
             text,
-            "No setup record on {}; removing only Stela's boot loader and files.",
+            "No setup record on {}; removing only Stambha's boot loader and files.",
             esp.display()
         )?;
     }
-    writeln!(text, "Stela uninstall from {}:", esp.display())?;
+    writeln!(text, "Stambha uninstall from {}:", esp.display())?;
     for directory in &removals {
         writeln!(text, "  remove   {}", directory.display())?;
     }

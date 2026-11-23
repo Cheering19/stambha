@@ -438,9 +438,9 @@ impl Unfinished {
             (false, true) => format!(" during \"{}\" or soon after", self.stage),
         };
         format!(
-            "The last start of Stela on this PC did not end by itself: the PC was switched off \
-             or reset{stage}. If Stela had stopped working, its log is on this USB: on any \
-             computer with stela, plug in this USB and run `stela log`, which saves it to \
+            "The last start of Stambha on this PC did not end by itself: the PC was switched off \
+             or reset{stage}. If Stambha had stopped working, its log is on this USB: on any \
+             computer with stambha, plug in this USB and run `stambha log`, which saves it to \
              log.txt; include that file in a report."
         )
     }
@@ -646,8 +646,8 @@ mod tests {
             "switched off or reset during \"Taking control of the other processors\" or soon \
              after"
         ));
-        assert!(notice.contains("on any computer with stela"), "{notice}");
-        assert!(notice.contains("`stela log`"), "{notice}");
+        assert!(notice.contains("on any computer with stambha"), "{notice}");
+        assert!(notice.contains("`stambha log`"), "{notice}");
     }
 
     #[test]

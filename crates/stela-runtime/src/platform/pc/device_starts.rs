@@ -171,7 +171,7 @@ pub fn decide(
 pub fn skipped_line(function: &Function) -> String {
     format!(
         "PCI {} {:04x}:{:04x} skipped: it did not finish starting on an earlier boot. \
-         Run stela repair to try it again.",
+         Run stambha repair to try it again.",
         function.address, function.vendor, function.device
     )
 }
@@ -181,7 +181,7 @@ pub fn skipped_line(function: &Function) -> String {
 pub fn retried_line(function: &Function) -> String {
     format!(
         "PCI {} {:04x}:{:04x} did not finish starting on an earlier boot. The boot needs it, \
-         so it is started again. If the boot stops here, `stela log --output log.txt` on \
+         so it is started again. If the boot stops here, `stambha log --output log.txt` on \
          another computer saves the USB's log; include that file in a report.",
         function.address, function.vendor, function.device
     )
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(
             skipped_line(&lan),
             "PCI 0000:07:00.0 10ec:8125 skipped: it did not finish starting on an earlier \
-             boot. Run stela repair to try it again."
+             boot. Run stambha repair to try it again."
         );
         assert!(retried_line(&nvme).contains("log.txt"));
     }

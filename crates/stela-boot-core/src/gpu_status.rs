@@ -11,7 +11,7 @@ pub const SUPPORTED: &str = "an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 se
 /// The boot screen's line when the NVIDIA GPU started with no screen
 /// connected and macOS is shown on the screen the PC started on, which
 /// another display adapter drives (a laptop with no display mux).
-pub const SHOWN_BY_COPY: &str = "No screen is connected to the NVIDIA GPU, so Stela copies each \
+pub const SHOWN_BY_COPY: &str = "No screen is connected to the NVIDIA GPU, so Stambha copies each \
     frame of macOS to the screen the PC started on. The picture is slower than on a screen \
     connected to the GPU.";
 
@@ -36,11 +36,11 @@ pub enum Reason {
 const HOLDS: &str = "the USB holds the firmware for";
 /// Its end when reading them before the firmware's exit failed.
 const READ_FAILED: &str = ", but reading it from the USB failed. The boot log on this USB \
-    says why; `stela repair` on another computer writes the files again";
+    says why; `stambha repair` on another computer writes the files again";
 /// Its end when they were not read because the GPU answered only after the
 /// firmware's exit.
 const NOT_READ: &str = ", but it was not read: the GPU answered only after the PC's firmware \
-    handed over to Stela. The boot log on this USB says why";
+    handed over to Stambha. The boot log on this USB says why";
 
 /// The screen line for the GPU `device` of `vendor` at PCI `address` that
 /// did not start for `reason`, `why` the refusal's own words (empty without
@@ -55,7 +55,7 @@ pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason, why: 
         return match (reason, why.is_empty()) {
             (Reason::MissingFirmware, _) => format!(
                 "the USB has no firmware for {gpu}. On another computer, plug in this USB and \
-                 run `stela repair`"
+                 run `stambha repair`"
             ),
             (Reason::FirmwareReadFailed, _) => format!("{HOLDS} {gpu}{READ_FAILED}"),
             (Reason::FirmwareNotRead, _) => format!("{HOLDS} {gpu}{NOT_READ}"),
@@ -69,12 +69,12 @@ pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason, why: 
     }
     match (nvidia_chip(device), reason) {
         (None, _) => format!(
-            "the NVIDIA GPU at {address} (device {device:04x}) is not supported: Stela needs \
+            "the NVIDIA GPU at {address} (device {device:04x}) is not supported: Stambha needs \
              {SUPPORTED}"
         ),
         (Some(chip), Reason::MissingFirmware) => format!(
             "the USB has no firmware for this PC's NVIDIA {chip} GPU. On another computer, plug \
-             in this USB and run `stela repair`"
+             in this USB and run `stambha repair`"
         ),
         (Some(chip), Reason::FirmwareReadFailed) => {
             format!("{HOLDS} this PC's NVIDIA {chip} GPU at {address}{READ_FAILED}")
@@ -157,11 +157,11 @@ pub fn unbound(address: &str, driver: &str, dark: bool) -> String {
 pub fn driver_stopped(stop: &str, failed_start: Option<&str>, firmware: Option<&str>) -> String {
     match (failed_start, firmware) {
         (Some(error), Some(firmware)) => format!(
-            "the NVIDIA GPU did not start ({error}). {firmware}. Stela cannot yet finish the GPU \
+            "the NVIDIA GPU did not start ({error}). {firmware}. Stambha cannot yet finish the GPU \
              driver's cleanup after that ({stop})"
         ),
         (Some(error), None) => format!(
-            "the NVIDIA GPU did not start ({error}), and Stela cannot yet finish the GPU \
+            "the NVIDIA GPU did not start ({error}), and Stambha cannot yet finish the GPU \
              driver's cleanup after that ({stop})"
         ),
         (None, _) => format!("the GPU driver stopped: {stop}"),
@@ -328,9 +328,9 @@ pub fn none(adapters: &[Adapter]) -> String {
         .map(adapter)
         .collect();
     match found.is_empty() {
-        true => format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}"),
+        true => format!("this PC has no NVIDIA GPU: Stambha needs {SUPPORTED}"),
         false => format!(
-            "this PC has no NVIDIA GPU, only {}: Stela needs {SUPPORTED}",
+            "this PC has no NVIDIA GPU, only {}: Stambha needs {SUPPORTED}",
             found.join(" and ")
         ),
     }
@@ -358,7 +358,7 @@ mod tests {
             missing.starts_with("the USB has no firmware for the Intel GPU at 00:02.0"),
             "{missing}"
         );
-        assert!(missing.ends_with("run `stela repair`"), "{missing}");
+        assert!(missing.ends_with("run `stambha repair`"), "{missing}");
         let named = refused(Vendor::Intel, "00:02.0", 0x9a49, Reason::Other, "no reset");
         assert!(
             named.contains("did not start: no reset. The boot log"),
@@ -390,7 +390,7 @@ mod tests {
             "",
         );
         assert!(missing.contains("NVIDIA ga104 GPU"), "{missing}");
-        assert!(missing.ends_with("run `stela repair`"), "{missing}");
+        assert!(missing.ends_with("run `stambha repair`"), "{missing}");
         // The files are on the USB: no `stela repair` for a GPU that
         // answered late, and the USB is not said to lack them.
         let late = refused(
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(
             late,
             "the USB holds the firmware for this PC's NVIDIA ad107 GPU at 01:00.0, but it was \
-             not read: the GPU answered only after the PC's firmware handed over to Stela. The \
+             not read: the GPU answered only after the PC's firmware handed over to Stambha. The \
              boot log on this USB says why"
         );
         let failed = refused(
@@ -458,10 +458,10 @@ mod tests {
         );
         assert_eq!(
             pascal,
-            "the NVIDIA GPU at 01:00.0 (device 1b80) is not supported: Stela needs an NVIDIA \
+            "the NVIDIA GPU at 01:00.0 (device 1b80) is not supported: Stambha needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stambha needs"));
     }
 
     #[test]
@@ -483,13 +483,13 @@ mod tests {
         assert_eq!(
             none(&[amd, intel]),
             "this PC has no NVIDIA GPU, only the AMD display adapter at 0000:03:00.0 (device \
-             744c) and the Intel display adapter at 0000:00:00.0 (device a780): Stela needs an \
+             744c) and the Intel display adapter at 0000:00:00.0 (device a780): Stambha needs an \
              NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
         assert_eq!(
             unused(&amd),
             "the AMD display adapter at 0000:03:00.0 (device 744c) is not used: AMDGPU is not \
-             ported to Stela"
+             ported to Stambha"
         );
         assert!(adapter(&at(1, Vendor::Other(0x1af4), 0x1050)).contains("PCI vendor 1af4"));
     }
@@ -503,7 +503,7 @@ mod tests {
                 None
             ),
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22), and \
-             Stela cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
+             Stambha cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
              unavailable; request retained)"
         );
         assert_eq!(driver_stopped("x", None, None), "the GPU driver stopped: x");
@@ -546,7 +546,7 @@ mod tests {
             "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22). The \
              GPU's own firmware, GSP-RM 570.144, ended its initialisation (GSP_INIT_DONE, right \
              after it booted) with NV_ERR_TIMEOUT (0x65): a step timed out inside that firmware, \
-             after it had raised RECOVERY_ACTION, its mark that the GPU needs a reset. Stela \
+             after it had raised RECOVERY_ACTION, its mark that the GPU needs a reset. Stambha \
              cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
              unavailable; request retained)"
         );

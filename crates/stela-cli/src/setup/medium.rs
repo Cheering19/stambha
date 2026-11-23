@@ -283,9 +283,9 @@ pub(super) fn locate(
     }
     bail!(
         "macOS and its boot files go on a FAT32 partition of the stick, and {usb} has none \
-         stela can use:\n{reasons}stela does not repartition the stick: add a FAT32 partition of \
-         at least 30 GB with a disk utility, mount it, and run stela again. Or erase the stick \
-         with `stela create` on its whole disk."
+         stambha can use:\n{reasons}stambha does not repartition the stick: add a FAT32 partition of \
+         at least 30 GB with a disk utility, mount it, and run stambha again. Or erase the stick \
+         with `stambha create` on its whole disk."
     )
 }
 
@@ -301,8 +301,8 @@ pub(super) fn reach(host: &dyn Host, esp: &Path) -> Result<PathBuf> {
         ),
         Search::Missing { reasons, .. } => bail!(
             "the stick's {} volume, which holds macOS and its boot files, is not mounted, and \
-             stela could not mount it:\n{reasons}Mount it, or plug the stick in again, and run \
-             stela again",
+             stambha could not mount it:\n{reasons}Mount it, or plug the stick in again, and run \
+             stambha again",
             super::create::USB_VOLUME
         ),
     }

@@ -97,23 +97,23 @@ impl Painter {
     /// `Canvas::header`: the logo and the name, centred at the top.
     fn header(&mut self) {
         const LOGO: usize = 32;
-        let left = self.width.saturating_sub(LOGO + 12 + 5 * 16) / 2;
+        const NAME: &str = "Stambha";
+        let left = self
+            .width
+            .saturating_sub(LOGO + 12 + NAME.chars().count() * 16)
+            / 2;
         for py in 0..LOGO {
             for px in 0..LOGO {
-                let (u, v) = (
-                    (px as f32 + 0.5) / LOGO as f32,
-                    (py as f32 + 0.5) / LOGO as f32,
-                );
-                if let Some(colour) = crate::screen::logo_pixel(u, v) {
+                if let Some(colour) = crate::screen::logo_pixel(px as u32, py as u32, LOGO as u32) {
                     self.fill(left + px, 28 + py, 1, 1, colour);
                 }
             }
         }
-        let ink = |y: usize| "Stela".chars().any(|c| (0..8).any(|x| glyph(c, x, y)));
+        let ink = |y: usize| NAME.chars().any(|c| (0..8).any(|x| glyph(c, x, y)));
         let first = (0..16).find(|&y| ink(y)).unwrap_or(0);
         let last = (0..16).rev().find(|&y| ink(y)).unwrap_or(15);
         let y = (28 + LOGO / 2).saturating_sub(first + last + 1);
-        self.text(left + LOGO + 12, y, "Stela", 2, rgb(Tone::Text));
+        self.text(left + LOGO + 12, y, NAME, 2, rgb(Tone::Text));
     }
 
     /// The page as `wifi_menu` shows it: background, header, then the scene.

@@ -201,7 +201,7 @@ impl Shortfall {
         let free = alloc::format!("{}.{}", self.free / GIB, self.free % GIB * 10 / GIB);
         let floor = GUEST_FLOOR / GIB;
         refuse!(
-            "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free: \
+            "this PC has {free} GB of RAM free; Stambha needs at least {needed} GB free: \
              {floor} GB for macOS and the rest for its own memory",
             free = %free,
             needed = %needed,

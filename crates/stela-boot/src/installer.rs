@@ -1187,7 +1187,7 @@ impl Picker {
         canvas.text(
             layout.left,
             buttons + 56,
-            "Check only reads the disk with Stela's driver and writes nothing",
+            "Check only reads the disk with Stambha's driver and writes nothing",
             1,
             ui::DIM,
         );

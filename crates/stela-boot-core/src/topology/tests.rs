@@ -1339,7 +1339,7 @@ fn a_missing_floor_names_each_feature() {
     assert_eq!(missing.names().collect::<Vec<_>>(), ["SSE4.2", "POPCNT"]);
     assert_eq!(
         missing.refusal().to_string(),
-        "this PC's CPU lacks SSE4.2 and POPCNT; Stela needs an x86-64-v2 CPU (Intel Nehalem, \
+        "this PC's CPU lacks SSE4.2 and POPCNT; Stambha needs an x86-64-v2 CPU (Intel Nehalem, \
          AMD Bulldozer or newer)"
     );
     for (field, bit, name) in [(0, 0, "SSE3"), (0, 9, "SSSE3"), (0, 13, "CX16")] {
@@ -1352,7 +1352,7 @@ fn a_missing_floor_names_each_feature() {
     changed.records[0].edx &= !(1 << 25);
     assert_eq!(
         refusal(changed).refusal().to_string(),
-        "this PC's CPU lacks SSE and a valid PAT setting; Stela needs an x86-64-v2 CPU (Intel Nehalem, AMD \
+        "this PC's CPU lacks SSE and a valid PAT setting; Stambha needs an x86-64-v2 CPU (Intel Nehalem, AMD \
          Bulldozer or newer)"
     );
 }

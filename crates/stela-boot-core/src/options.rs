@@ -1003,7 +1003,7 @@ impl System {
             verified
         } else if self.preboot.is_some() {
             self.native_cores.or(self.guest_pes).ok_or(refuse!(
-                "Preboot CPU count is unavailable before reservation; run stela repair or specify --guest-pes N"
+                "Preboot CPU count is unavailable before reservation; run stambha repair or specify --guest-pes N"
             ))?
         } else {
             1
@@ -1025,7 +1025,7 @@ impl System {
             && self.guest_pes != Some(source_pes)
         {
             return Err(refuse!(
-                "Preboot CPU count changed; run stela repair or update --guest-pes N"
+                "Preboot CPU count changed; run stambha repair or update --guest-pes N"
             ));
         }
         // Fewer cores than assigned run when firmware leaves no AP startup

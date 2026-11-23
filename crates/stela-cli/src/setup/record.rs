@@ -502,7 +502,7 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
     let path = esp.join(RECORD);
     ensure!(
         path.is_file(),
-        "{} holds no Stela setup: make an installer on the stick with `stela create`",
+        "{} holds no Stambha setup: make an installer on the stick with `stambha create`",
         usb.display()
     );
     let header: serde_json::Value = stela_engine::read_json(&path)
@@ -510,12 +510,12 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
     let schema = header["schema_version"].as_u64().unwrap_or(0);
     ensure!(
         header["kind"] == RECORD_KIND && schema <= u64::from(RECORD_SCHEMA),
-        "this stick's setup cannot be read by this stela; a newer stela may have made it"
+        "this stick's setup cannot be read by this stambha; a newer stambha may have made it"
     );
     ensure!(
         schema == u64::from(RECORD_SCHEMA),
-        "this stick was made by a stela too old for this one to read. Start over with \
-         `stela create` on the stick's whole disk, which erases it"
+        "this stick was made by a stambha too old for this one to read. Start over with \
+         `stambha create` on the stick's whole disk, which erases it"
     );
     let mut value = header;
     // A data partition out of reach is reported as that: the record's old
@@ -524,7 +524,7 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
     let volume = match reached_volume(environment.host, &esp, usb) {
         Ok(volume) => volume,
         Err(error) if volume_gone(&value) => {
-            return Err(error.context("the Stela setup on this stick cannot be read whole"));
+            return Err(error.context("the Stambha setup on this stick cannot be read whole"));
         }
         Err(_) => esp.clone(),
     };
@@ -533,7 +533,7 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         .with_context(|| format!("cannot read setup record {}", path.display()))?;
     ensure!(
         !record.installs.is_empty(),
-        "this stick's setup names no install. Start over with `stela create` on the stick's \
+        "this stick's setup names no install. Start over with `stambha create` on the stick's \
          whole disk, which erases it"
     );
     Ok(record)

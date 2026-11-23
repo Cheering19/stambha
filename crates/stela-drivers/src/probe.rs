@@ -665,7 +665,7 @@ pub fn disk_refusal(function: &crate::bus::pci::Identity) -> Option<&'static str
     }
     Some(match function.class[1] {
         0x04 => "Its controller is in RAID mode: set SATA to AHCI in firmware setup",
-        _ => "Stela has no driver for its controller",
+        _ => "Stambha has no driver for its controller",
     })
 }
 
@@ -4233,7 +4233,7 @@ mod tests {
         );
         assert_eq!(
             disk_refusal(&identity(0x8086, 0x7ae2, [0x01, 0x01, 0x8a])),
-            Some("Stela has no driver for its controller")
+            Some("Stambha has no driver for its controller")
         );
         // AHCI, Intel RAID-mode SATA the AHCI table lists, NVMe, VMD.
         assert_eq!(

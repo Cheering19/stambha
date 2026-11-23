@@ -307,7 +307,7 @@ fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
         ServiceError::Refused(
-            "Stela pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
+            "Stambha pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
                  not for this GPU",
         )
     })?;
@@ -412,7 +412,7 @@ fn lacks(name: &str, missing: &[(String, &str)], files: usize) -> ServiceError {
             let why = if held.contains(&Held::NoRoom) {
                 "the files read for such a GPU did not fit the firmware handoff"
             } else {
-                "the firmware showed a GPU of this family Stela drives or no PCI port with \
+                "the firmware showed a GPU of this family Stambha drives or no PCI port with \
                  nothing below it, so none was expected"
             };
             output::arguments(format_args!(

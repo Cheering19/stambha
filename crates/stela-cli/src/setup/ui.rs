@@ -155,16 +155,16 @@ impl Ui for NoTerminal {
         Ok(())
     }
     fn select(&self, prompt: &str, _: &[Item], _: usize) -> Result<usize> {
-        bail!("{prompt}: stela cannot ask without a terminal")
+        bail!("{prompt}: stambha cannot ask without a terminal")
     }
     fn input(&self, prompt: &str, _: &str, _: &str, _: Validate) -> Result<String> {
-        bail!("{prompt}: stela cannot ask without a terminal")
+        bail!("{prompt}: stambha cannot ask without a terminal")
     }
     fn password(&self, prompt: &str, _: Validate) -> Result<String> {
-        bail!("{prompt}: stela cannot ask without a terminal")
+        bail!("{prompt}: stambha cannot ask without a terminal")
     }
     fn confirm(&self, question: &str) -> Result<bool> {
-        bail!("{question} stela cannot ask without a terminal")
+        bail!("{question} stambha cannot ask without a terminal")
     }
     fn outro(&self, text: &str) -> Result<()> {
         eprintln!("{text}");

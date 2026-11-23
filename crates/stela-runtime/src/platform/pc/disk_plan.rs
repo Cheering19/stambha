@@ -224,7 +224,7 @@ impl fmt::Display for PlanError {
                 "the disk has no partition table to add macOS to, and this build never writes a \
                  new one",
             ),
-            Self::NotReusable => f.write_str("the partition chosen is not a Stela partition"),
+            Self::NotReusable => f.write_str("the partition chosen is not a Stambha partition"),
             Self::Overlap => f.write_str("the new partition overlaps one that stays"),
             Self::TooSmall => f.write_str("the partition is too small"),
             Self::Table(why) => write!(f, "the new partition table is invalid: {why}"),
@@ -479,7 +479,7 @@ pub enum LocateError {
 impl fmt::Display for LocateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoDisk => f.write_str("Stela's drivers found no disk that is the one chosen"),
+            Self::NoDisk => f.write_str("Stambha's drivers found no disk that is the one chosen"),
             Self::Ambiguous(count) => write!(f, "{count} disks could be the one chosen"),
         }
     }
@@ -886,7 +886,7 @@ impl Plan {
                 })
                 .ok_or(refuse(
                     partition.first_lba,
-                    "the partition to reuse is not that Stela partition on the disk",
+                    "the partition to reuse is not that Stambha partition on the disk",
                 ))?;
             say(&format!(
                 "PASS the partition reused, entry {}, is the Stela partition at {whole}; the \
@@ -1079,7 +1079,7 @@ impl Plan {
             })
             .ok_or(refuse(
                 2 + (slot * ENTRY_BYTES / block) as u64,
-                "the entry the plan adds is not the planned Stela partition",
+                "the entry the plan adds is not the planned Stambha partition",
             ))?;
         for (index, kept) in existing.partitions.iter().enumerate() {
             say(&format!(
