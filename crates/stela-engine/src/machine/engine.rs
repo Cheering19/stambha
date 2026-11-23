@@ -627,6 +627,25 @@ struct QuietFetch {
     size: u64,
 }
 
+/// One batch of walks no instruction asked for ([`Machine::refill_pages`]):
+/// the controls and requester the fetch runs under, which no walk of the
+/// batch changes, and the table the last walk read ([`mmu::WalkMemo`]).
+struct QuietWalk {
+    controls: mmu::Controls,
+    requester: mmu::Requester,
+    memo: mmu::WalkMemo,
+}
+
+impl QuietWalk {
+    fn new(cpu: &Cpu) -> Self {
+        Self {
+            controls: cpu.controls(cpu.regime()),
+            requester: cpu.requester(),
+            memo: mmu::WalkMemo::default(),
+        }
+    }
+}
+
 /// What a half's cached fetches and lookup contexts last as long as: the
 /// translation generation, and the table generation of a half that TTBR0
 /// selects ([`Machine::fetch_epoch`]).

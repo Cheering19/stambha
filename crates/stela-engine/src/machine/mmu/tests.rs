@@ -880,3 +880,106 @@ fn walks_from_a_noted_table_translate_as_full_walks() {
     assert!(held > 10_000 && outside > 500, "{held} {outside}");
     assert!(compared > 200_000 && mapped > 20_000, "{compared} {mapped}");
 }
+
+/// A batch of walks through one [`WalkMemo`] gives, for every address of a
+/// sorted run (as the post-TLBI refill walks them), what a full walk of each
+/// gives, on random tables in any regime and granule; and so does the next
+/// batch, made anew, after the tables change between the two (their leaf
+/// tables and the table descriptors above them, hierarchical bits
+/// included). A memo kept across that change is caught giving stale
+/// translations, which is why a batch drops it: the check can fail.
+#[test]
+fn a_batch_of_memo_walks_translates_as_full_walks_and_a_kept_memo_goes_stale() {
+    test_translation_chip();
+    let mut random = Random(0xba7c_4ed0_3a1c);
+    let requesters = [
+        KERNEL,
+        Requester { el: 0, ..KERNEL },
+        Requester {
+            pan: true,
+            ..KERNEL
+        },
+    ];
+    let (mut compared, mut from_table, mut mapped, mut stale) = (0u64, 0u64, 0u64, 0u64);
+    for _ in 0..300 {
+        let controls = random_controls(&mut random);
+        let mut tables = Tables::default();
+        for block in 0..4u64 {
+            tables.0.insert(
+                IDENTITY_VTTBR + block * 8,
+                block << 30 | 1 | 1 << 10 | 0b11 << 6 | 0b1111 << 2 | 0b11 << 8,
+            );
+        }
+        let upper = controls.regime != Regime::El2 && random.chance(50);
+        let low = random.below(1 << 36);
+        let address = if upper {
+            low | 0xffff_fff0_0000_0000
+        } else {
+            low
+        };
+        let level = random_tables(&mut random, &controls, address, &mut tables);
+        let (granule_bits, _) = walk_shape(&controls, address);
+        let stride = granule_bits - 3;
+        let entry_bits = granule_bits + stride * (3 - level) as u32;
+        let span_bits = entry_bits + stride;
+        // Pages of the table, of its neighbours and of the other half.
+        let mut pages: alloc::vec::Vec<u64> = (0..48)
+            .map(|_| {
+                let entry = random.below(1 << stride);
+                address & !((1u64 << span_bits) - 1) | entry << entry_bits
+            })
+            .collect();
+        pages.extend([
+            address.wrapping_add(1 << span_bits),
+            address.wrapping_sub(1 << span_bits),
+            address ^ 1 << 33,
+            address ^ 1 << 55,
+        ]);
+        pages.sort_unstable();
+        pages.dedup();
+        let requester = random.pick(&requesters);
+        let batch = |memo: &mut WalkMemo, tables: &mut Tables| {
+            pages
+                .iter()
+                .map(|&page| memo.translate(&controls, page, Access::Execute, requester, tables))
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        let mut kept = WalkMemo::default();
+        for round in 0..3 {
+            if round > 0 {
+                // The guest rewrites its tables and flushes: the walk path
+                // to the table and its entries take new values.
+                random_tables(&mut random, &controls, address, &mut tables);
+            }
+            let mut memo = WalkMemo::default();
+            let walked = batch(&mut memo, &mut tables);
+            from_table += memo.walks[1];
+            for (&page, outcome) in pages.iter().zip(&walked) {
+                compared += 1;
+                let full = translate(&controls, page, Access::Execute, requester, &mut tables);
+                mapped += u64::from(matches!(full, Outcome::Mapped(_)));
+                assert_eq!(
+                    *outcome, full,
+                    "{page:#x} round {round} {requester:?} {controls:#x?}"
+                );
+            }
+            // A memo of the round before, kept across the change: the walk
+            // of `address` starts at the table it noted then, past the
+            // table descriptors the change rewrote.
+            if round > 0 {
+                let full = translate(&controls, address, Access::Execute, requester, &mut tables);
+                if kept.translate(&controls, address, Access::Execute, requester, &mut tables)
+                    != full
+                {
+                    stale += 1;
+                }
+            }
+            kept = WalkMemo::default();
+            kept.translate(&controls, address, Access::Execute, requester, &mut tables);
+        }
+    }
+    assert!(compared > 30_000 && mapped > 3_000, "{compared} {mapped}");
+    // Most walks of a batch start at the table: what the memo saves.
+    assert!(from_table > compared / 2, "{from_table} of {compared}");
+    assert!(stale > 20, "a kept memo never went stale: {stale}");
+}

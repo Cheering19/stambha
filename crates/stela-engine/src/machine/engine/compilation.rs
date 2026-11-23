@@ -699,15 +699,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// faults or that the host refuses is left to its fetch. `el` (with
     /// the guarded level) and `context` are what the fetch runs in. A walk
     /// that forgets contexts ends it, and the fetch takes its contexts
-    /// anew.
+    /// anew. The pages are sorted, so runs of them share a leaf table: each
+    /// walk starts at the table the one before it read, when that holds its
+    /// page, as a walk cache lets hardware walk ([`mmu::WalkMemo`]). Nothing
+    /// in the batch runs guest code or changes the controls, and the walks
+    /// make no descriptor updates; the table is dropped with the batch.
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
         let generation = self.translation_generation;
+        let mut quiet = QuietWalk::new(&self.cpu);
         for pc in core::mem::take(&mut self.refills) {
             // Taken already, with its leaf's other pages.
             if self.current_key(pc).is_some() {
                 continue;
             }
-            let Some(walk) = self.quiet_fetch_physical(pc) else {
+            let Some(walk) = self.quiet_fetch_physical(pc, &mut quiet) else {
                 continue;
             };
             if self.translation_generation != generation {

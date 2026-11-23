@@ -464,14 +464,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// ([`Self::refill_pages`]). The walker makes no descriptor updates (no
     /// FEAT_HAFDBS), so the walk has no effect on memory. A global lower
     /// page that widens what the PE may hold is left to its fetch, which
-    /// walks again.
-    pub(super) fn quiet_fetch_physical(&mut self, pc: u64) -> Option<QuietFetch> {
-        let requester = self.cpu.requester();
-        let controls = self.cpu.controls(self.cpu.regime());
+    /// walks again. `walk` is the batch's: the controls and requester the
+    /// fetch runs under, read once, and the table the batch's last walk
+    /// read, where this one starts when it holds `pc` ([`mmu::WalkMemo`]).
+    pub(super) fn quiet_fetch_physical(
+        &mut self,
+        pc: u64,
+        walk: &mut QuietWalk,
+    ) -> Option<QuietFetch> {
         let mut tables = RamTables(&mut self.host);
-        let Translated::Mapped(translation) =
-            mmu::translate(&controls, pc, Access::Execute, requester, &mut tables)
-        else {
+        let Translated::Mapped(translation) = walk.memo.translate(
+            &walk.controls,
+            pc,
+            Access::Execute,
+            walk.requester,
+            &mut tables,
+        ) else {
             return None;
         };
         if !self.host.fetch_permitted(pc) {

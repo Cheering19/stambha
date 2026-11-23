@@ -189,6 +189,8 @@ pub(super) struct FakeHost {
     /// Root sets a native TTBR0 switch loads, for the tests that give the
     /// host some ([`FakeSets`]).
     pub(super) sets: Option<Box<FakeSets>>,
+    /// Page-table descriptors read ([`Host::read_ram_descriptor`]).
+    pub(super) descriptor_reads: usize,
 }
 
 /// A host's root sets as `x86_64::table_switch` reads them, one per TTBR0
@@ -291,6 +293,13 @@ impl FakeSets {
 pub(super) type Described = (usize, usize, Vec<(u32, step_timing::CodeRegion)>);
 
 impl Host for FakeHost {
+    fn read_ram_descriptor(&mut self, physical: u64) -> Option<u64> {
+        self.descriptor_reads += 1;
+        let mut bytes = [0; 8];
+        self.read_ram(physical, &mut bytes)
+            .then(|| u64::from_le_bytes(bytes))
+    }
+
     fn memory_barrier(&mut self) {
         self.memory_barriers += 1;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -774,6 +783,7 @@ pub(super) fn board_on<D: Devices>(
         idle_marks: Vec::new(),
         block_samples: Vec::new(),
         sets: None,
+        descriptor_reads: 0,
     };
     let profile = CpuProfile {
         name: "test",

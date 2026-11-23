@@ -727,6 +727,67 @@ fn a_whole_tlbi_refills_a_leaf_through_the_page_its_fetch_took() {
     assert_eq!(machine.statistics.itlb[0], misses);
 }
 
+/// After a TLBI of everything, the refill of the pages the forgotten context
+/// took walks each from the leaf table the walk before it read, not from
+/// the table base: one descriptor a page past the first. It takes what a
+/// full walk of each now gives, as before the memo: the pages that still
+/// translate come back with their keys, a page moved to another frame comes
+/// back with that frame's, and a page unmapped or made non-executable
+/// between the fills and the TLBI is not taken.
+#[test]
+fn a_whole_tlbi_refill_walks_from_the_leaf_table_and_takes_what_full_walks_give() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 48;
+    const FRAMES: u64 = 8;
+    let mut words = vec![0u32; (FRAMES * 0x1000 / 4) as usize];
+    for frame in 0..FRAMES as usize {
+        words[frame * 0x400] = RET;
+    }
+    let pc = |page: u64| BASE + page * 0x1000;
+    let frame = |page: u64| BASE + (page % FRAMES) * 0x1000;
+    let mut machine = machine(&words);
+    let frames: Vec<u64> = (0..PAGES).map(frame).collect();
+    paged_space(&mut machine, 0, &frames);
+    let fetch = |machine: &mut Machine<FakeHost, NoDevices>, page| {
+        assert!(matches!(
+            machine.fetch_block(pc(page), false),
+            Ok(Fetched::Block(_))
+        ));
+    };
+    for page in 0..PAGES {
+        fetch(&mut machine, page);
+    }
+    let keys: Vec<u64> = (0..PAGES)
+        .map(|page| machine.current_key(pc(page)).expect("taken"))
+        .collect();
+    // Between the fills and the TLBI: page 5 unmapped, page 6 moved to the
+    // frame page 7 maps, page 7 made privileged-execute-never.
+    let [_, _, l3] = SPACES_TABLES[0];
+    write_entry(&mut machine, l3 + 5 * 8, 0);
+    write_entry(&mut machine, l3 + 6 * 8, page_descriptor(frame(7), false));
+    write_entry(&mut machine, l3 + 7 * 8, page_descriptor(frame(7), true));
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    let context = machine.chain.contexts()[1];
+    let reads = machine.host.descriptor_reads;
+    fetch(&mut machine, 0);
+    let reads = machine.host.descriptor_reads - reads;
+    // The fetch runs in a context made anew.
+    assert_ne!(machine.chain.contexts()[1], context);
+    for page in 0..PAGES {
+        let expected = match page {
+            5 | 7 => None,
+            6 => Some(keys[7]),
+            _ => Some(keys[page as usize]),
+        };
+        assert_eq!(machine.current_key(pc(page)), expected, "page {page}");
+    }
+    // A full walk reads three descriptors (levels 1 to 3); the batch reads
+    // them for its first page and the leaf alone for each one after.
+    assert!(reads < 2 * PAGES as usize, "{reads} descriptor reads");
+    assert!(reads >= PAGES as usize - 1, "{reads} descriptor reads");
+}
+
 /// A machine running `words` at BASE through 4 KiB pages of address
 /// space 0, page `n` at frame `BASE + n * 4 KiB`.
 fn machine_with_pages(words: &[u32]) -> Machine<FakeHost, NoDevices> {
