@@ -62,7 +62,7 @@ pub struct Inputs {
 /// still reach stays held.
 #[derive(Debug)]
 pub enum AttachError {
-    /// Only MT7925's regulatory programming is ported.
+    /// No MT7921, MT7922 or MT7925: an MT7920 or another MediaTek ID.
     UnsupportedChip(PciIdentity),
     /// No regulatory database loaded, so the radio may not transmit.
     NoRegulatoryDatabase,
@@ -92,13 +92,13 @@ impl fmt::Display for AttachError {
             Self::Firmware(error) => write!(f, "{error}"),
             Self::Bootstrap(error) => write!(f, "{error}"),
             Self::Link(error) => write!(f, "{error}"),
-            Self::NoRegulatoryDatabase => f.write_str("MT7925: no regulatory database"),
+            Self::NoRegulatoryDatabase => f.write_str("MediaTek Wi-Fi: no regulatory database"),
             Self::Country(alpha2, error) => write!(
                 f,
-                "MT7925: regulatory.db country {}: {error:?}",
+                "MediaTek Wi-Fi: regulatory.db country {}: {error:?}",
                 alpha2.escape_ascii()
             ),
-            error => write!(f, "MT7925 attach: {error:?}"),
+            error => write!(f, "MediaTek Wi-Fi attach: {error:?}"),
         }
     }
 }
