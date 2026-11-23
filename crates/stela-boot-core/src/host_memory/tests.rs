@@ -1554,7 +1554,7 @@ fn more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused() 
         (8, 16, 4096),
         (8, 24, 3824),
     ] {
-        let sizes = sizes(free(installed), runners, runners).unwrap();
+        let sizes = sizes(free(installed), runners, runners, GpuMemory::Own).unwrap();
         assert_eq!(sizes.guest, guest * MIB, "{installed} GiB, {runners} PEs");
         assert!(sizes.guest >= GUEST_FLOOR);
         assert_eq!(
@@ -1564,7 +1564,9 @@ fn more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused() 
         );
     }
     for runners in [8, 16, 24] {
-        let refusal = sizes(free(6), runners, runners).unwrap_err().to_string();
+        let refusal = sizes(free(6), runners, runners, GpuMemory::Own)
+            .unwrap_err()
+            .to_string();
         assert!(
             refusal.contains("Stambha needs at least"),
             "{runners}: {refusal}"
