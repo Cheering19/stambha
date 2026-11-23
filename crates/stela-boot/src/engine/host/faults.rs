@@ -545,16 +545,23 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
 
 /// The shadow entry bits for `translation` in the current view. EL1 and
 /// PAN share a root. SMAP guards a leaf if a read with PAN set would be
-/// denied by either stage, or by stage 1's PAN rules.
+/// denied by either stage, or by stage 1's PAN rules. Accessed is set, and
+/// Dirty on a writable leaf, so the processor makes no locked update of a
+/// fresh entry at its first access or write: nothing reads them back
+/// ([`stela_boot_core::shadow_leaf`]).
 fn shadow_rights(state: &State, translation: &mmu::Translation) -> u64 {
     let guarded = state.contexts.pan_flag
         && state.current % VIEWS == EL1_VIEW
         && (!translation.readable || translation.pan_sensitive);
-    PRESENT
-        | NX
-        | if translation.writable { WRITABLE } else { 0 }
-        | if guarded { tables::USER } else { 0 }
+    stela_boot_core::shadow_leaf::rights(translation.writable, guarded)
 }
+
+// The leaf's bits are the page tables' own.
+const _: () = {
+    use stela_boot_core::shadow_leaf as leaf;
+    assert!(leaf::PRESENT == PRESENT && leaf::WRITABLE == WRITABLE && leaf::NX == NX);
+    assert!(leaf::USER == tables::USER);
+};
 
 /// Fault-around: map the leaf at `address` in the window of a fault just
 /// filled through `table` (the live leaf table that holds the whole
