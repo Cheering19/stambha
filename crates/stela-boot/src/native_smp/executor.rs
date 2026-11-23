@@ -178,6 +178,10 @@ pub(crate) struct Executors {
     /// BSP is absent: it already owns its local HostOwner. Slots 1 to
     /// `processors.len()`, in order.
     processors: Vec<Processor>,
+    /// The host core (`--host-core on`), taken out of `processors` by
+    /// [`Executors::set_aside_host_core`]: started like a PE's AP, it runs
+    /// no PE and is no part of the guest's topology.
+    host_core: Option<Processor>,
     /// The first AP that did not start, when one did not: it and every AP
     /// after it run no PE.
     failure: Option<StartupFailure>,
@@ -194,6 +198,34 @@ impl Executors {
     /// Why fewer cores started than were reserved.
     pub(crate) fn failure(&self) -> Option<&StartupFailure> {
         self.failure.as_ref()
+    }
+    /// Take the reservation's last processor out of the PEs' as the host
+    /// core, when `reserved` processors were reserved with one
+    /// (`Resources::host_core`) and every one of them started
+    /// (`stela_boot_core::host_core::confirm`). Otherwise nothing changes:
+    /// the started processors all run PEs, as without the option, and the
+    /// reason is returned.
+    pub(crate) fn set_aside_host_core(&mut self, reserved: usize) -> Result<(), &'static str> {
+        stela_boot_core::host_core::confirm(reserved, reserved, self.started())?;
+        let processor = self
+            .processors
+            .pop()
+            .ok_or("no processor beyond the boot processor started")?;
+        if processor.slot + 1 != reserved {
+            let slot = processor.slot;
+            self.processors.push(processor);
+            return Err(if slot + 1 < reserved {
+                "the last started processor is a PE's"
+            } else {
+                "the last started processor lies past the reservation"
+            });
+        }
+        self.host_core = Some(processor);
+        Ok(())
+    }
+    /// The host core set aside, if any.
+    pub(crate) fn host_core(&self) -> Option<&Processor> {
+        self.host_core.as_ref()
     }
 }
 
@@ -836,6 +868,7 @@ pub(crate) unsafe fn start(
     STARTED.store(true, Ordering::Relaxed);
     Ok(Executors {
         processors,
+        host_core: None,
         failure: failure.map(|(_, error)| error),
     })
 }

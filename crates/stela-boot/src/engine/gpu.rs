@@ -2846,6 +2846,13 @@ pub(super) fn pump_due(calm: Calm) -> bool {
         unmasked: gpu.tsc_after(DEFER_UNMASKED_NS),
         longest: gpu.tsc_after(DEFER_LONGEST_NS),
     };
+    // A serving host core with a fresh beat takes the work in its next
+    // pass (`host_core`); PE 0 pumps only what waited [`DEFER_LONGEST_NS`]
+    // anyway, or once the host core stops beating.
+    if waited < limits.longest && super::host_core::takes_pump() {
+        PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let Some(why) = boot_decision(calm, waited, limits) else {
         PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
         // A Linux timer that came due raised no event, so nothing woke a
@@ -2915,12 +2922,25 @@ pub(super) fn pump() {
 /// guest has work (`guest_work`). Nothing with no work ready, or while the
 /// GPUs stop.
 pub(super) fn pump_waiting_pe(guest_work: &dyn Fn() -> bool) {
+    pump_off_boot_cpu(guest_work);
+}
+
+/// Run what is ready from the host core (`--host-core on`, `host_core`), as
+/// a waiting PE does whose guest never has work: whether work was ready.
+pub(super) fn pump_host_core() -> bool {
+    pump_off_boot_cpu(&|| false)
+}
+
+/// [`pump_waiting_pe`]'s body: whether work was ready, and so pumped.
+fn pump_off_boot_cpu(guest_work: &dyn Fn() -> bool) -> bool {
     if on_boot_cpu() || !may_move() {
-        return;
+        return false;
     }
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         pump_as(Taker::Waiting, guest_work);
+        return true;
     }
+    false
 }
 
 /// One pump by `taker` on this processor, under the [`TURN`]: what was

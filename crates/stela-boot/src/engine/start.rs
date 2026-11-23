@@ -817,7 +817,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
     // SAFETY: the physical inventory and loader-owned reservations
     // were validated before any SIPI; the BSP Host is installed, guest entry
     // is excluded, and APs remain parked until canonical worker publication.
-    let executors = unsafe {
+    let mut executors = unsafe {
         crate::native_smp::executor::start(
             handoff,
             native_processors.expect("validated native roster"),
@@ -845,6 +845,26 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
             ));
         }
         None => crate::status::done(""),
+    }
+    // `--host-core on`: the reservation's last processor runs no PE. Unless
+    // every reserved processor started, they all run PEs, as without it.
+    if handoff.native_resources.host_core == 1 {
+        let reserved = handoff.native_resources.cores as usize;
+        match executors.set_aside_host_core(reserved) {
+            Ok(()) => {
+                let host_core = executors.host_core().expect("set aside");
+                output::arguments(format_args!(
+                    "HOST CORE set aside: slot={} apic={:#x}; {} PEs on the others\n",
+                    host_core.slot(),
+                    host_core.apic_id(),
+                    executors.started(),
+                ));
+            }
+            Err(why) => output::arguments(format_args!(
+                "HOST CORE off: {why}; {} PEs, as without --host-core\n",
+                executors.started(),
+            )),
+        }
     }
     let sender = crate::apic::Apic::new(
         handoff.apic_base,
@@ -1496,6 +1516,9 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
             &settings,
         )
         .unwrap_or_else(|error| output::fatal(error));
+        // `--host-core on`: its loop, and the ping it must answer before
+        // the guest starts, else PE 0 keeps everything.
+        host_core::start(&executors, &sender, handoff.tsc_hz, worker_bindings.len());
     }
     // The run's driver calls keep the engine's TLB entries; the serialized
     // workers' validations require PCIDE clear.
