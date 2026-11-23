@@ -332,6 +332,13 @@ impl AsusMode {
 /// laptop does not take it unasked until it is proven on hardware.
 pub const ACPI_HARDWARE: &str = "--acpi-hardware";
 
+/// Lets a guest whose kernel panicked run on (`--keep-running-on-panic`):
+/// without it the run stops `guest_watch::PANIC_HOLD_MILLIS` after the
+/// panic's first line when no reset follows (`crate::guest_watch`). A
+/// hand-written opt-in for debugging that setup never writes, so the
+/// options revision stays 13.
+pub const KEEP_RUNNING_ON_PANIC: &str = "--keep-running-on-panic";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -662,6 +669,8 @@ pub struct System {
     pub brightness_keys: bool,
     /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
     pub acpi_hardware: bool,
+    /// Run on after a guest kernel panic ([`KEEP_RUNNING_ON_PANIC`]).
+    pub keep_running_on_panic: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -796,6 +805,7 @@ impl Default for System {
             lid_sleep: false,
             brightness_keys: false,
             acpi_hardware: false,
+            keep_running_on_panic: false,
             laptop: None,
             asus_mode: None,
             amx_native: None,
@@ -1335,6 +1345,7 @@ impl fmt::Display for System {
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
+        line.flag(KEEP_RUNNING_ON_PANIC, self.keep_running_on_panic)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;

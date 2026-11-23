@@ -1142,7 +1142,12 @@ pub(super) fn run<H: Host>(
         // A wall-time service yield may precede even the final block limit.
         // Only the executed count can establish budget completion.
         let budget_reached = budget != 0 && machine.statistics.blocks >= budget;
-        let sliced = waiting || matches!(stop, Stop::Budget) && !budget_reached;
+        // A guest panic that never reset the Mac ends the run as a stop of
+        // its own (`super::watch_guest`).
+        // A stop the machine made itself, a reset among them, goes first.
+        let slice_ended = waiting || matches!(stop, Stop::Budget) && !budget_reached;
+        let panicked = super::watch_guest().filter(|_| slice_ended);
+        let sliced = slice_ended && panicked.is_none();
         let now = host::rdtsc();
         if !sliced {
             // Every guest line, the last ones before the stop first of all.
@@ -1163,7 +1168,7 @@ pub(super) fn run<H: Host>(
                 ));
             }
             output::report_log_stores();
-            return stop;
+            return panicked.unwrap_or(stop);
         }
         cursor.look(now);
         heartbeat.sample(machine, now, tsc_hz);
@@ -1379,7 +1384,10 @@ pub(super) fn report_drained<H: Host>(
                     machine.statistics.blocks,
                 ));
             }
-            crate::status::progress(&update.detail);
+            // A panic the run stops for keeps its line as the detail.
+            if !super::panic_shown() {
+                crate::status::progress(&update.detail);
+            }
         }
     }
     crate::status::stream(lines.iter().map(String::as_str));
