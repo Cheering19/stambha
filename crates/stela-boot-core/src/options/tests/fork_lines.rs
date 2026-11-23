@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 11] {
+fn forks() -> [Fork; 12] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -205,6 +205,16 @@ fn forks() -> [Fork; 11] {
             bad: &[],
             duplicate: None,
         },
+        Fork {
+            valid: &["--pack-preload on", "--pack-preload off"],
+            set: |o, t| o.pack_preload = Some(on(t)),
+            bad: &[
+                ("--pack-preload", Error::PackPreload),
+                ("--pack-preload yes", Error::PackPreload),
+                ("--pack-preload OFF", Error::PackPreload),
+            ],
+            duplicate: Some(Error::DuplicatePackPreload),
+        },
     ]
 }
 
@@ -252,6 +262,7 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert!(!options.hle && options.hle_off.is_empty());
         assert!(!options.core_trial);
         assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());
+        assert!(options.pack_preload.is_none() && options.pack_preload());
     }
 }
 

@@ -143,6 +143,26 @@ pub fn split(pack: &mut [u8], translator: &Digest) -> Result<Split, PackError> {
     })
 }
 
+/// Where, in the pack whose header, index and index checksum are `prefix`,
+/// the first of its records that does not end within its first `held` bytes
+/// begins: the bytes from there to the pack's end hold every record a
+/// reader of those first bytes still lacks. `None` when every record ends
+/// within them; `Err` when the index fails the checks `Pack::parse` makes.
+pub fn first_left(prefix: &[u8], translator: &Digest, held: u64) -> Result<Option<u64>, PackError> {
+    let start = pack::prefix_bytes(prefix, translator)?;
+    if prefix.len() < start {
+        return Err(PackError::Truncated);
+    }
+    Pack::length(&prefix[..start], translator)?;
+    let count = (start - HEADER_BYTES - CHECKSUM_BYTES) / INDEX_ENTRY_BYTES;
+    Ok((0..count)
+        .map(|index| entry(prefix, index))
+        // `Pack::length` checked that the sum does not overflow.
+        .filter(|&(offset, bytes)| offset + bytes > held)
+        .map(|(offset, _)| offset)
+        .min())
+}
+
 /// Index entry `index`'s record offset and length (the length field less
 /// the record's age, `pack::LENGTH_MASK`).
 fn entry(pack: &[u8], index: usize) -> (u64, u64) {

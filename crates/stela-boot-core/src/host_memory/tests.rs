@@ -500,6 +500,48 @@ fn a_16_gb_pc_reads_the_first_quarter_gigabyte_of_its_pack_ahead() {
     assert_eq!(preload_bound(0), 0);
 }
 
+/// The pack of the 2026-11-23 boots on the 16 GB laptop: 533 MB in five
+/// segments, 1.7 MB of indexes, the first 72 MiB read ahead by the loader.
+const PACK_1123: u64 = 533_202_872;
+const INDEXES_1123: u64 = 1_703_824;
+const AHEAD_1123: u64 = 72 * MIB;
+
+#[test]
+fn a_16_gb_pc_holds_its_whole_pack_in_the_background_and_still_grows_its_window() {
+    let host = free(16);
+    let budget = pack_budget(host, 8, 8);
+    let room = budget - INDEXES_1123 - AHEAD_1123;
+    let left = PACK_1123 - AHEAD_1123;
+    let bulk = bulk_bound(room, left);
+    // All of it: the pack fits the room the budget leaves.
+    assert_eq!(bulk, left);
+    assert!(bulk < BULK_MOST);
+    // The parts as the loader leaves them: without the preload all the room
+    // goes to the window and the guest; with it what the pack leaves does.
+    let held = INDEXES_1123 + AHEAD_1123;
+    let without = sizes_with_room(host - held, 8, 8, room).unwrap();
+    let with = sizes_with_room(host - held - bulk, 8, 8, room - bulk).unwrap();
+    // The heap moves with the window alone (its block records).
+    assert_eq!(with.pool, without.pool);
+    assert_eq!(
+        with.heap - with.code.window,
+        without.heap - without.code.window
+    );
+    assert!(with.code.window <= without.code.window);
+    assert!(with.code.window >= without.code.window - bulk / 2);
+    assert!(with.guest >= without.guest - bulk);
+    assert!(with.guest > 2 * GUEST_FLOOR);
+    // An 8 GB PC holds as much as its room, the records used first.
+    let small = pack_budget(free(8), 8, 8) - INDEXES_1123 - AHEAD_1123;
+    assert_eq!(bulk_bound(small, left), small.min(left));
+    let sizes = sizes_with_room(free(8) - held - small, 8, 8, 0).unwrap();
+    assert!(sizes.guest >= GUEST_FLOOR);
+    // No room, or one below the floor, holds nothing; a huge one the most.
+    assert_eq!(bulk_bound(0, left), 0);
+    assert_eq!(bulk_bound(PRELOAD_FLOOR - 1, left), 0);
+    assert_eq!(bulk_bound(16 * GIB, 4 * GIB), BULK_MOST);
+}
+
 #[test]
 fn a_preload_holds_the_boot_two_seconds_at_most_whatever_the_stick() {
     let bound = 246 * MIB;

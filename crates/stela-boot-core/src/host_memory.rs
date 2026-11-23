@@ -144,6 +144,23 @@ pub fn preload_bound(room: u64) -> u64 {
     if bound < PRELOAD_FLOOR { 0 } else { bound }
 }
 
+/// The most of a pack read on demand its background preload holds
+/// (`stela_runtime::translation_bulk`), whatever the room.
+pub const BULK_MOST: u64 = GIB;
+
+/// The memory the background preload of a pack read on demand sets aside,
+/// when the pack's indexes and what the loader read ahead leave `room` of
+/// its budget ([`pack_budget`]) and `left` bytes of its segments lie only in
+/// the file: all of them, as a pack read whole holds its bytes, within the
+/// room and [`BULK_MOST`]; none below [`PRELOAD_FLOOR`]. A room larger than
+/// the pack still grows the code window and the guest by what is left
+/// ([`sizes_with_room`]); a smaller one holds the records its boot used
+/// first, and the others are read on demand.
+pub fn bulk_bound(room: u64, left: u64) -> u64 {
+    let bound = left.min(room).min(BULK_MOST);
+    if bound < PRELOAD_FLOOR { 0 } else { bound }
+}
+
 /// What a preload within `bound` reads from a medium that reads
 /// `bytes_per_second`, and the milliseconds it holds the boot: the model of
 /// the stick [`PRELOAD_MILLIS`] was chosen with.

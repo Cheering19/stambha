@@ -76,6 +76,16 @@ impl ParseState<'_> {
                 }
             }
             TIER2_CHECK => options.tier2_check = true,
+            PACK_PRELOAD => {
+                let on = match value().ok_or(Error::PackPreload)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::PackPreload),
+                };
+                if options.pack_preload.replace(on).is_some() {
+                    return Err(Error::DuplicatePackPreload);
+                }
+            }
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

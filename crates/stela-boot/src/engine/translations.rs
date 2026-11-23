@@ -20,6 +20,15 @@
 //! is left and this boot's used-key list. The pack is a cache: every failure
 //! leaves the boot running without a store, or without writing it.
 //!
+//! A pack read on demand is preloaded in the background (`--pack-preload`,
+//! on unless `off`): the loader sets aside the memory the pack's budget
+//! leaves for the records its segments hold only in the file
+//! (`host_memory::bulk_bound`), and once the guest runs the reader fills it
+//! in large sequential reads ([`BULK_CHUNK`]) on idle time, the records the
+//! pack's merge laid out first, first (`stela_runtime::translation_bulk`).
+//! A lookup whose record it holds decodes it from memory; a record read a
+//! lookup asks for goes ahead of every later bulk read.
+//!
 //! When every PE runs on its own host core (the default), their machines
 //! share the store ([`Shared`]), split by page key into parts behind locks
 //! of their own, and it keeps the blocks any of them compiled for the others
@@ -50,6 +59,7 @@ use stela_formats::journal::{self, Commit, DATA_START, SLOT_BYTES};
 use stela_formats::payload::pieces::Extent;
 use stela_runtime::pc::fat32::Fat32;
 use stela_runtime::pc::gpt::Guid;
+use stela_runtime::translation_bulk::{self, Asked, Bulk, BulkReader, FileRead, Planned, Span};
 use stela_runtime::translation_store;
 use uefi::{
     CString16, boot,
@@ -209,12 +219,15 @@ pub enum PackRead {
     Part { read: u64, held: u64 },
     /// Its segments' headers and indexes, `index` bytes of its `held`, and
     /// the first `preloaded` bytes of its oldest segment ([`Preloaded`]):
-    /// the other records are read when a lookup asks for them, and `room`
-    /// of the budget is left to the window and the guest.
+    /// the other records are read when a lookup asks for them, `background`
+    /// bytes of memory are set aside to read them into once the guest runs
+    /// ([`plan_background`]), and `room` of the budget is left to the
+    /// window and the guest.
     OnDisk {
         index: u64,
         held: u64,
         preloaded: u64,
+        background: u64,
         room: u64,
     },
     /// None of it: this PC's budget holds less than the newest segment's
@@ -242,9 +255,11 @@ pub struct Opened {
 /// next boot on this PC can read. A pack read on demand holds its indexes
 /// within it, and the engine merges it within the file
 /// ([`writer::demand_limit`]), its records bounded by the indexes the
-/// budget holds ([`writer::resident_records`]). `None` when no volume has a
-/// store.
-pub fn read(budget: u64) -> Option<Opened> {
+/// budget holds ([`writer::resident_records`]). With `background`
+/// (`--pack-preload`), a pack read on demand also gets the memory its budget
+/// leaves for its records in the file, to read them into once the guest
+/// runs. `None` when no volume has a store.
+pub fn read(budget: u64, background: bool) -> Option<Opened> {
     let translator = translations::translator_id();
     for handle in boot::find_handles::<SimpleFileSystem>().ok()? {
         let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
@@ -294,7 +309,8 @@ pub fn read(budget: u64) -> Option<Opened> {
                 // The engine reads records from the partition it writes:
                 // a pack it may write is read on demand, its merges too.
                 let demand = allocated && partition.is_some() && ram >= PACK_FLOOR;
-                let loaded = read_journal(&mut file, &translator, size, held_ram, demand)?;
+                let loaded =
+                    read_journal(&mut file, &translator, size, held_ram, demand, background)?;
                 (loaded, size, allocated, demand)
             }
             None => (blank()?, 0, false, false),
@@ -319,6 +335,22 @@ pub fn read(budget: u64) -> Option<Opened> {
                 (index, held)
             }
         };
+        if let Some(bulk) = &loaded.bulk {
+            let mib = |bytes: u64| bytes >> 20;
+            output::arguments(format_args!(
+                "TRANSLATIONS background preload planned={} MiB of {} MiB in the file, spans={}, \
+                 room={} MiB{}: read once the guest runs\n",
+                mib(bulk.planned),
+                mib(bulk.left),
+                bulk.spans,
+                mib(bulk.room),
+                if bulk.planned < bulk.left {
+                    ", the records used first"
+                } else {
+                    ""
+                },
+            ));
+        }
         if let Some(preload) = &loaded.preload {
             let mib = |bytes: u64| bytes >> 20;
             output::arguments(format_args!(
@@ -427,6 +459,17 @@ struct Loaded {
     lists: usize,
     partial: bool,
     preload: Option<Preloaded>,
+    bulk: Option<BackgroundPlan>,
+}
+
+/// The memory set aside for a background preload: the bytes planned of
+/// those the segments hold only in the file, in how many spans, and the
+/// room of the budget there was.
+struct BackgroundPlan {
+    planned: u64,
+    left: u64,
+    spans: usize,
+    room: u64,
 }
 
 /// The first bytes of a segment of a pack read on demand that the loader
@@ -450,6 +493,17 @@ const PRELOAD_STEP: usize = 4 << 20;
 /// first bytes follow the blobs (zero for none): their length, then those
 /// bytes.
 const PRELOAD_AT: usize = 56;
+/// The background preload's descriptor, right after the blobs: its magic,
+/// the physical address and bytes of the memory set aside, the span count,
+/// then each span's file offset and length (`translation_bulk::Span`). A
+/// region whose descriptor lacks the magic has no preload. The bytes read
+/// ahead follow it.
+const BULK_MAGIC: [u8; 8] = *b"STLBULK1";
+const BULK_BYTES: usize = 32 + 16 * pack::MAX_SEGMENTS;
+/// The bytes of one background read: a lookup's read waits behind one at
+/// most (about 60 ms on a USB 2 stick); smaller ones cost the preload a
+/// command each (the `translation_bulk` tests' launch model).
+const BULK_CHUNK: u64 = 2 << 20;
 
 /// A handoff region of a placement and a blank commit slot.
 fn blank() -> Option<Loaded> {
@@ -467,6 +521,7 @@ fn blank() -> Option<Loaded> {
         lists: 0,
         partial: false,
         preload: None,
+        bulk: None,
     })
 }
 
@@ -480,14 +535,17 @@ fn blank() -> Option<Loaded> {
 /// records are read from the file as lookups and merges need them, and
 /// the budget they leave goes to the window and the guest, less the first
 /// bytes of the oldest segment read ahead after the blobs
-/// ([`preload_segment`], [`PRELOAD_AT`]). `None` only when no memory is
-/// left for the region.
+/// ([`preload_segment`], [`PRELOAD_AT`]), and, with `background`, the
+/// memory for the rest of the records the segments hold only in the file
+/// ([`plan_background`]). `None` only when no memory is left for the
+/// region.
 fn read_journal(
     file: &mut RegularFile,
     translator: &Digest,
     size: u64,
     limit: u64,
     demand: bool,
+    background: bool,
 ) -> Option<Loaded> {
     let mut slots = vec![0; DATA_START as usize];
     let commit = if size >= DATA_START && read_exact(file, &mut slots).is_some() {
@@ -583,7 +641,8 @@ fn read_journal(
         .sum();
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize + 8 * entries.len();
     let tail = head + blobs;
-    let bytes = tail + preload.map_or(0, |(_, capacity)| 8 + capacity);
+    let ahead = tail + BULK_BYTES;
+    let bytes = ahead + preload.map_or(0, |(_, capacity)| 8 + capacity);
     let pages = bytes.div_ceil(PAGE);
     let physical = firmware::pages(pages).ok()?;
     // SAFETY: firmware returned this exclusive allocation of `bytes` or
@@ -650,18 +709,18 @@ fn read_journal(
             &entries[index],
             translator,
             prefix,
-            &mut region[tail + 8..tail + 8 + capacity],
+            &mut region[ahead + 8..ahead + 8 + capacity],
             preload_bound,
         )?;
-        region[tail..tail + 8].copy_from_slice(&read.read.to_le_bytes());
+        region[ahead..ahead + 8].copy_from_slice(&read.read.to_le_bytes());
         region[PRELOAD_AT..PRELOAD_AT + 8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
         Some(read)
     });
     // The pages past what was read ahead go back to the firmware, whose
     // free memory the parts and the guest are sized from.
     let used = match &preloaded {
-        Some(preloaded) => tail + 8 + preloaded.read as usize,
-        None => tail,
+        Some(preloaded) => ahead + 8 + preloaded.read as usize,
+        None => ahead,
     };
     let kept = used.div_ceil(PAGE);
     if let Some(start) = core::ptr::NonNull::new((physical + kept * PAGE) as *mut u8)
@@ -672,6 +731,24 @@ fn read_journal(
         let _ = unsafe { boot::free_pages(start, pages - kept) };
     }
     let preloaded_bytes = preloaded.as_ref().map_or(0, |preloaded| preloaded.read);
+    // The rest of the records in the file, in the memory the budget leaves.
+    let bulk = (demand && background)
+        .then(|| {
+            let read_ahead = preload
+                .zip(preloaded.as_ref())
+                .map(|((index, _), preloaded)| (index, preloaded.read));
+            let room = limit.saturating_sub(indexes + preloaded_bytes);
+            plan_background(
+                entries,
+                &prefixes,
+                translator,
+                read_ahead,
+                room,
+                &mut region[tail..ahead],
+            )
+        })
+        .flatten();
+    let background_bytes = bulk.as_ref().map_or(0, |bulk| bulk.planned);
     let segment = |index: usize| entries[index].kind == SEGMENT;
     let (mut read, mut whole, mut segments, mut committed) = (0, 0, 0, 0);
     for (index, &length) in held.iter().enumerate().filter(|(index, _)| segment(*index)) {
@@ -689,7 +766,8 @@ fn read_journal(
             index: read,
             held: whole,
             preloaded: preloaded_bytes,
-            room: limit.saturating_sub(read + preloaded_bytes),
+            background: background_bytes,
+            room: limit.saturating_sub(read + preloaded_bytes + background_bytes),
         },
         () if partial => PackRead::Part { read, held: whole },
         () => PackRead::Whole(read),
@@ -708,7 +786,103 @@ fn read_journal(
             .count(),
         partial,
         preload: preloaded,
+        bulk,
     })
+}
+
+/// Set aside the memory to read the records the held segments (`entries`,
+/// their checked indexes `prefixes`) keep only in the file into once the
+/// guest runs, within `room` (`host_memory::bulk_bound`): each segment from
+/// its first record not read ahead (`read_ahead`, the entry and bytes of
+/// the oldest's first bytes), in commit order, the oldest (merged, its
+/// records in the order a boot first used them) first. Writes the
+/// descriptor ([`BULK_MAGIC`]) into `descriptor`. `None` when nothing is
+/// left in the file, the room is below the floor or the firmware has no
+/// memory for it: the records are then read on demand.
+fn plan_background(
+    entries: &[journal::Entry],
+    prefixes: &[(usize, Vec<u8>)],
+    translator: &Digest,
+    read_ahead: Option<(usize, u64)>,
+    room: u64,
+    descriptor: &mut [u8],
+) -> Option<BackgroundPlan> {
+    let mut planned = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some((_, prefix)) = prefixes.iter().find(|(held, _)| *held == index) else {
+            continue;
+        };
+        let held = match read_ahead {
+            Some((ahead, read)) if ahead == index => read,
+            _ => prefix.len() as u64,
+        };
+        if let Ok(Some(from)) = translation_store::first_left(prefix, translator, held) {
+            planned.push(Planned {
+                file: entry.offset,
+                from,
+                length: entry.length,
+            });
+        }
+    }
+    let left: u64 = planned
+        .iter()
+        .map(|segment| segment.length.saturating_sub(segment.from))
+        .sum();
+    let capacity = stela_boot_core::host_memory::bulk_bound(room, left);
+    let spans = translation_bulk::plan(&planned, capacity);
+    let total: u64 = spans.iter().map(|span| span.length).sum();
+    if total == 0 || spans.len() > pack::MAX_SEGMENTS {
+        return None;
+    }
+    let Ok(physical) = firmware::pages((total as usize).div_ceil(PAGE)) else {
+        output::arguments(format_args!(
+            "TRANSLATIONS background preload of {} MiB refused: the firmware has no memory \
+             for it; the records are read on demand\n",
+            total >> 20
+        ));
+        return None;
+    };
+    descriptor[..8].copy_from_slice(&BULK_MAGIC);
+    descriptor[8..16].copy_from_slice(&(physical as u64).to_le_bytes());
+    descriptor[16..24].copy_from_slice(&total.to_le_bytes());
+    descriptor[24..32].copy_from_slice(&(spans.len() as u64).to_le_bytes());
+    for (at, span) in descriptor[32..]
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(&spans)
+    {
+        at[..8].copy_from_slice(&span.file.to_le_bytes());
+        at[8..].copy_from_slice(&span.length.to_le_bytes());
+    }
+    Some(BackgroundPlan {
+        planned: total,
+        left,
+        spans: spans.len(),
+        room,
+    })
+}
+
+/// The background preload a handoff region's descriptor names: the
+/// physical address and bytes of the memory set aside, and its spans.
+/// `None` without the magic, or with no span or more than a descriptor
+/// holds.
+fn bulk_descriptor(descriptor: &[u8]) -> Option<(u64, u64, Vec<Span>)> {
+    if descriptor.len() < BULK_BYTES || descriptor[..8] != BULK_MAGIC {
+        return None;
+    }
+    let field = |at: usize| u64::from_le_bytes(descriptor[at..at + 8].try_into().expect("a field"));
+    let count = usize::try_from(field(24)).ok()?;
+    if count == 0 || count > pack::MAX_SEGMENTS {
+        return None;
+    }
+    let spans = (0..count)
+        .map(|index| Span {
+            file: field(32 + 16 * index),
+            length: field(40 + 16 * index),
+        })
+        .collect();
+    Some((field(8), field(16), spans))
 }
 
 /// Read the first bytes of the segment `entry` names into `into`, its
@@ -931,6 +1105,12 @@ struct Costs {
     lookups: AtomicU64,
     lookup_ticks: AtomicU64,
     decode_ticks: AtomicU64,
+    /// Lookups whose record was in memory (`found`), those of them the
+    /// background preload held, and lookups whose record was only on the
+    /// stick (`asked`); `[1]` counts those after the preload stopped.
+    found: [AtomicU64; 2],
+    preloaded: [AtomicU64; 2],
+    asked: [AtomicU64; 2],
 }
 
 static COSTS: Costs = Costs {
@@ -943,7 +1123,82 @@ static COSTS: Costs = Costs {
     lookups: AtomicU64::new(0),
     lookup_ticks: AtomicU64::new(0),
     decode_ticks: AtomicU64::new(0),
+    found: [const { AtomicU64::new(0) }; 2],
+    preloaded: [const { AtomicU64::new(0) }; 2],
+    asked: [const { AtomicU64::new(0) }; 2],
 };
+
+/// The background preload of a pack read on demand: the memory the loader
+/// set aside ([`plan_background`]) and the file offset of each of the
+/// store's segments (`None` for one held whole), as the reader's.
+struct Background {
+    bulk: Bulk,
+    offsets: Vec<Option<u64>>,
+}
+
+/// The boot's preload, set once ([`install_background`]).
+static BACKGROUND: core::sync::atomic::AtomicPtr<Background> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+/// The preload stopped, every span read or not: lookups after it count
+/// apart.
+static PRELOAD_STOPPED: AtomicBool = AtomicBool::new(false);
+
+fn preload_memory() -> Option<&'static Background> {
+    // SAFETY: set once to a leaked `Background`, never freed.
+    unsafe { BACKGROUND.load(Ordering::Acquire).as_ref() }
+}
+
+/// Make the memory at `physical` of `bytes` bytes the loader set aside the
+/// preload of `spans`, the store's segments lying at `offsets`: once a run.
+fn install_background(
+    physical: u64,
+    bytes: u64,
+    spans: &[Span],
+    offsets: &[Option<u64>],
+) -> Option<&'static Background> {
+    if preload_memory().is_some() {
+        return None;
+    }
+    let base = crate::layout::physical(physical) as *mut u8;
+    // SAFETY: the loader allocated these pages for the preload alone
+    // (`plan_background`) and handed them off; the physmap maps them, and
+    // nothing else refers to them.
+    let bulk = unsafe { Bulk::new(base, usize::try_from(bytes).ok()?, spans) }?;
+    let background: &'static Background = Box::leak(Box::new(Background {
+        bulk,
+        offsets: offsets.to_vec(),
+    }));
+    BACKGROUND.store(
+        core::ptr::from_ref(background).cast_mut(),
+        Ordering::Release,
+    );
+    output::arguments(format_args!(
+        "TRANSLATIONS background preload of {} MiB in {} spans: read on idle time from the \
+         guest's start, {} KiB a read\n",
+        bytes >> 20,
+        spans.len(),
+        BULK_CHUNK >> 10,
+    ));
+    Some(background)
+}
+
+/// Count a lookup that found its record in memory, from the preload or
+/// not, or asked the stick for it.
+fn count_lookup(looked: &Looked, preload: bool) {
+    let after = usize::from(PRELOAD_STOPPED.load(Ordering::Relaxed));
+    match looked {
+        Looked::Found(_) => {
+            COSTS.found[after].fetch_add(1, Ordering::Relaxed);
+            if preload {
+                COSTS.preloaded[after].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Looked::Awaited => {
+            COSTS.asked[after].fetch_add(1, Ordering::Relaxed);
+        }
+        Looked::Absent => {}
+    }
+}
 
 /// What the store keeps beyond its pack, for an engine heap of `heap` bytes:
 /// entries added during the boot, decoded records, and the fetch pages the
@@ -1038,7 +1293,9 @@ impl Translations for Shared {
     }
 
     /// The pack bytes outlive the lock, so other PEs can reach the store
-    /// while a record is decoded. A writer also tracks absent keys.
+    /// while a record is decoded. A writer also tracks absent keys. A key
+    /// no segment's index holds is absent at once: the indexes are in
+    /// memory, and nothing is read for it.
     fn lookup(&mut self, key: &Digest) -> Looked {
         if !available(READ_PACK | WRITE_PACK) {
             return Looked::Absent;
@@ -1057,8 +1314,26 @@ impl Translations for Shared {
                     stored,
                     *store.translator(),
                     store.take_decode_scratch(stored),
+                    None,
                 ))),
                 None => {
+                    // A record the background preload holds is decoded
+                    // from its memory, as one read from the file.
+                    if let Some(background) = preload_memory()
+                        && let Some((wanted, stored)) = translation_bulk::held_record(
+                            store,
+                            &background.offsets,
+                            &background.bulk,
+                            key,
+                        )
+                    {
+                        return Some(Err((
+                            stored,
+                            *store.translator(),
+                            pack::DecodeScratch::default(),
+                            Some(wanted.bytes()),
+                        )));
+                    }
                     // A record left in the file is asked for: the block
                     // compiles meanwhile, and a later fetch asks again.
                     awaited = store.want(key);
@@ -1069,22 +1344,26 @@ impl Translations for Shared {
                 }
             }
         });
-        let (stored, translator, mut scratch) = match lookup {
+        let (stored, translator, mut scratch, preloaded) = match lookup {
             Some(Ok(record)) => {
                 COSTS
                     .lookup_ticks
                     .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-                return Looked::Found(record);
+                let looked = Looked::Found(record);
+                count_lookup(&looked, false);
+                return looked;
             }
             Some(Err(source)) => source,
             None => {
                 COSTS
                     .lookup_ticks
                     .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-                return match awaited {
+                let looked = match awaited {
                     true => Looked::Awaited,
                     false => Looked::Absent,
                 };
+                count_lookup(&looked, false);
+                return looked;
             }
         };
         let decoding = output::now();
@@ -1094,15 +1373,20 @@ impl Translations for Shared {
             .fetch_add(output::now().wrapping_sub(decoding), Ordering::Relaxed);
         let evicted = lock.with(|store| {
             let store = store.as_mut()?;
-            Some(store.finish_decode(key, stored, &decoded, &mut scratch))
+            Some(match preloaded {
+                Some(bytes) => store.finish_read(key, bytes, Some(&decoded)),
+                None => store.finish_decode(key, stored, &decoded, &mut scratch),
+            })
         });
         drop(evicted);
         COSTS
             .lookup_ticks
             .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-        decoded.ok().map_or(Looked::Absent, |decoded| {
+        let looked = decoded.ok().map_or(Looked::Absent, |decoded| {
             Looked::Found(decoded.into_record())
-        })
+        });
+        count_lookup(&looked, preloaded.is_some());
+        looked
     }
 
     fn prepared(
@@ -1383,6 +1667,8 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             .expect("a field"),
     );
     let (contents, tail) = region.split_at_mut(blobs);
+    let (descriptor, tail) = tail.split_at_mut(BULK_BYTES.min(tail.len()));
+    let bulk = bulk_descriptor(descriptor);
     let contents: &'static [u8] = contents;
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let word = |at: usize| u32::from_le_bytes(contents[at..at + 4].try_into().expect("a word"));
@@ -1508,6 +1794,12 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
         if offsets.iter().any(Option::is_some) {
             let order = pack::LayoutOrder::new(&segments);
             let segments = segments.clone();
+            let background = bulk
+                .as_ref()
+                .and_then(|(physical, bytes, spans)| {
+                    install_background(*physical, *bytes, spans, &offsets)
+                })
+                .map(|background| BulkReader::new(&background.bulk, BULK_CHUNK));
             READER.holding(true, |slot| {
                 *slot = Some(Reader {
                     segments,
@@ -1524,6 +1816,13 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
                     next: 0,
                     launched: 0,
                     dropped: 0,
+                    bulk: background,
+                    parked: Vec::new(),
+                    retry: alloc::collections::VecDeque::new(),
+                    ready: Vec::new(),
+                    records: 0,
+                    records_after: 0,
+                    logged: false,
                 })
             });
         }
@@ -1845,6 +2144,10 @@ fn report_event(event: &Event) {
             for lock in &STORES {
                 lock.with(|store| store.as_mut().map(Store::retire));
             }
+            // Nor does the preload serve or read them.
+            if let Some(background) = preload_memory() {
+                background.bulk.retire();
+            }
         }
         Event::Released { room, bytes, lost } => output::arguments(format_args!(
             "TRANSLATIONS released room={}M bytes={}M lost={lost}: the heap is nearly full; \
@@ -1926,74 +2229,6 @@ const LAUNCH: usize = 16;
 /// The most of those waiting to be read.
 const LAUNCH_QUEUE: usize = 256;
 
-/// One read of `bytes` bytes of the pack file at `at` in flight: the
-/// blocks' buffer, where the bytes start in it, and the device reads (tag,
-/// where each lands in the buffer).
-struct FileRead {
-    buffer: Vec<u8>,
-    skip: usize,
-    bytes: usize,
-    reads: Vec<(u32, usize)>,
-    failed: bool,
-}
-
-impl FileRead {
-    /// Start the read: `None` when the range is outside the file or the
-    /// device refused a command.
-    fn start(
-        device: &mut dyn BlockDevice,
-        extents: &[Extent],
-        at: u64,
-        bytes: u64,
-    ) -> Option<Self> {
-        let block = u64::from(device.identity().block_size).max(1);
-        let start = at / block * block;
-        let end = at.checked_add(bytes)?.next_multiple_of(block);
-        let ranges = journal::device_ranges(extents, block, start, end - start)?;
-        let mut read = Self {
-            buffer: vec![0; (end - start) as usize],
-            skip: (at - start) as usize,
-            bytes: bytes as usize,
-            reads: Vec::new(),
-            failed: false,
-        };
-        for (lba, length, from) in ranges {
-            let command = stela_drivers::block::Command::Read {
-                lba,
-                bytes: length as usize,
-            };
-            let tag = device.start_more(command).ok()?;
-            read.reads.push((tag, from));
-        }
-        Some(read)
-    }
-
-    /// Take the device reads that ended: whether every one did.
-    fn poll(&mut self, device: &mut dyn BlockDevice) -> bool {
-        let (buffer, failed) = (&mut self.buffer, &mut self.failed);
-        self.reads.retain(|&(tag, from)| match device.finish(tag) {
-            None => true,
-            Some(Ok(Some(data))) => {
-                match buffer.get_mut(from..from + data.len()) {
-                    Some(into) => into.copy_from_slice(&data),
-                    None => *failed = true,
-                }
-                false
-            }
-            Some(_) => {
-                *failed = true;
-                false
-            }
-        });
-        self.reads.is_empty()
-    }
-
-    /// The bytes read, once every device read ended: `None` when one failed.
-    fn bytes(&self) -> Option<&[u8]> {
-        (!self.failed).then(|| &self.buffer[self.skip..self.skip + self.bytes])
-    }
-}
-
 /// One record being read: what was asked, each piece's read, when it
 /// started, and whether a read could not start.
 struct Flight {
@@ -2029,13 +2264,36 @@ struct Reader {
     failed: u64,
     launched: u64,
     dropped: u64,
+    /// The background preload's reader, when the loader set memory aside
+    /// for it; the records lookups asked for that wait for its reads, those
+    /// to read after all (it stopped short of them), and those it holds, to
+    /// decode after the step's disk work.
+    bulk: Option<BulkReader<'static>>,
+    parked: Vec<pack::Wanted>,
+    retry: alloc::collections::VecDeque<pack::Wanted>,
+    ready: Vec<pack::Wanted>,
+    /// Records read from the stick alone, and those of them started after
+    /// the preload stopped; whether its end was logged.
+    records: u64,
+    records_after: u64,
+    logged: bool,
 }
 
 static READER: Held<Reader> = Held::new();
 
+/// The most records waiting for the preload's reads: past it a record is
+/// read on its own.
+const MAX_PARKED: usize = 4096;
+/// How long a step decodes the records lookups asked for that the preload
+/// holds, in microseconds (a record takes tens of them).
+const READY_MICROS: u64 = 300;
+
 /// Read what lookups asked for and, while they ask nothing, what boots
 /// used most, on the store's staged partition: a bounded step on a PE whose
-/// guest waits. A lookup never waits for a read: its block compiles.
+/// guest waits, the host core, or PE 0 at EL0 ([`background`]). A lookup
+/// never waits for a read: its block compiles. With a background preload,
+/// its next read starts after the records lookups asked for, and the
+/// records it holds are decoded from memory.
 fn read_step() {
     if !available(READ_PACK) {
         return;
@@ -2049,6 +2307,14 @@ fn read_step() {
         };
         let done = lend_staged_partition(|device| {
             let done = reader.collect(device);
+            let now = super::host::fresh_counter();
+            let landed = reader
+                .bulk
+                .as_mut()
+                .is_some_and(|bulk| bulk.collect(device, now));
+            if landed || reader.bulk.as_ref().is_some_and(BulkReader::done) {
+                reader.unpark();
+            }
             reader.start(device, &extents);
             done
         });
@@ -2056,7 +2322,29 @@ fn read_step() {
         for flight in done.into_iter().flatten() {
             reader.decode(flight);
         }
+        // The records the preload holds, for a bounded time: those left
+        // wait for the next step.
+        let started = super::host::fresh_counter();
+        let deadline = started + super::host::COUNTER_HZ * READY_MICROS / 1_000_000;
+        let mut served = 0;
+        while served < reader.ready.len() && super::host::fresh_counter() < deadline {
+            let wanted = reader.ready[served];
+            reader.serve_held(&wanted);
+            served += 1;
+        }
+        reader.ready.drain(..served);
+        reader.log_preload();
     });
+}
+
+/// A bounded step of the reader from a processor that is not a PE whose
+/// guest waits: the host core (`--host-core on`), or PE 0 between slices
+/// at EL0 where it holds no kernel lock, so the background preload goes on
+/// while every PE runs guest code.
+pub(super) fn background() {
+    if READER.try_with(|reader| reader.bulk.is_some()) == Some(true) {
+        read_step();
+    }
 }
 
 impl Reader {
@@ -2096,7 +2384,13 @@ impl Reader {
     /// the most used ahead on a disk that does not seek, and on one that
     /// does the next in the order the file holds them.
     fn take(&mut self) -> Option<pack::Wanted> {
-        let slow = self.slow();
+        if let Some(wanted) = self.retry.pop_front() {
+            return Some(wanted);
+        }
+        // A preload under way reads the records ahead itself, in their
+        // order: only what lookups asked is read beside it.
+        let preloading = self.preloading();
+        let slow = self.slow() || preloading;
         // On a seeking disk, the reads that would wait past the bound.
         let keep = match slow {
             true => {
@@ -2114,12 +2408,17 @@ impl Reader {
             });
             self.dropped += dropped as u64;
             if let Some(wanted) = wanted {
-                let after = self.order.after(&self.segments, &wanted.key, LAUNCH);
-                if self.launch.len() + after.len() <= LAUNCH_QUEUE {
-                    self.launch.extend(after);
+                if !preloading {
+                    let after = self.order.after(&self.segments, &wanted.key, LAUNCH);
+                    if self.launch.len() + after.len() <= LAUNCH_QUEUE {
+                        self.launch.extend(after);
+                    }
                 }
                 return Some(wanted);
             }
+        }
+        if preloading {
+            return None;
         }
         while let Some((segment, index)) = self.launch.pop_front() {
             if let Some(wanted) = self.claim(segment, index) {
@@ -2168,14 +2467,41 @@ impl Reader {
         })
     }
 
-    /// Start reads while the disk has room.
+    /// Whether a background preload is under way.
+    fn preloading(&self) -> bool {
+        self.bulk.as_ref().is_some_and(|bulk| !bulk.done())
+    }
+
+    /// Start reads while the disk has room: the records lookups asked for
+    /// first (while a preload runs, [`translation_bulk::RECORD_READS`] at
+    /// most, those it holds decoded from memory after the step and those it
+    /// reads soon left to it), then the preload's next read, behind them.
     fn start(&mut self, device: &mut dyn BlockDevice, extents: &[Extent]) {
-        let depth = device.depth().clamp(1, MAX_FLIGHTS);
+        let depth = match self.preloading() {
+            true => translation_bulk::RECORD_READS,
+            false => device.depth().clamp(1, MAX_FLIGHTS),
+        };
         let mut started = false;
-        while self.flights.len() < depth && device.room() {
+        while self.flights.len() < depth && device.room() && self.ready.len() < DECODES_PER_STEP {
             let Some(wanted) = self.take() else {
                 break;
             };
+            if let Some(reader) = self.bulk.as_ref() {
+                match translation_bulk::asked(reader.bulk(), reader, &self.offsets, &wanted) {
+                    Asked::Held(_) => {
+                        self.ready.push(wanted);
+                        continue;
+                    }
+                    Asked::Landing if self.parked.len() < MAX_PARKED => {
+                        self.parked.push(wanted);
+                        continue;
+                    }
+                    Asked::Landing | Asked::Read => {}
+                }
+            }
+            if PRELOAD_STOPPED.load(Ordering::Relaxed) {
+                self.records_after += 1;
+            }
             match self.flight(device, extents, wanted) {
                 Some(flight) => {
                     started = true;
@@ -2192,9 +2518,100 @@ impl Reader {
                 }
             }
         }
+        if let Some(bulk) = self.bulk.as_mut() {
+            started |= bulk.start(device, extents, super::host::fresh_counter());
+        }
         if started {
             device.commit();
         }
+    }
+
+    /// The records that waited for the preload's reads: those it holds now
+    /// to decode, those it still reads soon to wait, the others (it stopped
+    /// short of them) to read.
+    fn unpark(&mut self) {
+        let Some(reader) = self.bulk.as_ref() else {
+            return;
+        };
+        for wanted in core::mem::take(&mut self.parked) {
+            match translation_bulk::asked(reader.bulk(), reader, &self.offsets, &wanted) {
+                Asked::Held(_) => self.ready.push(wanted),
+                Asked::Landing => self.parked.push(wanted),
+                Asked::Read => self.retry.push_back(wanted),
+            }
+        }
+    }
+
+    /// Decode `wanted`'s record from what the preload holds, outside the
+    /// store's lock, and give it to the store as a record read.
+    fn serve_held(&mut self, wanted: &pack::Wanted) {
+        let Some(read) = self
+            .bulk
+            .as_ref()
+            .and_then(|reader| translation_bulk::held(reader.bulk(), &self.offsets, wanted))
+        else {
+            self.retry.push_back(*wanted);
+            return;
+        };
+        let key = wanted.key;
+        let lock = part(&key);
+        let source = lock.with(|store| {
+            let store = store.as_mut()?;
+            Some((store.read_stored(wanted, &read)?, *store.translator()))
+        });
+        let decoded = source.map(|(stored, translator)| {
+            DecodedRecord::decode(
+                stored,
+                &translator,
+                &key,
+                &mut pack::DecodeScratch::default(),
+            )
+        });
+        let evicted = lock.with(|store| {
+            store
+                .as_mut()
+                .map(|store| store.finish_read(&key, wanted.bytes(), decoded.as_ref()))
+        });
+        drop(evicted);
+    }
+
+    /// Log the preload's end once: what it read, in how long, and the
+    /// lookups it served so far.
+    fn log_preload(&mut self) {
+        let Some(reader) = self.bulk.as_ref().filter(|_| !self.logged) else {
+            return;
+        };
+        let Some(stopped) = reader.stats.stopped else {
+            return;
+        };
+        self.logged = true;
+        PRELOAD_STOPPED.store(true, Ordering::Relaxed);
+        let stats = reader.stats;
+        let bulk = reader.bulk();
+        let millis = match (stats.started, stats.ended) {
+            (Some(started), Some(ended)) => {
+                ended.wrapping_sub(started) / (super::host::COUNTER_HZ / 1000).max(1)
+            }
+            _ => 0,
+        };
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        output::arguments(format_args!(
+            "TRANSLATIONS background preload read={} MiB in {}.{} s ({} MB/s) held={} MiB of {} \
+             MiB reads={} stopped={}; lookups until now: in memory={} (the preload's {}), from \
+             the stick={}, records read alone={}\n",
+            stats.bytes >> 20,
+            millis / 1000,
+            millis % 1000 / 100,
+            stats.bytes / 1000 / millis.max(1),
+            bulk.held() >> 20,
+            bulk.total() >> 20,
+            stats.reads,
+            stopped.name(),
+            load(&COSTS.found[0]),
+            load(&COSTS.preloaded[0]),
+            load(&COSTS.asked[0]),
+            self.records,
+        ));
     }
 
     /// The reads of `wanted`'s pieces in the file, started.
@@ -2236,6 +2653,7 @@ impl Reader {
             }
         }
         self.failed += u64::from(failed);
+        self.records += u64::from(!failed);
         let key = flight.wanted.key;
         let lock = part(&key);
         let bytes = flight.wanted.bytes();
@@ -2294,6 +2712,13 @@ impl WriterReads {
             let Some((id, offset, bytes)) = reads.take_asked() else {
                 break;
             };
+            // What the background preload holds is copied, never read.
+            if let Some(held) =
+                preload_memory().and_then(|background| background.bulk.bytes(offset, bytes))
+            {
+                reads.finish(id, Some(held.to_vec()));
+                continue;
+            }
             match FileRead::start(device, extents, offset, bytes) {
                 Some(read) => {
                     started = true;
@@ -2345,6 +2770,49 @@ fn report_reader(counters: &pack::Counters) {
         COSTS.awaited_pages.load(Ordering::Relaxed),
         COSTS.awaited_lookups.load(Ordering::Relaxed),
         COSTS.awaited_found.load(Ordering::Relaxed),
+    ));
+    report_preload();
+}
+
+/// Report the background preload: what it read and why it stopped, and
+/// the lookups whose record was in memory (the preload's among them) and
+/// those that asked the stick, before it stopped and after, with the
+/// records read from the stick alone.
+fn report_preload() {
+    let Some((stats, held, total, records, after)) = READER
+        .with(|reader| {
+            let bulk = reader.bulk.as_ref()?;
+            Some((
+                bulk.stats,
+                bulk.bulk().held(),
+                bulk.bulk().total(),
+                reader.records,
+                reader.records_after,
+            ))
+        })
+        .flatten()
+    else {
+        return;
+    };
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    output::arguments(format_args!(
+        "TRANSLATIONS background preload held={} MiB of {} MiB reads={} stopped={} lookups \
+         before it stopped: memory={} preload={} stick={}; after: memory={} preload={} \
+         stick={}; records read alone={} after={}\n",
+        held >> 20,
+        total >> 20,
+        stats.reads,
+        stats
+            .stopped
+            .map_or("running", translation_bulk::Stopped::name),
+        load(&COSTS.found[0]),
+        load(&COSTS.preloaded[0]),
+        load(&COSTS.asked[0]),
+        load(&COSTS.found[1]),
+        load(&COSTS.preloaded[1]),
+        load(&COSTS.asked[1]),
+        records,
+        after,
     ));
 }
 
