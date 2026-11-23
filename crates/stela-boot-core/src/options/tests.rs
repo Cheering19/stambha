@@ -996,3 +996,99 @@ fn host_check_bluetooth_check_is_off_unless_named_and_round_trips() {
         "--host-check --key-seconds 5"
     );
 }
+
+#[test]
+fn a_core_trial_reaches_no_disk() {
+    const TRIAL: &str =
+        "--system --bundle m2u --storage-ram 0x200000000 --native-cores 16 --core-trial";
+    let options = round_trip(TRIAL);
+    assert!(options.core_trial);
+    assert!(!System::default().core_trial);
+    assert_eq!(options.native_cores, Some(16));
+    assert!(options.storage.is_none() && options.nor.is_none() && options.preboot.is_none());
+    // Its order in the canonical line does not matter to the grammar.
+    assert_eq!(
+        System::parse(
+            "--system --core-trial --native-cores 16 --storage-ram 0x200000000 --bundle m2u"
+        ),
+        Ok(options.clone())
+    );
+    // Without the flag nothing changes, and the line has no word for it.
+    let plain = System::parse("--system --bundle m2u --storage-ram 0x200000000").unwrap();
+    assert!(!plain.core_trial);
+    assert!(!plain.to_string().contains(CORE_TRIAL));
+    let refused = Error::Constraint(Constraint::CoreTrial);
+    // What it needs: a bundle, RAM-backed disks and an explicit PE count.
+    for missing in [
+        "--system --storage-ram 0x200000000 --native-cores 16 --core-trial",
+        "--system --bundle m2u --native-cores 16 --core-trial",
+        "--system --bundle m2u --storage-ram 0x200000000 --core-trial",
+    ] {
+        assert_eq!(System::parse(missing).err(), Some(refused), "{missing}");
+    }
+    // Every option that can reach a disk is refused beside it.
+    for added in [
+        format!("--nor {DISK}"),
+        format!("--preboot {DISK}"),
+        "--external-disks".to_string(),
+        "--usb-storage A".to_string(),
+        "--wifi home".to_string(),
+    ] {
+        let text = format!("{TRIAL} {added}");
+        assert_eq!(System::parse(&text).err(), Some(refused), "{text}");
+    }
+    // `--storage` cannot stand beside `--storage-ram` at all; on its own
+    // it is refused as the trial's.
+    let storage = format!("--system --bundle m2u --storage {DISK} --native-cores 16 --core-trial");
+    assert_eq!(System::parse(&storage).err(), Some(refused), "{storage}");
+    // An install or a restore study needs `--storage`, so either refusal
+    // stops it before anything opens.
+    for text in [
+        format!(
+            "--system --bundle m2u --storage {DISK} --nor {DISK} --install p.json \
+             --native-cores 16 --core-trial"
+        ),
+        format!(
+            "--system --bundle m2u --storage {DISK} --restore-study --restore-source {DISK} \
+             --restore-manifest m.plist --restore-identity 2 --native-cores 16 --core-trial"
+        ),
+    ] {
+        assert_eq!(System::parse(&text).err(), Some(refused), "{text}");
+    }
+    assert!(refused.message().contains("--core-trial writes nothing"));
+}
+
+/// The scaling test's boots: a Mac mini M2 disk boot (setup's line, with
+/// `--guest-pes 8`) on a 16-core, 32-thread PC, given `--native-cores` 4, 6
+/// and 8. Each reserves that many host cores before the Preboot is read,
+/// passes the live check against the disk's 8 CPUs, and skips the CPU-count
+/// check the count stands in for. Past the board's 8 the boot stops at that
+/// check, before any AP starts.
+#[test]
+fn a_disk_boot_runs_on_four_six_or_eight_native_cores() {
+    const LAPTOP_THREADS: usize = 32;
+    const MAC_MINI_CPUS: usize = 8;
+    let line = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK} --guest-pes 8");
+    let plain = System::parse(&line).unwrap();
+    assert_eq!(plain.assigned_native_cores(LAPTOP_THREADS, None), Ok(8));
+    for count in [4, 6, 8] {
+        let options = round_trip(&format!("{line} --native-cores {count}"));
+        assert_eq!(options.guest_pes, Some(8));
+        assert_eq!(
+            options.assigned_native_cores(LAPTOP_THREADS, None),
+            Ok(count),
+            "{count}"
+        );
+        assert_eq!(
+            options.validate_native_cores(LAPTOP_THREADS, count, MAC_MINI_CPUS),
+            Ok(()),
+            "{count}"
+        );
+    }
+    let over = System::parse(&format!("{line} --native-cores 9")).unwrap();
+    assert_eq!(over.assigned_native_cores(LAPTOP_THREADS, None), Ok(9));
+    assert!(
+        over.validate_native_cores(LAPTOP_THREADS, 9, MAC_MINI_CPUS)
+            .is_err()
+    );
+}

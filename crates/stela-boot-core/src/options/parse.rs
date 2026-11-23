@@ -64,6 +64,7 @@ impl ParseState<'_> {
                 &mut options.tlbi_verify_check,
                 Error::DuplicateTlbiVerifyCheck,
             )?,
+            CORE_TRIAL => options.core_trial = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

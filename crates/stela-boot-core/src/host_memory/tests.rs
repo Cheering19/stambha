@@ -790,3 +790,48 @@ fn a_pack_read_on_demand_splits_its_room_between_the_window_and_the_guest() {
         sizes(free, 8, 8).unwrap()
     );
 }
+
+/// What a many-core boot costs the guest: the board's code window and the
+/// heap follow the host's RAM, not its PEs, so each PE past 8 takes only
+/// its own 2 MiB of code and its share of the pool. A 16 GiB PC keeps
+/// macOS 9538 MiB on 8 PEs, 9522 MiB on 16 and 9488 MiB on 24; an 8 GiB PC
+/// keeps it above its floor on 24. A host too small for macOS's floor is
+/// refused whatever its PE count, by the same shortfall.
+#[test]
+fn more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused() {
+    for (installed, runners, guest) in [
+        (16, 8, 9538),
+        (16, 12, 9530),
+        (16, 16, 9522),
+        (16, 24, 9488),
+        (8, 16, 4096),
+        (8, 24, 3824),
+    ] {
+        let sizes = sizes(free(installed), runners, runners).unwrap();
+        assert_eq!(sizes.guest, guest * MIB, "{installed} GiB, {runners} PEs");
+        assert!(sizes.guest >= GUEST_FLOOR);
+        assert_eq!(
+            sizes.code.window,
+            sizes_of_window(installed),
+            "{installed} GiB, {runners} PEs"
+        );
+    }
+    for runners in [8, 16, 24] {
+        let refusal = sizes(free(6), runners, runners).unwrap_err().to_string();
+        assert!(
+            refusal.contains("Stambha needs at least"),
+            "{runners}: {refusal}"
+        );
+        assert!(refusal.contains("3 GB for macOS"), "{runners}: {refusal}");
+    }
+}
+
+/// The window [`more_pes_take_little_of_the_guest_and_a_host_short_of_its_floor_is_refused`]
+/// finds at every PE count of an `installed` GiB host.
+fn sizes_of_window(installed: u64) -> u64 {
+    match installed {
+        8 => 624 * MIB,
+        16 => 1200 * MIB,
+        _ => unreachable!(),
+    }
+}

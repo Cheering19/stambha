@@ -399,6 +399,16 @@ pub const TLBI_KEEP: &str = "--tlbi-keep";
 /// `--acpi-hardware`, so the options revision stays 13.
 pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
 
+/// A read-only bring-up boot (`--core-trial`): runs a prepared `--bundle`
+/// from the USB on an explicit `--native-cores` count, its disks backed by
+/// engine memory (`--storage-ram`), so nothing it does persists. It is for
+/// trying a many-core Mac's restore ramdisk, such as the M2 Ultra Mac
+/// Studio's (Mac14,14) on 16 PEs, without installing it. Every option that
+/// can reach a disk is refused ([`Constraint::CoreTrial`]), and the boot
+/// opens no translation store and applies no pending disk plan. A
+/// hand-written opt-in setup never writes, so the options revision stays 13.
+pub const CORE_TRIAL: &str = "--core-trial";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -740,6 +750,8 @@ pub struct System {
     /// Walk every entry a kept context's verification keeps in full as
     /// well ([`TLBI_VERIFY_CHECK`]).
     pub tlbi_verify_check: bool,
+    /// A read-only bring-up boot ([`CORE_TRIAL`]).
+    pub core_trial: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -881,6 +893,7 @@ impl Default for System {
             keep_running_on_panic: false,
             tlbi_keep: None,
             tlbi_verify_check: false,
+            core_trial: false,
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
@@ -1452,6 +1465,7 @@ impl fmt::Display for System {
             self.tlbi_keep.map(|keep| if keep { "on" } else { "off" }),
         )?;
         line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
+        line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;

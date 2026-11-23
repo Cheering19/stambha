@@ -341,6 +341,14 @@ pub const DISPEXT_T6000: &str = "dispext0,t600x";
 /// This admits its resource contract; visible Recovery output still requires
 /// original firmware/kernel execution through that graph.
 pub const T6000_EXTERNAL_OUTPUT_ADMITTED: bool = true;
+/// The M2 Pro, Max and Ultra boards' first external pipe (J474s, J475c,
+/// J475d and J180d in 26B123). Each has the T6000 graph's shape exactly:
+/// `dcpext0` with role `DCPEXT0` and an RTBuddy nub of `external-index` 1,
+/// `dcpext0-expert` with only `role` and `join-power-plane`, and `dispext0`
+/// with `external` 1. Only the pipe's compatible differs. That mac14j's
+/// IOMFB speaks the link the DCP model answers is not yet shown on a run.
+pub const DISPEXT_T602X: &str = "dispext0,t602x";
+pub const T602X_EXTERNAL_OUTPUT_ADMITTED: bool = true;
 
 /// A source-checked external pipeline family, preserving native identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,12 +387,33 @@ pub const EXTERNAL_OUTPUTS: &[ExternalOutput] = &[
         identity: dcp::ExternalIdentity::Numbered(0),
         admitted: T6000_EXTERNAL_OUTPUT_ADMITTED,
     },
+    ExternalOutput {
+        controller: "dcpext0",
+        role: "DCPEXT0",
+        role_property: b"DCPEXT0\0",
+        expert: "dcpext0-expert",
+        pipe: "dispext0",
+        compatible: DISPEXT_T602X,
+        external_index: Some(1),
+        identity: dcp::ExternalIdentity::Numbered(0),
+        admitted: T602X_EXTERNAL_OUTPUT_ADMITTED,
+    },
 ];
 
-pub fn external_output(role: &[u8]) -> Option<&'static ExternalOutput> {
-    EXTERNAL_OUTPUTS
+/// The admitted pipeline whose controller has `role` and whose pipe
+/// `pipe_named` says carries the profile's compatible. Two profiles share
+/// a role (`DCPEXT0` on the T6000 and the T602x), so the pipe decides; when
+/// no pipe matches, the role's first profile is returned and the pipe check
+/// refuses the graph as before.
+pub fn external_output(
+    role: &[u8],
+    pipe_named: impl Fn(&ExternalOutput) -> bool,
+) -> Option<&'static ExternalOutput> {
+    let mut by_role = EXTERNAL_OUTPUTS
         .iter()
-        .find(|p| p.admitted && p.role_property == role)
+        .filter(|p| p.admitted && p.role_property == role);
+    let first = by_role.clone().next();
+    by_role.find(|p| pipe_named(p)).or(first)
 }
 
 /// These features require native expert operations beyond RTKit power.
