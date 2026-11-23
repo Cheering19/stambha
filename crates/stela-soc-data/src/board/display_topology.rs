@@ -69,7 +69,14 @@ pub(super) fn dcp_device(
         .ok_or(refuse!("DCP arm-io children are malformed"))?;
     let mut matches = children.iter().filter_map(|n| {
         n.compatible(ASC)
-            .then(|| n.property("role").and_then(external_output))
+            .then(|| {
+                n.property("role").and_then(|role| {
+                    external_output(role, |profile| {
+                        io.child(profile.pipe)
+                            .is_some_and(|pipe| pipe.compatible(profile.compatible))
+                    })
+                })
+            })
             .flatten()
             .map(|profile| (n, profile))
     });
@@ -430,7 +437,29 @@ mod tests {
             models(DISPEXT_T6000, |_| None),
             T6000_EXTERNAL_OUTPUT_ADMITTED
         );
-        assert!(external_output(b"DCPEXT1\0").is_none());
+        assert!(external_output(b"DCPEXT1\0", |_| true).is_none());
+        // `DCPEXT0` names two profiles; the pipe's compatible picks one, and
+        // with neither pipe the first stays, for the pipe check to refuse.
+        for (pipe, expected) in [
+            (DISPEXT_T6000, DISPEXT_T6000),
+            (DISPEXT_T602X, DISPEXT_T602X),
+            ("dispext0,t8112", DISPEXT_T6000),
+        ] {
+            let profile =
+                external_output(b"DCPEXT0\0", |profile| profile.compatible == pipe).unwrap();
+            assert_eq!(profile.compatible, expected, "{pipe}");
+            assert_eq!(profile.identity, dcp::ExternalIdentity::Numbered(0));
+        }
+        assert_eq!(
+            models(DISPEXT_T602X, |_| None),
+            T602X_EXTERNAL_OUTPUT_ADMITTED
+        );
+        // The Mac mini's unnumbered pipe is not changed by the role's
+        // second profile.
+        assert_eq!(
+            external_output(DCPEXT_ROLE, |_| false).unwrap().compatible,
+            DISPEXT
+        );
 
         assert!(!models(DPTX_PHY, |_| None) && !models(DISPLAY_CROSSBAR, |_| None));
         // Its power expert binds; the internal display's expert does not.

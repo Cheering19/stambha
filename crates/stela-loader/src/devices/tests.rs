@@ -1469,3 +1469,206 @@ fn a_hidden_neural_engine_withdraws_its_capability_and_keeps_its_links() {
     // Once withdrawn, a second preparation has nothing to note.
     assert!(hide_unmodeled(&mut tree).is_empty());
 }
+
+/// `dcpext0`, its expert and the pipe `dispext0` with `pipe` as its
+/// compatible, in the shape every original `DCPEXT0` graph has.
+fn numbered_external_output(pipe: &str) -> DeviceTree {
+    let z = |text: &str| [text.as_bytes(), &[0]].concat();
+    let mut nub = node("iop-dcpext0-nub", Some(&z(board::RTBUDDY)), vec![]);
+    nub.set_property("external-index", 1u32.to_le_bytes().to_vec())
+        .unwrap();
+    let mut controller = node("dcpext0", Some(&z(board::ASC)), vec![nub]);
+    controller
+        .set_property("role", b"DCPEXT0\0".to_vec())
+        .unwrap();
+    let mut expert = node("dcpext0-expert", Some(&z(board::DCP_EXPERT)), vec![]);
+    expert.set_property("role", b"DCPEXT0\0".to_vec()).unwrap();
+    expert
+        .set_property("join-power-plane", 1u32.to_le_bytes().to_vec())
+        .unwrap();
+    let mut display = node("dispext0", Some(&z(pipe)), vec![]);
+    display
+        .set_property("external", 1u32.to_le_bytes().to_vec())
+        .unwrap();
+    DeviceTree {
+        root: node(
+            "device-tree",
+            None,
+            vec![node("arm-io", None, vec![controller, expert, display])],
+        ),
+    }
+}
+
+#[test]
+fn the_pipe_chooses_between_the_profiles_that_share_dcpext0() {
+    const PATHS: [&str; 3] = [
+        "/arm-io/dcpext0",
+        "/arm-io/dcpext0-expert",
+        "/arm-io/dispext0",
+    ];
+    // The M1 Pro/Max and the M2 Pro/Max/Ultra graphs differ only in the
+    // pipe; neither profile hides the other's.
+    for pipe in [board::DISPEXT_T6000, board::DISPEXT_T602X] {
+        let mut tree = numbered_external_output(pipe);
+        let mut hidden = Vec::new();
+        hide_incomplete_external_outputs(&mut tree, &mut hidden);
+        assert!(hidden.is_empty(), "{pipe}: {hidden:?}");
+        for path in PATHS {
+            assert!(tree.property(path, COMPATIBLE).is_some(), "{pipe} {path}");
+        }
+    }
+    // A pipe neither profile models still takes the whole graph down.
+    let mut tree = numbered_external_output("dispext0,t8122");
+    let mut hidden = Vec::new();
+    hide_incomplete_external_outputs(&mut tree, &mut hidden);
+    assert_eq!(hidden, PATHS);
+    for path in PATHS {
+        assert!(tree.property(path, COMPATIBLE).is_none(), "{path}");
+    }
+    // So does a T602x pipe without its external marker.
+    let mut tree = numbered_external_output(board::DISPEXT_T602X);
+    tree.node_mut("/arm-io/dispext0")
+        .unwrap()
+        .remove_property("external");
+    let mut hidden = Vec::new();
+    hide_incomplete_external_outputs(&mut tree, &mut hidden);
+    assert_eq!(hidden, PATHS);
+}
+
+/// The admission steps a bundle's preparation runs on an IPSW DeviceTree
+/// (`boot_bundle::layout` `publish_platform`, then the engine's AGX hiding
+/// when no GPU firmware is loaded), after the `/chosen` facts iBoot adds
+/// that the board parser reads. Returns the hidden paths.
+fn admitted(tree: &mut DeviceTree, chip: u32, board_id: u32, dram_base: u64) -> Vec<String> {
+    for (name, value) in [
+        ("chip-id", chip.to_le_bytes().to_vec()),
+        ("board-id", board_id.to_le_bytes().to_vec()),
+        ("dram-base", dram_base.to_le_bytes().to_vec()),
+        ("dram-size", (16u64 << 30).to_le_bytes().to_vec()),
+    ] {
+        tree.set_property("/chosen", name, value).unwrap();
+    }
+    crate::aic::publish(tree, chip).unwrap();
+    crate::nvram::publish(tree).unwrap();
+    if let Some(controller) = crate::lock_regs::table(chip, None) {
+        crate::lock_regs::publish(tree, controller).unwrap();
+    }
+    if let Some(controller) = crate::lock_regs::ioa_table(chip, None) {
+        crate::lock_regs::publish_ioa(tree, controller).unwrap();
+    }
+    crate::darts::publish(tree).unwrap();
+    crate::dvfs::publish(tree, chip).unwrap();
+    let mut hidden = hide_unmodeled(tree);
+    crate::gpu_dvfs::publish(tree, chip).unwrap();
+    hidden.extend(hide_agx(tree));
+    hidden
+}
+
+/// The Mac mini M2's admission is byte for byte what it was before the
+/// T602x display pipe and memory cache were admitted. The digests were
+/// taken at 72a0c83c0, the commit before them, from the 26B123 IPSW's
+/// `DeviceTree.j473ap` (`STELA_TEST_M2_DT_DIR/j473ap.adt`).
+#[test]
+#[ignore = "oracle: STELA_TEST_M2_DT_DIR"]
+fn original_mac_mini_m2_admission_is_unchanged_by_the_t602x_rows() {
+    let directory = std::env::var("STELA_TEST_M2_DT_DIR").unwrap();
+    let input = std::fs::read(format!("{directory}/j473ap.adt")).unwrap();
+    assert_eq!(
+        stela_formats::sha256(&input),
+        "375e5f929a60a8eeb38d8266365177efeada82dcd5e8d899dd21e3b72caf7395"
+    );
+    let mut tree = DeviceTree::parse(&input).unwrap();
+    let hidden = hide_unmodeled(&mut tree);
+    assert_eq!(hidden.len(), 145);
+    assert_eq!(
+        stela_formats::sha256(hidden.join("\n").as_bytes()),
+        "92bd92cafef7ad753b4905c98097b1f347338006b64476392b57ba7b964cf6d5"
+    );
+    assert_eq!(
+        stela_formats::sha256(&tree.serialize()),
+        "a54b58d63473f43e18c48df308a884f46844d81861ad9315b31327931c80d6ea"
+    );
+    let mut tree = DeviceTree::parse(&input).unwrap();
+    let hidden = admitted(&mut tree, 0x8112, 0x24, 0x8_0000_0000);
+    assert_eq!(hidden.len(), 149);
+    let bytes = tree.serialize();
+    assert_eq!(
+        stela_formats::sha256(&bytes),
+        "9d65dadccac79a085320cdf47994bcbc5390267c00cad8a07c8da47a90a441e7"
+    );
+    let parsed = board::board(&bytes).unwrap();
+    assert_eq!(parsed.cpus.processors.len(), 8);
+    assert_eq!(
+        parsed.dcp.map(|dcp| dcp.identity),
+        Some(stela_soc_data::dcp::ExternalIdentity::Unnumbered)
+    );
+    assert!(parsed.memory_cache.is_some() && parsed.t6020_memory.is_none());
+}
+
+/// Every 26B123 M2 Pro, Max and Ultra board keeps its first external
+/// display graph and its MCC, and parses as the engine's board with every
+/// CPU its tree lists.
+#[test]
+#[ignore = "oracle: STELA_TEST_M2_DT_DIR"]
+fn original_t602x_boards_keep_their_external_pipe_and_memory_cache() {
+    let directory = std::env::var("STELA_TEST_M2_DT_DIR").unwrap();
+    for (name, digest, chip, board_id, cpus) in [
+        (
+            "j474sap",
+            "db93803145e2b0d7d059e717816e4e45323cbbe10cc93e7f509e2a8d97693d54",
+            0x6020,
+            0x02,
+            12,
+        ),
+        (
+            "j475cap",
+            "ab310ae4f55cd38fa5ccc2de6f37d1e0052b6d216755053a2c04ee25036024f8",
+            0x6021,
+            0x0a,
+            12,
+        ),
+        (
+            "j475dap",
+            "cd78387b6c9f7613ac045af00193011f439d358db5e832b9c1bee6ab9611e60d",
+            0x6022,
+            0x0a,
+            24,
+        ),
+        (
+            "j180dap",
+            "a28baa466a849cee9d133b6cbd09dd24aa84f21188b7d62d0da1e80df3557f45",
+            0x6022,
+            0x08,
+            24,
+        ),
+    ] {
+        let input = std::fs::read(format!("{directory}/{name}.adt")).unwrap();
+        assert_eq!(stela_formats::sha256(&input), digest, "{name}");
+        let mut tree = DeviceTree::parse(&input).unwrap();
+        let hidden = admitted(&mut tree, chip, board_id, 0x100_0000_0000);
+        for path in [
+            "/arm-io/mcc",
+            "/arm-io/dcpext0",
+            "/arm-io/dcpext0/iop-dcpext0-nub",
+            "/arm-io/dcpext0-expert",
+            "/arm-io/dispext0",
+        ] {
+            assert!(!hidden.iter().any(|entry| entry == path), "{name} {path}");
+            assert!(tree.property(path, COMPATIBLE).is_some(), "{name} {path}");
+        }
+        // The other external pipes stay hidden: one GOP backs one graph.
+        assert!(
+            hidden.iter().any(|entry| entry == "/arm-io/dcpext1"),
+            "{name}"
+        );
+        let parsed = board::board(&tree.serialize()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(parsed.cpus.processors.len(), cpus, "{name}");
+        assert_eq!(
+            parsed.dcp.map(|dcp| dcp.identity),
+            Some(stela_soc_data::dcp::ExternalIdentity::Numbered(0)),
+            "{name}"
+        );
+        assert!(parsed.t6020_memory.is_some(), "{name}");
+        assert!(parsed.memory_cache.is_none(), "{name}");
+    }
+}
