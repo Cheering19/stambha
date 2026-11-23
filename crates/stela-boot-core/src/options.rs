@@ -421,11 +421,11 @@ pub const TIER2: &str = "--tier2";
 pub const TIER2_CHECK: &str = "--tier2-check";
 
 /// Reads the rest of a translation pack read on demand into memory in the
-/// background once the guest runs (`--pack-preload on|off`, on unless
+/// background once the guest runs (`--pack-preload on|off`, off unless
 /// given): large sequential reads of the USB on idle time, never ahead of a
 /// lookup's own read, within the memory the pack's budget leaves
 /// (`host_memory::bulk_bound`). `off` leaves the records to be read as
-/// lookups ask for them, as before. A hand-written opt-out setup never
+/// lookups ask for them, as before. A hand-written opt-in setup never
 /// writes, so the options revision stays 13.
 pub const PACK_PRELOAD: &str = "--pack-preload";
 
@@ -778,7 +778,7 @@ pub struct System {
     /// Check tier 2 ([`TIER2_CHECK`]), which runs it.
     pub tier2_check: bool,
     /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
-    /// `None` unless given, which preloads ([`Self::pack_preload`]).
+    /// `None` unless given, which does not preload ([`Self::pack_preload`]).
     pub pack_preload: Option<bool>,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
@@ -1152,10 +1152,13 @@ impl System {
         self.gpu_aspm.unwrap_or_default()
     }
 
-    /// Whether the translation pack is preloaded in the background:
-    /// unless `--pack-preload off`.
+    /// Whether the translation pack is preloaded in the background: only
+    /// with `--pack-preload on`. Off by default: on Garvit's 16 GB laptop the
+    /// preload's memory shrank the code window (1280 to 1200 MiB) and raised
+    /// re-installs (7-32% to 43-49% again), costing more than its lookups
+    /// saved, since compile was 1-4% of PE time (boots 29-30, 2026-11-23).
     pub fn pack_preload(&self) -> bool {
-        self.pack_preload != Some(false)
+        self.pack_preload == Some(true)
     }
 
     /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
