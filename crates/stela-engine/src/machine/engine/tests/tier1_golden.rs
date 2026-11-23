@@ -271,6 +271,7 @@ pub(super) fn variants() -> [Options; 4] {
         self_loops: true,
         loop_counts: false,
         regions: true,
+        traces: false,
     };
     let el1 = MemoryChecks::system(true, false, true, false);
     let el0 = MemoryChecks::system(true, false, true, false)

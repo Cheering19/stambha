@@ -1436,6 +1436,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         watches: options.watches.clone(),
         step_timing: options.profile,
         amx_model: options.amx_model().0,
+        tier2: super::tier2_options(options),
     };
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.

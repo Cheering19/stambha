@@ -442,7 +442,7 @@ fn every_option_survives_a_round_trip() {
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
          --native-artifacts --serialized --profile --lid method --lid-sleep --brightness-keys \
-         --acpi-hardware --amx-native off \
+         --acpi-hardware --tier2 on --tier2-check --amx-native off \
          --monitor-trace \
          --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
@@ -461,6 +461,8 @@ fn every_option_survives_a_round_trip() {
     assert!(!System::default().brightness_keys);
     assert!(options.acpi_hardware);
     assert!(!System::default().acpi_hardware);
+    assert_eq!(options.tier2, Some(true));
+    assert!(options.tier2_check && options.tier2_runs());
     assert_eq!(options.amx_model(), AmxModel::ALL);
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
@@ -910,4 +912,37 @@ fn host_check_bluetooth_check_is_off_unless_named_and_round_trips() {
             .to_string(),
         "--host-check --key-seconds 5"
     );
+}
+
+/// Tier 2 is off unless `--tier2 on` or `--tier2-check` asks for it, and
+/// both are hand-written: a line without them parses as it did.
+#[test]
+fn tier2_runs_only_when_asked() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(
+        (plain.tier2, plain.tier2_check, plain.tier2_runs()),
+        (None, false, false)
+    );
+    for (line, tier2, check, runs) in [
+        ("--system --tier2 on", Some(true), false, true),
+        ("--system --tier2 off", Some(false), false, false),
+        ("--system --tier2-check", None, true, true),
+        ("--system --tier2 on --tier2-check", Some(true), true, true),
+    ] {
+        let options = System::parse(line).unwrap();
+        assert_eq!(
+            (options.tier2, options.tier2_check, options.tier2_runs()),
+            (tier2, check, runs),
+            "{line}"
+        );
+        assert_eq!(round_trip(line).tier2, tier2, "{line}");
+    }
+    for (line, error) in [
+        ("--system --tier2", Error::Tier2),
+        ("--system --tier2 yes", Error::Tier2),
+        ("--system --tier2 on --tier2 off", Error::DuplicateTier2),
+        ("--system --tier2 off --tier2-check", Error::Tier2CheckOff),
+    ] {
+        assert_eq!(System::parse(line).err(), Some(error), "{line}");
+    }
 }

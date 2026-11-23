@@ -218,6 +218,15 @@ pub struct NativeSystem {
     /// itself jump there (`block::region`).
     #[serde(default)]
     pub regions: bool,
+    /// Tier 2: a region forms wherever the scan runs past a branch, with a
+    /// loop or without one (`block::region`). A hot block then becomes a
+    /// superblock: its direct branches into itself jump there, the others
+    /// leave by side exits, NZCV is captured only where some path reads it,
+    /// and one run's locals stay in their hosts across it. The engine
+    /// compiles with it only for blocks it found hot, and never stores what
+    /// it compiles (`--tier2`). Without [`Self::regions`] it does nothing.
+    #[serde(default)]
+    pub traces: bool,
 }
 
 impl NativeSystem {
@@ -232,6 +241,7 @@ impl NativeSystem {
         self_loops: false,
         loop_counts: false,
         regions: false,
+        traces: false,
     };
 }
 

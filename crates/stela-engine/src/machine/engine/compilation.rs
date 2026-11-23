@@ -792,6 +792,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         variant: Variant,
         available: usize,
     ) -> Result<Option<Fetched>, Stop> {
+        // Only tier 1 compiles here, and only what compiles here reaches the
+        // translation store: tier 2 ([`super::tier2`]) installs its own.
+        debug_assert!(!variant.system.traces, "tier-2 code is never stored");
         let whole = available == source_window(pc, variant);
         let page = pc & !(FETCH_PAGE - 1);
         let offset = (pc - page) as usize;
@@ -1377,6 +1380,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installer: self.current as u8,
             part: shared_part(&self.code, code),
             device_stub: self.installing_stub,
+            tier2: self.installing_tier2,
         };
         let shared = Arc::clone(&self.code);
         shared.blocks.fill(slot, block);
@@ -1389,7 +1393,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.census_installed(pc, physical, variant, installed_bytes, instructions);
         // Another PE installed the block meanwhile: the first install wins,
         // and this one's code stays unreachable until its part goes.
-        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
+        // A tier-2 block takes a tier-1 block's place instead ([`super::tier2`]):
+        // the index replaces it below, and detaches it. It loses only to
+        // another tier-2 block.
+        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id)
+            && !(self.installing_tier2 && !shared.blocks[held].tier2)
+        {
             shared.blocks.record(slot).mark_lost();
             // Its rows go: nothing faults in a block never reached.
             shared.blocks.recovery().remove(&slot);

@@ -101,6 +101,8 @@ pub(crate) struct Settings {
     /// `--amx-native`: the AMX register operations the reference model
     /// completes alone, by number, as on the home machine.
     pub amx_model: u32,
+    /// `--tier2` and `--tier2-check`, as on the home machine.
+    pub tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -133,6 +135,7 @@ pub(crate) fn spawn<H: Host>(
             watches: settings.watches.clone(),
             step_timing: settings.step_timing,
             amx_model: settings.amx_model,
+            tier2: settings.tier2,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -156,6 +159,7 @@ struct Pe {
     watches: Vec<(u64, u64)>,
     step_timing: bool,
     amx_model: u32,
+    tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
 
 impl Pe {
@@ -169,6 +173,7 @@ impl Pe {
             watches,
             step_timing,
             amx_model,
+            tier2,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -192,6 +197,7 @@ impl Pe {
             .unwrap_or_else(|error| output::fatal(error));
         machine.set_step_timing(step_timing);
         machine.set_amx_model(amx_model);
+        machine.set_tier2(tier2);
         if step_timing {
             host::pmu::start(pe);
         }
