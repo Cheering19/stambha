@@ -190,8 +190,11 @@ pub fn line(ssid: &[u8], secret: &[u8]) -> Vec<u8> {
         if n == 1 {
             line.push(b' ');
         }
-        for &byte in word {
-            if byte == b'%' || byte <= b' ' || byte >= 0x7f {
+        for (at, &byte) in word.iter().enumerate() {
+            // A line that starts with `#` reads as a comment, so a name's
+            // leading `#` is written as `%23`.
+            let comment = n == 0 && at == 0 && byte == b'#';
+            if comment || byte == b'%' || byte <= b' ' || byte >= 0x7f {
                 line.extend_from_slice(alloc::format!("%{byte:02X}").as_bytes());
             } else {
                 line.push(byte);
@@ -212,6 +215,20 @@ mod tests {
             .iter()
             .map(|network| &network.ssid[..])
             .collect()
+    }
+
+    #[test]
+    fn a_name_that_starts_with_a_hash_is_saved_as_a_network_not_a_comment() {
+        let mut file = line(b"#Home", b"hunter2hunter2");
+        assert_eq!(file, b"%23Home hunter2hunter2\n");
+        let saved = parse(&file);
+        assert_eq!(saved_names(&saved), [&b"#Home"[..]]);
+        assert_eq!(names(&file), [b"#Home".to_vec()]);
+        // Forgotten again by its name.
+        assert!(without(&file, b"#Home").is_empty());
+        // A `#` past the first byte, or in the secret, is written as it is.
+        assert_eq!(line(b"Home#2", b"pass#word1"), b"Home#2 pass#word1\n");
+        wipe(&mut file);
     }
 
     #[test]
