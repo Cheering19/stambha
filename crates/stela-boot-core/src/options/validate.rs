@@ -24,6 +24,33 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     if options.trackpad.is_some() && !options.input {
         return Err(Error::Constraint(Constraint::TrackpadDependency));
     }
+    core_trial(options)
+}
+
+/// A `--core-trial` boot reaches no disk: its guest disks are engine memory
+/// and no option that opens a host disk, the NOR store, an install or
+/// restore source, or a lent USB disk, or that writes the USB's saved
+/// Wi-Fi networks, is admitted beside it. `--preboot` is refused, and with
+/// it every option that chooses a Preboot boot (`boot_selection`).
+fn core_trial(options: &System) -> Result<(), Error> {
+    if options.core_trial
+        && (!options.bundle
+            || options.storage_ram.is_none()
+            || options.native_cores.is_none()
+            || options.storage.is_some()
+            || options.nor.is_some()
+            || options.preboot.is_some()
+            || options.install.is_some()
+            || options.install_source.is_some()
+            || options.update_restore
+            || options.restore
+            || options.restore_source.is_some()
+            || options.external_disks
+            || !options.usb_storage.is_empty()
+            || options.ssid.is_some())
+    {
+        return Err(Error::Constraint(Constraint::CoreTrial));
+    }
     Ok(())
 }
 

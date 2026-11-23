@@ -332,6 +332,16 @@ impl AsusMode {
 /// laptop does not take it unasked until it is proven on hardware.
 pub const ACPI_HARDWARE: &str = "--acpi-hardware";
 
+/// A read-only bring-up boot (`--core-trial`): runs a prepared `--bundle`
+/// from the USB on an explicit `--native-cores` count, its disks backed by
+/// engine memory (`--storage-ram`), so nothing it does persists. It is for
+/// trying a many-core Mac's restore ramdisk, such as the M2 Ultra Mac
+/// Studio's (Mac14,14) on 16 PEs, without installing it. Every option that
+/// can reach a disk is refused ([`Constraint::CoreTrial`]), and the boot
+/// opens no translation store and applies no pending disk plan. A
+/// hand-written opt-in setup never writes, so the options revision stays 13.
+pub const CORE_TRIAL: &str = "--core-trial";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -662,6 +672,8 @@ pub struct System {
     pub brightness_keys: bool,
     /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
     pub acpi_hardware: bool,
+    /// A read-only bring-up boot ([`CORE_TRIAL`]).
+    pub core_trial: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -796,6 +808,7 @@ impl Default for System {
             lid_sleep: false,
             brightness_keys: false,
             acpi_hardware: false,
+            core_trial: false,
             laptop: None,
             asus_mode: None,
             amx_native: None,
@@ -1335,6 +1348,7 @@ impl fmt::Display for System {
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
+        line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;

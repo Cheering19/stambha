@@ -424,6 +424,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
     // partition.
     #[cfg(feature = "nvk")]
     if files.len() < MAX_FILES
+        && !system.core_trial
         && let Some(store) = crate::engine::pipelines::read()
     {
         files.push((String::from(crate::engine::pipelines::FILE), store));
@@ -809,6 +810,14 @@ fn load(
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
+    // A read-only trial applies no disk plan and writes no firmware
+    // variable: the options already refuse every disk it could reach.
+    if system.core_trial && !pending.is_empty() {
+        return Err(refuse!(
+            "--core-trial writes nothing, but this boot carries a pending disk plan or \
+             firmware write; start the trial without choosing a disk"
+        ));
+    }
     // The engine's drivers apply the plan to the `--storage` partition's
     // disk and no other.
     if let Some(plan) = &pending.plan
@@ -840,7 +849,17 @@ fn load(
     // so it is read last before they are reserved: only the engine image's
     // copy comes between.
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
-    let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
+    // A trial's translations stay in memory: another Mac's kernel would
+    // only crowd the installed one's out of the USB's store.
+    let (bundle, storage) = if system.core_trial {
+        output::arguments(format_args!(
+            "CORE TRIAL read-only: {cores} PEs on the USB's bundle; guest disks are engine memory, \
+             and no host disk, NOR store or translation store is opened or written\n"
+        ));
+        (bundle, storage)
+    } else {
+        translation_store(bundle, storage, cores, image_bytes)
+    };
     crate::status::begin("Setting up Stambha's memory");
     let image = memory::prepare_image(&snapshot)?;
     let mut memory = memory::reserve(cores, &image.ram, system.code_window)?;

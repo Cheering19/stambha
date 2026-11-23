@@ -157,6 +157,7 @@ pub enum Constraint {
     NativePciIoapicExclusive,
     LidSleepDependency,
     TrackpadDependency,
+    CoreTrial,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -319,6 +320,11 @@ impl Constraint {
             Self::LidSleepDependency => "--lid-sleep requires --lid method",
             Self::TrackpadDependency => {
                 "--trackpad needs --input: the trackpad sits on the native keyboard and pointer's hub"
+            }
+            Self::CoreTrial => {
+                "--core-trial writes nothing: it needs --bundle, --storage-ram and --native-cores, and \
+                 refuses --storage, --nor, --preboot, --install, --restore-study, --external-disks, \
+                 --usb-storage and --wifi, each of which can write a disk"
             }
         }
     }
