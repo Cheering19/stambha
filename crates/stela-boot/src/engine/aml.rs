@@ -1612,31 +1612,50 @@ impl HostAcpi {
     /// for [`Self::service_lid`], as Linux's `acpi_lid_notify` takes them.
     /// The reading the lid starts with counts for nothing
     /// ([`stela_boot_core::lid_panel`]). One line for the lid.
-    pub(super) fn retain_power(&self, power: stela_drivers::probe::Power) {
-        use stela_drivers::platform::lid::NOTIFY_STATUS;
-        if let Some(lid) = &power.lid {
-            let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
-            let follows = if super::lid::method() {
-                "--lid method: a close it notifies darkens a display on built-in panels alone"
-            } else {
-                "--lid ignore: nothing follows it"
-            };
-            match lid.handle().notify(|value| {
-                if value == NOTIFY_STATUS {
-                    LID_NOTIFIED.fetch_add(1, Ordering::AcqRel);
-                }
-            }) {
-                Ok(notification) => {
-                    output::arguments(format_args!("HOST ACPI lid {path}: {follows}\n"));
-                    *self.lid_notification.borrow_mut() = Some(notification);
-                }
-                Err(error) => output::arguments(format_args!(
-                    "HOST ACPI lid {path}: notify handler refused: {error:?}; nothing follows it\n"
-                )),
-            }
-        }
+    ///
+    /// The devices' start returns here on the dispatcher's stack, outside
+    /// the work owner's continuation, where ACPICA must not run: its
+    /// namespace guard and mutexes take the continuation's identity
+    /// ([`thread_id`]), which stops the boot anywhere else. So the lid's
+    /// path and its notify handler are a bounded firmware call
+    /// ([`Self::firmware`]), as the brightness keys' attachment is; what is
+    /// kept and published reads only what the probe already read.
+    pub(super) fn retain_power(&'static self, power: stela_drivers::probe::Power) {
+        let lid = power.lid.as_ref().map(|lid| lid.handle());
         super::battery::publish(&power);
         *self.power.borrow_mut() = power;
+        if let Some(lid) = lid {
+            self.firmware(
+                "lid notify handler",
+                "nothing follows the lid",
+                false,
+                move |_| self.follow_lid(lid),
+            );
+        }
+    }
+    /// The lid's notify handler and its line, in the firmware call
+    /// [`Self::retain_power`] makes.
+    fn follow_lid(&'static self, lid: stela_drivers::platform::acpi::Handle<'static>) {
+        use stela_drivers::platform::lid::NOTIFY_STATUS;
+        let path = lid.path().unwrap_or_else(|_| String::from("PNP0C0D"));
+        let follows = if super::lid::method() {
+            "--lid method: a close it notifies darkens a display on built-in panels alone"
+        } else {
+            "--lid ignore: nothing follows it"
+        };
+        match lid.notify(|value| {
+            if value == NOTIFY_STATUS {
+                LID_NOTIFIED.fetch_add(1, Ordering::AcqRel);
+            }
+        }) {
+            Ok(notification) => {
+                output::arguments(format_args!("HOST ACPI lid {path}: {follows}\n"));
+                *self.lid_notification.borrow_mut() = Some(notification);
+            }
+            Err(error) => output::arguments(format_args!(
+                "HOST ACPI lid {path}: notify handler refused: {error:?}; nothing follows it\n"
+            )),
+        }
     }
     /// Read the batteries' state (`_BST`) and the AC adapter (`_PSR`) again
     /// at the next poll, as Linux polls them, while hardware mode runs; a
