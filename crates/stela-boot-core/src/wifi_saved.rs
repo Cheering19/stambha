@@ -74,6 +74,37 @@ fn decode(word: &[u8]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// What a read of a saved networks file found.
+pub enum Stored {
+    /// No such file.
+    Absent,
+    /// Its bytes.
+    Bytes(Vec<u8>),
+    /// The file is there but did not read.
+    Unreadable,
+}
+
+/// The saved networks: [`WIFI_SAVED`](crate::options::WIFI_SAVED)'s bytes
+/// (`saved`) when it reads, else, when a menu write it could not finish left
+/// it absent, the copy that write made first
+/// ([`WIFI_SAVED_NEW`](crate::options::WIFI_SAVED_NEW), `spare`); empty when
+/// neither is there. `None` when the one that counts is there but does not
+/// read: it is not an empty file, and a change written over it would erase
+/// every network it holds. The bytes not returned are wiped.
+pub fn current(saved: Stored, spare: Stored) -> Option<Vec<u8>> {
+    let (chosen, mut other) = match (saved, spare) {
+        (Stored::Bytes(bytes), spare) => (Some(bytes), spare),
+        (Stored::Unreadable, spare) => (None, spare),
+        (Stored::Absent, Stored::Bytes(bytes)) => (Some(bytes), Stored::Absent),
+        (Stored::Absent, Stored::Absent) => (Some(Vec::new()), Stored::Absent),
+        (Stored::Absent, Stored::Unreadable) => (None, Stored::Absent),
+    };
+    if let Stored::Bytes(bytes) = &mut other {
+        wipe(bytes);
+    }
+    chosen
+}
+
 /// Overwrite a decoded secret before its memory is freed.
 pub fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
@@ -181,6 +212,32 @@ mod tests {
             .iter()
             .map(|network| &network.ssid[..])
             .collect()
+    }
+
+    #[test]
+    fn an_unreadable_file_is_never_taken_for_an_empty_one() {
+        let bytes = |text: &[u8]| Stored::Bytes(text.to_vec());
+        // The file, whatever the spare holds.
+        assert_eq!(
+            current(bytes(b"Home pass1234"), bytes(b"Old pass1234")),
+            Some(b"Home pass1234".to_vec())
+        );
+        assert_eq!(
+            current(bytes(b"Home pass1234"), Stored::Unreadable),
+            Some(b"Home pass1234".to_vec())
+        );
+        // There but unreadable: nothing to write over, spare or not.
+        assert_eq!(current(Stored::Unreadable, Stored::Absent), None);
+        assert_eq!(current(Stored::Unreadable, bytes(b"New pass1234")), None);
+        // Left absent by a write that deleted it and stopped: the copy that
+        // write made first.
+        assert_eq!(
+            current(Stored::Absent, bytes(b"New pass1234")),
+            Some(b"New pass1234".to_vec())
+        );
+        assert_eq!(current(Stored::Absent, Stored::Unreadable), None);
+        // Never saved: empty.
+        assert_eq!(current(Stored::Absent, Stored::Absent), Some(Vec::new()));
     }
 
     #[test]

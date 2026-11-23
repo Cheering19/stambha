@@ -16,7 +16,7 @@ use crate::{
 };
 use alloc::{string::String, vec::Vec};
 use stela_boot_core::{
-    options::WIFI_SAVED,
+    options::{WIFI_SAVED, WIFI_SAVED_NEW},
     wifi_hardware,
     wifi_page::{self, Action, Draw, Geometry, Key, Network, Page, Save, Scene, Tone},
     wifi_saved,
@@ -117,7 +117,7 @@ fn translate(press: Press) -> Key {
 /// The networks to list: `configured`, then the saved file's; the file's
 /// bytes are wiped once read.
 fn networks(volume: &mut FileSystem, configured: Option<&str>) -> Vec<Network> {
-    let mut file = read(volume);
+    let mut file = saved_file(volume).unwrap_or_default();
     let listed = wifi_saved::listing(&file);
     wifi_saved::wipe(&mut file);
     wifi_page::networks(configured, listed)
@@ -127,23 +127,76 @@ fn path() -> Option<PathBuf> {
     CString16::try_from(WIFI_SAVED).map(PathBuf::from).ok()
 }
 
-/// The saved file's bytes; none when it is absent or unreadable.
-fn read(volume: &mut FileSystem) -> Vec<u8> {
-    path()
-        .and_then(|path| volume.read(&path).ok())
-        .unwrap_or_default()
+/// The copy a write makes first ([`WIFI_SAVED_NEW`]).
+fn spare_path() -> Option<PathBuf> {
+    CString16::try_from(WIFI_SAVED_NEW).map(PathBuf::from).ok()
 }
 
-fn write(volume: &mut FileSystem, bytes: &[u8]) -> Result<(), &'static str> {
-    let path = path().ok_or("The saved networks file has no path.")?;
-    volume
-        .write(&path, bytes)
-        .map_err(|_| "The saved networks could not be written to the USB.")
+/// What `path` holds on `volume`.
+fn stored(volume: &mut FileSystem, path: Option<PathBuf>) -> wifi_saved::Stored {
+    let Some(path) = path else {
+        return wifi_saved::Stored::Unreadable;
+    };
+    match volume.try_exists(&path) {
+        Ok(false) => wifi_saved::Stored::Absent,
+        Ok(true) => match volume.read(&path) {
+            Ok(bytes) => wifi_saved::Stored::Bytes(bytes),
+            Err(_) => wifi_saved::Stored::Unreadable,
+        },
+        Err(_) => wifi_saved::Stored::Unreadable,
+    }
 }
+
+/// The saved networks' bytes as the page and the boot read them
+/// (`wifi_saved::current`): `None` when the file is there but did not read.
+pub(crate) fn saved_file(volume: &mut FileSystem) -> Option<Vec<u8>> {
+    let saved = stored(volume, path());
+    let spare = stored(volume, spare_path());
+    wifi_saved::current(saved, spare)
+}
+
+/// Whether `path` reads back as `bytes`; what was read is wiped.
+fn reads_back(volume: &mut FileSystem, path: &PathBuf, bytes: &[u8]) -> bool {
+    match volume.read(path) {
+        Ok(mut read) => {
+            let same = read == bytes;
+            wifi_saved::wipe(&mut read);
+            same
+        }
+        Err(_) => false,
+    }
+}
+
+/// Write `bytes` as the saved networks. The firmware file protocol has no
+/// truncate and uefi's `write` deletes a file before it writes it again, so
+/// the bytes go to [`WIFI_SAVED_NEW`] first and are read back: a write of
+/// the file itself that stops after the delete leaves that copy, which
+/// [`saved_file`] then reads. The copy goes once the file reads back whole.
+fn write(volume: &mut FileSystem, bytes: &[u8]) -> Result<(), &'static str> {
+    const FAILED: &str = "The saved networks could not be written to the USB.";
+    let path = path().ok_or("The saved networks file has no path.")?;
+    let spare = spare_path().ok_or("The saved networks file has no path.")?;
+    volume.write(&spare, bytes).map_err(|_| FAILED)?;
+    if !reads_back(volume, &spare, bytes) {
+        return Err(FAILED);
+    }
+    volume.write(&path, bytes).map_err(|_| FAILED)?;
+    if !reads_back(volume, &path, bytes) {
+        return Err(FAILED);
+    }
+    // The file is whole: the copy is no longer needed, and one left behind
+    // is read only while the file is absent.
+    let _ = volume.remove_file(&spare);
+    Ok(())
+}
+
+/// Refused when the saved networks are there but did not read: writing a
+/// change over them would erase every network the file holds.
+const UNREAD: &str = "The saved networks could not be read from the USB, so nothing was changed.";
 
 /// Forget the saved network `name`: every line of it leaves the file.
 fn forget(volume: &mut FileSystem, name: &[u8]) -> Result<(), &'static str> {
-    let mut file = read(volume);
+    let mut file = saved_file(volume).ok_or(UNREAD)?;
     let mut kept = wifi_saved::without(&file, name);
     let written = write(volume, &kept);
     wifi_saved::wipe(&mut file);
@@ -166,7 +219,7 @@ fn add(volume: &mut FileSystem, save: Save) -> Result<(), &'static str> {
     if Secret::parse(&save.password).is_err() {
         return Err(wifi_page::PASSWORD_LENGTH);
     }
-    let mut file = read(volume);
+    let mut file = saved_file(volume).ok_or(UNREAD)?;
     let mut updated = wifi_saved::without(&file, save.name.as_bytes());
     let mut line = wifi_saved::line(save.name.as_bytes(), &save.password);
     updated.extend_from_slice(&line);

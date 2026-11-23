@@ -21,7 +21,7 @@ use alloc::{format, string::String, vec::Vec};
 use core::{arch::asm, ops::Range, ptr::NonNull};
 use stela_boot_core::firmware_map::{self, RuntimeMapping};
 use stela_boot_core::firmware_runtime;
-use stela_boot_core::options::{DEFAULT_WIFI_KEY, System, WIFI_SAVED};
+use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_runtime::pc;
@@ -323,14 +323,13 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
             volume.read(uefi::fs::PathBuf::from(path)).ok()
         })
         .unwrap_or_default();
-    // The other saved networks, beside the key: none when the file is absent.
+    // The other saved networks, beside the key: none when the file is absent
+    // or unreadable; the copy a menu write left when it could not finish the
+    // file stands for an absent one (`wifi_menu::saved_file`).
     let wifi_saved = system
         .ssid
         .as_ref()
-        .and_then(|_| {
-            let path = uefi::CString16::try_from(WIFI_SAVED).ok()?;
-            volume.read(uefi::fs::PathBuf::from(path)).ok()
-        })
+        .and_then(|_| crate::wifi_menu::saved_file(&mut volume))
         .unwrap_or_default();
     let host_devices = system.storage.is_some()
         || system.preboot.is_some()

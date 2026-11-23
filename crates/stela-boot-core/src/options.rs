@@ -140,6 +140,11 @@ pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
 /// The saved networks a boot with `--wifi` also joins when its network is
 /// not in range (`wifi_saved`); none when the file is absent.
 pub const WIFI_SAVED: &str = "\\EFI\\stela\\wifi.saved";
+/// What the startup menu's Wi-Fi page writes first when it changes
+/// [`WIFI_SAVED`], whose rewrite deletes the file before writing it: it
+/// stands for that file when a write it could not finish left it absent
+/// (`wifi_saved::current`).
+pub const WIFI_SAVED_NEW: &str = "\\EFI\\stela\\wifi.saved.new";
 /// IEEE 802.11 SSIDs are 1 to 32 octets.
 const SSID_BYTES: core::ops::RangeInclusive<usize> = 1..=32;
 pub const IPV4: &str = "--ipv4";
