@@ -2871,6 +2871,7 @@ fn start_platform(
         native_mmio,
         handoff.tsc_hz,
         work.as_ref().ok().copied(),
+        options.acpi_hardware,
     );
     if let Some(acpi) = host_acpi {
         // As an operating system does before it looks for any device.

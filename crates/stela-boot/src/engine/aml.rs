@@ -23,8 +23,11 @@
 //! ECAM windows.
 //!
 //! The namespace loads before the PCI census, so ports can be powered on
-//! before it; hardware mode, with its SCI route, follows the census
-//! ([`HostAcpi::activate`]).
+//! before it, and its devices' `_INI` runs there too, with or without
+//! hardware mode; hardware mode, with its SCI route, follows the census
+//! ([`HostAcpi::activate`]), and only with `--acpi-hardware`
+//! ([`stela_boot_core::acpi_hardware`]): the SCI's storm guard and the EC's
+//! query budget and failure breaker are that module's.
 pub(super) mod sci;
 use super::{
     host,
@@ -44,12 +47,15 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use stela_boot_core::ecam::memory as ecam_memory;
+use stela_boot_core::{
+    acpi_hardware::{self as hardware_mode, Admit, EcGovernor, SciGovernor},
+    ecam::memory as ecam_memory,
+};
 use stela_drivers::{
     bus::pci::{Address, EcamWindow},
     platform::acpi::{
-        Bound, Interrupt, Mode, PciId, SERVICES_ABI_BYTES, SERVICES_ABI_VERSION, Services, Session,
-        Status, Value, Work,
+        Bound, FULL_CAPABILITIES, Interrupt, Mode, PciId, SERVICES_ABI_BYTES, SERVICES_ABI_VERSION,
+        Services, Session, Status, Value, Work,
     },
     usb::typec::ucsi::acpi::attachment as ucsi,
 };
@@ -159,6 +165,8 @@ struct Provider {
     reported: Cell<u32>,
     prepared_sci: RefCell<Option<sci::Prepared>>,
     sci: RefCell<Option<sci::Armed>>,
+    /// The SCI's storm guard, from its first dispatch.
+    sci_governor: Cell<Option<SciGovernor>>,
     polling: Cell<bool>,
     needs_rearm: Cell<bool>,
     /// AML may write PCI configuration through the native owner while it
@@ -359,27 +367,65 @@ impl Provider {
         true
     }
 
+    /// Milliseconds of the TSC, for the SCI's and the EC's guards.
+    fn now_ms(&self) -> u64 {
+        host::rdtsc() / (self.tsc_hz / 1000).max(1)
+    }
+
+    /// ACPICA's SCI handler, when the SCI's interrupt arrived or, while its
+    /// storm guard keeps the line masked, every `POLL_MS`
+    /// ([`SciGovernor`]); then the line rearmed, unless the guard keeps it
+    /// masked, and with `work` the deferred work run.
     fn dispatch_sci(&self, work: bool) -> bool {
         if self.polling.replace(true) {
             return false;
         }
         let armed = self.sci.borrow_mut().take();
         let mut handled = false;
+        let mut masked = false;
         if let Some(armed) = &armed {
-            match armed.dispatch() {
-                Ok(dispatched) => {
-                    handled = dispatched;
-                    if dispatched {
-                        self.needs_rearm.set(true);
+            let now = self.now_ms();
+            let mut governor = self
+                .sci_governor
+                .get()
+                .unwrap_or_else(|| SciGovernor::new(now));
+            let turn = governor.turn(now, armed.interrupted());
+            self.sci_governor.set(Some(governor));
+            masked = governor.polled();
+            if let Some(change) = turn.change {
+                output::arguments(format_args!("{}", change.line()));
+                if masked {
+                    output::arguments(format_args!(
+                        "HOST ACPI SCI storm registers: {}\n",
+                        armed.registers()
+                    ));
+                }
+            }
+            // While masked, and on the turn interrupts are tried again, the
+            // handler runs with no interrupt pending: the line was masked, so
+            // what asserted it since is read from the status registers, and
+            // the rearm that follows needs that dispatch.
+            let polled = masked || turn.change == Some(hardware_mode::Change::Retry);
+            if turn.dispatch {
+                match armed.dispatch(polled) {
+                    Ok(dispatched) => {
+                        handled = dispatched;
+                        if dispatched && turn.rearm {
+                            self.needs_rearm.set(true);
+                        }
+                    }
+                    Err(error) => {
+                        output::arguments(format_args!("HOST ACPI SCI failed: {error:?}\n"))
                     }
                 }
-                Err(error) => output::arguments(format_args!("HOST ACPI SCI failed: {error:?}\n")),
             }
         }
         // ACPICA's ISR has acknowledged fixed events and disabled deferred
         // GPE contributors. Rearm the parent before executing AML: a worker
         // may wait for the FACS global-lock release fixed event on this SCI.
+        // A line the storm guard keeps masked is not rearmed.
         if self.needs_rearm.get()
+            && !masked
             && let Some(armed) = &armed
         {
             // SAFETY: the native IRQ returned/EOIed and the C ISR completed;
@@ -1150,6 +1196,8 @@ pub struct HostAcpi {
         )>,
     >,
     ec_pending: Cell<bool>,
+    /// The EC's query budget and failure breaker, from its first event.
+    ec_governor: RefCell<Option<EcGovernor>>,
     hardware: AtomicBool,
     ec_failed: AtomicBool,
     deferred_failed: AtomicBool,
@@ -1192,7 +1240,8 @@ impl HostAcpi {
     /// Load the tables at `rsdp` and their namespace, in interpreter mode;
     /// `None`, reported, when ACPICA refuses them. `root` is the loader
     /// root. The namespace lives until the host powers off, so it is leaked
-    /// here, once. Hardware mode follows the PCI census ([`Self::activate`]).
+    /// here, once. Hardware mode follows the PCI census ([`Self::activate`]),
+    /// where `hardware` (`--acpi-hardware`) admits it.
     pub(super) fn start(
         rsdp: u64,
         root: u64,
@@ -1200,6 +1249,7 @@ impl HostAcpi {
         pci: Option<&'static native_mmio::Source>,
         tsc_hz: u64,
         executor: Option<&'static KernelWork>,
+        hardware: bool,
     ) -> Option<&'static Self> {
         let Some(executor) = executor else {
             output::arguments(format_args!(
@@ -1225,7 +1275,7 @@ impl HostAcpi {
             None
         };
         match executor.call_owned(5_000_000, move || {
-            Self::start_entered(rsdp, root, ecam, pci, tsc_hz, executor)
+            Self::start_entered(rsdp, root, ecam, pci, tsc_hz, executor, hardware)
         }) {
             Ok(acpi) => acpi,
             Err(error) => {
@@ -1245,16 +1295,23 @@ impl HostAcpi {
         pci: Option<&'static native_mmio::Source>,
         tsc_hz: u64,
         executor: &'static KernelWork,
+        hardware: bool,
     ) -> Option<&'static Self> {
         if rsdp == 0 {
             output::arguments(format_args!("ACPI firmware AML unavailable: no RSDP\n"));
             return None;
         }
-        // An SCI route alone does not check ACPICA hardware mode. The draft
-        // provider still lacks real role-specific continuations/thread IDs and
-        // exact resource-owned map/unmap leases. Keep namespace-only operation
-        // until that complete provider is admitted by the work owner.
-        let capabilities = 0;
+        // An SCI route alone does not check ACPICA hardware mode, which is
+        // off unless `--acpi-hardware` asks for it until a laptop has proven
+        // it. With it, the provider attests its services: the SCI through
+        // the owned IOAPIC route (`sci`), deferred work on this continuation
+        // (`execute`, `drain_work`), the EC's region handler installed before
+        // hardware activation runs `_REG`, and allocations from the heap,
+        // which ACPICA's handler reaches only on this continuation, never in
+        // the hard interrupt (`sci::Deferred` only masks and flags). ACPICA's
+        // `map` leases stay the loader root's for good, which a namespace
+        // that lives until power-off never gives back.
+        let capabilities = if hardware { FULL_CAPABILITIES } else { 0 };
         let provider = Box::new(Provider {
             executor,
             root,
@@ -1267,6 +1324,7 @@ impl HostAcpi {
             reported: Cell::new(0),
             prepared_sci: RefCell::new(None),
             sci: RefCell::new(None),
+            sci_governor: Cell::new(None),
             polling: Cell::new(false),
             needs_rearm: Cell::new(false),
             config_writes: Cell::new(false),
@@ -1361,6 +1419,7 @@ impl HostAcpi {
             backlights: RefCell::new(Vec::new()),
             asus: RefCell::new(None),
             ec_pending: Cell::new(false),
+            ec_governor: RefCell::new(None),
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
             deferred_failed: AtomicBool::new(false),
@@ -1375,10 +1434,10 @@ impl HostAcpi {
     /// without it a laptop's touchpad `_CRS` holds no I2C connection. It
     /// runs before the PCI census, where AML may write PCI configuration as
     /// it does under Linux, bounded like every firmware call, and reported.
+    /// It runs with `--acpi-hardware` too, so the census sees what it sees
+    /// without it; hardware activation then runs no `_INI` again, and the
+    /// EC's `_REG` follows `_INI`, as under Linux without an ECDT.
     pub(super) fn initialize_devices(&'static self) {
-        if self.capabilities != 0 {
-            return;
-        }
         match self.firmware(
             "device initialization",
             "devices are described as far as it got",
@@ -1403,23 +1462,46 @@ impl HostAcpi {
     pub(super) fn activate(&'static self, prepared_sci: Option<sci::Prepared>) {
         if self.capabilities == 0 {
             // No hardware callback may take the route in namespace mode: it
-            // is dropped here. The line says whose gap this is: the provider
-            // has no ACPI interrupt, event and deferred-work services yet
-            // (`start_entered`), whatever the PC.
-            output::arguments(format_args!(
-                "UNSUPPORTED ACPI hardware mode: not implemented in Stela yet, on any PC (no ACPI \
-                 interrupt, ACPI events or deferred firmware work); off because of it: the \
-                 embedded controller and what firmware reads through it (battery, AC adapter, \
-                 lid), ACPI device notifications and USB-C port reports (UCSI)\n"
-            ));
+            // is dropped here. The line names the option that turns it on.
+            output::arguments(format_args!("{}", hardware_mode::off_line()));
             return;
         }
+        let Some(prepared) = prepared_sci else {
+            output::arguments(format_args!(
+                "{}",
+                hardware_mode::refused_line(
+                    "the SCI's route was not captured (no contained PCI fabric, no FADT power \
+                     registers, or the HOST ACPI SCI unavailable line's cause)"
+                )
+            ));
+            return;
+        };
         // SAFETY: this permanent provider is held by the leaked Session.
         let provider = unsafe { &*self.provider };
-        if let Err(error) = provider
-            .executor
-            .call_owned(5_000_000, move || self.activate_entered(prepared_sci))
-        {
+        let registers = provider
+            .pci
+            .and_then(|pci| hardware_mode::Registers::read(pci.fadt()));
+        if let Some(registers) = registers {
+            // SAFETY: the FADT's PM1a control port, whose read changes
+            // nothing; ACPICA reads it itself before it writes SMI_CMD.
+            let control = registers.control_port().map(|port| unsafe { in16(port) });
+            output::arguments(format_args!(
+                "{}",
+                hardware_mode::starting_line(&registers, &prepared.route(), control)
+            ));
+        }
+        // Bounded as every firmware call is, and given that bound's time:
+        // `_REG` and ACPICA's wait for SCI_EN after SMI_CMD (3 s) are the
+        // firmware's to make slow, and a continuation past its deadline
+        // closes the work owner's entry for every later firmware call.
+        let timeout = u64::from(AML_BOUND_MS) * 1000 + 1_000_000;
+        if let Err(error) = provider.executor.call_owned(timeout, move || {
+            bounded(
+                "hardware activation",
+                "ACPI hardware mode is left as far as it got",
+                || self.activate_entered(Some(prepared)),
+            )
+        }) {
             output::arguments(format_args!(
                 "UNSUPPORTED ACPI hardware activation: continuation unavailable: {error}\n"
             ));
@@ -1746,40 +1828,7 @@ impl HostAcpi {
         if EC_EVENT.swap(false, Ordering::AcqRel) || self.ec_pending.get() {
             let bindings = self.ec.borrow();
             if let Some(binding) = bindings.as_ref() {
-                self.ec_pending.set(true);
-                for _ in 0..32 {
-                    match binding.poll_query() {
-                        Ok(Some(event)) => {
-                            if let Err(error) = event.dispatch() {
-                                output::arguments(format_args!(
-                                    "HOST ACPI EC query failed: {error:?}\n"
-                                ));
-                            }
-                        }
-                        Ok(None) => {
-                            if let Some(number) = binding.device().gpe {
-                                let gpe = stela_drivers::platform::acpi::Gpe {
-                                    block: None,
-                                    number,
-                                };
-                                if let Err(error) = self.session.enable_gpe(gpe) {
-                                    output::arguments(format_args!(
-                                        "HOST ACPI EC GPE resume failed: {error:?}\n"
-                                    ));
-                                    return;
-                                }
-                            }
-                            self.ec_pending.set(false);
-                            break;
-                        }
-                        Err(error) => {
-                            output::arguments(format_args!(
-                                "HOST ACPI EC transaction failed: {error:?}\n"
-                            ));
-                            return;
-                        }
-                    }
-                }
+                self.service_ec(binding);
             }
         }
         // A notification's full refresh reads the state a timed one would.
@@ -1833,6 +1882,88 @@ impl HostAcpi {
         self.service_lid();
         self.service_brightness();
         self.service_asus_wmi();
+    }
+
+    /// Linux's `acpi_ec_event_handler`: the EC's queries (`QR_EC`), each
+    /// one's `_Qxx` run, until the EC has none, then its GPE resumed, which
+    /// its raw handler disabled ([`Session::flag_gpe`]). At most 32 a poll
+    /// and `QUERIES_PER_WINDOW` a second; past `EC_FAILURES` failed
+    /// transactions in a row its events stop, its GPE left disabled
+    /// ([`EcGovernor`]). Each query number is named once.
+    fn service_ec(&self, binding: &stela_drivers::platform::ec::binding::Binding<'static>) {
+        // SAFETY: this permanent provider is held by the leaked Session.
+        let now = unsafe { &*self.provider }.now_ms();
+        let mut governor = self.ec_governor.borrow_mut();
+        let governor = governor.get_or_insert_with(|| EcGovernor::new(now));
+        self.ec_pending.set(true);
+        for _ in 0..32 {
+            match governor.admit(now) {
+                Admit::Take => {}
+                Admit::Wait { first } => {
+                    if first {
+                        output::arguments(format_args!(
+                            "HOST ACPI EC query budget: {} queries in the last second; the rest \
+                             wait for the next\n",
+                            hardware_mode::QUERIES_PER_WINDOW
+                        ));
+                    }
+                    return;
+                }
+                Admit::Stopped => {
+                    self.ec_pending.set(false);
+                    return;
+                }
+            }
+            match binding.poll_query() {
+                Ok(Some(event)) => {
+                    governor.succeeded();
+                    let number = event.value();
+                    let result = event.dispatch();
+                    if governor.first(number) {
+                        match result {
+                            Ok(()) => output::arguments(format_args!(
+                                "HOST ACPI EC query {number:#04x}: _Q{number:02X} ran (each \
+                                 query is named once)\n"
+                            )),
+                            Err(error) => output::arguments(format_args!(
+                                "HOST ACPI EC query {number:#04x} failed: {error:?} (each query \
+                                 is named once)\n"
+                            )),
+                        }
+                    }
+                }
+                Ok(None) => {
+                    governor.succeeded();
+                    if let Some(number) = binding.device().gpe {
+                        let gpe = stela_drivers::platform::acpi::Gpe {
+                            block: None,
+                            number,
+                        };
+                        if let Err(error) = self.session.enable_gpe(gpe) {
+                            output::arguments(format_args!(
+                                "HOST ACPI EC GPE resume failed: {error:?}\n"
+                            ));
+                            return;
+                        }
+                    }
+                    self.ec_pending.set(false);
+                    return;
+                }
+                Err(error) => {
+                    output::arguments(format_args!("HOST ACPI EC transaction failed: {error:?}\n"));
+                    if governor.failed() {
+                        output::arguments(format_args!(
+                            "HOST ACPI EC events stopped after {} failed transactions in a row: \
+                             its GPE stays disabled, so the battery, lid and hotkey events that \
+                             come as EC queries no longer arrive\n",
+                            hardware_mode::EC_FAILURES
+                        ));
+                        self.ec_pending.set(false);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// The lid's STATUS notifications since the last poll: `_LID` read

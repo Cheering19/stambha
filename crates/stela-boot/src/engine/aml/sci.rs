@@ -3,7 +3,7 @@ use crate::{
     native_irq::{self, ioapic},
     native_mmio,
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, Ordering},
@@ -54,6 +54,16 @@ impl Prepared {
         self.irq
     }
 
+    /// The SCI's physical route, for the start's line: `GSI 9 Low Level`.
+    pub(super) fn route(&self) -> String {
+        alloc::format!(
+            "GSI {} {:?} {:?}",
+            self.line.gsi,
+            self.line.polarity,
+            self.line.trigger
+        )
+    }
+
     /// # Safety
     /// Called once by this boot's ACPICA activation, with the same permanent
     /// provider/handler argument kept until acknowledged removal. The hardware
@@ -66,6 +76,7 @@ impl Prepared {
     ) -> Result<Armed, IrqError> {
         let pending = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
+        let registers = Registers(self.power.clone());
         let devices = Sources::new(self.power);
         let unit = self.mmio.original_line(self.line)?;
         self.mmio
@@ -94,6 +105,7 @@ impl Prepared {
             registration,
             handler,
             argument: argument as usize,
+            registers,
         })
     }
 }
@@ -206,6 +218,44 @@ impl Handler for Deferred {
     }
 }
 
+/// The SCI's fixed-event and GPE registers, read for a storm's line.
+struct Registers(HostPower);
+impl Registers {
+    /// `PM1a 0x800 sts=0x0100 en=0x0120; GPE0 0x820 sts=00 80 .. en=..`:
+    /// each status and enable register, which reads change nothing.
+    fn describe(&self) -> String {
+        let mut line = String::new();
+        let power = &self.0;
+        for (index, pm1) in power.blocks().enumerate() {
+            // SAFETY: the FADT's PM1 event block, owned by this SCI; a status
+            // read has no effect.
+            let (status, enable) =
+                unsafe { (super::in16(pm1.event), super::in16(power.enable_port(pm1))) };
+            line.push_str(&alloc::format!(
+                "PM1{} {:#x} sts={status:#06x} en={enable:#06x}; ",
+                if index == 0 { 'a' } else { 'b' },
+                pm1.event
+            ));
+        }
+        for (index, block) in power.gpe.iter().flatten().enumerate() {
+            let (mut status, mut enable) = (String::new(), String::new());
+            for (status_port, enable_port) in block.registers() {
+                // SAFETY: the FADT's GPE block, owned by this SCI; reads only.
+                let (s, e) = unsafe { (super::in8(status_port), super::in8(enable_port)) };
+                status.push_str(&alloc::format!(" {s:02x}"));
+                enable.push_str(&alloc::format!(" {e:02x}"));
+            }
+            line.push_str(&alloc::format!(
+                "GPE{index} {:#x} sts={} en={}; ",
+                block.port,
+                status.trim_start(),
+                enable.trim_start()
+            ));
+        }
+        String::from(line.trim_end_matches("; "))
+    }
+}
+
 pub(super) struct Armed {
     pending: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
@@ -213,15 +263,29 @@ pub(super) struct Armed {
     registration: Box<dyn IrqRegistration>,
     handler: Interrupt,
     argument: usize,
+    registers: Registers,
 }
 impl Armed {
+    /// Whether the SCI's interrupt arrived since its last dispatch.
+    pub(super) fn interrupted(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+    /// The fixed-event and GPE registers as they read now, for a storm's
+    /// line: which status bit keeps the SCI asserted.
+    pub(super) fn registers(&self) -> String {
+        self.registers.describe()
+    }
     /// Dispatch only in BSP process context under the provider's loader root.
     /// The hard IRQ has already returned through the registry's local EOI.
-    pub(super) fn dispatch(&self) -> Result<bool, IrqError> {
+    /// `polled` runs ACPICA's handler with no interrupt pending, as the
+    /// storm guard does while the line stays masked
+    /// (`stela_boot_core::acpi_hardware::SciGovernor`): its handler reads
+    /// every status register itself.
+    pub(super) fn dispatch(&self, polled: bool) -> Result<bool, IrqError> {
         if self.failed.load(Ordering::Acquire) {
             return Err(IrqError::Mask);
         }
-        if !self.pending.swap(false, Ordering::AcqRel) {
+        if !self.pending.swap(false, Ordering::AcqRel) && !polled {
             return Ok(false);
         }
         // SAFETY: activation keeps this exact ACPICA SCI callback/context;
