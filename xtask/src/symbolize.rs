@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
 
-mod code;
+pub(crate) mod code;
 #[cfg(test)]
 mod fixtures;
 mod log;
