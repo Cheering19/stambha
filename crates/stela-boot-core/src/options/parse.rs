@@ -44,6 +44,12 @@ impl ParseState<'_> {
                 }
                 options.lid = Some(Lid::parse(value().ok_or(Error::Lid)?)?);
             }
+            LAPTOP => {
+                let laptop = Laptop::parse(value().ok_or(Error::Laptop)?)?;
+                if options.laptop.replace(laptop).is_some() {
+                    return Err(Error::DuplicateLaptop);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {

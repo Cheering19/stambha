@@ -33,6 +33,38 @@ fn the_lid_is_ignored_unless_asked_and_its_sleep_needs_the_method() {
 }
 
 #[test]
+fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
+    // The default is auto, and writes nothing.
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.laptop(), Laptop::Auto);
+    assert_eq!(plain.laptop, None);
+    for (text, laptop) in [
+        ("--system --laptop auto", Laptop::Auto),
+        ("--system --laptop off", Laptop::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.laptop(), laptop);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --laptop", Error::Laptop),
+        ("--system --laptop on", Error::Laptop),
+        (
+            "--system --laptop off --laptop auto",
+            Error::DuplicateLaptop,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+    // `off` beside the opt-ins it leaves: each still parses as before.
+    let given =
+        System::parse("--system --laptop off --battery --lid method --brightness-keys").unwrap();
+    assert_eq!(given.battery, Some(Battery::Host));
+    assert_eq!(given.lid(), Lid::Method);
+    assert!(given.brightness_keys);
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),

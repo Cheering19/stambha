@@ -46,7 +46,10 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// Revision 13: `--tss` is gone; every `--install` signs with Apple's
 /// signing service. The fork's `--trackpad mt2|builtin`, which cables an
 /// emulated Magic Trackpad 2, is a hand-written opt-in setup never writes:
-/// no line setup writes changes meaning, so it keeps revision 13.
+/// no line setup writes changes meaning, so it keeps revision 13. So does
+/// the fork's `--laptop auto|off`, as hand-written: a laptop's boot takes
+/// `--battery`, `--lid method`, `--brightness-keys` and `--trackpad mt2`
+/// unasked from what it reads of the PC, which the line does not hold.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

@@ -1450,6 +1450,21 @@ impl HostAcpi {
             move |_| self.attach_asus_wmi(),
         );
     }
+    /// The brightness keys' outputs, for `--brightness-keys` a laptop took
+    /// after hardware mode started (`stela_boot_core::laptop`): attached
+    /// as [`Self::attach_laptop_controls`] attaches them with the option,
+    /// in their own bounded firmware call, where hardware mode runs.
+    pub(super) fn attach_brightness_keys(&'static self) {
+        if !self.hardware_active() {
+            return;
+        }
+        self.firmware(
+            "brightness key attachment",
+            "the outputs it reached are followed",
+            false,
+            move |_| self.attach_backlights(),
+        );
+    }
     fn activate_entered(&'static self, prepared_sci: Option<sci::Prepared>) {
         // SAFETY: this permanent provider is held by the leaked Session.
         let provider = unsafe { &*self.provider };
