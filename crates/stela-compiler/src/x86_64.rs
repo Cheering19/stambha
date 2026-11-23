@@ -103,6 +103,8 @@ pub mod flag_word;
 mod flags;
 mod fp_register;
 mod guest_range;
+// fingerprint: not a translation input: HLE composites are never stored
+pub mod hle;
 mod integer_math;
 mod integer_minmax;
 mod integer_unary;

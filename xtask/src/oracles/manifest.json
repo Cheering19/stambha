@@ -5366,5 +5366,25 @@
       "STELA_SYMBOLIZE_DSC"
     ],
     "reason": "requires the guest's own dyld shared cache (its main file or directory, with its subcaches and .symbols) in STELA_SYMBOLIZE_DSC; checks that its page keys and symbols name its functions back"
+  },
+  {
+    "package": "stela-engine",
+    "test": "real_platform_functions_match_their_natives",
+    "source": "crates/stela-engine/tests/hle_real.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_HLE_FUNCTIONS"
+    ],
+    "reason": "requires the macOS platform functions cargo xtask hle-signatures --extract wrote (private, outside the repository) in STELA_HLE_FUNCTIONS; runs each eligible one against its HLE native over the differential cases"
+  },
+  {
+    "package": "stela-engine",
+    "test": "real_platform_functions_time_by_size",
+    "source": "crates/stela-engine/tests/hle_real.rs",
+    "kind": "manual",
+    "inputs": [
+      "STELA_HLE_FUNCTIONS"
+    ],
+    "reason": "times each extracted platform function's calls by size, translated and through its native; report only, run on request in a release build"
   }
 ]

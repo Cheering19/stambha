@@ -641,6 +641,121 @@ impl Drop for Mapped {
     }
 }
 
+/// A function an image of a dyld shared cache names: its symbol, its
+/// image's path, its unslid address and its bytes, from there to the next
+/// function start or symbol of its image (at most the bytes asked for).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Function {
+    pub symbol: String,
+    pub image: String,
+    pub address: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The functions `symbols` name in the dyld shared cache at `path` (its
+/// main file, with its subcaches beside it, or the directory holding it),
+/// each at most `limit` bytes long. A symbol several images define is
+/// found in each.
+pub(crate) fn cache_functions(
+    path: &Path,
+    symbols: &[&str],
+    limit: usize,
+) -> Result<Vec<Function>> {
+    let main_path = if path.is_dir() {
+        let mut found = Vec::new();
+        collect(path, DEPTH, &mut found)?;
+        found.sort();
+        found
+            .into_iter()
+            .find(|file| {
+                let name = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                name.starts_with("dyld_shared_cache_") && !name.contains('.')
+            })
+            .with_context(|| format!("no dyld shared cache main file under {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    let main = Mapped::open(&main_path)?;
+    let suffixes =
+        DyldCache::<Endianness>::subcache_suffixes(&main[..]).map_err(|e| anyhow!("{e}"))?;
+    let mut subcaches = Vec::new();
+    for suffix in suffixes {
+        let sub = PathBuf::from(format!("{}{suffix}", main_path.display()));
+        subcaches
+            .push(Mapped::open(&sub).with_context(|| format!("its subcache {}", sub.display()))?);
+    }
+    let slices: Vec<&[u8]> = subcaches.iter().map(|sub| &sub[..]).collect();
+    functions_of(&main, &slices, symbols, limit)
+}
+
+/// [`cache_functions`] of a cache already read.
+pub(crate) fn functions_of(
+    main: &[u8],
+    subcaches: &[&[u8]],
+    symbols: &[&str],
+    limit: usize,
+) -> Result<Vec<Function>> {
+    let cache = DyldCache::<Endianness>::parse(main, subcaches).map_err(|e| anyhow!("{e}"))?;
+    let mut functions = Vec::new();
+    for image in cache.images() {
+        let (Ok(path), Ok(object::File::MachO64(file))) = (image.path(), image.parse_object())
+        else {
+            continue;
+        };
+        let linkedit = file
+            .segments()
+            .find(|segment| segment.name().ok().flatten() == Some("__LINKEDIT"))
+            .and_then(|segment| cache.data_and_offset_for_address(segment.address()))
+            .map(|(data, _)| data);
+        let mut starts = function_starts(&file, |offset, size| {
+            linkedit.and_then(|data| data.get(offset..offset + size))
+        });
+        let mut named: Vec<(u64, String)> = file
+            .symbols()
+            .filter(|symbol| symbol.kind() == SymbolKind::Text && symbol.is_definition())
+            .filter_map(|symbol| Some((symbol.address(), symbol.name().ok()?.to_owned())))
+            .collect();
+        if let Ok(exports) = file.exports() {
+            named.extend(exports.iter().filter_map(|export| {
+                Some((
+                    export.address(),
+                    core::str::from_utf8(export.name()).ok()?.to_owned(),
+                ))
+            }));
+        }
+        // Every address a symbol or start names bounds the function before.
+        starts.extend(named.iter().map(|(address, _)| *address));
+        starts.sort_unstable();
+        starts.dedup();
+        named.sort();
+        named.dedup();
+        for (address, symbol) in named {
+            if !symbols.contains(&symbol.as_str()) {
+                continue;
+            }
+            let next = starts.iter().copied().find(|&start| start > address);
+            let length = next.map_or(limit as u64, |next| (next - address).min(limit as u64));
+            let Some((data, offset)) = cache.data_and_offset_for_address(address) else {
+                continue;
+            };
+            let offset = usize::try_from(offset)?;
+            let Some(bytes) = data.get(offset..offset + length as usize) else {
+                continue;
+            };
+            functions.push(Function {
+                symbol,
+                image: path.to_owned(),
+                address,
+                bytes: bytes.to_vec(),
+            });
+        }
+    }
+    Ok(functions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{self, ALPHA, BETA, CACHE_BASE, CACHE_PATH, PAGE, STUBS, UNNAMED};
@@ -723,6 +838,29 @@ mod tests {
             code.loaded,
             ["libfixture.dylib: 1 image, 2 of 3 wanted pages"]
         );
+    }
+
+    #[test]
+    fn a_dyld_cache_gives_a_named_function_s_bytes_to_the_next_start() {
+        let file = fixtures::cache();
+        let functions = functions_of(&file, &[], &["_alpha", "_missing"], PAGE).unwrap();
+        assert_eq!(functions.len(), 1, "{functions:?}");
+        let alpha = &functions[0];
+        assert_eq!(
+            (alpha.symbol.as_str(), alpha.image.as_str(), alpha.address),
+            ("_alpha", CACHE_PATH, CACHE_BASE + ALPHA)
+        );
+        // To the unnamed function start after it.
+        assert_eq!(alpha.bytes.len() as u64, UNNAMED - ALPHA);
+        let cache = DyldCache::<Endianness>::parse(&file[..], &[]).unwrap();
+        let (data, offset) = cache.data_and_offset_for_address(alpha.address).unwrap();
+        assert_eq!(
+            alpha.bytes[..],
+            data[offset as usize..][..alpha.bytes.len()]
+        );
+        // Bounded by the limit asked for.
+        let short = functions_of(&file, &[], &["_alpha"], 64).unwrap();
+        assert_eq!(short[0].bytes.len(), 64);
     }
 
     #[test]

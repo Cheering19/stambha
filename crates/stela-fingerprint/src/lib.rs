@@ -20,12 +20,24 @@ pub struct Options<'a> {
     /// directory beside it) when its parent declares it only under
     /// `#[cfg(test)]` or `#[cfg(all(test, ...))]`. A test module declared any
     /// other way, or whose parent is not among the inputs, is hashed.
+    ///
+    /// Also leave out a module declared on the line after
+    /// [`NOT_AN_INPUT`] (its `name.rs` and its `name/` directory), with that
+    /// line and its declaration: code no output the fingerprint keys depends
+    /// on, such as the compiler's HLE composites, which are never stored.
+    /// Its parent then hashes as it would without the module.
     pub skip_test_modules: bool,
     /// Lock files, relative to the crate root, and the registry packages whose
     /// locked versions and checksums (with every package they depend on) the
     /// fingerprint covers. A missing lock file is hashed as missing.
     pub locked: &'a [(&'a str, &'a [&'a str])],
 }
+
+/// The comment that, alone on the line before a module's declaration
+/// (`mod name;`, `pub mod name;` or `pub(crate) mod name;`), leaves the
+/// module out of a fingerprint that skips test modules
+/// ([`Options::skip_test_modules`]). Text after it on its line says why.
+pub const NOT_AN_INPUT: &str = "// fingerprint: not a translation input";
 
 /// Prints `cargo:rerun-if-changed` for each input of the crate whose build
 /// script is running and sets the environment variable `variable` to the
@@ -68,13 +80,29 @@ pub fn source_sha256_with(root: &Path, inputs: &[&str], options: &Options) -> St
     }
     files.sort();
     files.dedup();
+    // Files whose marked module declarations are left out of their content.
+    let mut marked = Vec::new();
     if options.skip_test_modules {
-        let skipped: Vec<String> = files
+        let mut skipped: Vec<String> = files
             .iter()
             .filter_map(|file| test_module_directory(root, file))
             .collect();
+        let mut skipped_files = Vec::new();
+        for file in &files {
+            let modules = unmarked_modules(root, file);
+            if modules.is_empty() {
+                continue;
+            }
+            let directory = module_directory(file);
+            for name in modules {
+                skipped_files.push(format!("{directory}/{name}.rs"));
+                skipped.push(format!("{directory}/{name}"));
+            }
+            marked.push(file.clone());
+        }
         files.retain(|file| {
             test_module_directory(root, file).is_none()
+                && !skipped_files.contains(file)
                 && !skipped
                     .iter()
                     .any(|directory| file.starts_with(&format!("{directory}/")))
@@ -82,7 +110,10 @@ pub fn source_sha256_with(root: &Path, inputs: &[&str], options: &Options) -> St
     }
     let mut hasher = Sha256::new();
     for file in files {
-        let content = normalize(&fs::read(root.join(&file)).expect("readable source file"));
+        let mut content = normalize(&fs::read(root.join(&file)).expect("readable source file"));
+        if marked.contains(&file) {
+            content = without_marked_modules(&content);
+        }
         hasher.update(file.as_bytes());
         hasher.update([0]);
         hasher.update((content.len() as u64).to_le_bytes());
@@ -107,6 +138,70 @@ pub fn source_sha256_with(root: &Path, inputs: &[&str], options: &Options) -> St
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The directory a Rust file's submodules live in: its own directory for a
+/// crate root or `mod.rs`, else the directory named as the file.
+fn module_directory(file: &str) -> String {
+    let (parent, name) = file.rsplit_once('/').unwrap_or(("", file));
+    match name {
+        "lib.rs" | "main.rs" | "mod.rs" => parent.to_owned(),
+        _ => file.strip_suffix(".rs").unwrap_or(file).to_owned(),
+    }
+}
+
+/// The name a declaration line `mod name;` (or `pub` / `pub(crate)` /
+/// `pub(super)` before it) declares.
+fn declared_module(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let rest = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))?;
+    let name = rest.strip_suffix(';')?;
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
+}
+
+/// The modules `file` (a `.rs`) declares on the line after a
+/// [`NOT_AN_INPUT`] comment.
+fn unmarked_modules(root: &Path, file: &str) -> Vec<String> {
+    if !file.ends_with(".rs") {
+        return Vec::new();
+    }
+    let Ok(text) = fs::read_to_string(root.join(file)) else {
+        return Vec::new();
+    };
+    let text = normalize_text(&text);
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .windows(2)
+        .filter(|pair| pair[0].trim().starts_with(NOT_AN_INPUT))
+        .filter_map(|pair| declared_module(pair[1]).map(str::to_owned))
+        .collect()
+}
+
+/// `content` without each [`NOT_AN_INPUT`] line and the module declaration
+/// after it, every other byte as it was.
+fn without_marked_modules(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len());
+    let lines: Vec<&[u8]> = content.split_inclusive(|&byte| byte == b'\n').collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = String::from_utf8_lossy(lines[index]);
+        let next = lines
+            .get(index + 1)
+            .map(|next| String::from_utf8_lossy(next));
+        if line.trim().starts_with(NOT_AN_INPUT)
+            && next.as_deref().and_then(declared_module).is_some()
+        {
+            index += 2;
+            continue;
+        }
+        out.extend_from_slice(lines[index]);
+        index += 1;
+    }
+    out
 }
 
 /// When `file` is a `tests.rs` that only test builds compile, the path of
@@ -367,6 +462,69 @@ mod tests {
             digest = changed;
         }
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_marked_module_is_left_out_with_its_declaration() {
+        let options = Options {
+            skip_test_modules: true,
+            locked: &[],
+        };
+        let without = tree(
+            "marked-without",
+            &[
+                ("src/lib.rs", b"mod a;\nmod c;\n"),
+                ("src/a.rs", b"mod b;\nfn a() {}\n"),
+                ("src/a/b.rs", b"b"),
+            ],
+        );
+        let with = tree(
+            "marked-with",
+            &[
+                ("src/lib.rs", b"mod a;\nmod c;\n"),
+                (
+                    "src/a.rs",
+                    b"mod b;\n// fingerprint: not a translation input: never stored\npub mod hle;\nfn a() {}\n",
+                ),
+                ("src/a/b.rs", b"b"),
+                ("src/a/hle.rs", b"one"),
+                ("src/a/hle/deep.rs", b"two"),
+            ],
+        );
+        let digest = source_sha256_with(&without, &["src"], &options);
+        assert_eq!(digest, source_sha256_with(&with, &["src"], &options));
+        // Its files change nothing; every other file still counts.
+        fs::write(with.join("src/a/hle/deep.rs"), b"edited").unwrap();
+        fs::write(with.join("src/a/hle/new.rs"), b"new").unwrap();
+        assert_eq!(digest, source_sha256_with(&with, &["src"], &options));
+        fs::write(with.join("src/a/b.rs"), b"edited").unwrap();
+        assert_ne!(digest, source_sha256_with(&with, &["src"], &options));
+        // Unmarked, or without the option, the module counts.
+        let unmarked = tree(
+            "marked-unmarked",
+            &[
+                ("src/lib.rs", b"mod a;\nmod c;\n"),
+                ("src/a.rs", b"mod b;\npub mod hle;\nfn a() {}\n"),
+                ("src/a/b.rs", b"b"),
+                ("src/a/hle.rs", b"one"),
+            ],
+        );
+        assert_ne!(digest, source_sha256_with(&unmarked, &["src"], &options));
+        assert_ne!(
+            source_sha256(&without, &["src"]),
+            source_sha256(&with, &["src"])
+        );
+        // The marker before anything but a declaration leaves its line.
+        assert_eq!(
+            without_marked_modules(b"// fingerprint: not a translation input\nfn a() {}\n"),
+            b"// fingerprint: not a translation input\nfn a() {}\n"
+        );
+        assert_eq!(module_directory("src/lib.rs"), "src");
+        assert_eq!(module_directory("src/x86_64.rs"), "src/x86_64");
+        assert_eq!(module_directory("src/a/mod.rs"), "src/a");
+        for root in [without, with, unmarked] {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

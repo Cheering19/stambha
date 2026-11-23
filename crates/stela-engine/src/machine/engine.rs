@@ -44,6 +44,7 @@ mod fetch;
 #[cfg(all(feature = "std", feature = "native-profile"))]
 pub mod floating_profile;
 mod guarded;
+mod hle;
 mod install_census;
 pub mod installed_code;
 mod interrupts;
@@ -480,6 +481,9 @@ struct Block {
     /// exit is the site's access, on whichever PE runs it, whether or not
     /// that PE learnt the site.
     device_stub: bool,
+    /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
+    /// ends, which a fault inside it is taken back from.
+    hle: Option<hle::Mark>,
 }
 
 // The board keeps one per block, millions in all.
@@ -765,6 +769,8 @@ pub struct Machine<H: Host, D: Devices> {
     pub devices: D,
     pub profile: CpuProfile,
     pub statistics: Statistics,
+    /// The native routines it replaces signed functions with (`hle`).
+    hle: hle::State,
     /// `--profile`'s phase timing, while it is on.
     step_timing: Option<step_timing::StepTiming>,
     /// Exits to the engine from compiled code (System, FP, PAC and AMX), by
@@ -1408,6 +1414,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             devices,
             profile,
             statistics: Statistics::default(),
+            hle: Default::default(),
             step_timing: None,
             exit_words: BTreeMap::new(),
             exit_pending: [PendingExits::default(); PENDING_EXITS],

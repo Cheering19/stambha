@@ -64,6 +64,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// turns the GPU links' ASPM off at the claim: no line setup writes holds it.
 /// So does the fork's `--core-trial`, a hand-written read-only boot of a
 /// USB bundle on RAM-backed disks: no line setup writes holds it.
+/// So do the fork's `--hle` and `--hle-off ID[,ID...]`, hand-written
+/// opt-ins that replace signed guest functions with native routines: no
+/// line setup writes holds them.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

@@ -1461,6 +1461,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         step_timing: options.profile,
         amx_model: options.amx_model().0,
         tlbi_keep: options.tlbi_keep(),
+        hle: stela_engine::hle::Config::boot(options.hle, &options.hle_off),
     };
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.

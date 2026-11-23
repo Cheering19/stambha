@@ -853,6 +853,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Blocks end before a device site, which no entry context names:
         // the store neither gives nor takes its page's blocks.
         let sited = !variant.single && self.page_has_device_sites(physical);
+        if let Some(fetched) = self.hle_compile(pc, physical, variant, source)? {
+            return Ok(Some(fetched));
+        }
         let reading = self.host.counter();
         let stored = match variant.single || sited {
             true => None,
@@ -1416,6 +1419,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installer: self.current as u8,
             part: shared_part(&self.code, code),
             device_stub: self.installing_stub,
+            hle: self.hle.installing,
         };
         let shared = Arc::clone(&self.code);
         shared.blocks.fill(slot, block);

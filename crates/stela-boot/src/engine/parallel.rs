@@ -104,6 +104,9 @@ pub(crate) struct Settings {
     /// `--tlbi-keep` and `--tlbi-verify-check` ([`stela_boot_core::options::System::tlbi_keep`]),
     /// as on the home machine.
     pub tlbi_keep: (bool, bool),
+    /// `--hle` and `--hle-off`: the functions native routines replace, as
+    /// on the home machine.
+    pub hle: stela_engine::hle::Config,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -137,6 +140,7 @@ pub(crate) fn spawn<H: Host>(
             step_timing: settings.step_timing,
             amx_model: settings.amx_model,
             tlbi_keep: settings.tlbi_keep,
+            hle: settings.hle.clone(),
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -161,6 +165,7 @@ struct Pe {
     step_timing: bool,
     amx_model: u32,
     tlbi_keep: (bool, bool),
+    hle: stela_engine::hle::Config,
 }
 
 impl Pe {
@@ -175,6 +180,7 @@ impl Pe {
             step_timing,
             amx_model,
             tlbi_keep,
+            hle,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -199,6 +205,7 @@ impl Pe {
         machine.set_step_timing(step_timing);
         machine.set_amx_model(amx_model);
         machine.set_tlbi_keep(tlbi_keep.0, tlbi_keep.1);
+        machine.set_hle(hle);
         if step_timing {
             host::pmu::start(pe);
         }
@@ -233,6 +240,8 @@ impl Pe {
         output::share_draining();
         #[cfg(feature = "native-profile")]
         let mut stored_report = None;
+        // Under --profile, this PE's HLE counts once a beat.
+        let mut hle_report: Option<u64> = None;
         // This PE's part of giving the screen its frames while it runs.
         let mut screen = Share::new(super::display::BUSY_SHARE);
         loop {
@@ -338,6 +347,15 @@ impl Pe {
                     }
                 }
                 stop => stopped(pe, stop),
+            }
+            if step_timing && machine.hle_enabled() {
+                let counter = host::fresh_counter();
+                if hle_report.is_none_or(|before| {
+                    counter.wrapping_sub(before) >= super::run::BEAT_SECONDS * host::COUNTER_HZ
+                }) {
+                    super::run::host_part("hle report", pe, || super::run::hle_report(&machine));
+                    hle_report = Some(counter);
+                }
             }
             super::run::host_part("publish", pe, || hub.publish(pe, machine.counts()));
             // Whether the boot processor's Linux step returns.

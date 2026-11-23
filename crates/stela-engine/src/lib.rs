@@ -40,6 +40,7 @@ pub mod blocks;
 pub mod dispatch;
 pub mod execution;
 mod floating;
+pub mod hle;
 #[cfg(feature = "std")]
 mod json;
 pub mod machine;
