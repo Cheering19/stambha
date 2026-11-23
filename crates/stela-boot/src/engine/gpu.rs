@@ -3470,7 +3470,9 @@ fn nvkm_report() -> String {
 /// `\nGPU PERF pstate=… seen=… pcie=… rounds=…`: the GPU's P-state as GSP-RM
 /// reported it and its PCIe link since the last report
 /// (`stela_drivers::gpu::gsp_perf`), at the first report after GSP starts and
-/// then when they changed. Empty otherwise.
+/// then when they changed; then `\nGPU THERMAL temp=… max=… power=unread`
+/// every report whose rounds read the GPU's temperature, or once for a
+/// sensor that gives none. Empty otherwise.
 #[cfg(feature = "nvk")]
 fn perf_report() -> String {
     use stela_drivers::gpu::gsp_perf::{Report, Reported};
@@ -3482,11 +3484,14 @@ fn perf_report() -> String {
     static REPORTED: Reported = Reported::new();
     // SAFETY: nouveau's static report, which it only updates atomically.
     let report = unsafe { &nvkm_perf };
-    report
-        .take()
-        .and_then(|taken| REPORTED.line(&taken))
+    let Some(taken) = report.take() else {
+        return String::new();
+    };
+    [REPORTED.line(&taken), REPORTED.thermal_line(&taken)]
+        .into_iter()
+        .flatten()
         .map(|line| format!("\n{line}"))
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The function of the timer-list timer due first when Linux last looked,

@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:18:57 +0000
+Subject: [PATCH] feat(nouveau): read the GPU's internal temperature sensor
+ each second beside GSP-RM's P-state, with the highest reading since the host
+ last took it, where nothing read the GPU's temperature and a laptop whose GPU
+ dropped off the bus under load could not show whether it ran hot
+
+Each perf round reads NV_THERM_I2CS_SENSOR_00 (0x020460) as
+gp100_temp_get() reads it: degrees C in bits 16:8, valid with bit 29.
+nvkm_perf keeps the register as last read, the temperature or -1, and
+the highest temperature since the host took it. A 0xbadXXXXX priv error
+or an all-ones read counts as no reading; whether GSP-RM leaves the
+sensor readable to the CPU is untested. GSP-RM 570.144's headers hold no
+power monitor control, so power is not read.
+---
+ .../drm/nouveau/include/nvkm/core/counts.h    |  9 +++++
+ .../nouveau/nvkm/subdev/gsp/rm/r535/perf.c    | 33 +++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+index 2bfd1f058e25244f6b0287d41a2055239c935a4e..f3037b1617e19572fe0b8b1909e888ad52a98f0a 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+@@ -39,6 +39,12 @@ extern u64 nvkm_counts[NVKM_COUNTS][3];
+  * Capabilities' low word, all zero for a function with no PCIe capability or
+  * a read that failed. A host takes the counts and the speeds seen with atomic
+  * swaps and reads the rest.
++ *
++ * Each round also reads the GPU's internal temperature sensor
++ * (NV_THERM_I2CS_SENSOR_00, as gp100_temp_get() reads it): the register as
++ * last read, the temperature it gave in degrees C or -1 where it gave none,
++ * and the highest temperature since the host last took it, 0 for none,
++ * which the host takes with an atomic swap.
+  */
+ struct nvkm_perf_report {
+ 	u32 started;
+@@ -50,6 +56,9 @@ struct nvkm_perf_report {
+ 	u32 link_control;
+ 	u32 link_speeds;
+ 	u32 link_cap;
++	u32 tsensor;
++	s32 temp;
++	u32 temp_max;
+ };
+ 
+ extern struct nvkm_perf_report nvkm_perf;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+index 8722a6587a516678e1952628e85956d2f94f4fe3..750dbcfc889082bc133573ed8ece2d083edaf506 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+@@ -120,6 +120,38 @@ r535_gsp_perf_link(struct nvkm_gsp *gsp)
+ 			  __ATOMIC_RELAXED);
+ }
+ 
++/*
++ * The GPU's internal temperature, as gp100_temp_get() reads it from
++ * NV_THERM_I2CS_SENSOR_00: bits 16:8 are degrees C, bit 29 says the reading
++ * is valid. GSP-RM owns the thermal unit, and whether it leaves the sensor
++ * readable to the CPU is untested: a register it guards answers a
++ * 0xbadXXXXX priv error, which counts as no reading, as does a device that
++ * answers all ones, and the raw register is kept for the host's line.
++ * GSP-RM 570.144's headers hold no power monitor control, so power is not
++ * read.
++ */
++static void
++r535_gsp_perf_temp(struct nvkm_gsp *gsp)
++{
++	struct nvkm_device *device = gsp->subdev.device;
++	u32 tsensor = nvkm_rd32(device, 0x020460);
++	s32 temp = -1;
++	u32 max;
++
++	if (tsensor != 0xffffffff && (tsensor & 0xfff00000) != 0xbad00000 &&
++	    (tsensor & 0x20000000))
++		temp = (tsensor & 0x0001fff8) >> 8;
++	__atomic_store_n(&nvkm_perf.tsensor, tsensor, __ATOMIC_RELAXED);
++	__atomic_store_n(&nvkm_perf.temp, temp, __ATOMIC_RELAXED);
++	if (temp < 0)
++		return;
++	max = __atomic_load_n(&nvkm_perf.temp_max, __ATOMIC_RELAXED);
++	while ((u32)temp > max &&
++	       !__atomic_compare_exchange_n(&nvkm_perf.temp_max, &max, temp, true,
++					    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++		;
++}
++
+ static void
+ r535_gsp_perf_work(struct work_struct *work)
+ {
+@@ -130,6 +162,7 @@ r535_gsp_perf_work(struct work_struct *work)
+ 		return;
+ 
+ 	r535_gsp_perf_link(gsp);
++	r535_gsp_perf_temp(gsp);
+ 	if (!gsp->perf.pstate_off)
+ 		r535_gsp_perf_pstate(gsp);
+ 	__atomic_fetch_add(&nvkm_perf.rounds, 1, __ATOMIC_RELAXED);
