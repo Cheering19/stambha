@@ -160,7 +160,7 @@ pub const PLAIN_PASSWORD: &str = "A password uses only plain keyboard characters
 pub const PASSWORD_LENGTH: &str = "A password is 8 to 63 characters, or 64 hex digits.";
 pub const PASSWORD_HEX: &str = "A 64 character password is all hex digits, 0-9 and a-f.";
 /// Why Enter on a network chooses nothing when no `--wifi` is set.
-pub const NO_WIFI: &str = "This boot joins no Wi-Fi: no startup entry sets --wifi.";
+pub const NO_WIFI: &str = "Wi-Fi is off. Turn it on with stambha settings.";
 
 /// The "Join other network" dialog: a name, then a password.
 pub struct Form {
@@ -415,7 +415,7 @@ impl Page {
             Key::Delete | Key::Backspace => match self.selected() {
                 Row::Network(index) if self.networks[index].configured => {
                     self.notice = Some(format!(
-                        "{} is stela.cfg's network; it is not forgotten here.",
+                        "{} is this USB's own network; change it with stambha settings.",
                         self.networks[index].name
                     ));
                 }

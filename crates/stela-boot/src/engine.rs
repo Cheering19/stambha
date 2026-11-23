@@ -1078,7 +1078,9 @@ pub(super) fn watch_guest() -> Option<Stop> {
                 ));
                 PANIC_SHOWN.store(true, Ordering::Relaxed);
                 crate::status::progress(&format!(
-                    "macOS panicked: {}",
+                    "macOS crashed. Waiting {} s for it to restart. Its panic text, for a \
+                     report: {}",
+                    guest_watch::PANIC_HOLD_MILLIS / 1000,
                     guest_panic().unwrap_or_else(|| String::from(&*line))
                 ));
             }
@@ -1613,7 +1615,10 @@ fn finish<H: Host>(
                 // A model's refusal is the machine's stop, not a halt macOS
                 // asked for; a panic macOS printed still names it first.
                 Transition::Halt if panicked.is_some() => stop_here(
-                    &format!("macOS panicked: {}", panicked.unwrap_or_default()),
+                    &format!(
+                        "macOS crashed and did not restart. Its panic text, for a report: {}",
+                        panicked.unwrap_or_default()
+                    ),
                     power::RESTART_CODE,
                 ),
                 Transition::Halt => stop_here(

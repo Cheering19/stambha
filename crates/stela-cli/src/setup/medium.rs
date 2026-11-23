@@ -344,7 +344,7 @@ fn search(host: &dyn Host, esp: &Path, explicit: Option<&Path>) -> Result<Search
         }
         if partition.content == "EFI" {
             reasons.push_str(&format!(
-                "  {} is the EFI partition, which keeps Stela\n",
+                "  {} is the EFI partition, which keeps Stambha\n",
                 mount.display()
             ));
             continue;

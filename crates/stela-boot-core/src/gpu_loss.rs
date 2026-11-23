@@ -127,6 +127,10 @@ impl Gpu<'_> {
     }
 }
 
+/// The plain start of [`verdict`]'s reason, before the details.
+pub const LOST: &str = "The graphics card stopped working, and macOS cannot run without it. \
+     Details for a report: ";
+
 /// Why the boot stops, once no GPU of `gpus` (those that serve Metal) can
 /// serve macOS again; `None` while any of them works or may still reopen,
 /// and for a boot that has none.
@@ -153,10 +157,7 @@ pub fn verdict(gpus: &[Gpu<'_>]) -> Option<String> {
             )
         })
         .collect();
-    Some(format!(
-        "macOS cannot run without a GPU: {}",
-        each.join("; ")
-    ))
+    Some(format!("{LOST}{}", each.join("; ")))
 }
 
 /// The kernel drivers' lines that a GPU stopped answering, the first of each
@@ -305,8 +306,9 @@ mod tests {
     #[test]
     fn a_gpu_off_the_bus_ends_the_session_at_its_first_failed_reopen() {
         let reason = verdict(&[gpu(true, 1, Some(GONE))]).expect("stops");
-        assert!(reason.starts_with(
-            "macOS cannot run without a GPU: the GPU 0000:02:00.0 was lost while macOS ran and \
+        assert!(reason.starts_with(LOST));
+        assert!(reason[LOST.len()..].starts_with(
+            "the GPU 0000:02:00.0 was lost while macOS ran and \
              did not reopen (1 try, last: DeviceLost). Its driver said: nouveau 0000:02:00.0: \
              stopped answering: BOOT_0 read ffffffff for 1004 ms; config vendor ffff"
         ));
