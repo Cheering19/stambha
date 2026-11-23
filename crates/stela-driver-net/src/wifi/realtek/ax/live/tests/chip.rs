@@ -110,6 +110,137 @@ fn joined(ch: Channel, legacy: u16, ht: Option<HtPeer>) -> Association {
     }
 }
 
+/// [`Chip::associate`] until programmed: the clock moved to the begun
+/// association's deadline whenever it waits, as later polls would find it.
+fn associate_now(live: &mut Live<RegisterModel>, a: &Association) -> Result<(), String> {
+    for _ in 0..2 {
+        if Chip::associate(live, a)? {
+            return Ok(());
+        }
+        let due = live.association_due_us().expect("a waiting association");
+        let io = live.io_mut();
+        io.now = io.now.max(due);
+    }
+    Err("the association still waits past its deadline".to_string())
+}
+
+/// Boot 23's 101 ms: the port update's `msleep(beacon_int + 1)`, which was
+/// a busy wait on the guest processor serving the host. Through the
+/// station's chip the association begins, answers "not yet" until the
+/// beacon interval and a millisecond passed, waiting nowhere, and then
+/// finishes with exactly the register and H2C steps of the blocking
+/// [`Live::associate`] on a twin chip, less its one delay.
+#[test]
+fn an_association_waits_out_its_port_update_across_calls() {
+    let ch36 = channel(HwBand::G5, 36);
+    let a = joined(ch36, 0xFF, None);
+    let (mut live, m, _air) = on_air(&|_| {});
+    let (mut twin, twin_m, _twin_air) = on_air(&|_| {});
+    for chip in [&mut live, &mut twin] {
+        Chip::tune(chip, ch36).unwrap();
+        Chip::set_bssid(chip, Mac(AP)).unwrap();
+    }
+    let before = live.io().trace.len();
+    let start = live.io().now;
+    assert_eq!(Chip::associate(&mut live, &a), Ok(false));
+    // Vif init left the port function on, so the update waits 101 ms.
+    assert_eq!(live.association_due_us(), Some(start + 101_000));
+    assert!(!live.associated());
+    let begun = live.io().trace.len();
+    let long = |t: &[Op]| t.iter().any(|o| matches!(o, Op::Delay(us) if *us >= 1000));
+    assert!(!long(&live.io().trace[before..]));
+    // Asked again before its deadline: no register access, still waiting.
+    live.io_mut().now = start + 100_999;
+    assert_eq!(Chip::associate(&mut live, &a), Ok(false));
+    assert_eq!(live.io().trace.len(), begun);
+    // Another BSS is refused while one is begun.
+    let other = Association {
+        bssid: Mac([0x02, 0x03, 0x04, 0x05, 0x06, 0x08]),
+        ..a
+    };
+    assert!(Chip::associate(&mut live, &other).is_err());
+    assert_eq!(live.io().trace.len(), begun);
+    live.io_mut().now = start + 101_000;
+    assert_eq!(Chip::associate(&mut live, &a), Ok(true));
+    assert!(live.associated());
+    assert_eq!(live.association_due_us(), None);
+    assert!(!long(&live.io().trace[before..]));
+    // The blocking path on the twin: the same steps with the delay between.
+    let twin_before = twin.io().trace.len();
+    let inputs = AssocInputs {
+        mac: twin.mac(),
+        bssid: AP,
+        aid: 1,
+        band: HwBand::G5,
+        beacon_int: 100,
+        dtim: 1,
+        peer: RaPeer {
+            legacy: 0xFF,
+            ht: None,
+            rssi: 0,
+        },
+        edca: None,
+        short_slot: true,
+    };
+    // SAFETY: as in `start_on`.
+    unsafe { twin.associate(&inputs) }.unwrap();
+    let twin_ops = &twin.io().trace[twin_before..];
+    assert_eq!(
+        twin_ops
+            .iter()
+            .filter(|o| **o == Op::Delay(101_000))
+            .count(),
+        1
+    );
+    let without_quiet = |t: &[Op]| -> Vec<Op> {
+        t.iter()
+            .filter(|o| **o != Op::Delay(101_000))
+            .copied()
+            .collect()
+    };
+    assert_eq!(
+        without_quiet(&live.io().trace[before..]),
+        without_quiet(twin_ops)
+    );
+    assert_eq!(live.h2c(), twin.h2c());
+    assert_eq!(h2c_of(&m, 1, 9, 0x0F, 30), h2c_of(&twin_m, 1, 9, 0x0F, 30));
+}
+
+/// A join left while its association waits (a deauthentication, the
+/// keeper giving up) leaves as from a made association: its CMAC table,
+/// join info and address CAM were sent. The next join begins afresh.
+#[test]
+fn leaving_a_begun_association_leaves_it_as_made() {
+    let ch36 = channel(HwBand::G5, 36);
+    let a = joined(ch36, 0xFF, None);
+    let (mut live, _m, _air) = on_air(&|_| {});
+    let (mut twin, _twin_m, _twin_air) = on_air(&|_| {});
+    for chip in [&mut live, &mut twin] {
+        Chip::tune(chip, ch36).unwrap();
+        Chip::set_bssid(chip, Mac(AP)).unwrap();
+    }
+    assert_eq!(Chip::associate(&mut live, &a), Ok(false));
+    associate_now(&mut twin, &a).unwrap();
+    // Seq 18-26 begun (four EDCA, the CMAC table, join, CAM, RA, the beacon
+    // filter); the made one's short slot sent four EDCA more.
+    assert_eq!(live.h2c(), H2c::at(27));
+    assert_eq!(twin.h2c(), H2c::at(31));
+    Chip::disassociate(&mut live).unwrap();
+    Chip::disassociate(&mut twin).unwrap();
+    assert!(!live.associated());
+    assert_eq!(live.association_due_us(), None);
+    assert_eq!(live.bssid(), None);
+    // The same leave, 13 H2Cs (the beacon filter off, the CMAC table,
+    // join, the CAM without the link, the CAM without the BSSID, eight
+    // EDCA), from the begun one as from the made one.
+    assert_eq!(live.h2c(), H2c::at(40));
+    assert_eq!(twin.h2c(), H2c::at(44));
+    Chip::tune(&mut live, ch36).unwrap();
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    associate_now(&mut live, &a).unwrap();
+    assert!(live.associated());
+}
+
 /// The CH12 packet of cat `cat`, `class`, `func` and `seq`, its
 /// descriptor included.
 fn h2c_of(m: &Arc<Mutex<Model>>, cat: u32, class: u8, func: u8, seq: u8) -> Vec<u8> {
@@ -338,7 +469,7 @@ fn associate_takes_the_negotiated_ht() {
         rx_stbc: true,
         sgi20: true,
     };
-    Chip::associate(&mut live, &joined(ch36, 0xFF, Some(ht))).unwrap();
+    associate_now(&mut live, &joined(ch36, 0xFF, Some(ht))).unwrap();
     assert!(live.associated());
     // Seq 18-21 EDCA, 22 the CMAC table, 23 join, 24 the CAM, 25 the RA.
     let ra = h2c_of(&m, 2, 1, 0, 25);
@@ -374,7 +505,7 @@ fn an_association_without_wmm_programs_the_qos_defaults() {
             edca,
             ..joined(ch36, 0xFF, None)
         };
-        Chip::associate(&mut live, &a).unwrap();
+        associate_now(&mut live, &a).unwrap();
         assert_qos_defaults(&live, &m);
     }
 }
@@ -406,7 +537,7 @@ fn associate_tunes_only_off_the_joined_channel() {
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
     // Linux's channel context is the BSS's since the join: no switch.
     let before = live.io().trace.len();
-    Chip::associate(&mut live, &joined(ch36, 0xFF, None)).unwrap();
+    associate_now(&mut live, &joined(ch36, 0xFF, None)).unwrap();
     let t = &live.io().trace[before..];
     assert!(!t.iter().any(|o| matches!(o, Op::W32(0xC398, _))));
     Chip::disassociate(&mut live).unwrap();
@@ -414,7 +545,7 @@ fn associate_tunes_only_off_the_joined_channel() {
     Chip::tune(&mut live, ch36).unwrap();
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
     let before = live.io().trace.len();
-    Chip::associate(&mut live, &joined(channel(HwBand::G5, 40), 0xFF, None)).unwrap();
+    associate_now(&mut live, &joined(channel(HwBand::G5, 40), 0xFF, None)).unwrap();
     let t = &live.io().trace[before..];
     let switch = first_of(t, |o| matches!(o, Op::W32(0xC398, _)));
     let kick = first_of(t, |o| matches!(o, Op::W16(0x1080, _)));
@@ -432,7 +563,7 @@ fn disassociate_releases_the_channel_to_the_default() {
     assert_eq!(live.io().trace.len(), idle);
     Chip::tune(&mut live, ch36).unwrap();
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
-    Chip::associate(&mut live, &joined(ch36, 0xFF, None)).unwrap();
+    associate_now(&mut live, &joined(ch36, 0xFF, None)).unwrap();
     let before = live.io().trace.len();
     Chip::disassociate(&mut live).unwrap();
     assert!(!live.associated());
@@ -932,7 +1063,7 @@ fn the_chip_installs_and_removes_keys() {
     );
     let ch1 = channel(HwBand::G2, 1);
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
-    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    associate_now(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
     // The security CAM entries, the first free each time (spec S12.1).
     assert_eq!(Chip::add_key(&mut live, &key(true, 0)), Ok(0));
     assert_eq!(Chip::add_key(&mut live, &key(false, 1)), Ok(1));
@@ -953,7 +1084,7 @@ fn keyed_data_goes_under_its_cam_entry_and_pn() {
     let material: [u8; 16] = core::array::from_fn(|i| i as u8);
     let ch1 = channel(HwBand::G2, 1);
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
-    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    associate_now(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
     let ptk = HardwareKey {
         pairwise: true,
         index: 0,
@@ -1040,15 +1171,15 @@ fn a_flush_without_drop_waits_on_the_rings_then_the_mac() {
     assert_eq!(reads32(t), want);
     assert_eq!(delays(t), 0);
     assert_eq!(kicks(t), 0);
-    // The MAC's queues never empty: read_poll_timeout every 10 ms for
-    // 200 ms, one last sample after it, and the flush ends without error
-    // as Linux's only logs.
+    // The MAC's queues never empty: sampled every 100 us (Linux sleeps
+    // 10 ms between its reads) for 200 ms, one last sample after it, and
+    // the flush ends without error as Linux's only logs.
     live.io_mut().set32(DLE_EMPTY0, TXQ_EMPTY & !1);
     let before = live.io().trace.len();
     assert_eq!(Chip::flush(&mut live, false), Ok(()));
     let t = &live.io().trace[before..];
     let samples = reads32(t).iter().filter(|&&r| r == DLE_EMPTY0).count();
-    assert!((21..=22).contains(&samples), "{samples}");
+    assert!((2001..=2002).contains(&samples), "{samples}");
     assert!((200_000..=210_000).contains(&delays(t)), "{}", delays(t));
 }
 
@@ -1089,7 +1220,7 @@ fn a_flush_with_drop_drops_the_stations_four_queues() {
     let (mut live, m, _air) = on_air(&|_| {});
     let ch1 = channel(HwBand::G2, 1);
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
-    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    associate_now(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
     let seq = live.h2c();
     let before = live.io().trace.len();
     assert_eq!(Chip::flush(&mut live, true), Ok(()));

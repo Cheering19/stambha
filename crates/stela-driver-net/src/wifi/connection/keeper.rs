@@ -484,6 +484,10 @@ pub struct Keeper<R: Radio> {
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
     directed: bool,
+    /// The slowest of the keeper's own steps since [`Link::slowest_step`]
+    /// last took it, and its µs: what a service turn that ran long spent
+    /// its time on.
+    slowest: Option<(&'static str, u64)>,
 }
 
 impl<R: Radio> Keeper<R> {
@@ -529,6 +533,32 @@ impl<R: Radio> Keeper<R> {
             reported: None,
             michael_failed: None,
             directed: false,
+            slowest: None,
+        }
+    }
+
+    /// `f`, timed on the keeper's clock as `step` for [`Link::slowest_step`].
+    fn timed<T>(&mut self, step: &'static str, f: impl FnOnce(&mut Self) -> T) -> T {
+        let start = self.clock.now_us();
+        let result = f(self);
+        let took = self.clock.now_us().saturating_sub(start);
+        if self.slowest.is_none_or(|(_, longest)| took > longest) {
+            self.slowest = Some((step, took));
+        }
+        result
+    }
+
+    /// What [`Self::advance`] would do from the state it finds, named for
+    /// [`Self::timed`].
+    fn advance_step(&self) -> &'static str {
+        match &self.state {
+            State::Waiting { .. } => "scan",
+            State::Scanning(_) => "scan end and join",
+            State::Authenticating(_) => "associate",
+            State::Joining(_) => "configure",
+            State::Handshake { .. } => "handshake",
+            State::Connected { .. } => "connected",
+            State::Leaving { .. } => "leave",
         }
     }
 
@@ -587,13 +617,15 @@ impl<R: Radio> Keeper<R> {
                 self.failed(now, message);
             }
         }
-        if let Err(error) = self.link.service() {
+        if let Err(error) = self.timed("radio service", |keeper| keeper.link.service()) {
             self.fail(format!("{error}"));
         }
         while let Some(event) = self.link.take_event() {
             match event {
-                Event::Eapol(ethernet) => self.eapol(&ethernet, now),
-                Event::Sae(received) => self.sae(&received, now),
+                Event::Eapol(ethernet) => self.timed("eapol and keys", |keeper| {
+                    keeper.eapol(&ethernet, now);
+                }),
+                Event::Sae(received) => self.timed("sae", |keeper| keeper.sae(&received, now)),
                 Event::SaeEnded(failure) if matches!(self.state, State::Authenticating(_)) => {
                     self.failed(
                         now,
@@ -619,10 +651,11 @@ impl<R: Radio> Keeper<R> {
                 }
             }
         }
-        if let Err(message) = self.complete() {
+        if let Err(message) = self.timed("port", Self::complete) {
             self.failed(now, message);
         }
-        self.advance(now);
+        let step = self.advance_step();
+        self.timed(step, |keeper| keeper.advance(now));
     }
 
     fn advance(&mut self, now: u64) {
@@ -1247,15 +1280,23 @@ impl<R: Radio> Keeper<R> {
         Ok((join, profile))
     }
 
-    /// Configure the association the AP accepted, then await message 1.
+    /// Configure the association the AP accepted, then await message 1. A
+    /// radio whose configuration waits for its own time ([`Radio::deferred`])
+    /// with the admission still held ([`Stage::Admitted`]) stays joining and
+    /// is asked again at the next poll; any other failure fails the join.
     fn configure(&mut self, now: u64) {
         let State::Joining(candidate) =
             core::mem::replace(&mut self.state, State::Scanning(Vec::new()))
         else {
             return;
         };
-        if let Err(error) = self.link.configure() {
-            return self.failed(now, format!("{error}"));
+        match self.link.configure() {
+            Ok(()) => {}
+            Err(error) if R::deferred(&error) && self.link.stage() == Stage::Admitted => {
+                self.state = State::Joining(candidate);
+                return;
+            }
+            Err(error) => return self.failed(now, format!("{error}")),
         }
         let mut links = candidate.links;
         if let Some(links) = &mut links {
@@ -1609,6 +1650,9 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn diagnostic(&mut self) -> Option<String> {
         self.link.diagnostic()
+    }
+    fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
+        self.slowest.take()
     }
 }
 

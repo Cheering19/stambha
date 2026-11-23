@@ -78,6 +78,9 @@ impl<L: Link> Link for Located<L> {
     fn diagnostic(&mut self) -> Option<String> {
         self.link.diagnostic()
     }
+    fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
+        self.link.slowest_step()
+    }
 }
 
 /// The drivers here that attach through [`NativeServices`].
@@ -3934,7 +3937,7 @@ mod tests {
         fn associate(
             &mut self,
             _: &realtek_wifi::ax::station::chip::Association,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             Err(String::from("idle"))
         }
         fn disassociate(&mut self) -> Result<(), String> {

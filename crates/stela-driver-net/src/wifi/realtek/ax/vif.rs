@@ -177,15 +177,28 @@ const CCTL_INFO_SIZE: u32 = 32;
 /// `rtw89_mac_cmac_tbl_init`'s eight words (`mac.c:4426-4434`).
 const CMAC_TBL_DEFAULT: [u32; 8] = [0x4, 0x400A_0004, 0, 0, 0, 0x0E43_000B, 0, 0x000B_8109];
 
+/// `rtw89_mac_port_cfg_func_sw`'s check (`mac.c:4557-4603`): whether the
+/// port function is on, so that the update waits [`quiet_us`] before it
+/// turns it off.
+pub fn port_function_on<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
+    Ok(io.read32(R_AX_PORT_CFG_P0)? & B_AX_PORT_FUNC_EN != 0)
+}
+
+/// `rtw89_mac_port_cfg_func_sw`'s `msleep(beacon_int + 1)`, in µs: 101 ms
+/// for a 100 TU beacon interval. Linux sleeps there; a caller on a guest
+/// processor waits it out across polls instead ([`port_update_after`]).
+pub const fn quiet_us(beacon_int: u16) -> u64 {
+    (beacon_int as u64 + 1) * 1000
+}
+
 /// `rtw89_mac_port_cfg_func_sw` (`mac.c:4557-4603`) for 8852C and a non-AP
-/// vif: nothing unless the port function is on; then, after
-/// `msleep(beacon_int + 1)`, the port function and BRK_SETUP off, the TSF
-/// reset and the beacon counter timer cleared.
-fn cfg_func_sw<I: AxIo + ?Sized>(io: &mut I, beacon_int: u16) -> Result<(), AxError> {
-    if io.read32(R_AX_PORT_CFG_P0)? & B_AX_PORT_FUNC_EN == 0 {
+/// vif, after its check found the port function `on` and, when on, its
+/// [`quiet_us`] passed: the port function and BRK_SETUP off, the TSF reset
+/// and the beacon counter timer cleared; nothing when off.
+fn cfg_func_sw_after<I: AxIo + ?Sized>(io: &mut I, on: bool) -> Result<(), AxError> {
+    if !on {
         return Ok(());
     }
-    io.delay_us((u64::from(beacon_int) + 1) * 1000);
     clear32(io, R_AX_PORT_CFG_P0, B_AX_PORT_FUNC_EN | B_AX_BRK_SETUP)?;
     set32(io, R_AX_PORT_CFG_P0, B_AX_TSFTR_RST)?;
     io.write32(R_AX_BCN_CNT_TMR_P0, 0)
@@ -224,16 +237,37 @@ fn port_cfg_bits<I: AxIo + ?Sized>(io: &mut I, bits: u32, on: bool) -> Result<()
 /// read-modify-write at Linux's width. Any other net type is refused with
 /// `Mac` before any access: AD_HOC and AP mode are not ported.
 pub fn port_update<I: AxIo + ?Sized>(io: &mut I, port: &PortConfig) -> Result<(), AxError> {
-    let infra = match port.net_type {
-        NET_TYPE_NO_LINK => false,
-        NET_TYPE_INFRA => true,
-        _ => {
-            return Err(AxError::Mac(
-                "port update for a net type other than NO_LINK or INFRA",
-            ));
-        }
-    };
-    cfg_func_sw(io, port.beacon_int)?;
+    infra(port)?;
+    let on = port_function_on(io)?;
+    if on {
+        io.delay_us(quiet_us(port.beacon_int));
+    }
+    port_update_after(io, port, on)
+}
+
+/// Whether `port` is INFRA rather than NO_LINK; any other net type is
+/// refused with `Mac`.
+fn infra(port: &PortConfig) -> Result<bool, AxError> {
+    match port.net_type {
+        NET_TYPE_NO_LINK => Ok(false),
+        NET_TYPE_INFRA => Ok(true),
+        _ => Err(AxError::Mac(
+            "port update for a net type other than NO_LINK or INFRA",
+        )),
+    }
+}
+
+/// [`port_update`] past `cfg_func_sw`'s check, which found the port
+/// function `on` ([`port_function_on`]): the caller has let [`quiet_us`]
+/// pass since then when it was on, and changed nothing of the port. Refused
+/// as [`port_update`] refuses, before any access.
+pub fn port_update_after<I: AxIo + ?Sized>(
+    io: &mut I,
+    port: &PortConfig,
+    on: bool,
+) -> Result<(), AxError> {
+    let infra = infra(port)?;
+    cfg_func_sw_after(io, on)?;
     clear32(io, R_AX_PORT_CFG_P0, B_AX_TXBCN_RPT_EN)?;
     clear32(io, R_AX_PORT_CFG_P0, B_AX_RXBCN_RPT_EN)?;
     field32(

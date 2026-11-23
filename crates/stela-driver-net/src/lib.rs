@@ -176,6 +176,13 @@ pub trait Link {
     fn diagnostic(&mut self) -> Option<String> {
         None
     }
+    /// The slowest named step of the link's own polling since the last
+    /// call, and the µs it took, where the driver times its steps (a Wi-Fi
+    /// connection keeper's scan, join, configuration, keys); None
+    /// elsewhere. A host service turn that ran long names it.
+    fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
+        None
+    }
 }
 
 mod timing;

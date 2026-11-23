@@ -259,6 +259,59 @@ impl Turn {
     }
 }
 
+/// A part's own time inside one turn, for a part made of pieces it can stop
+/// between (one frame, one packet) and leave the rest of to a later turn:
+/// a piece starts only while the part has run less than its limit, and the
+/// first always does, so a part always gets on. A piece that started runs
+/// to its end, so a single piece's time is not bounded here; a part whose
+/// one piece is long must be split by its own code.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    started: u64,
+    limit: u64,
+    pieces: u32,
+    cut: bool,
+}
+
+impl Budget {
+    /// A part started at counter value `started` that may start pieces for
+    /// `limit` ticks.
+    pub const fn new(started: u64, limit: u64) -> Self {
+        Self {
+            started,
+            limit,
+            pieces: 0,
+            cut: false,
+        }
+    }
+
+    /// Whether the next piece starts, asked at counter value `now`: the
+    /// first always; a later one while less than the limit has passed
+    /// since the part started. Once it refuses, it refuses for the rest of
+    /// the turn.
+    pub fn allows(&mut self, now: u64) -> bool {
+        if self.cut {
+            return false;
+        }
+        if self.pieces > 0 && now.wrapping_sub(self.started) >= self.limit {
+            self.cut = true;
+            return false;
+        }
+        self.pieces = self.pieces.saturating_add(1);
+        true
+    }
+
+    /// Whether a piece was refused: the part left work for a later turn.
+    pub const fn cut(&self) -> bool {
+        self.cut
+    }
+
+    /// The pieces that started.
+    pub const fn pieces(&self) -> u32 {
+        self.pieces
+    }
+}
+
 /// What kept guest work for the serving PE waiting past the floor, as one
 /// part ends ([`blame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -540,5 +593,56 @@ mod tests {
         split.add(0, u64::MAX - 1, 3);
         assert_eq!(split.line(2, 1_000_000), " piece=5 rest=0");
         assert_eq!(split.line(10, 0), " piece=5000000 rest=5000000");
+    }
+
+    /// A part of 1 ms pieces with a 2 ms budget: what runs, and that the
+    /// rest is left to a later turn.
+    #[test]
+    fn a_budget_starts_pieces_until_its_limit_then_cuts_for_the_turn() {
+        let mut budget = Budget::new(10_000, 2_000);
+        let mut now = 10_000;
+        let mut ran = 0;
+        while budget.allows(now) {
+            ran += 1;
+            now += 1_000;
+            assert!(ran < 100, "the budget never cut");
+        }
+        // Pieces starting at 0 and 1 ms ran; the one at 2 ms did not.
+        assert_eq!(ran, 2);
+        assert_eq!(budget.pieces(), 2);
+        assert!(budget.cut());
+        // Cut stays cut, even asked as if time went back.
+        assert!(!budget.allows(10_000));
+    }
+
+    /// A part always gets on: its first piece starts however late the
+    /// turn came to it, and an unused budget leaves nothing behind.
+    #[test]
+    fn a_budget_always_starts_the_first_piece() {
+        let mut late = Budget::new(0, 2_000);
+        assert!(late.allows(1_000_000));
+        assert!(!late.allows(1_000_001));
+        assert!(late.cut());
+        let mut quick = Budget::new(0, 2_000);
+        for now in [0, 10, 20] {
+            assert!(quick.allows(now));
+        }
+        assert!(!quick.cut());
+        assert_eq!(quick.pieces(), 3);
+    }
+
+    /// The boot 23 case: one 101 ms piece cannot be cut, but nothing more
+    /// starts after it in the same turn.
+    #[test]
+    fn a_budget_starts_nothing_after_a_long_piece_and_survives_a_wrap() {
+        let mut budget = Budget::new(u64::MAX - 500, 2_000);
+        assert!(budget.allows(u64::MAX - 500));
+        // The piece took 101 ms on a 1 MHz counter, past the wrap.
+        assert!(!budget.allows(101_000));
+        assert!(budget.cut());
+        let mut within = Budget::new(u64::MAX - 500, 2_000);
+        assert!(within.allows(u64::MAX - 500));
+        assert!(within.allows(1_000));
+        assert!(!within.cut());
     }
 }

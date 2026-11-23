@@ -204,9 +204,11 @@ pub const KEY_NOT_IN_CAM: &str = "a key not in the security CAM";
 /// wants empty in it (`mac.c:2393-2405`, bits `reg.h:632-651`).
 const R_AX_DLE_EMPTY0: u32 = 0x8430;
 const DLE_TXQ_EMPTY: u32 = 0x07FF_079F;
-/// `rtw89_mac_flush_txq`'s `read_poll_timeout`: every 10 ms for up to
-/// 200 ms (`mac.c:6360-6361`).
-const FLUSH_TXQ_STEP_US: u64 = 10_000;
+/// `rtw89_mac_flush_txq`'s `read_poll_timeout`: up to 200 ms
+/// (`mac.c:6360-6361`). Linux sleeps 10 ms between reads; this waits busy
+/// on the processor that serves the host, so it reads every 100 µs and
+/// returns as soon as the queues are empty rather than at the next 10 ms.
+const FLUSH_TXQ_STEP_US: u64 = 100;
 const FLUSH_TXQ_WAIT_US: u64 = 200_000;
 /// `rtw89_mac_pkt_drop_sta`'s selections (`mac.c:7259-7264`),
 /// `RTW89_PKT_DROP_SEL_MACID_BE_ONCE` to `_VO_ONCE` (`core.h:6485-6488`).
@@ -284,6 +286,9 @@ pub struct Live<I: AxIo> {
     authenticated: bool,
     /// The association made, until [`Live::leave`].
     associated: Option<AssocInputs>,
+    /// The association [`Live::begin_association`] began, whose port
+    /// update waits for its deadline ([`Live::finish_association`]).
+    associating: Option<Associating>,
     /// DIG's pause.
     dig: Dig,
     /// The security CAM and the station's address CAM key fields, empty
@@ -297,6 +302,17 @@ pub struct Live<I: AxIo> {
     ba_counts: BaCounts,
     /// A failure powered the chip off.
     off: bool,
+}
+
+/// An association whose steps up to the INFRA port update ran
+/// ([`assoc::associate_begin`]): the rest waits until the chip's clock
+/// reaches `due_us`, `rtw89_mac_port_cfg_func_sw`'s `msleep(beacon_int +
+/// 1)` past the check that found the port function `on`.
+#[derive(Clone, Copy, Debug)]
+struct Associating {
+    inputs: AssocInputs,
+    on: bool,
+    due_us: u64,
 }
 
 /// A firmware scan on a [`Live`] chip.
@@ -552,6 +568,7 @@ pub unsafe fn start<I: AxIo>(
         bssid: None,
         authenticated: false,
         associated: None,
+        associating: None,
         dig: Dig::default(),
         keys: KeyCam::default(),
         ba: BaCam::default(),
@@ -1053,7 +1070,7 @@ impl<I: AxIo> Live<I> {
         if bssid == [0; 6] {
             return Err(AxError::Mac("a zero BSSID is no BSSID"));
         }
-        if self.associated.is_some() {
+        if self.associated.is_some() || self.associating.is_some() {
             return Err(AxError::Mac("a new BSSID while associated"));
         }
         let mac = self.running.mac;
@@ -1101,20 +1118,12 @@ impl<I: AxIo> Live<I> {
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
+    ///
+    /// The port update's `beacon_int + 1` ms ([`vif::quiet_us`]) is waited
+    /// here, busy, as Linux sleeps it; [`Live::begin_association`] and
+    /// [`Live::finish_association`] leave it to their caller's later polls.
     pub unsafe fn associate(&mut self, inputs: &AssocInputs) -> Result<(), AxError> {
-        self.idle()?;
-        if self.associated.is_some() {
-            return Err(AxError::Mac("already associated"));
-        }
-        if self.bssid != Some(inputs.bssid) {
-            return Err(AxError::Mac("an association without its BSSID set"));
-        }
-        if inputs.mac != self.running.mac {
-            return Err(AxError::Mac("an association for another address"));
-        }
-        if inputs.band != self.chan.band {
-            return Err(AxError::Mac("an association on a band not tuned"));
-        }
+        self.associable(inputs)?;
         let features = Features::of(self.running.firmware);
         let mut dig = self.dig;
         let done = self.holding(|io, session, held| {
@@ -1126,6 +1135,106 @@ impl<I: AxIo> Live<I> {
         self.done(done)?;
         self.associated = Some(*inputs);
         Ok(())
+    }
+
+    /// [`Live::associate`]'s refusals, before any I/O: a chip off or
+    /// scanning, an association made or begun, another BSSID than the one
+    /// set, another address than the chip's, another band than the one
+    /// tuned.
+    fn associable(&self, inputs: &AssocInputs) -> Result<(), AxError> {
+        self.idle()?;
+        if self.associated.is_some() {
+            return Err(AxError::Mac("already associated"));
+        }
+        if self.associating.is_some() {
+            return Err(AxError::Mac("an association is already begun"));
+        }
+        if self.bssid != Some(inputs.bssid) {
+            return Err(AxError::Mac("an association without its BSSID set"));
+        }
+        if inputs.mac != self.running.mac {
+            return Err(AxError::Mac("an association for another address"));
+        }
+        if inputs.band != self.chan.band {
+            return Err(AxError::Mac("an association on a band not tuned"));
+        }
+        Ok(())
+    }
+
+    /// [`Live::associate`] without its wait: the steps up to the INFRA port
+    /// update's check ([`assoc::associate_begin`]), refused and failing as
+    /// [`Live::associate`]; then the association waits, begun, for
+    /// [`Live::finish_association`] once the chip's clock passes what this
+    /// returns: [`vif::quiet_us`] of the beacon interval from now when the
+    /// port function was on, else now. Nothing of the port changes in
+    /// between, and every other operation sees the station not yet
+    /// associated; [`Live::leave`] leaves a begun association as a made one.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn begin_association(&mut self, inputs: &AssocInputs) -> Result<u64, AxError> {
+        self.associable(inputs)?;
+        let features = Features::of(self.running.firmware);
+        let mut dig = self.dig;
+        let begun = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which
+            // `associate_begin`'s is, for the live chip's own window and
+            // rings.
+            unsafe { assoc::associate_begin(io, session, inputs, features, &mut dig, held) }
+        });
+        self.dig = dig;
+        let on = match begun {
+            Ok(Ok(on)) => on,
+            Ok(Err(error)) => {
+                self.power_off();
+                return Err(error);
+            }
+            Err(off) => return Err(off),
+        };
+        let now = self.io.now_us()?;
+        let due_us = match on {
+            true => now.saturating_add(vif::quiet_us(inputs.beacon_int)),
+            false => now,
+        };
+        self.associating = Some(Associating {
+            inputs: *inputs,
+            on,
+            due_us,
+        });
+        Ok(due_us)
+    }
+
+    /// The begun association's rest ([`assoc::associate_end`]) once the
+    /// chip's clock reached its deadline: `Ok(true)` once associated,
+    /// `Ok(false)`, with no I/O but the clock read, while it waits. Refused
+    /// with `Mac` when none is begun, and as [`Live::idle`] refuses; a later
+    /// failure powers the chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn finish_association(&mut self) -> Result<bool, AxError> {
+        self.idle()?;
+        let Some(begun) = self.associating else {
+            return Err(AxError::Mac("no association begun"));
+        };
+        if self.io.now_us()? < begun.due_us {
+            return Ok(false);
+        }
+        self.associating = None;
+        let done = self.holding(|io, session, held| {
+            // SAFETY: the caller's contract is `start`'s, which
+            // `associate_end`'s is, for the live chip's own window and rings.
+            unsafe { assoc::associate_end(io, session, &begun.inputs, begun.on, held) }
+        });
+        self.done(done)?;
+        self.associated = Some(begun.inputs);
+        Ok(true)
+    }
+
+    /// When a begun association's port update may go on
+    /// ([`Live::begin_association`]), while one waits.
+    pub fn association_due_us(&self) -> Option<u64> {
+        self.associating.map(|begun| begun.due_us)
     }
 
     /// Leave (M3 spec S11): from an association, first every RX Block Ack
@@ -1161,7 +1270,11 @@ impl<I: AxIo> Live<I> {
         if self.bssid.is_none() {
             return Ok(());
         }
-        let associated = self.associated.take();
+        // A begun association sent its CMAC table, join info and address
+        // CAM, so it is left as a made one; its port update never ran, and
+        // leaving touches no port.
+        let begun = self.associating.take().map(|begun| begun.inputs);
+        let associated = self.associated.take().or(begun);
         let bssid = self.bssid.take();
         let authenticated = core::mem::take(&mut self.authenticated);
         let mut cam = core::mem::take(&mut self.keys);
@@ -1726,6 +1839,7 @@ impl<I: AxIo> Live<I> {
         self.bssid = None;
         self.authenticated = false;
         self.associated = None;
+        self.associating = None;
         self.keys = KeyCam::default();
         self.ba = BaCam::default();
         self.rx_stats.forget();
@@ -1907,9 +2021,23 @@ impl<I: AxIo> Chip for Live<I> {
     /// join's switch, so there is none here unless `association` names
     /// another channel than the one tuned, which is switched to first (a
     /// failure named as [`Chip::tune`] names it).
-    fn associate(&mut self, association: &Association) -> Result<(), String> {
+    ///
+    /// Without its wait: the first call begins the association
+    /// ([`Live::begin_association`]), and it and each later call for the
+    /// same BSS finish it once its port update's wait passed
+    /// ([`Live::finish_association`]), `Ok(false)` until then. A guest
+    /// processor that serves the host polls this, where a 101 ms busy wait
+    /// held it and every PE spinning on a lock its guest held.
+    fn associate(&mut self, association: &Association) -> Result<bool, String> {
         if self.off {
             return Err(POWERED_OFF.to_string());
+        }
+        if let Some(begun) = self.associating {
+            if begun.inputs.bssid != association.bssid.0 {
+                return Err(AxError::Mac("another association is begun").to_string());
+            }
+            // SAFETY: `start`'s contract holds for the live chip's every use.
+            return unsafe { self.finish_association() }.map_err(|e| e.to_string());
         }
         let chan = chan_of(association.channel).map_err(|e| failed("set channel", e))?;
         if chan != self.chan {
@@ -1932,7 +2060,9 @@ impl<I: AxIo> Chip for Live<I> {
             short_slot: association.short_slot,
         };
         // SAFETY: `start`'s contract holds for the live chip's every use.
-        unsafe { Live::associate(self, &inputs) }.map_err(|e| e.to_string())
+        unsafe { self.begin_association(&inputs) }.map_err(|e| e.to_string())?;
+        // SAFETY: as above.
+        unsafe { self.finish_association() }.map_err(|e| e.to_string())
     }
 
     /// [`Live::leave`] (AUTH to NONE's disconnect too after

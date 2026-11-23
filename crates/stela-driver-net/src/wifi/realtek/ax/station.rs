@@ -1993,12 +1993,24 @@ impl<C: Chip> Rtl8852c<C> {
     /// Ack limits: `max_rx_agg_num` and A-MSDUs in A-MPDUs
     /// (`SUPPORTS_AMSDU_IN_AMPDU`, `core.c:7500`). No TX agreement is
     /// configured (spec S1.13).
+    ///
+    /// While the chip's association waits for its own time
+    /// ([`chip::Chip::associate`]) this is [`Error::Pending`] with the
+    /// admission kept, so the keeper asks again at a later poll.
     fn configure_admitted(&mut self) -> Result<(), Error> {
+        let (_, context) = self
+            .admitted
+            .as_ref()
+            .ok_or(Error::Refused("configuration"))?;
+        let programmed = self.chip.associate(&association(context));
+        if let Ok(false) = programmed {
+            return Err(Error::Pending);
+        }
         let (ticket, context) = self
             .admitted
             .take()
             .ok_or(Error::Refused("configuration"))?;
-        Self::chip(self.chip.associate(&association(&context)))?;
+        Self::chip(programmed)?;
         let ht = context.negotiated().ht.is_some();
         self.context = Some(context);
         self.station
