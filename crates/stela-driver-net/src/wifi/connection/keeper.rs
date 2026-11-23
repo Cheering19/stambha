@@ -720,7 +720,7 @@ impl<R: Radio> Keeper<R> {
             State::Authenticating(_) => "associate",
             State::Joining(_) => "configure",
             State::Handshake { .. } => "handshake",
-            State::Connected { .. } => "connected",
+            State::Connected { .. } | State::Open => "connected",
             State::Leaving { .. } => "leave",
         }
     }
