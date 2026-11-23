@@ -36,7 +36,7 @@ use super::{
     error::{Error, Result, ensure},
     fault_dump::{self, ShaderImage},
     vulkan::{
-        SampleCounts,
+        DriverId, SampleCounts,
         backend::{
             Backend, BufferAllocation, Descriptor, HeapUse, IdleStep, MemoryBlocks, Object,
             Outside, PreparedImport, Requirements, requirements,
@@ -548,6 +548,19 @@ struct ExtensionFns {
 struct Executables {
     fns: khr::pipeline_executable_properties::Device,
     log: fn(&str),
+    /// The driver answers internal representations of a pipeline made
+    /// without `CAPTURE_INTERNAL_REPRESENTATIONS` ([`reads_representations`]).
+    representations: bool,
+}
+
+/// Whether the fault dump may ask `driver` for a pipeline's internal
+/// representations, which Stela's pipelines are created without asking to
+/// capture: NVK answers them (Mesa patch 0043), while the Vulkan spec makes
+/// the query invalid without the capture flag and RADV then runs
+/// `strlen(NULL)` (radv_pipeline.c `radv_copy_representation`), stopping the
+/// PC on the device loss the dump reports.
+fn reads_representations(driver: DriverId) -> bool {
+    driver == DriverId::MesaNvk
 }
 
 /// A statistic's value as an unsigned count; 0 for a format that is none.
@@ -625,7 +638,11 @@ impl Executables {
 
     /// The executable's internal representations, by name, with their
     /// bytes: the driver says each one's size, then fills buffers of them.
+    /// None from a driver that cannot be asked ([`reads_representations`]).
     fn representations(&self, info: &vk::PipelineExecutableInfoKHR<'_>) -> Vec<(String, Vec<u8>)> {
+        if !self.representations {
+            return Vec::new();
+        }
         // SAFETY: the executable is one the pipeline listed; with no data
         // pointers the driver writes each representation's size alone.
         let Ok(sized) = (unsafe {
@@ -925,6 +942,7 @@ impl NativeBackend {
             executables: has(khr::pipeline_executable_properties::NAME).then(|| Executables {
                 fns: khr::pipeline_executable_properties::Device::new(&instance, &device),
                 log: loader.log,
+                representations: reads_representations(snapshot.identity.driver_id),
             }),
         };
         let kernels = kernels(physical);
@@ -1973,7 +1991,7 @@ impl NativeBackend {
     fn report_executables(&self, pipeline: vk::Pipeline) {
         /// Instructions past which a shader is reported.
         const LARGE_SHADER: u64 = 16384;
-        let Some(Executables { fns, log }) = &self.fns.executables else {
+        let Some(Executables { fns, log, .. }) = &self.fns.executables else {
             return;
         };
         let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
