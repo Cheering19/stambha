@@ -806,8 +806,20 @@ fn a_whole_tlbi_refill_walks_from_the_leaf_table_and_takes_what_full_walks_give(
 /// and in each the pages it did not change still run their frames. Every
 /// scenario fails where the TLBI keeps a context's entries without checking
 /// them, as removing its forgetting from `tlb_maintained` shows (all five).
+/// With `--tlbi-keep on` (`tlbi_keep.rs`) they run in `tests/tlbi_keep.rs`,
+/// with the check and under the mutation that keeps without verifying.
 #[test]
 fn after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives() {
+    let (failed, _) = whole_tlbi_acceptance(&|_| {});
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The scenarios of [`after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives`],
+/// each on a machine `configure` sets up before its first fetch: what failed,
+/// and what keeping the contexts did on all of them.
+pub(super) fn whole_tlbi_acceptance(
+    configure: &dyn Fn(&mut Machine<FakeHost, NoDevices>),
+) -> (Vec<String>, TlbiKeepCounts) {
     use mmu::tlbi::{Everywhere, Reach};
     const RET: u32 = 0xd65f_03c0;
     const NG: u64 = 1 << 11;
@@ -842,6 +854,7 @@ fn after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives() {
             words[frame * 0x400] = RET;
         }
         let mut machine = machine(&words);
+        configure(&mut machine);
         paged_space(&mut machine, 0, &(0..FRAMES).map(frame).collect::<Vec<_>>());
         for page in 0..FRAMES {
             map(&mut machine, l3, page, frame(page));
@@ -920,6 +933,7 @@ fn after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives() {
         }),
     ];
     let mut failed = Vec::new();
+    let mut kept = TlbiKeepCounts::default();
     for (name, scenario) in scenarios {
         let (mut machine, keys) = start();
         for (what, ran, expected) in scenario(&mut machine, &keys) {
@@ -929,8 +943,9 @@ fn after_a_whole_tlbi_every_fetch_runs_what_its_walk_now_gives() {
                 ));
             }
         }
+        kept.add(&machine.statistics.tlbi_keep);
     }
-    assert!(failed.is_empty(), "{failed:#?}");
+    (failed, kept)
 }
 
 /// A machine running `words` at BASE through 4 KiB pages of address

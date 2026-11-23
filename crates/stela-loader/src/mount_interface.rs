@@ -55,6 +55,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So does the fork's `--asus-mode performance|turbo|silent|off`, as
 /// hand-written: an ASUS laptop's firmware thermal policy is set to
 /// performance unasked, and no line setup writes holds the option.
+/// So do the fork's `--tlbi-keep on|off` and `--tlbi-verify-check`,
+/// hand-written opt-ins that keep the ITLB's contexts across a TLBI of
+/// everything and check what they keep: no line setup writes holds them.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

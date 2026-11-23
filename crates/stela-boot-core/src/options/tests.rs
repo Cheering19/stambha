@@ -94,6 +94,41 @@ fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
 }
 
 #[test]
+fn the_tlbi_keep_is_off_unless_asked_for_and_its_check_needs_it() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.tlbi_keep(), (false, false));
+    assert_eq!(plain.to_string(), "--system");
+    for (text, keep) in [
+        ("--system --tlbi-keep on", (true, false)),
+        ("--system --tlbi-keep off", (false, false)),
+        ("--system --tlbi-keep on --tlbi-verify-check", (true, true)),
+        (
+            "--system --tlbi-keep off --tlbi-verify-check",
+            (false, false),
+        ),
+        ("--system --tlbi-verify-check", (false, false)),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.tlbi_keep(), keep, "{text}");
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --tlbi-keep", Error::TlbiKeep),
+        ("--system --tlbi-keep yes", Error::TlbiKeep),
+        (
+            "--system --tlbi-keep on --tlbi-keep off",
+            Error::DuplicateTlbiKeep,
+        ),
+        (
+            "--system --tlbi-verify-check --tlbi-verify-check",
+            Error::DuplicateTlbiVerifyCheck,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),

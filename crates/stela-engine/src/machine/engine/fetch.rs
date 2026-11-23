@@ -171,9 +171,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let (controls, hcr) = self.half_inputs(half, el);
         let frame = self.context_frame(controls, hcr);
         let key = context_key(&controls, frame, el, variant);
+        // A context kept across a TLBI of everything is verified before its
+        // number is given to anything (`tlbi_keep.rs`); one that cannot be
+        // goes, and the key's context is made anew.
         let number = match self.spaces[half].find(&key) {
             Some(number) => number,
-            None => self.make_context(half, key, &controls),
+            None => match self.spaces[half].kept(&key) {
+                Some(kept) if self.verify_kept(half, el, variant, kept) => kept,
+                _ => self.make_context(half, key, &controls),
+            },
         };
         self.salt_clock += 1;
         self.salt_uses[(number % chain::LOOKUP_SALTS as u64) as usize] = self.salt_clock;
@@ -386,8 +392,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let requester = self.cpu.requester();
         let controls = self.cpu.controls(self.cpu.regime());
-        let mut tables = RamTables(&mut self.host);
-        match mmu::translate(&controls, pc, Access::Execute, requester, &mut tables) {
+        // With `--tlbi-keep on` the walk's reads are kept with its cache
+        // entry, for the ITLB entries it fills (`tlbi_keep.rs`).
+        let mut reads = None;
+        let outcome = if self.tlbi_keep.on {
+            let mut tables = tlbi_keep::RecordingTables::new(&mut self.host);
+            let outcome = mmu::translate(&controls, pc, Access::Execute, requester, &mut tables);
+            reads = Some(tables.reads);
+            outcome
+        } else {
+            mmu::translate(
+                &controls,
+                pc,
+                Access::Execute,
+                requester,
+                &mut RamTables(&mut self.host),
+            )
+        };
+        match outcome {
             Translated::Mapped(_) if !self.host.fetch_permitted(pc) => {
                 let fault =
                     mmu::Fault::stage1(mmu::FaultKind::Permission, HOST_REFUSED_FETCH_LEVEL);
@@ -407,7 +429,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
                 self.fetched_through(half, pc, translation.size, translation.global);
                 let physical = translation.physical & !(FETCH_PAGE - 1);
-                self.fetch[slot] = Some(FetchEntry {
+                let entry = FetchEntry {
                     page,
                     physical,
                     guarded: translation.guarded,
@@ -415,7 +437,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     size: translation.size,
                     el,
                     epoch: self.fetch_epoch(half),
-                });
+                };
+                self.fetch[slot] = Some(entry);
+                if let Some(reads) = reads {
+                    self.note_fetch_walk(slot, entry, &reads, &translation, controls.ttbr0);
+                }
                 Ok(translation.physical)
             }
             Translated::Fault(fault)
@@ -472,14 +498,30 @@ impl<H: Host, D: Devices> Machine<H, D> {
         pc: u64,
         walk: &mut QuietWalk,
     ) -> Option<QuietFetch> {
-        let mut tables = RamTables(&mut self.host);
-        let Translated::Mapped(translation) = walk.memo.translate(
-            &walk.controls,
-            pc,
-            Access::Execute,
-            walk.requester,
-            &mut tables,
-        ) else {
+        // With `--tlbi-keep on` an entry needs the walk's every read, which a
+        // walk from the memo's table leaves out: it walks in full.
+        let mut reads = None;
+        let outcome = if self.tlbi_keep.on {
+            let mut tables = tlbi_keep::RecordingTables::new(&mut self.host);
+            let outcome = mmu::translate(
+                &walk.controls,
+                pc,
+                Access::Execute,
+                walk.requester,
+                &mut tables,
+            );
+            reads = Some(tables.reads);
+            outcome
+        } else {
+            walk.memo.translate(
+                &walk.controls,
+                pc,
+                Access::Execute,
+                walk.requester,
+                &mut RamTables(&mut self.host),
+            )
+        };
+        let Translated::Mapped(translation) = outcome else {
             return None;
         };
         if !self.host.fetch_permitted(pc) {
@@ -495,6 +537,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             guarded: translation.guarded,
             global: translation.global,
             size: translation.size,
+            record: reads.and_then(|reads| reads.record(pc, &translation, walk.controls.ttbr0)),
         })
     }
 

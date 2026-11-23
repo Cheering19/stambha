@@ -332,6 +332,19 @@ impl AsusMode {
 /// laptop does not take it unasked until it is proven on hardware.
 pub const ACPI_HARDWARE: &str = "--acpi-hardware";
 
+/// Keep the ITLB's lookup contexts across a TLBI of everything and verify
+/// each entry against the tables before any lookup uses it again, instead
+/// of forgetting them all (`--tlbi-keep on|off`, off unless given). A
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13; it stays off by default until a boot has proven it.
+pub const TLBI_KEEP: &str = "--tlbi-keep";
+
+/// With `--tlbi-keep on`, also walk every entry verification keeps in full
+/// and drop it, counted as a mismatch, where the walk differs
+/// (`--tlbi-verify-check`): a debug safety mode, hand-written like
+/// `--acpi-hardware`, so the options revision stays 13.
+pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -662,6 +675,12 @@ pub struct System {
     pub brightness_keys: bool,
     /// Run the host's ACPI in hardware mode ([`ACPI_HARDWARE`]).
     pub acpi_hardware: bool,
+    /// [`TLBI_KEEP`]'s value, unset where the line has none
+    /// ([`Self::tlbi_keep`]).
+    pub tlbi_keep: Option<bool>,
+    /// Walk every entry a kept context's verification keeps in full as
+    /// well ([`TLBI_VERIFY_CHECK`]).
+    pub tlbi_verify_check: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -796,6 +815,8 @@ impl Default for System {
             lid_sleep: false,
             brightness_keys: false,
             acpi_hardware: false,
+            tlbi_keep: None,
+            tlbi_verify_check: false,
             laptop: None,
             asus_mode: None,
             amx_native: None,
@@ -970,6 +991,15 @@ impl System {
     /// else [`AsusMode::Performance`].
     pub fn asus_mode(&self) -> AsusMode {
         self.asus_mode.unwrap_or_default()
+    }
+
+    /// Whether the ITLB keeps its contexts across a TLBI of everything and
+    /// verifies them ([`TLBI_KEEP`]), and whether every entry it keeps is
+    /// walked in full as well ([`TLBI_VERIFY_CHECK`], only with the first):
+    /// off unless `--tlbi-keep on`.
+    pub fn tlbi_keep(&self) -> (bool, bool) {
+        let keep = self.tlbi_keep.unwrap_or(false);
+        (keep, keep && self.tlbi_verify_check)
     }
 
     /// The trackpad this boot cables: `--trackpad`, on the hub `--input`
@@ -1335,6 +1365,11 @@ impl fmt::Display for System {
         line.flag("--lid-sleep", self.lid_sleep)?;
         line.flag("--brightness-keys", self.brightness_keys)?;
         line.flag(ACPI_HARDWARE, self.acpi_hardware)?;
+        line.value(
+            TLBI_KEEP,
+            self.tlbi_keep.map(|keep| if keep { "on" } else { "off" }),
+        )?;
+        line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
