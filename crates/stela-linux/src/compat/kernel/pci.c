@@ -368,7 +368,11 @@ static u32 lane_mbps(enum pci_bus_speed speed)
 /* The bandwidth the function's path to the root complex gives it, following
  * drivers/pci/pci.c: the slowest trained link from the function up, with
  * its device, speed and width. The path is Linux's bridges, else the ports
- * the function's owner gave it (stela_linux_pci_upstream). */
+ * the function's owner gave it (stela_linux_pci_upstream). A device whose
+ * link status names no width or no known speed (a port whose snapshot did
+ * not read it) is passed over: in Linux's comparison its zero would win
+ * when it is last, so amdgpu took the slot as x0 of an unknown speed and
+ * asked the GPU's firmware for lane 0, which it refuses. */
 u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
 			     enum pci_bus_speed *speed, enum pcie_link_width *width)
 {
@@ -388,6 +392,8 @@ u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
 		next_speed = link_speed(status);
 		next_width = (enum pcie_link_width)FIELD_GET(PCI_EXP_LNKSTA_NLW, status);
 		next = (u32)next_width * lane_mbps(next_speed);
+		if (!next)
+			continue;
 		if (!bandwidth || next <= bandwidth) {
 			bandwidth = next;
 			if (limiting_dev)
