@@ -71,27 +71,44 @@ fn has_text(scene: &Scene, wanted: &str) -> bool {
 #[test]
 fn the_status_line_names_the_network_this_boot_joins_first() {
     assert_eq!(
-        status_line(Some("home"), None, false).as_deref(),
-        Some("Wi-Fi: home \u{b7} press W to change")
+        status_line(Some("home"), None, false),
+        "Wi-Fi: home \u{b7} press W to change"
     );
     assert_eq!(
-        status_line(Some("home"), Some("cafe"), true).as_deref(),
-        Some("Wi-Fi: cafe \u{b7} press W to change")
+        status_line(Some("home"), Some("cafe"), true),
+        "Wi-Fi: cafe \u{b7} press W to change"
     );
 }
 
 #[test]
 fn the_status_line_shows_not_set_up_only_with_saved_networks() {
     assert_eq!(
-        status_line(None, None, true).as_deref(),
-        Some("Wi-Fi: not set up \u{b7} press W to change")
+        status_line(None, None, true),
+        "Wi-Fi: not set up \u{b7} press W to change"
     );
     // A preference without `--wifi` joins nothing, as `with_prefer` adds none.
     assert_eq!(
-        status_line(None, Some("cafe"), true).as_deref(),
-        Some("Wi-Fi: not set up \u{b7} press W to change")
+        status_line(None, Some("cafe"), true),
+        "Wi-Fi: not set up \u{b7} press W to change"
     );
-    assert_eq!(status_line(None, None, false), None);
+}
+
+/// Testers with a Wi-Fi chip the driver starts missed that a network is
+/// chosen with W: with none set up the menu and the log both say so.
+#[test]
+fn with_no_network_set_up_the_line_and_the_log_say_to_press_w() {
+    assert_eq!(
+        status_line(None, None, false),
+        "Wi-Fi: press W to choose a network"
+    );
+    let hint = hint_line(None, false).unwrap();
+    assert_eq!(
+        hint,
+        "CHOICE Wi-Fi: no network is set up; press W in this menu to choose one, or Wi-Fi \
+         stays off\n"
+    );
+    assert_eq!(hint_line(Some("home"), false), None);
+    assert_eq!(hint_line(None, true), None);
 }
 
 // The rows.
@@ -560,7 +577,7 @@ fn no_other_screen_draws_the_password() {
     };
     assert_eq!(save.password, b"password");
     assert!(!has_text(&page.scene(SCREEN), "password"));
-    let status = status_line(Some("home"), Some("cafe"), true).unwrap_or_default();
+    let status = status_line(Some("home"), Some("cafe"), true);
     assert!(!status.contains("password"));
 }
 

@@ -177,7 +177,7 @@ fn main_menu() -> Painter {
         painter.text(left + 20, y + 8, name, 1, rgb(Tone::Text));
         y += 36;
     }
-    let line = status_line(Some("GarvitRoom_5G"), None, true).unwrap_or_default();
+    let line = status_line(Some("GarvitRoom_5G"), None, true);
     painter.centred(640, 720 - 24, &line, rgb(Tone::Dim));
     painter.centred(640, 720 - 56, "macOS Tahoe in 5", rgb(Tone::Dim));
     painter

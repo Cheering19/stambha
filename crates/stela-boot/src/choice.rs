@@ -500,13 +500,12 @@ impl<'a> Menu<'a> {
         }
         // The network this boot joins first and the Wi-Fi page's key, on
         // the bottom line.
-        if self.wifi_offered
-            && let Some(line) = wifi_page::status_line(
+        if self.wifi_offered {
+            let line = wifi_page::status_line(
                 self.wifi.as_deref(),
                 self.wifi_prefer.as_deref(),
                 self.wifi_saved,
-            )
-        {
+            );
             canvas.text_centred(width / 2, height.saturating_sub(24), &line, 1, ui::DIM);
         }
         let (status, colour) = match (self.notice, self.countdown, self.held) {
@@ -640,6 +639,11 @@ fn asked() -> bool {
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
     menu.wifi_saved = crate::wifi_menu::saved(volume);
     menu.wifi_offered = crate::wifi_menu::offered();
+    if menu.wifi_offered
+        && let Some(hint) = wifi_page::hint_line(menu.wifi.as_deref(), menu.wifi_saved)
+    {
+        output::arguments(format_args!("{hint}"));
+    }
     loop {
         let index = match menu.run()? {
             Pick::Item(index) => index,

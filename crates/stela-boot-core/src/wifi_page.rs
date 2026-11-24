@@ -28,16 +28,29 @@ const CARD: usize = 244;
 /// The startup menu's Wi-Fi line: the network this boot joins first, the
 /// one the page chose (`prefer`) or else stela.cfg's `--wifi` one
 /// (`configured`), and the key that changes it. With no `--wifi` the boot
-/// joins nothing, and saved networks (`saved`) can still be managed. `None`
-/// when this boot has neither. No password reaches it.
-pub fn status_line(configured: Option<&str>, prefer: Option<&str>, saved: bool) -> Option<String> {
+/// joins nothing, and saved networks (`saved`) can still be managed. With
+/// neither, the line says how to choose one: Wi-Fi works only once a
+/// network is chosen, and testers missed the key. No password reaches it.
+pub fn status_line(configured: Option<&str>, prefer: Option<&str>, saved: bool) -> String {
     let network = match (configured, prefer) {
         (Some(_), Some(prefer)) => prefer,
         (Some(configured), None) => configured,
         (None, _) if saved => "not set up",
-        (None, _) => return None,
+        (None, _) => return String::from(CHOOSE),
     };
-    Some(format!("Wi-Fi: {network} \u{b7} press W to change"))
+    format!("Wi-Fi: {network} \u{b7} press W to change")
+}
+
+/// The startup menu's Wi-Fi line when no network is set up.
+pub const CHOOSE: &str = "Wi-Fi: press W to choose a network";
+
+/// The boot log's line for a menu that offers Wi-Fi with no network set up
+/// (`configured` none and nothing `saved`): the hint the menu shows.
+pub fn hint_line(configured: Option<&str>, saved: bool) -> Option<&'static str> {
+    (configured.is_none() && !saved).then_some(
+        "CHOICE Wi-Fi: no network is set up; press W in this menu to choose one, or Wi-Fi \
+         stays off\n",
+    )
 }
 
 /// One network the page lists.

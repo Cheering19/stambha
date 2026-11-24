@@ -1042,7 +1042,8 @@ const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again afte
                                its devices are out of reach for this boot";
 
 /// Why a Wi-Fi adapter is left alone.
-const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
+const NO_WIFI_NETWORK: &str =
+    "Wi-Fi adapter stays off: no network is chosen (press W at the boot menu to choose one)";
 
 /// Said when an RTL8852CE's MAC was found powered on.
 const RTW89_WAS_ON: &str =
