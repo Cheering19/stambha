@@ -6,7 +6,11 @@
 
 <p align="center">
   <b>Run Apple-silicon macOS on your PC.</b><br>
-  Desktops and laptops. NVIDIA graphics. Installs over Ethernet or Wi-Fi.
+  Desktops and laptops. NVIDIA graphics (AMD and Intel experimental). Installs over Ethernet or Wi-Fi.
+</p>
+
+<p align="center">
+  <a href="https://github.com/garvitsurana271/stambha/releases/latest"><b>⬇️ Download Stambha 0.6.0</b></a>: about 1.5x faster than Stela 0.5.0
 </p>
 
 <p align="center">
@@ -36,25 +40,25 @@ Apple hardware macOS expects. No Mac, no Hackintosh kexts, no virtual machine.
 > Experimental. It may not boot on your hardware, and it is slower than a real Mac.
 > Back up anything you care about before installing.
 
-## ✨ What works
+## ✨ What works (0.6.0)
 
 | | |
 |---|---|
 | 🖥️ **macOS on your PC** | Apple-silicon macOS boots, with NVIDIA GPU acceleration (GTX 16, RTX 20/30/40/50) |
-| 📶 **Install over Wi-Fi** | No Ethernet cable needed with a Realtek RTL8852CE (Wi-Fi 6E, in many recent laptops) |
+| ⚡ **About 1.5x faster than Stela 0.5.0** | Hundreds of translator and engine improvements, and Apple's matrix engine (AMX) running natively on your CPU |
+| 🛡️ **Steady** | No Wi-Fi freezes, laptop touchpads stay working, and a macOS crash stops cleanly with the log saved |
+| 📶 **Wi-Fi** | Install over Wi-Fi and network inside macOS with a Realtek RTL8852CE; more chips experimental |
+| 🎮 **AMD & Intel graphics** | An experimental build for Radeon and Intel GPUs |
 | 🛡️ **A safe installer** | Only ever uses empty space on your disk; see [below](#-safe-for-the-system-you-already-have) |
-| 📈 **Install progress** | A progress line every minute (stage, percent, speed), so a long install never looks frozen |
 
-## 🔧 Coming in the first release
+## 🔧 Coming next
 
-- ⚡ **Speed:** Apple's matrix unit (AMX) running natively on your CPU, faster translator paths, faster installs
-- 📶 **Wi-Fi inside macOS**, and a Wi-Fi picker right in the boot menu with saved networks
-- 💻 **Laptops:** battery level and charging, a Magic-Trackpad-style touchpad, brightness and keyboard-backlight keys,
-  power button and lid, audio fixes
-- 🟦 **Bluetooth** (Realtek)
-- 🧩 **Fixes for known issues** and the best community contributions
+- ⚡ **More speed:** the next release's main focus
+- 💻 **Laptops:** battery level and charging, brightness keys and lid (in testing now)
+- 🟦 **Bluetooth** (Realtek), and a Wi-Fi network picker in the boot menu
+- 📶 **More Wi-Fi chips** and full Wi-Fi speed
 
-Next after that: AMD and Intel graphics, more Wi-Fi chips and full Wi-Fi speed, and laptops presented as a MacBook.
+Later: laptops presented as a MacBook, more CPU cores.
 
 ## 🛡️ Safe for the system you already have
 
@@ -79,8 +83,10 @@ Installing macOS next to Windows or Linux should never risk them. Stambha's inst
 
 ## 🚀 Getting it
 
-The first release is on its way. **[Join the Discord](https://discord.gg/M66z9fPJy5)** to get it the day it lands, to
-test early builds, and to get help. The [website](https://garvitsurana271.github.io/stambha/) has the short version.
+**[Download Stambha 0.6.0](https://github.com/garvitsurana271/stambha/releases/latest)**: the `stambha` tool for Windows or
+Linux sets up your USB stick (already on Stela? run `stambha update` and your macOS stays). AMD or Intel graphics? Try the
+[experimental build](https://github.com/garvitsurana271/stambha/releases/tag/v0.6.0-gpu-experimental).
+**[Join the Discord](https://discord.gg/M66z9fPJy5)** for help, hardware reports and early builds. The [website](https://garvitsurana271.github.io/stambha/) has the short version.
 
 <details>
 <summary>Build from source</summary>
