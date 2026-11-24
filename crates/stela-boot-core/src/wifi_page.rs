@@ -35,7 +35,7 @@ pub fn status_line(configured: Option<&str>, prefer: Option<&str>, saved: bool) 
     let network = match (configured, prefer) {
         (Some(_), Some(prefer)) => prefer,
         (Some(configured), None) => configured,
-        (None, _) if saved => "not set up",
+        (None, _) if saved => "saved networks",
         (None, _) => return String::from(CHOOSE),
     };
     format!("Wi-Fi: {network} \u{b7} press W to change")
@@ -198,6 +198,14 @@ impl Form {
         }
     }
 
+    /// The dialog for `name` again, its password field ready.
+    fn retry(name: &str) -> Self {
+        let mut form = Self::new();
+        form.name = String::from(name);
+        form.field = Field::Password;
+        form
+    }
+
     pub fn field(&self) -> Field {
         self.field
     }
@@ -330,6 +338,11 @@ pub struct Page {
     selected: usize,
     mode: Mode,
     notice: Option<String>,
+    /// The page opened by itself (`wifi_prompt`): Esc anywhere starts the
+    /// boot without Wi-Fi, and a network saved goes on to start it.
+    opened: bool,
+    /// Why it opened by itself, drawn while no notice is.
+    intro: Option<String>,
 }
 
 impl Page {
@@ -346,7 +359,35 @@ impl Page {
             selected,
             mode: Mode::List,
             notice: None,
+            opened: false,
+            intro: None,
         }
+    }
+
+    /// The page as the boot opens it by itself with no network set up
+    /// (`wifi_prompt::Prompt::Choose`), `intro` saying why.
+    pub fn auto(networks: Vec<Network>, joins: bool, intro: String) -> Self {
+        Self {
+            opened: true,
+            intro: Some(intro),
+            ..Self::new(networks, joins, None)
+        }
+    }
+
+    /// The page as the boot opens it by itself after the earlier boot could
+    /// not join `name` (`wifi_prompt::Prompt::Retry`): that network
+    /// selected and its dialog open on the password, `intro` saying why.
+    pub fn retry(networks: Vec<Network>, joins: bool, name: &str, intro: String) -> Self {
+        let mut page = Self::auto(networks, joins, intro);
+        if let Some(index) = page
+            .networks
+            .iter()
+            .position(|network| network.name == name)
+        {
+            page.selected = index;
+        }
+        page.mode = Mode::Add(Form::retry(name));
+        page
     }
 
     pub fn mode(&self) -> &Mode {
@@ -391,6 +432,10 @@ impl Page {
                     }
                     _ => Action::Stay,
                 }
+            }
+            Mode::Add(_) if key == Key::Escape && self.opened => {
+                self.mode = Mode::List;
+                Action::Leave
             }
             Mode::Add(_) if key == Key::Escape => {
                 self.mode = Mode::List;
@@ -467,7 +512,7 @@ impl Page {
         self.networks = networks;
         self.selected = self.selected.min(self.rows() - 1);
         match result {
-            Ok(()) if self.joins => return Action::Join(String::from(name)),
+            Ok(()) if self.joins || self.opened => return Action::Join(String::from(name)),
             Ok(()) => {
                 if let Some(index) = self.networks.iter().position(|n| n.name == name) {
                     self.selected = index;
@@ -513,6 +558,16 @@ impl Page {
                     Field::Password => "Enter: save   Tab: show or hide   Up: name   Esc: cancel",
                 };
                 scene.centred(layout.middle, layout.keys, keys, Tone::Dim);
+            }
+        }
+        if self.notice.is_none()
+            && let Some(intro) = &self.intro
+        {
+            let columns = (geometry.width / scene.glyph).saturating_sub(4).max(16);
+            let lines = wrap(intro, columns);
+            for (index, line) in lines.iter().enumerate() {
+                let y = layout.notice.saturating_sub((lines.len() - 1 - index) * 20);
+                scene.centred(layout.middle, y, line, Tone::Orange);
             }
         }
         scene
@@ -655,6 +710,25 @@ fn draw_form(scene: &mut Scene, layout: &Layout, form: &Form, joins: bool) {
         (None, Field::Password) => ("8 to 63 characters, or 64 hex digits.", Tone::Dim),
     };
     scene.text(left + 20, y + 212, message, tone);
+}
+
+/// `text` in lines of at most `columns` characters, broken at spaces; a
+/// word longer than that keeps its own line.
+pub fn wrap(text: &str, columns: usize) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for (at, _) in text.match_indices(' ').chain([(text.len(), "")]) {
+        if text[start..at].chars().count() > columns && end > start {
+            lines.push(&text[start..end]);
+            start = end + 1;
+        }
+        end = at;
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }
 
 /// The page `W` opens where the startup menu offers no Wi-Fi page

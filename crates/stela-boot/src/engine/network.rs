@@ -221,6 +221,14 @@ impl RootLink {
         Some(self.state(state))
     }
 
+    /// The Wi-Fi link's join outcome (`Link::take_join`) for a service
+    /// turn, as [`Self::transmit_now`].
+    fn join_now(&mut self) -> Option<Option<stela_drivers::net::Join>> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.take_join())
+    }
+
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
@@ -895,6 +903,54 @@ pub(super) fn report_absent() {
 /// How often the host adapter's carrier is looked at for the guest's link.
 const CARRIER_MILLIS: u64 = 100;
 
+/// Where each network this boot may join is set, by name: the `--wifi` one
+/// and each usable saved one (`wifi_prompt::Which`), so the boot's record
+/// of a join names the network by that alone. Set once before any adapter
+/// starts; the names never reach the log.
+static NETWORKS: output::Global<Vec<(Vec<u8>, stela_boot_core::wifi_prompt::Which)>> =
+    output::Global(core::cell::RefCell::new(Vec::new()));
+
+/// Keep where `configured` (`--wifi`) and each of `saved`, in the file's
+/// order, are set; a saved network that repeats an earlier name is that one.
+pub(super) fn remember_networks<'a>(
+    configured: Option<&[u8]>,
+    saved: impl Iterator<Item = &'a [u8]>,
+) {
+    use stela_boot_core::wifi_prompt::Which;
+    let Ok(mut networks) = NETWORKS.0.try_borrow_mut() else {
+        return;
+    };
+    networks.clear();
+    if let Some(ssid) = configured {
+        networks.push((ssid.to_vec(), Which::Configured));
+    }
+    for (index, ssid) in saved.enumerate() {
+        if !networks.iter().any(|(known, _)| known == ssid) {
+            networks.push((ssid.to_vec(), Which::Saved(index + 1)));
+        }
+    }
+}
+
+/// The boot's record of `join`, naming the network only by where it is set;
+/// none for a network not set here.
+fn record(join: &stela_drivers::net::Join) -> Option<stela_boot_core::wifi_prompt::Record> {
+    use stela_boot_core::wifi_prompt::{Cause, Record};
+    use stela_drivers::net::Join;
+    let ssid = match join {
+        Join::Joined { ssid } | Join::WrongPassword { ssid } | Join::NotInRange { ssid } => ssid,
+    };
+    let networks = NETWORKS.0.try_borrow().ok()?;
+    let which = networks
+        .iter()
+        .find(|(known, _)| known == ssid)
+        .map(|(_, which)| *which)?;
+    Some(match join {
+        Join::Joined { .. } => Record::Joined(which),
+        Join::WrongPassword { .. } => Record::Failed(which, Cause::Password),
+        Join::NotInRange { .. } => Record::Failed(which, Cause::Range),
+    })
+}
+
 /// The APIC ID of the core the guest network's receive signal goes to once
 /// the guest's link is up ([`set_receive_core`]); none past 254.
 static RECEIVE_CORE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -993,6 +1049,18 @@ impl GuestNetwork {
                 self.link.device.location(),
                 if carrier { "up" } else { "down" }
             ));
+            // The next boot's menu leaves its Wi-Fi page closed after a
+            // boot whose wired network was up (`wifi_prompt`).
+            if carrier && !self.link.device.wireless() {
+                let line = stela_boot_core::wifi_prompt::Record::Wired.line();
+                output::arguments(format_args!("{line}"));
+            }
+        }
+        // What a Wi-Fi join came to, for the next boot's menu.
+        if let Some(Some(join)) = self.link.join_now()
+            && let Some(record) = record(&join)
+        {
+            output::arguments(format_args!("{}", record.line()));
         }
         Some(carrier)
     }

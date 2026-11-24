@@ -3077,12 +3077,16 @@ fn start_platform(
 
 /// The network `--wifi` names, with the secret of the key file the loader
 /// read, whose bytes are wiped here. A file it cannot use is reported once,
-/// without its contents, and no network is joined.
+/// without its contents, and no network is joined. With no `--wifi`, the
+/// saved networks, the newest first: the one the startup menu's Wi-Fi page
+/// saved last ([`saved_only`]).
 fn wifi_network(
     handoff: &Handoff,
     options: &Options,
 ) -> Option<stela_drivers::net::wifi::network::Network> {
-    let ssid = options.ssid.as_ref()?;
+    let Some(ssid) = options.ssid.as_ref() else {
+        return saved_only(handoff);
+    };
     let path = options
         .wifi_key
         .as_deref()
@@ -3120,11 +3124,16 @@ fn wifi_network(
         .wifi_country
         .as_deref()
         .and_then(|code| code.as_bytes().try_into().ok());
+    let alternates = saved_networks(handoff);
+    super::network::remember_networks(
+        Some(ssid.as_bytes()),
+        alternates.iter().map(|alternate| &alternate.ssid[..]),
+    );
     let mut network = stela_drivers::net::wifi::network::Network {
         ssid: ssid.as_bytes().to_vec(),
         secret,
         country,
-        alternates: saved_networks(handoff),
+        alternates,
     };
     // The startup menu's Wi-Fi choice for this boot, named in no line.
     if let Some(prefer) = options.wifi_prefer.as_deref() {
@@ -3138,6 +3147,24 @@ fn wifi_network(
         ));
     }
     Some(network)
+}
+
+/// The saved networks to join with no `--wifi`: the newest, the line the
+/// startup menu's Wi-Fi page wrote last, first, then the others; none when
+/// none is saved. With no `--wifi` there is no `--wifi-country`.
+fn saved_only(handoff: &Handoff) -> Option<stela_drivers::net::wifi::network::Network> {
+    let mut alternates = saved_networks(handoff);
+    super::network::remember_networks(None, alternates.iter().map(|alternate| &alternate.ssid[..]));
+    let newest = alternates.pop()?;
+    output::arguments(format_args!(
+        "HOST Wi-Fi no --wifi network: the saved networks are joined, the newest first\n"
+    ));
+    Some(stela_drivers::net::wifi::network::Network {
+        ssid: newest.ssid,
+        secret: newest.secret,
+        country: None,
+        alternates,
+    })
 }
 
 /// The other saved networks (`options::WIFI_SAVED`) the loader read, whose

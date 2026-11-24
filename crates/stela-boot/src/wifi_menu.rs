@@ -19,7 +19,7 @@ use stela_boot_core::{
     options::{WIFI_SAVED, WIFI_SAVED_NEW},
     wifi_hardware,
     wifi_page::{self, Action, Draw, Geometry, Key, Network, Page, Save, Scene, Tone},
-    wifi_saved,
+    wifi_prompt, wifi_saved,
 };
 use stela_drivers::net::wifi::network::Secret;
 use uefi::{
@@ -74,40 +74,86 @@ pub(crate) fn unavailable(lines: &[String]) {
 
 /// The page until a network is chosen, the one `--wifi` names being
 /// `configured` and the one chosen before `prefer`: the chosen network's
-/// name, or `None` when the page is left with Escape, the console has no
-/// input, or no `--wifi` is set, when a network can be saved or forgotten
-/// but not chosen.
+/// name, or `None` when the page is left with Escape or the console has no
+/// input. With no `--wifi`, the boot joins the saved networks, and the one
+/// chosen goes last in their file, which it joins first ([`chosen`]).
 pub(crate) fn run(
     volume: &mut FileSystem,
     configured: Option<&str>,
     prefer: Option<&str>,
 ) -> Option<String> {
+    let page = Page::new(networks(volume, configured), true, prefer);
+    drive(volume, configured, None, page)
+}
+
+/// The page as the boot opens it by itself (`wifi_prompt::decide`): to
+/// choose a network, or on the one the earlier boot could not join, its
+/// password ready. `key` is the `--wifi` network's key file, where its
+/// password typed again goes; `saved` the usable saved networks' names in
+/// the file's order, which a record's `Which::Saved` counts. The chosen
+/// network's name, as [`run`] gives it; `None` when the page is left.
+pub(crate) fn open(
+    volume: &mut FileSystem,
+    configured: Option<&str>,
+    key: Option<&str>,
+    prompt: wifi_prompt::Prompt,
+    saved: &[String],
+) -> Option<String> {
+    let networks = networks(volume, configured);
+    let page = match prompt {
+        wifi_prompt::Prompt::Choose => {
+            Page::auto(networks, true, String::from(wifi_prompt::CHOOSE))
+        }
+        wifi_prompt::Prompt::Retry(which, cause) => {
+            let name = match which {
+                wifi_prompt::Which::Configured => String::from(configured?),
+                wifi_prompt::Which::Saved(place) => saved.get(place.checked_sub(1)?)?.clone(),
+            };
+            let notice = wifi_prompt::retry_notice(&name, cause);
+            Page::retry(networks, true, &name, notice)
+        }
+    };
+    drive(volume, configured, key, page)
+}
+
+/// `page` until it is left or a network chosen: [`run`]'s and [`open`]'s.
+fn drive(
+    volume: &mut FileSystem,
+    configured: Option<&str>,
+    key_file: Option<&str>,
+    mut page: Page,
+) -> Option<String> {
     let (screen, font) = Framebuffer::from_firmware().zip(font::console())?;
     let mut canvas = Canvas::new(screen, font);
-    let mut page = Page::new(networks(volume, configured), configured.is_some(), prefer);
     loop {
         let scene = page.scene(geometry(&canvas));
         paint(&mut canvas, &scene);
         drop(scene);
-        let key = match key(None) {
+        let pressed = match key(None) {
             Wait::Key(press) => translate(press),
             Wait::NoInput => return None,
             Wait::Nothing | Wait::Timeout => continue,
         };
-        match page.press(key) {
+        match page.press(pressed) {
             Action::Stay => {}
             Action::Leave => return None,
-            Action::Join(name) => return Some(name),
+            Action::Join(name) => return chosen(volume, configured, name),
             Action::Forget(name) => {
                 let forgot = forget(volume, name.as_bytes());
                 page.forgotten(&name, forgot, networks(volume, configured));
             }
             Action::Save(save) => {
                 let name = save.name.clone();
-                let written = add(volume, save);
+                // The `--wifi` network's password is its key file's.
+                let written = match (configured, key_file) {
+                    (Some(configured), Some(path)) if configured == name => {
+                        write_key(volume, path, save)
+                    }
+                    _ => add(volume, save),
+                };
                 if let Action::Join(name) = page.saved(&name, written, networks(volume, configured))
                 {
-                    return Some(name);
+                    return chosen(volume, configured, name);
                 }
             }
         }
@@ -219,6 +265,60 @@ fn write(volume: &mut FileSystem, bytes: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// `name`, chosen on the page: with no `--wifi`, its lines go last in the
+/// saved file, so this boot joins it first; with `--wifi`, the menu names
+/// it with `--wifi-prefer`.
+fn chosen(volume: &mut FileSystem, configured: Option<&str>, name: String) -> Option<String> {
+    if configured.is_none()
+        && let Some(mut file) = saved_file(volume)
+    {
+        let mut moved = wifi_saved::last(&file, name.as_bytes());
+        if moved != file {
+            let written = write(volume, &moved);
+            output::arguments(format_args!(
+                "CHOICE Wi-Fi: a saved network chosen at the menu joins first ({})\n",
+                match written {
+                    Ok(()) => "written",
+                    Err(_) => "not written",
+                }
+            ));
+        }
+        wifi_saved::wipe(&mut file);
+        wifi_saved::wipe(&mut moved);
+    }
+    Some(name)
+}
+
+/// Write the `--wifi` network's password typed again into its key file at
+/// `path`, as `stambha settings` writes it, and read it back; it is wiped
+/// as `save` drops. A failure the earlier boot recorded is the old key's.
+fn write_key(volume: &mut FileSystem, path: &str, save: Save) -> Result<(), &'static str> {
+    const FAILED: &str = "The network's key could not be written to the USB.";
+    if Secret::parse(&save.password).is_err() {
+        return Err(wifi_page::PASSWORD_LENGTH);
+    }
+    let path = CString16::try_from(path)
+        .map(PathBuf::from)
+        .map_err(|_| FAILED)?;
+    let written = match volume.write(&path, &save.password[..]) {
+        Ok(()) if reads_back(volume, &path, &save.password) => Ok(()),
+        _ => Err(FAILED),
+    };
+    drop(save);
+    output::arguments(format_args!(
+        "CHOICE Wi-Fi: the --wifi network's password typed again at the menu ({}; it is not \
+         logged)\n",
+        match written {
+            Ok(()) => "written",
+            Err(_) => "not written",
+        }
+    ));
+    if written.is_ok() {
+        output::arguments(format_args!("{}", wifi_prompt::Record::Cleared.line()));
+    }
+    written
+}
+
 /// Refused when the saved networks are there but did not read: writing a
 /// change over them would erase every network the file holds.
 const UNREAD: &str = "The saved networks could not be read from the USB, so nothing was changed.";
@@ -237,6 +337,9 @@ fn forget(volume: &mut FileSystem, name: &[u8]) -> Result<(), &'static str> {
             Err(_) => "not written",
         }
     ));
+    if written.is_ok() {
+        output::arguments(format_args!("{}", wifi_prompt::Record::Cleared.line()));
+    }
     written
 }
 
@@ -264,6 +367,9 @@ fn add(volume: &mut FileSystem, save: Save) -> Result<(), &'static str> {
             Err(_) => "not written",
         }
     ));
+    if written.is_ok() {
+        output::arguments(format_args!("{}", wifi_prompt::Record::Cleared.line()));
+    }
     written
 }
 
