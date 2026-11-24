@@ -292,7 +292,8 @@ impl Events {
 /// and configuration registers, whether the station address registers
 /// still hold `mac` (never the address itself), the receive buffers' size,
 /// both rings' positions and ownership, and what the receive path took,
-/// dropped and found missing from its own buffer.
+/// dropped, found missing from its own buffer and skipped to follow the
+/// chip.
 fn diagnostic_line<R: Registers>(
     r: &R,
     revision: Revision,
@@ -322,7 +323,8 @@ fn diagnostic_line<R: Registers>(
     format!(
         "phystatus={:#04x} chipcmd={:#04x} isr={status:#x} imr={mask:#x} rxconfig={:#010x} \
          txconfig={:#010x} cpcmd={:#06x} rxmax={} station={} rx buffers={} next={} own={own} \
-         taken={} dropped={} misplaced={} device_owned={} tx next={} device_owned={} events \
+         taken={} dropped={} misplaced={} resyncs={} skipped={} device_owned={} tx next={} \
+         device_owned={} events \
          descriptors_empty={} fifo_overflow={} receive_error={} link_change={} signalled={signalled}",
         r.read8(PHY_STATUS),
         r.read8(COMMAND),
@@ -336,6 +338,8 @@ fn diagnostic_line<R: Registers>(
         receive.taken,
         receive.dropped,
         receive.misplaced,
+        receive.resyncs,
+        receive.skipped,
         receive.device_owned(),
         transmit.next(),
         transmit.device_owned(),
@@ -1121,8 +1125,14 @@ impl Realtek {
             self.link.last_phy_poll = None;
             self.update_link()?;
         }
-        let frame = self.receive.receive_with(take);
+        let mut frame = self.receive.receive_with(&mut take);
         self.leave_multiple_fetch();
+        // Nothing at the driver's slot: the chip may have passed it and be
+        // writing the slots after it (`Ring::follow_the_chip`).
+        if frame.is_none() && self.receive.follow_the_chip() {
+            frame = self.receive.receive_with(take);
+            self.leave_multiple_fetch();
+        }
         Ok(frame)
     }
 
