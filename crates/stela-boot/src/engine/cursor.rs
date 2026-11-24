@@ -5,21 +5,53 @@
 //! counter, so its own rate (`DCP PACING`) is per guest second.
 //!
 //! The service notes the host read of the first pointer report a present
-//! has not yet answered ([`motion`]); the boot PE looks at the display's
+//! has not yet answered ([`inputs`]); the boot PE looks at the display's
 //! count of moved presents after each slice ([`Cursor::look`]), so a
-//! latency is late by one slice at most.
+//! latency is late by one slice at most. A pointer report is a mouse's or
+//! a touchpad's motion, or, with `--trackpad`, a touch frame whose one
+//! finger moved: the guest's trackpad moves its pointer by one finger's
+//! travel.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
+use stela_drivers::input::{Input, multitouch::Frame};
 use stela_soc::dcp::iomfb::moved_presents;
 
 /// When the host read the oldest pointer report no moved present followed
 /// yet, in TSC ticks; zero for none.
 static MOTION_AT: AtomicU64 = AtomicU64::new(0);
 
-/// The host read a pointer report at TSC `now`.
-pub(super) fn motion(now: u64) {
-    let _ = MOTION_AT.compare_exchange(0, now.max(1), Ordering::Relaxed, Ordering::Relaxed);
+/// The last touch frame's one finger ([`touched`]); zero for none.
+static TOUCHED: AtomicU64 = AtomicU64::new(0);
+
+/// The host read `inputs` at TSC `now`.
+pub(super) fn inputs(inputs: &[Input], now: u64) {
+    for input in inputs {
+        let moved = match input {
+            Input::Move { .. } | Input::Motion { .. } => true,
+            Input::Touch(frame) => {
+                let finger = touched(frame);
+                let last = TOUCHED.swap(finger, Ordering::Relaxed);
+                finger != 0 && last != 0 && finger != last
+            }
+            _ => false,
+        };
+        if moved {
+            let _ = MOTION_AT.compare_exchange(0, now.max(1), Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Where `frame`'s one finger touching the pad is, as `x << 32 | y` in
+/// micrometres with bit 63 set; zero unless one finger touches it.
+fn touched(frame: &Frame) -> u64 {
+    let mut tips = frame.fingers().iter().filter(|finger| finger.tip);
+    match (tips.next(), tips.next()) {
+        (Some(finger), None) => {
+            1 << 63 | u64::from(finger.x_um & 0x7fff_ffff) << 32 | u64::from(finger.y_um)
+        }
+        _ => 0,
+    }
 }
 
 /// The moved presents and latencies since the last report.

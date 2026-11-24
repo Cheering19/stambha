@@ -64,7 +64,11 @@
 //! itself: in the runs measured, WindowServer kept at most two of its own
 //! swaps open, while its cursor client (layer 1 only, one surface moved)
 //! kept submitting behind a fenced frame, 19 deep at most, until it
-//! cleared. The vsync callback
+//! cleared. Its layer is shown ahead meanwhile: a ready swap's slots that
+//! no waiting swap in front of it set are composed over the frame on
+//! screen at the next vblank, though it still completes in order
+//! ([`Methods::ahead`]), so the pointer follows its client and not the
+//! GPU's slowest frame. The vsync callback
 //! `D588` carries the vblank's own counter value, not the time the model
 //! looked, as its first value and as its timestamp, the second. The AP's
 //! library turns that timestamp from the coprocessor's clock, continuous
@@ -289,6 +293,10 @@ pub struct Pacing {
     /// Presents that moved a layer: one whose destination kept its size at
     /// another place, as a pointer's does ([`moved_presents`]).
     pub moved: u32,
+    /// Presents that showed a later swap's slots ahead of a swap still
+    /// waiting for its GPU fence ([`Methods::ahead`]): the pointer moved
+    /// over a frame still drawing.
+    pub overtaking: u32,
     /// Where a swap's time goes, in counter ticks, so a slow frame rate can
     /// be told apart from a late display: `fence`, from its submit to the
     /// notice of its last GPU fence (swaps that waited for one); `notice`,
@@ -521,7 +529,7 @@ impl core::fmt::Display for Pacing {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
         write!(
             f,
-            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={}",
+            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} overtaking={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={}",
             ms(self.ticks) / 1000.0,
             self.presented,
             self.submitted,
@@ -546,6 +554,7 @@ impl core::fmt::Display for Pacing {
             self.unmodeled,
             self.color_matrix,
             self.moved,
+            self.overtaking,
             self.fence,
             self.notice,
             self.latch,
@@ -779,6 +788,9 @@ struct Batch {
     planes: [Option<scanout::Layer>; swap::LAYERS],
     layers: Vec<scanout::Layer>,
     damage: Option<core::ops::Range<usize>>,
+    /// The slots shown ahead of the swaps waiting in front of theirs
+    /// ([`Methods::ahead`]): with `count` 0, all the batch shows anew.
+    ahead: u32,
 }
 
 /// The IOMFB methods of the one connected display, presenting to a host
@@ -1191,16 +1203,59 @@ impl Methods {
     }
 
     /// Whether the last vblank latches a swap at counter `now`
-    /// ([`Self::frame_ready`]).
+    /// ([`Self::frame_ready`]), or shows a later swap's layers ahead of
+    /// one still drawing ([`Self::ahead`]).
     fn swap_ready(&mut self, now: u64) -> bool {
         if self.latched.is_none() {
             return false;
         }
-        if self.ready_swaps(now) != 0 {
+        if self.ready_swaps(now) != 0 || self.ahead_wanted() {
             return true;
         }
         self.latched = None;
         false
+    }
+
+    /// `base` with the slots that swaps queued from the `count`th on set
+    /// and that may be shown ahead of the swaps waiting in front of them,
+    /// and those slots. A swap's slots go ahead when its own surfaces are
+    /// ready and no swap in front of it that is still waiting set any of
+    /// them, so each slot still shows its swaps in submission order. This
+    /// is the pointer: WindowServer's cursor client sets layer 1 only, with
+    /// a surface the CPU drew, and kept submitting behind a frame waiting
+    /// for its GPU fence, 33 deep in the runs measured, its moves latched
+    /// up to 1.7 s after they were ready. Only what is shown changes: every swap still
+    /// completes in order, once the ones in front of it are latched, so
+    /// the AP keeps each surface until after its swap left the screen.
+    fn ahead(
+        &self,
+        count: usize,
+        base: [Option<scanout::Layer>; swap::LAYERS],
+    ) -> ([Option<scanout::Layer>; swap::LAYERS], u32) {
+        let (mut planes, mut ahead, mut held) = (base, 0u32, 0u32);
+        for frame in self.frames.iter().skip(count) {
+            if frame.fenced != 0 || frame.updated & held != 0 {
+                held |= frame.updated;
+                continue;
+            }
+            for (slot, plane) in planes.iter_mut().enumerate() {
+                if frame.updated & 1 << slot != 0 {
+                    *plane = frame.planes[slot];
+                }
+            }
+            ahead |= frame.updated;
+        }
+        (planes, ahead)
+    }
+
+    /// Whether, with no swap ready, a later one's slots would change the
+    /// frame on screen if shown ahead ([`Self::ahead`]).
+    fn ahead_wanted(&self) -> bool {
+        let Some(shown) = self.shown else {
+            return false;
+        };
+        let (planes, ahead) = self.ahead(0, shown);
+        ahead != 0 && planes != shown
     }
 
     /// `io_fence_notify`: the GPU finished `surface` for `swap_id`. A queued
@@ -1398,7 +1453,7 @@ impl Methods {
             read,
             &mut self.frame,
         );
-        if batch.count == 0 {
+        if batch.count == 0 && batch.ahead == 0 {
             return self.repainted(presented);
         }
         presented?;
@@ -1427,18 +1482,24 @@ impl Methods {
                 planes,
                 layers: planes.iter().flatten().copied().collect(),
                 damage: None,
+                ahead: 0,
             });
         }
         let due = self.latched.expect("a ready frame has an open latch");
         let count = self.ready_swaps(now);
-        let newest = &self.frames[count - 1];
-        let planes = newest.planes;
-        let layers = newest.layers();
+        // With none ready, only a later swap's slots shown ahead: a frame
+        // on screen it changes (`ahead_wanted`).
+        let base = match count {
+            0 => self.shown.expect("only a frame on screen is shown ahead"),
+            _ => self.frames[count - 1].planes,
+        };
+        let (planes, ahead) = self.ahead(count, base);
+        let layers = planes.iter().flatten().copied().collect();
         let updated = self
             .frames
             .iter()
             .take(count)
-            .fold(self.unshown, |slots, frame| slots | frame.updated);
+            .fold(self.unshown | ahead, |slots, frame| slots | frame.updated);
         let damage = self
             .shown
             .map(|shown| damage(&shown, &planes, updated, self.mode().height));
@@ -1449,6 +1510,7 @@ impl Methods {
             planes,
             layers,
             damage,
+            ahead,
         })
     }
 
@@ -1549,7 +1611,7 @@ impl Methods {
             self.in_place = true;
             return Ok(false);
         }
-        if batch.count == 0 {
+        if batch.count == 0 && batch.ahead == 0 {
             return self.repainted(result).map(|()| false);
         }
         result?;
@@ -1578,7 +1640,8 @@ impl Methods {
     }
 
     /// Finish the present of `batch`, whose rows the scanout now holds:
-    /// complete its swaps, oldest first, and pace by it.
+    /// complete its swaps, oldest first, and pace by it. A batch of slots
+    /// shown ahead only ([`Self::ahead`]) completes nothing.
     fn presented(&mut self, batch: Batch) {
         let Batch {
             now,
@@ -1587,6 +1650,7 @@ impl Methods {
             planes,
             layers,
             damage: _,
+            ahead,
         } = batch;
         // A vblank passed during a compose opened a new latch: it stays.
         if self.latched == Some(due) {
@@ -1600,10 +1664,17 @@ impl Methods {
             self.pacing.moved += 1;
             MOVED.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
+        self.pacing.overtaking += u32::from(ahead != 0);
         self.shown = Some(planes);
         self.unshown = 0;
         self.repaint_refused = false;
         let waiting = self.frames.len();
+        if count == 0 {
+            // The newest swap on screen is still the last one latched.
+            let last = self.last_present.map_or(0, |(_, swap_id)| swap_id);
+            self.pace(now, due, last, waiting);
+            return;
+        }
         let batch: Vec<Frame> = self.frames.drain(..count).collect();
         let (shown, merged) = batch.split_last().expect("a latched batch is not empty");
         for frame in &batch {
