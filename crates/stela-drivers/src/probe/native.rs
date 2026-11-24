@@ -87,6 +87,10 @@ impl<L: Link> Link for Located<L> {
     fn take_diagnostic(&mut self) -> Option<String> {
         self.link.take_diagnostic()
     }
+    /// The Wi-Fi keeper's join outcome, for the boot's record.
+    fn take_join(&mut self) -> Option<crate::net::Join> {
+        self.link.take_join()
+    }
 }
 
 /// The drivers here that attach through [`NativeServices`].

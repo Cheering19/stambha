@@ -594,6 +594,16 @@ impl Link for Adapter {
             _ => None,
         }
     }
+    fn take_join(&mut self) -> Option<crate::net::Join> {
+        match self {
+            #[cfg(feature = "native-acpi")]
+            Self::IntelWifi(device) => device.take_join(),
+            Self::MediatekWifi(device) => device.take_join(),
+            Self::RealtekWifi(device) => device.take_join(),
+            Self::Rtw89Wifi(device) => device.take_join(),
+            _ => None,
+        }
+    }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         match self {
             Self::Virtio(device) => device.transmit(frame),

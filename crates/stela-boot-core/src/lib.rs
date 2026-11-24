@@ -159,6 +159,7 @@ pub mod video_bios;
 pub mod vtd;
 pub mod wifi_hardware;
 pub mod wifi_page;
+pub mod wifi_prompt;
 pub mod wifi_saved;
 pub mod work_status;
 pub mod worker_bindings;
