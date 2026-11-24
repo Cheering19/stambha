@@ -249,6 +249,106 @@ fn a_table_not_taken_says_where_it_was_read_and_what_it_held() {
     );
 }
 
+fn memory(start: u64, bytes: u64) -> crate::firmware_pci::BarRegion {
+    crate::firmware_pci::BarRegion {
+        resource_type: 0,
+        general_flags: 0,
+        specific_flags: 0,
+        granularity: 32,
+        observed_maximum: 0,
+        host: start..start + bytes,
+        translation: 0,
+        pci: start..start + bytes,
+    }
+}
+
+/// A firmware that describes the register BAR without a memory range, as
+/// an RX 7900 XTX's board firmware answered, or with one too short, gives an
+/// error, so the caller reads the BAR by its address; a whole range gives
+/// its start.
+#[test]
+fn a_described_bar_without_a_whole_memory_range_is_read_by_its_address() {
+    assert_eq!(
+        described_registers(5, &[]),
+        Err(alloc::string::String::from(
+            "its BAR 5 holds no memory range"
+        ))
+    );
+    let mut io = memory(0x2000, 0x100);
+    io.resource_type = 1;
+    assert!(described_registers(5, &[io]).is_err());
+    assert_eq!(
+        described_registers(5, &[memory(0x9540_0000, 0x100)]),
+        Err(alloc::string::String::from(
+            "its BAR 5 at 0x95400000 holds 0x100 bytes, under the 0x58188 the table's registers \
+             need"
+        ))
+    );
+    assert_eq!(
+        described_registers(5, &[memory(0x9540_0000, 1 << 20)]),
+        Ok(0x9540_0000)
+    );
+}
+
+fn bridge(bus: u8, vendor: u16, device: u16, secondary: u8) -> Bridge {
+    let mut header = [0u8; 64];
+    header[0..2].copy_from_slice(&vendor.to_le_bytes());
+    header[2..4].copy_from_slice(&device.to_le_bytes());
+    header[0x0e] = 0x01;
+    header[0x18] = bus;
+    header[0x19] = secondary;
+    header[0x1a] = secondary;
+    Bridge::of(0, bus, &header).unwrap()
+}
+
+/// An RX 7900 XTX at 03:00.0 below its card's switch (02:00.0 1002:1479
+/// below 01:00.0 1002:1478) below a Raptor Lake root port is discrete; an
+/// APU below a host bridge or root port alone, a GPU below only one of the
+/// switch's ports, or below another maker's switch, is not told so.
+#[test]
+fn a_gpu_below_its_own_switch_is_discrete() {
+    let root = bridge(0, 0x8086, 0xa70d, 1);
+    let upstream = bridge(1, ATI_VENDOR, SWITCH_UPSTREAM, 2);
+    let downstream = bridge(2, ATI_VENDOR, SWITCH_DOWNSTREAM, 3);
+    assert!(behind_own_switch(0, 3, &[root, upstream, downstream]));
+    assert!(!behind_own_switch(1, 3, &[root, upstream, downstream]));
+    assert!(!behind_own_switch(0, 3, &[root, downstream]));
+    assert!(!behind_own_switch(0, 2, &[root, upstream, downstream]));
+    // Raphael's GPU at 0e:00.0 below its internal bridge 00:08.1.
+    assert!(!behind_own_switch(
+        0,
+        0x0e,
+        &[bridge(0, 0x1022, 0x14ef, 0x0e)]
+    ));
+    // Another maker's switch with the same device IDs.
+    let foreign = bridge(2, 0x10b5, SWITCH_DOWNSTREAM, 3);
+    assert!(!behind_own_switch(0, 3, &[root, upstream, foreign]));
+    // A bridge whose buses were never numbered is above nothing.
+    let unset = bridge(0, ATI_VENDOR, SWITCH_DOWNSTREAM, 0);
+    assert!(!behind_own_switch(0, 0, &[unset]));
+    // An endpoint header is no bridge.
+    assert_eq!(Bridge::of(0, 0, &[0u8; 64]), None);
+}
+
+/// A GPU whose table was not read is discrete below its own switch, and
+/// integrated otherwise, as before.
+#[test]
+fn an_unread_gpu_below_its_own_switch_is_discrete() {
+    assert_eq!(
+        unread_kind(true, "its BAR 5 holds no memory range"),
+        (
+            false,
+            alloc::string::String::from(
+                "its IP discovery table was not read (its BAR 5 holds no memory range); discrete: \
+                 behind its own PCIe switch"
+            )
+        )
+    );
+    let (integrated, how) = unread_kind(false, "x");
+    assert!(integrated);
+    assert!(how.ends_with("taken as integrated"));
+}
+
 #[test]
 fn the_security_processor_state_is_read_in_words() {
     assert_eq!(

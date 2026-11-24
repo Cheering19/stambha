@@ -775,6 +775,8 @@ pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
 ///
 /// The firmware's PCI protocol reads the BAR where it describes it. Where
 /// it does not (a GPU no firmware driver started may get no description),
+/// or describes it without a memory range that holds the registers (as one
+/// RX 7900 XTX's board firmware does),
 /// the BAR's address is read from the function's configuration space, each
 /// bridge above it must forward the register window and decode memory (one
 /// that does not is turned on for the read, as `pci_enable_bridge` does,
@@ -787,7 +789,6 @@ pub(crate) fn amd_graphics_version(
     registers: u8,
 ) -> Result<(u8, u8, u8), alloc::string::String> {
     use alloc::{format, string::String};
-    use stela_boot_core::amd_discovery::REGISTER_BYTES;
     let handles = boot::find_handles::<PciIo>().map_err(|error| format!("{error:?}"))?;
     let mut found = None;
     for &handle in &handles {
@@ -804,23 +805,10 @@ pub(crate) fn amd_graphics_version(
     let header = io
         .read_header()
         .map_err(|error| format!("its configuration header was not read: {error}"))?;
+    // A description without a whole memory range is read by the BAR's
+    // address too, as a BAR the firmware does not describe is.
     let described = match io.bar_regions(registers) {
-        Ok(regions) => {
-            let window = regions
-                .into_iter()
-                .find(|region| region.resource_type == 0)
-                .ok_or_else(|| format!("its BAR {registers} holds no memory range"))?
-                .host;
-            let length = window.end.saturating_sub(window.start);
-            if length < REGISTER_BYTES as u64 {
-                return Err(format!(
-                    "its BAR {registers} at {:#x} holds {length:#x} bytes, under the \
-                     {REGISTER_BYTES:#x} the table's registers need",
-                    window.start
-                ));
-            }
-            Ok(window.start)
-        }
+        Ok(regions) => stela_boot_core::amd_discovery::described_registers(registers, &regions),
         Err(error) => Err(format!(
             "the firmware does not describe its BAR {registers}: {error}"
         )),
