@@ -84,7 +84,7 @@ final class HostInventoryTests: XCTestCase {
       Translation: AVX2, FMA
       Extensions: F16C, AES-NI, SHA, PCLMUL, BMI2, LZCNT, POPCNT, MOVBE, GFNI
       Target: x86_64-baseline+ssse3+sse4.1+sse4.2+pclmulqdq+fma+f16c+popcnt+bmi1+aes+sha+atomic-load16+cx8+cx16+avx2+lzcnt+bmi2+fast-pdep+movbe+gfni
-      Stela 0.1.0
+      Stambha 0.1.0
       Presented as Mac14,3, Apple M2
       """)
     XCTAssertEqual(

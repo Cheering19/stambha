@@ -56,6 +56,17 @@ impl Model {
         &mut self,
         op: Op,
     ) -> Result<std::sync::MutexGuard<'_, ModelState>, power::AccessError> {
+        // The bounds `NativeBootIo` keeps, so no fixture reaches a register
+        // the real BAR window refuses.
+        match op {
+            Op::Read(register) | Op::Write(register, _) => {
+                reach(register, 4)?;
+            }
+            Op::Write8(register, _) => {
+                reach(register, 1)?;
+            }
+            Op::Delay(_) | Op::Reset => {}
+        }
         let mut state = self.state.lock().unwrap();
         let index = state.ops.len();
         state.ops.push(op);

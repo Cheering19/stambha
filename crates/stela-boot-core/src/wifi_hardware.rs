@@ -78,10 +78,54 @@ pub fn decide(census: Result<Census<'_>, &str>) -> Hardware {
     )
 }
 
+/// The widest line of [`Hardware::unavailable`], in characters, so the
+/// page's text stays inside the startup menu's column.
+pub const PAGE_LINE: usize = 40;
+
 impl Hardware {
     /// Whether the menu shows its Wi-Fi line and `W` opens the page.
     pub fn offered(&self) -> bool {
         !matches!(self, Self::Absent(_))
+    }
+
+    /// The menu's bottom line on a PC with a Wi-Fi chip no driver here
+    /// starts, where `W` opens [`Self::unavailable`]'s page; none otherwise.
+    pub fn unsupported_line(&self) -> Option<&'static str> {
+        matches!(self, Self::Absent(chips) if !chips.is_empty())
+            .then_some("Wi-Fi: this chip isn't supported yet (press W)")
+    }
+
+    /// What `W` shows when the menu offers no Wi-Fi page: that the PC's
+    /// Wi-Fi chip (the first, by vendor and device ID) is not supported yet
+    /// and what to use instead, or that the PC has none. Each line at most
+    /// [`PAGE_LINE`] characters. None when the Wi-Fi page is offered.
+    pub fn unavailable(&self) -> Option<Vec<String>> {
+        let Self::Absent(chips) = self else {
+            return None;
+        };
+        let Some((chip, rest)) = chips.split_first() else {
+            return Some(Vec::from([
+                String::from("This PC has no Wi-Fi chip that Stambha"),
+                String::from("can see. Use Ethernet, or a USB tether"),
+                String::from("or a supported Wi-Fi card."),
+            ]));
+        };
+        let id = format!("{:04x}:{:04x}", chip.vendor, chip.device);
+        let named = match vendor(chip.vendor) {
+            Some(vendor) => format!("{vendor} {id}"),
+            None => id,
+        };
+        let more = match rest.len() {
+            0 => String::new(),
+            more => format!(", and {more} more"),
+        };
+        Some(Vec::from([
+            String::from("This PC's Wi-Fi chip isn't supported"),
+            format!("yet: {named}{more}."),
+            String::from("Use Ethernet, or a USB tether or a"),
+            String::from("supported Wi-Fi card. To ask for this"),
+            String::from("chip, post your log in hardware-reports."),
+        ]))
     }
 
     /// The boot log's one line saying which way the menu decided.
@@ -110,6 +154,20 @@ impl Hardware {
             }
         }
     }
+}
+
+/// The name of a Wi-Fi chip's PCI vendor, for the few that make them.
+fn vendor(id: u16) -> Option<&'static str> {
+    Some(match id {
+        0x8086 => "Intel",
+        0x14c3 => "MediaTek",
+        0x10ec => "Realtek",
+        0x14e4 => "Broadcom",
+        0x168c => "Qualcomm Atheros",
+        0x17cb => "Qualcomm",
+        0x1814 => "Ralink",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -192,6 +250,56 @@ mod tests {
             hardware.line(),
             "CHOICE Wi-Fi hidden: no PCI function is a Wi-Fi chip the driver starts\n"
         );
+    }
+
+    /// W on a PC whose Wi-Fi chip no driver here starts, or with none:
+    /// the menu says the chip is not supported and W opens a page saying
+    /// what to use instead; with no chip, the page says so and the menu
+    /// keeps its bottom line clear.
+    #[test]
+    fn an_unsupported_or_missing_chip_gets_its_own_page() {
+        let ac9560 = function(2, 0x8086, 0x9df0, WIFI);
+        let mut functions = others();
+        functions.push(ac9560);
+        let hardware = decide(census(&functions, 0));
+        assert_eq!(
+            hardware.unsupported_line(),
+            Some("Wi-Fi: this chip isn't supported yet (press W)")
+        );
+        let page = hardware.unavailable().unwrap();
+        assert_eq!(page[1], "yet: Intel 8086:9df0.");
+        assert!(page.iter().any(|line| line.contains("hardware-reports")));
+        assert!(page.iter().all(|line| line.chars().count() <= PAGE_LINE));
+        // A second chip is counted, and an unknown vendor shows its ID alone.
+        functions.push(function(3, 0x1234, 0x5678, WIFI));
+        let page = decide(census(&functions, 0)).unavailable().unwrap();
+        assert_eq!(page[1], "yet: Intel 8086:9df0, and 1 more.");
+        let unnamed = Hardware::Absent(Vec::from([function(3, 0x1234, 0x5678, WIFI)]));
+        assert_eq!(unnamed.unavailable().unwrap()[1], "yet: 1234:5678.");
+        let atheros = Hardware::Absent(Vec::from([function(3, 0x168c, 0x003e, WIFI)]));
+        assert!(
+            atheros
+                .unavailable()
+                .unwrap()
+                .iter()
+                .all(|line| line.chars().count() <= PAGE_LINE)
+        );
+        // No Wi-Fi chip at all.
+        let none = decide(census(&others(), 0));
+        assert_eq!(none.unsupported_line(), None);
+        let page = none.unavailable().unwrap();
+        assert!(page[0].starts_with("This PC has no Wi-Fi chip"));
+        assert!(page.iter().all(|line| line.chars().count() <= PAGE_LINE));
+        // A chip the driver starts, or an unknown census, opens the Wi-Fi
+        // page itself.
+        let mut functions = others();
+        functions.push(function(3, 0x10ec, 0xc852, WIFI));
+        for hardware in [decide(census(&functions, 0)), decide(Err("none"))] {
+            assert_eq!(
+                (hardware.unsupported_line(), hardware.unavailable()),
+                (None, None)
+            );
+        }
     }
 
     #[test]

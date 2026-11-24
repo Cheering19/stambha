@@ -289,7 +289,7 @@ impl fmt::Display for PlatformError {
             Self::Refused(why) => f.write_str(why),
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
-            // Stela assigns no PCI BARs: one the firmware left at 0 stays
+            // Stambha assigns no PCI BARs: one the firmware left at 0 stays
             // unmapped where Linux would assign it.
             Self::PciBar {
                 index,
@@ -298,8 +298,8 @@ impl fmt::Display for PlatformError {
                 error,
             } => write!(
                 f,
-                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware, and Stela assigns \
-                 none yet: {error}"
+                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware, and Stambha \
+                 assigns none yet: {error}"
             ),
             Self::PciBar {
                 index,
@@ -1107,7 +1107,8 @@ const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again afte
                                its devices are out of reach for this boot";
 
 /// Why a Wi-Fi adapter is left alone.
-const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
+const NO_WIFI_NETWORK: &str =
+    "Wi-Fi adapter stays off: no network is chosen (press W at the boot menu to choose one)";
 
 /// Said when an RTL8852CE's MAC was found powered on.
 const RTW89_WAS_ON: &str =
@@ -5122,9 +5123,10 @@ mod tests {
             format!("{}", bar(0x40_1700_0000)),
             "BAR0 at 0x4017000000 (0x1000 bytes): outside"
         );
-        assert!(
-            format!("{}", bar(0))
-                .starts_with("BAR0 (0x1000 bytes) left unassigned by the firmware")
+        assert_eq!(
+            format!("{}", bar(0)),
+            "BAR0 (0x1000 bytes) left unassigned by the firmware, and Stambha assigns none yet: \
+             outside"
         );
     }
 }

@@ -206,7 +206,7 @@ public struct HostInventory: Codable, Equatable, Sendable {
       }
     }
     if let translatorTarget { lines.append("Target: \(translatorTarget)") }
-    if let stelaVersion { lines.append("Stela \(stelaVersion)") }
+    if let stelaVersion { lines.append("Stambha \(stelaVersion)") }
     let presented = [presentedModel, presentedChip].compactMap { $0 }
     if !presented.isEmpty { lines.append("Presented as \(presented.joined(separator: ", "))") }
     return lines.joined(separator: "\n")

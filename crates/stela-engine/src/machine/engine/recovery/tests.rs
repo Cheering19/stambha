@@ -212,6 +212,100 @@ fn a_stored_block_whose_record_went_qualifies_from_its_bytes_in_memory() {
     );
 }
 
+/// A record of the block's page that no longer holds its entry (after the
+/// pack is retired, a lookup gives only the pieces of the record still in
+/// memory) is no record of it: the fault reads the entry's bytes from guest
+/// memory, as for a record the store let go, and gets the block's rows.
+#[test]
+fn a_stored_block_whose_record_lost_its_entry_qualifies_from_its_bytes_in_memory() {
+    let preparation = Arc::new(prepare::test_preparation());
+    let source: Vec<u8> = [0x9100_0400u32, 0xf940_0043, 0xd400_0001]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let mut page = [0u8; crate::translations::PAGE_BYTES];
+    page[..source.len()].copy_from_slice(&source);
+    let key = Digest::of(&page);
+    let context = preparation.context(BASE);
+    let compile = |pc: u64, input: &[u8]| {
+        Offer::compile(key, BASE, pc, context, input.to_vec(), preparation.clone()).unwrap()
+    };
+    let offer = compile(BASE, &source);
+    let expected = offer.block().fault_recovery.clone();
+    assert!(!expected.is_empty());
+    let translator = translator_id();
+    let encode = |offer: &Offer| {
+        let mut record = Record::new(translator, key);
+        record.insert(offer.entry().unwrap());
+        Record::decode(&record.encode(), &translator, &key).unwrap()
+    };
+    let whole = encode(&offer);
+    // The same page's record, holding only another block's entry.
+    let partial = encode(&compile(BASE + 8, &source[8..]));
+    let (whole, partial) = (
+        crate::translations::StoredRecord::of(&whole),
+        crate::translations::StoredRecord::of(&partial),
+    );
+    let origin = Arc::new(StoredOrigin {
+        key,
+        context,
+        page: BASE,
+        preparation: preparation.clone(),
+        kept: None,
+    });
+    let entry = whole.find(0, &context).unwrap();
+    let mut relocated = crate::translations::Relocated::default();
+    assert!(entry.relocate(BASE, offer.input(), &mut relocated));
+    let mut owner = Template::stored(&entry, &relocated, origin).installed();
+    assert!(owner.stored_in(&whole));
+    assert!(!owner.stored_in(&partial));
+    let bytes = owner.stored_input_bytes().unwrap();
+    // The partial record alone gives no rows: what the fault was.
+    assert_eq!(
+        owner
+            .qualify(BASE, Some(&partial), None)
+            .map(|rows| rows.rows()),
+        Err(NativeFailureReason::StoredRecord)
+    );
+    assert_eq!(
+        owner
+            .qualify(BASE, Some(&partial), Some(&source[..bytes]))
+            .unwrap()
+            .rows(),
+        expected
+    );
+}
+
+/// Retired, a lookup of a key with a piece left in the file gives the
+/// pieces in memory alone, where before it gave none: a record that can lack
+/// an entry the boot installed from the whole record, which a fault must not
+/// take for that entry's (`CodeRecovery::stored_in`). Asimose's 0.6.0
+/// stopped at `NativeFailureReason::StoredRecord` 2 s after a retirement.
+#[test]
+fn a_retired_store_gives_a_record_of_only_its_pieces_in_memory() {
+    use crate::translations::pack::{Layout, Pack, Piece, Store, prefix_bytes};
+    let translator = translator_id();
+    let keys: Vec<Digest> = (0..64u32).map(|n| Digest::of(&n.to_le_bytes())).collect();
+    let layout = |keys: &[Digest]| {
+        let records = keys
+            .iter()
+            .map(|&key| (key, Piece::New(Record::new(translator, key).encode())))
+            .collect();
+        Layout::new(&translator, records).to_vec()
+    };
+    // Every key in a segment left in the file, half of them in one in memory.
+    let bytes = [layout(&keys), layout(&keys[..32])];
+    let prefix = prefix_bytes(&bytes[0], &translator).unwrap();
+    let disk = Pack::index_only(&bytes[0][..prefix], &translator).unwrap();
+    let whole = Pack::parse(&bytes[1], &translator).unwrap();
+    let mut store = Store::over(translator, alloc::vec![disk, whole]);
+    assert!(store.stored(&keys[3]).is_none());
+    assert!(store.stored(&keys[40]).is_none());
+    store.retire();
+    assert!(store.stored(&keys[3]).is_some());
+    assert!(store.stored(&keys[40]).is_none());
+}
+
 /// An entry proven during the boot qualifies from itself, at the page it
 /// was rebased to: the rows of the block compiled at that page.
 #[test]
