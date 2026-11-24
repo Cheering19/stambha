@@ -24,6 +24,12 @@ pub(super) struct Model {
     pub(super) phy_asleep: bool,
     /// An Intel ME that never finishes taking the PHY out of ULP.
     pub(super) me_stuck: bool,
+    /// SPT and later: this many LANPHYPC toggles leave a sleeping PHY
+    /// asleep, as one left by the last OS can stay after the first.
+    pub(super) toggles_ignored: usize,
+    /// SPT and later: a PHY in SMBus mode, reachable only while the MAC
+    /// forces SMBus too, until its CV_SMB_CTRL force bit is cleared.
+    pub(super) smbus_only: bool,
     pub(super) flush_after_tx: bool,
     pub(super) flush_after_rx: bool,
     pub(super) phy: BTreeMap<(u8, u16, u16), u16>,
@@ -93,6 +99,8 @@ impl Model {
             ulp_stuck: false,
             phy_asleep: false,
             me_stuck: false,
+            toggles_ignored: 0,
+            smbus_only: false,
             flush_after_tx: false,
             flush_after_rx: false,
             phy: BTreeMap::from([((2, 0, 2), 0x154), ((2, 0, 3), 0x93)]),
@@ -245,7 +253,11 @@ unsafe impl Registers for Io {
             m.mac.insert(at, value);
         } else if m.spt && at == CTRL && previous & (1 << 16) != 0 && value & (1 << 16) == 0 {
             m.power_pending = true;
-            m.phy_asleep = false;
+            if m.toggles_ignored > 0 {
+                m.toggles_ignored -= 1;
+            } else {
+                m.phy_asleep = false;
+            }
             if m.smb_hidden_after_power {
                 m.smb_hidden = true;
                 let value = m.phy.get(&(1, 769, 23)).copied().unwrap_or(0) | 1;
@@ -266,7 +278,10 @@ unsafe impl Registers for Io {
                 m.kmrn.insert(index, value as u16);
                 m.mac.insert(at, value);
             }
-        } else if at == super::super::MDIC && m.phy_asleep {
+        } else if at == super::super::MDIC
+            && (m.phy_asleep
+                || (m.smbus_only && m.mac.get(&CTRL_EXT).copied().unwrap_or(0) & FORCE_SMBUS == 0))
+        {
             m.mac.insert(at, value & !super::super::MDIC_READY);
         } else if at == super::super::MDIC {
             let index = ((value >> 16) & 31) as u16;
@@ -275,6 +290,9 @@ unsafe impl Registers for Io {
             let mut mdi_error = false;
             let data = if value & super::super::MDIC_WRITE != 0 {
                 let switching = smb && m.phy_load(address, index) & 1 != 0 && value & 1 == 0;
+                if smb && value & 1 == 0 {
+                    m.smbus_only = false;
+                }
                 m.phy_store(address, index, value as u16);
                 if switching {
                     m.smb_hidden = false;

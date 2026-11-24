@@ -363,9 +363,13 @@ fn every_spt_cold_access_failure_keeps_owner_and_prevents_packet_dma() {
     for at in 0..count {
         let (state, released, io, timer) = fixture_spt();
         state.borrow_mut().fail_at = Some(at);
+        let error = start_spt(0x1570, io, timer).err();
+        assert!(error.is_some(), "lost SPT cold access{at}");
+        // The fault itself is named, never the `Poisoned` of an access
+        // after it (the forced ULP exit used to hide its own fault so).
         assert!(
-            start_spt(0x1570, io, timer).is_err(),
-            "lost SPT cold access{at}"
+            !matches!(&error, Some(Error::Phy(e)) if e.primary == Fault::Poisoned),
+            "SPT cold access{at} reported {error:?}"
         );
         assert_eq!(released.load(Ordering::SeqCst), 0, "released SPT owner{at}");
         assert!(!state.borrow().operations.iter().any(|o| o[0] == 1
@@ -512,4 +516,141 @@ fn an_i219_the_me_manages_leaves_ulp_through_the_me() {
     assert!(!controller.is_poisoned());
     drop(controller);
     assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
+fn lanphypc_toggles(state: &Rc<RefCell<Model>>) -> usize {
+    state
+        .borrow()
+        .operations
+        .iter()
+        .filter(|o| o[0] == 1 && o[1] == super::super::CTRL && o[2] & LANPHYPC_OVERRIDE != 0)
+        .count()
+}
+/// The Raptor Lake I219-V (0dc6, `board_pch_adp`) a tester's PC has, and
+/// the initial SPT cohort.
+const I219_DEVICES: [u16; 2] = [0x0dc6, 0x156f];
+fn start_device(device: u16, io: Io, timer: Timer) -> Result<Controller<Io, Timer>, Error> {
+    // SAFETY: one synchronous modeled Function/config/PHY/flash.
+    unsafe { Controller::new_i219(device, io, timer) }
+}
+
+/// `e1000_disable_ulp_lpt_lp`: a PHY still in SMBus mode after the toggle,
+/// with the MAC in PCIe mode, answers no MDIO cycle, so the CV_SMB_CTRL
+/// read's page select fails first. Linux's read includes that select and
+/// retries with the MAC forced to SMBus; the exit used to give up at the
+/// select, poison the PHY epoch and report "an earlier PHY failure left it
+/// unusable" for the access check after it.
+#[test]
+fn a_phy_left_in_smbus_mode_is_reached_through_forced_smbus_from_the_page_select() {
+    for device in I219_DEVICES {
+        let (state, released, io, timer) = fixture_spt();
+        {
+            let mut m = state.borrow_mut();
+            m.smbus_only = true;
+            m.phy.insert((1, 769, 23), 0x7f01);
+        }
+        let controller = start_device(device, io, timer).unwrap();
+        assert!(!controller.ulp_exit_failed(), "{device:04x}");
+        assert!(!controller.is_poisoned());
+        {
+            let m = state.borrow();
+            assert_eq!(m.phy[&(1, 769, 23)] & 1, 0);
+            assert_eq!(m.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
+            assert_eq!(m.phy[&(1, 779, 16)] & ULP_CLEAR, 0);
+            assert!(
+                m.operations
+                    .iter()
+                    .any(|o| o[0] == 1 && o[1] == CTRL_EXT && o[2] & FORCE_SMBUS != 0),
+                "the exit never forced the MAC to SMBus"
+            );
+        }
+        assert_eq!(lanphypc_toggles(&state), 1);
+        drop(controller);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// `e1000_init_phy_workarounds_pchlan`: a ULP exit whose PHY does not
+/// answer is logged and the start goes on. Linux's exit releases the
+/// semaphore, resets the PHY and waits 50 ms (`release:`), and the access
+/// checks after it wake the PHY with another LANPHYPC toggle. A PHY that
+/// does not answer is no transport fault: the epoch stays usable, where it
+/// was poisoned and the start refused.
+#[test]
+fn a_phy_still_asleep_after_the_ulp_exit_is_woken_by_the_access_checks() {
+    for device in I219_DEVICES {
+        let (state, released, io, timer) = fixture_spt();
+        {
+            let mut m = state.borrow_mut();
+            m.phy_asleep = true;
+            m.toggles_ignored = 1;
+        }
+        let mut controller = start_device(device, io, timer).unwrap();
+        assert!(controller.ulp_exit_failed(), "{device:04x}");
+        assert!(!controller.is_poisoned());
+        assert_eq!(controller.identity().id, 0x0154_00a0);
+        assert_eq!(lanphypc_toggles(&state), 2);
+        {
+            let m = state.borrow();
+            let toggles: alloc::vec::Vec<usize> = m
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o[0] == 1 && o[1] == super::super::CTRL && o[2] & LANPHYPC_OVERRIDE != 0
+                })
+                .map(|(at, _)| at)
+                .collect();
+            assert!(
+                m.operations[toggles[0]..toggles[1]]
+                    .iter()
+                    .any(|o| o[0] == 1
+                        && o[1] == super::super::CTRL
+                        && o[2] & super::super::PHY_RESET != 0),
+                "no PHY reset after the failed exit, before the access checks"
+            );
+            assert_eq!(m.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
+            assert_eq!(
+                m.mac[&super::super::super::EXTCNF_CTRL] & super::super::super::SWFLAG,
+                0
+            );
+        }
+        let line = controller.state();
+        assert!(line.contains(" ulp_exit=lanphypc:failed("), "{line}");
+        drop(controller);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// A start that fails after a failed ULP exit names both, the exit first
+/// cause, where only the last step's reason reached the log.
+#[test]
+fn a_start_failing_after_a_failed_ulp_exit_names_the_exit_too() {
+    let (state, released, io, timer) = fixture_spt();
+    {
+        let mut m = state.borrow_mut();
+        m.phy_asleep = true;
+        m.toggles_ignored = 1;
+        // The ME blocks the PHY reset and so the LANPHYPC wake.
+        m.mac.insert(super::super::super::FWSM, 0);
+    }
+    let error = start_device(0x0dc6, io, timer).err().unwrap();
+    let Error::AfterUlpExit { how, exit, then } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(*how, "lanphypc");
+    assert!(
+        matches!(**exit, Error::Phy(e) if e.primary == Fault::MdicTimeout),
+        "{exit:?}"
+    );
+    assert_eq!(**then, Error::RecoveryBlocked);
+    let text = alloc::format!("{error}");
+    assert!(
+        text.starts_with("the PHY does not answer, and the Intel ME blocks")
+            && text.contains("after the PHY did not leave its ultra-low-power state (lanphypc: ")
+            && text.contains("MDIO timeout"),
+        "{text}"
+    );
+    assert_eq!(lanphypc_toggles(&state), 1);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
 }
