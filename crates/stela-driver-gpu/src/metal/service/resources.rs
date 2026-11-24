@@ -33,6 +33,58 @@ use core::num::NonZeroU64;
 /// How many heap nils the platform's log names; the rest only count.
 const NOTED_HEAP_NILS: u64 = 32;
 
+/// A two-plane IOSurface texture's line for the platform's log, which
+/// names each distinct one once: its format, size, usage, the surface's
+/// pixel format, each plane's offset and row in bytes and its image's
+/// extent and format, and whether the GPU samples a device copy of the
+/// planes, refreshed when the surface's seed changes, or the rows in guest
+/// RAM. Both planes are pitch-linear images (no block-linear kind), so a
+/// video frame that shows wrong reads as a layout here or a race with the
+/// surface's writer.
+pub(in crate::metal::service) fn two_plane_note(
+    descriptor: &TextureDescriptor,
+    planes: [PlaneLayout; 2],
+    surface_format: u32,
+    copied: bool,
+) -> alloc::string::String {
+    let format = descriptor.pixel_format;
+    let (second_width, second_height) = format.planes().map_or((0, 0), |ratio| {
+        ratio.second(descriptor.width, descriptor.height)
+    });
+    let [luma, chroma] = format
+        .plane_formats()
+        .map_or([alloc::string::String::from("?"), "?".into()], |formats| {
+            formats.map(|format| alloc::format!("{format:?}"))
+        });
+    let fourcc: alloc::string::String = surface_format
+        .to_be_bytes()
+        .iter()
+        .map(|&byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                char::from(byte)
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    alloc::format!(
+        "TWO-PLANE TEXTURE {:?} {}x{} usage={:#x} surface='{fourcc}' ({surface_format:#010x}) \
+         plane0={}+{}/row {}x{} {luma} plane1={}+{}/row {second_width}x{second_height} {chroma} \
+         linear sampled={}",
+        format,
+        descriptor.width,
+        descriptor.height,
+        descriptor.usage.bits(),
+        planes[0].offset,
+        planes[0].bytes_per_row,
+        descriptor.width,
+        descriptor.height,
+        planes[1].offset,
+        planes[1].bytes_per_row,
+        if copied { "device-copy" } else { "in-place" },
+    )
+}
+
 impl<B: Backend, C: Compiler> Service<B, C> {
     pub(super) fn new_buffer(&mut self, call: &mut Call) -> Result<(), Fault> {
         let request: NewBufferRequest = call.request()?;
@@ -150,15 +202,17 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     "a two-plane texture without its second plane",
                 ));
             }
-            self.device.new_two_plane_texture(
-                buffer,
-                &descriptor,
-                [
-                    plane(request.offset, request.bytes_per_row),
-                    plane(request.second_offset, request.second_bytes_per_row),
-                ],
-                request.surface_format as u32,
-            )?
+            let planes = [
+                plane(request.offset, request.bytes_per_row),
+                plane(request.second_offset, request.second_bytes_per_row),
+            ];
+            let surface_format = request.surface_format as u32;
+            let texture =
+                self.device
+                    .new_two_plane_texture(buffer, &descriptor, planes, surface_format)?;
+            let copied = self.device.has_aligned_copy(texture);
+            self.noted = Some(two_plane_note(&descriptor, planes, surface_format, copied));
+            texture
         } else {
             self.device.new_texture_from_buffer(
                 buffer,

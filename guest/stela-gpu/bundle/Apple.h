@@ -255,6 +255,8 @@ size_t IOSurfaceGetPlaneCount(IOSurfaceRef surface);
 uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef surface);
 uint32_t IOSurfaceGetID(IOSurfaceRef surface);
 uint32_t IOSurfaceGetSeed(IOSurfaceRef surface);
+void IOSurfaceIncrementUseCount(IOSurfaceRef surface);
+void IOSurfaceDecrementUseCount(IOSurfaceRef surface);
 IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 CFTypeRef IOSurfaceCopyValue(IOSurfaceRef surface, CFStringRef key);
 mach_port_t IOSurfaceCreateMachPort(IOSurfaceRef surface);
