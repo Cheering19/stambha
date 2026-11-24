@@ -409,5 +409,113 @@ pub fn version(ips: &[Ip], hw_id: u16) -> Option<(u8, u8, u8)> {
         .map(|ip| (ip.major, ip.minor, ip.revision))
 }
 
+/// Where the register BAR `bar` starts, by the firmware's description of
+/// it (`regions`, its GetBarAttributes answer): the start of its memory
+/// range, which must hold the registers the table's read needs. A
+/// description without a memory range, or with one too short, is an error
+/// that says so, as a BAR the firmware does not describe at all is: the
+/// caller then reads the BAR by its address instead.
+pub fn described_registers(
+    bar: u8,
+    regions: &[crate::firmware_pci::BarRegion],
+) -> Result<u64, alloc::string::String> {
+    let Some(window) = regions
+        .iter()
+        .find(|region| region.resource_type == 0)
+        .map(|region| &region.host)
+    else {
+        return Err(alloc::format!("its BAR {bar} holds no memory range"));
+    };
+    let length = window.end.saturating_sub(window.start);
+    if length < REGISTER_BYTES as u64 {
+        return Err(alloc::format!(
+            "its BAR {bar} at {:#x} holds {length:#x} bytes, under the {REGISTER_BYTES:#x} the \
+             table's registers need",
+            window.start
+        ));
+    }
+    Ok(window.start)
+}
+
+/// AMD's PCI vendor ID, which its GPUs and the bridges on its cards carry
+/// (Linux's `PCI_VENDOR_ID_ATI`).
+pub const ATI_VENDOR: u16 = 0x1002;
+/// The upstream port of the PCIe switch on AMD's discrete cards from Navi
+/// on, whose ports amdgpu skips to find the slot's link
+/// (`amdgpu_device_init_pcie_links`).
+pub const SWITCH_UPSTREAM: u16 = 0x1478;
+/// That switch's downstream port, right above the GPU.
+pub const SWITCH_DOWNSTREAM: u16 = 0x1479;
+
+/// A PCI-to-PCI bridge, as its configuration header gives it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bridge {
+    pub segment: u16,
+    /// The bus the bridge itself is on.
+    pub bus: u8,
+    pub vendor: u16,
+    pub device: u16,
+    /// The bus right below it.
+    pub secondary: u8,
+}
+
+impl Bridge {
+    /// The bridge on `segment` and `bus` whose configuration header's first
+    /// 64 bytes are `header`, or `None` for a header of another type.
+    pub fn of(segment: u16, bus: u8, header: &[u8; 64]) -> Option<Self> {
+        const HEADER_TYPE: usize = 0x0e;
+        const SECONDARY_BUS: usize = 0x19;
+        (header[HEADER_TYPE] & 0x7f == 1).then(|| Self {
+            segment,
+            bus,
+            vendor: u16::from_le_bytes([header[0], header[1]]),
+            device: u16::from_le_bytes([header[2], header[3]]),
+            secondary: header[SECONDARY_BUS],
+        })
+    }
+
+    /// The bridge among `bridges` whose secondary bus is `bus` on `segment`;
+    /// a bridge whose bus numbers were never set is above nothing.
+    fn above(segment: u16, bus: u8, bridges: &[Self]) -> Option<&Self> {
+        bridges.iter().find(|bridge| {
+            bridge.segment == segment && bridge.secondary == bus && bridge.secondary > bridge.bus
+        })
+    }
+}
+
+/// Whether the function on `bus` of `segment` sits right below an AMD
+/// card's own PCIe switch, among `bridges`: its downstream port (1002:1479)
+/// above it, and that port below the switch's upstream port (1002:1478). An
+/// APU sits straight below a host bridge or root port, so such a GPU is
+/// discrete.
+pub fn behind_own_switch(segment: u16, bus: u8, bridges: &[Bridge]) -> bool {
+    let is = |bridge: &Bridge, device: u16| bridge.vendor == ATI_VENDOR && bridge.device == device;
+    Bridge::above(segment, bus, bridges)
+        .filter(|downstream| is(downstream, SWITCH_DOWNSTREAM))
+        .and_then(|downstream| Bridge::above(segment, downstream.bus, bridges))
+        .is_some_and(|upstream| is(upstream, SWITCH_UPSTREAM))
+}
+
+/// The kind of an AMD GPU whose IP discovery table was not read (`why`):
+/// discrete where it sits below its card's own PCIe switch
+/// ([`behind_own_switch`]), else integrated, as a GPU whose kind is not
+/// known counts. Whether it is integrated, and how that was told.
+pub fn unread_kind(behind_switch: bool, why: &str) -> (bool, alloc::string::String) {
+    match behind_switch {
+        true => (
+            false,
+            alloc::format!(
+                "its IP discovery table was not read ({why}); discrete: behind its own PCIe switch"
+            ),
+        ),
+        false => (
+            true,
+            alloc::format!(
+                "not known: its IP discovery table was not read ({why}); taken as integrated"
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests;

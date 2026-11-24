@@ -326,8 +326,9 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
 /// with every claim taken as made). Each GPU a stack drives is integrated
 /// as its driver's table says, or, for a driver that decides by the GPU's
 /// IP discovery table, as the graphics version that table lists says, read
-/// here through the firmware. A GPU whose kind stays unknown counts as
-/// integrated: a share a discrete GPU leaves unused costs the guest that
+/// here through the firmware; where that table is not read, a GPU below its
+/// card's own PCIe switch is discrete. A GPU whose kind stays unknown counts
+/// as integrated: a share a discrete GPU leaves unused costs the guest that
 /// memory, where a heap short of an integrated GPU's pages stops the boot.
 /// The firmware's screen is on the function whose BAR holds it; where no
 /// function is found, it may be on any GPU, so a GPU that would only show
@@ -343,6 +344,18 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
         return;
     }
     let screen = crate::console::Framebuffer::firmware_function();
+    // The bridges the firmware lists, which tell a GPU below its card's own
+    // switch where its kind is not read otherwise.
+    let bridges: Vec<_> = functions
+        .iter()
+        .filter_map(|function| {
+            stela_boot_core::amd_discovery::Bridge::of(
+                function.address.segment,
+                function.address.bus,
+                &function.header,
+            )
+        })
+        .collect();
     let mut found = Vec::new();
     // The BAR each GPU's driver maps whole, where it does, and its kernel.
     let mut apertures = Vec::new();
@@ -379,7 +392,7 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
                 continue;
             }
         };
-        let (integrated, how) = gpu_kind(stack, &adapter);
+        let (integrated, how) = gpu_kind(stack, &adapter, &bridges);
         output::arguments(format_args!(
             "HOST GPU {} {}{}: {how}\n",
             adapter.address,
@@ -471,12 +484,16 @@ fn aperture_tables(address: stela_drivers::bus::pci::Address, bar: u8) -> u64 {
 }
 
 /// Whether the GPU at `adapter` is integrated, by `stack`'s table or its IP
-/// discovery table, and how that was told; one that cannot be told counts
-/// as integrated.
+/// discovery table, and how that was told. One whose table is not read is
+/// discrete where it sits below its card's own PCIe switch, among
+/// `bridges` (`amd_discovery::behind_own_switch`); any other that cannot
+/// be told counts as integrated.
 fn gpu_kind(
     stack: &stela_drivers::gpu::stack::GpuStack,
     adapter: &stela_drivers::gpu::Adapter,
+    bridges: &[stela_boot_core::amd_discovery::Bridge],
 ) -> (bool, alloc::string::String) {
+    use stela_boot_core::amd_discovery;
     let table = stack.kernel.table_integrated(adapter).or_else(|| {
         stack
             .kernel
@@ -497,11 +514,13 @@ fn gpu_kind(
                 integrated,
                 alloc::format!("graphics {major}.{minor}.{revision} by its IP discovery table"),
             ),
-            Some(Err(why)) => (
-                true,
-                alloc::format!(
-                    "not known: its IP discovery table was not read ({why}); taken as integrated"
+            Some(Err(why)) => amd_discovery::unread_kind(
+                amd_discovery::behind_own_switch(
+                    adapter.address.segment,
+                    adapter.address.bus,
+                    bridges,
                 ),
+                &why,
             ),
             None => (
                 true,

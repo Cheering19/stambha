@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:41:40 +0000
+Subject: [PATCH] feat(amdgpu): log the link masks the SMU's PCIe override is
+ made from, what they give it, and each forced level's table values, argument
+ and answer on SMU 13.0.0 and 13.0.7, where a refused override left no line
+ saying whether it was asked for lane 0
+
+A refused OverridePcieParameters (SMU_RESP_CMD_FAIL, -EIO) prints no
+"SMU:" line, so the log did not say whether amdgpu asked for lane 0 (no
+platform width bit in pcie_mlw_mask) or for a link the SMU should take.
+One line in smu_smc_hw_setup names the masks, the gen and width they
+give and whether PCIe DPM is on; each level the force-all-levels loop of
+smu_v13_0_0 and smu_v13_0_7 sends names its table values, its argument
+and the SMU's answer.
+---
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c            |  9 +++++++++
+ drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c | 12 ++++++++++++
+ drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c | 12 ++++++++++++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 3969a7670482005facb8a00294288b96a75db146..6cc951c4d1f83180294740b4843283c83f5d943c 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -1818,6 +1818,15 @@ static int smu_smc_hw_setup(struct smu_context *smu)
+ 		pcie_width = 2;
+ 	else if (adev->pm.pcie_mlw_mask & CAIL_PCIE_LINK_WIDTH_SUPPORT_X1)
+ 		pcie_width = 1;
++#if IS_ENABLED(CONFIG_STELA)
++	/* Stela: the link masks the override is made from, and what they
++	 * give it, so a refused override shows whether its input was a width
++	 * of 0 (no platform width bit) or a link the SMU should take. */
++	dev_info(adev->dev,
++		 "Stela: pcie gen_mask %#x mlw_mask %#x -> gen %u width %u, PCIe DPM %s\n",
++		 adev->pm.pcie_gen_mask, adev->pm.pcie_mlw_mask, pcie_gen, pcie_width,
++		 adev->pm.pp_feature & PP_PCIE_DPM_MASK ? "on" : "off");
++#endif
+ 	ret = smu_update_pcie_parameters(smu, pcie_gen, pcie_width);
+ 	if (ret) {
+ 		dev_err(adev->dev, "Attempt to override pcie params failed!\n");
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c
+index 4177211f32dcaf64e128d4aa67a9543af91d4775..5c9d370bd12ca944f491fa2ca23e0cc33b59a51b 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c
+@@ -3122,6 +3122,10 @@ static int smu_v13_0_0_update_pcie_parameters(struct smu_context *smu,
+ 
+ 		/* Force all levels to use the same settings */
+ 		for (i = 0; i < num_of_levels; i++) {
++#if IS_ENABLED(CONFIG_STELA)
++			uint8_t table_gen = pcie_table->pcie_gen[i];
++			uint8_t table_lane = pcie_table->pcie_lane[i];
++#endif
+ 			pcie_table->pcie_gen[i] = pcie_gen_cap;
+ 			pcie_table->pcie_lane[i] = pcie_width_cap;
+ 			smu_pcie_arg = i << 16;
+@@ -3132,6 +3136,14 @@ static int smu_v13_0_0_update_pcie_parameters(struct smu_context *smu,
+ 								SMU_MSG_OverridePcieParameters,
+ 								smu_pcie_arg,
+ 								NULL);
++#if IS_ENABLED(CONFIG_STELA)
++			/* Stela: each level's table values and the argument
++			 * sent, with the SMU's answer. */
++			dev_info(smu->adev->dev,
++				 "Stela: OverridePcieParameters level %d of %d (table gen %u lane %u lclk %u) arg %#010x: %d\n",
++				 i, num_of_levels, table_gen, table_lane,
++				 pcie_table->lclk_freq[i], smu_pcie_arg, ret);
++#endif
+ 			if (ret)
+ 				break;
+ 		}
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c
+index 845bd00c9df8564c3b664f48b3024c7ff862fb83..63fa1de7a496f58196f966764cac9e5a73e0e21c 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c
+@@ -2743,6 +2743,10 @@ static int smu_v13_0_7_update_pcie_parameters(struct smu_context *smu,
+ 
+ 		/* Force all levels to use the same settings */
+ 		for (i = 0; i < num_of_levels; i++) {
++#if IS_ENABLED(CONFIG_STELA)
++			uint8_t table_gen = pcie_table->pcie_gen[i];
++			uint8_t table_lane = pcie_table->pcie_lane[i];
++#endif
+ 			pcie_table->pcie_gen[i] = pcie_gen_cap;
+ 			pcie_table->pcie_lane[i] = pcie_width_cap;
+ 			smu_pcie_arg = i << 16;
+@@ -2753,6 +2757,14 @@ static int smu_v13_0_7_update_pcie_parameters(struct smu_context *smu,
+ 								SMU_MSG_OverridePcieParameters,
+ 								smu_pcie_arg,
+ 								NULL);
++#if IS_ENABLED(CONFIG_STELA)
++			/* Stela: each level's table values and the argument
++			 * sent, with the SMU's answer. */
++			dev_info(smu->adev->dev,
++				 "Stela: OverridePcieParameters level %d of %d (table gen %u lane %u lclk %u) arg %#010x: %d\n",
++				 i, num_of_levels, table_gen, table_lane,
++				 pcie_table->lclk_freq[i], smu_pcie_arg, ret);
++#endif
+ 			if (ret)
+ 				break;
+ 		}

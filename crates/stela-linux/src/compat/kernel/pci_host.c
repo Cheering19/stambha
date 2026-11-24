@@ -1116,6 +1116,45 @@ static void test_upstream(struct stela_linux_pci_function function)
 	assert(!pci_read_config_dword(partner, PCI_VENDOR_ID, &value) && value == 0x14ab1022);
 	assert(pci_read_config_dword(partner, 0x100, &value) == PCIBIOS_DEVICE_NOT_FOUND);
 
+	/* A root port whose link status reads 0, as a snapshot that did not
+	 * read it gives, is passed over: the slowest link that did read is the
+	 * card's upstream port's, not x0 at an unknown speed. */
+	memset(ports, 0, sizeof(ports));
+	identify(downstream->config, PCI_VENDOR_ID_ATI, 0x1479, PCI_CLASS_BRIDGE_PCI << 8);
+	express(downstream->config, PCI_EXP_TYPE_DOWNSTREAM, 4, 16, 4, 16);
+	downstream->bus = 2;
+	identify(upstream->config, PCI_VENDOR_ID_ATI, 0x1478, PCI_CLASS_BRIDGE_PCI << 8);
+	express(upstream->config, PCI_EXP_TYPE_UPSTREAM, 4, 16, 3, 8);
+	upstream->bus = 1;
+	identify(root->config, PCI_VENDOR_ID_INTEL, 0xa70d, PCI_CLASS_BRIDGE_PCI << 8);
+	express(root->config, PCI_EXP_TYPE_ROOT_PORT, 5, 16, 0, 0);
+	root->devfn = PCI_DEVFN(1, 0);
+	struct pci_dev *unread = stela_linux_pci_attach(&function, NULL);
+
+	assert(unread);
+	struct pci_dev *card_upstream = stela_linux_pci_upstream(stela_linux_pci_upstream(unread));
+
+	assert(card_upstream && card_upstream->device == 0x1478);
+	assert(pcie_bandwidth_available(unread, &limiting, &speed, &width) ==
+	       8 * (8000 * 128 / 130));
+	assert(limiting == card_upstream && speed == PCIE_SPEED_8_0GT && width == PCIE_LNK_X8);
+	stela_linux_pci_remove_device(unread);
+
+	/* With every link unread there is no bandwidth, and neither a speed
+	 * nor a width, which amdgpu takes as unknown rather than as x0. */
+	express((u32 *)config, PCI_EXP_TYPE_ENDPOINT, 4, 16, 0, 0);
+	memset(ports, 0, sizeof(ports));
+	identify(root->config, PCI_VENDOR_ID_INTEL, 0xa70d, PCI_CLASS_BRIDGE_PCI << 8);
+	express(root->config, PCI_EXP_TYPE_ROOT_PORT, 5, 16, 0, 0);
+	function.upstream = root;
+	function.upstream_count = 1;
+	unread = stela_linux_pci_attach(&function, NULL);
+	assert(unread);
+	assert(!pcie_bandwidth_available(unread, NULL, &speed, &width));
+	assert(speed == PCI_SPEED_UNKNOWN && width == PCIE_LNK_WIDTH_UNKNOWN);
+	stela_linux_pci_remove_device(unread);
+	express((u32 *)config, PCI_EXP_TYPE_ENDPOINT, 4, 16, 4, 16);
+
 	/* A function attached without ports is on a root bus. */
 	function.upstream = NULL;
 	function.upstream_count = 0;

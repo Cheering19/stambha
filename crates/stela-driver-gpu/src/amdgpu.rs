@@ -7,6 +7,8 @@ use stela_driver_core::amd_metal;
 
 include!(concat!(env!("OUT_DIR"), "/amdgpu_devices.rs"));
 
+pub mod link;
+
 /// The table's entry for `device`, if it names the device by ID: its DMA
 /// mask's bits and its `AMD_IS_APU` flag.
 fn entry(device: u16) -> Option<(u8, bool)> {
