@@ -215,9 +215,15 @@ struct kmem_cache *__kmem_cache_create_args(const char *name, unsigned int objec
  * ordinary ready slot, then fail without backing growth or metadata allocation. */
 static bool request_supported(gfp_t flags)
 {
-	/* Growth already makes one fallible attempt and forwards NORETRY. */
+	/* Growth makes one fallible attempt, which meets both NORETRY and
+	 * RETRY_MAYFAIL ("may fail, no OOM killer"), and forwards either to the
+	 * page allocator, which accepts both, as kmalloc's policy does
+	 * (slab.c). shmem forwards RETRY_MAYFAIL to the xarray node it grows
+	 * (file.c), so i915's blocking retry of a shmem object's pages
+	 * (shmem_sg_alloc_table) needs it: refused, Raptor Lake P's GuC log
+	 * buffer failed with -ENOMEM. */
 	gfp_t allowed = GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NOMEMALLOC |
-		__GFP_ACCOUNT | __GFP_NORETRY;
+		__GFP_ACCOUNT | __GFP_NORETRY | __GFP_RETRY_MAYFAIL;
 	if ((flags & (__GFP_HIGH | __GFP_RECLAIM)) == GFP_ATOMIC)
 		allowed |= __GFP_HIGH;
 	if ((flags & ~allowed) ||
@@ -1109,9 +1115,23 @@ static void policy_and_creation(void)
 	void *object = kmem_cache_alloc(cache, no_retry);
 	assert(object && page_attempts() == attempts + 2);
 	kmem_cache_free(cache, object);
+	/* RETRY_MAYFAIL grows with one fallible attempt, as NORETRY does, and
+	 * is no refusal. */
+	assert(!kmem_cache_shrink(cache) && !cache->slabs);
+	const gfp_t retry_may_fail = GFP_KERNEL | __GFP_RETRY_MAYFAIL;
+	attempts = page_attempts();
+	unsigned int refused_before = refusals();
+	stela_test_pages_refuse(true);
+	assert(!kmem_cache_alloc(cache, retry_may_fail));
+	assert(page_attempts() == attempts + 1 && !cache->slabs);
+	stela_test_pages_refuse(false);
+	object = kmem_cache_alloc(cache, retry_may_fail);
+	assert(object && page_attempts() == attempts + 2);
+	assert(refusals() == refused_before);
+	kmem_cache_free(cache, object);
 	const gfp_t unsupported_requests[] = {
 		GFP_KERNEL | __GFP_HIGH, GFP_KERNEL | __GFP_MEMALLOC,
-		GFP_KERNEL | __GFP_NOFAIL, GFP_KERNEL | __GFP_RETRY_MAYFAIL,
+		GFP_KERNEL | __GFP_NOFAIL,
 		GFP_KERNEL | __GFP_RECLAIMABLE,
 		GFP_KERNEL | __GFP_MOVABLE, GFP_KERNEL | __GFP_DMA,
 		GFP_KERNEL | __GFP_COMP,
