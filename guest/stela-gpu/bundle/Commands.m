@@ -162,6 +162,9 @@ static void name_functions(id object, NSMutableSet *seen, NSMutableString *names
 	/* Synchronization notification blocks, in the order added. */
 	NSMutableArray *_synchronization;
 	os_unfair_lock _referencesLock;
+	/* The IOSurfaces its commit marked in use, each once, until it completes
+	 * (`holdSurface`). */
+	NSMutableArray *_surfacesInUse;
 	CFTimeInterval _kernelStart, _kernelEnd;
 	bool _enqueued;
 	bool _retains;
@@ -383,6 +386,7 @@ static StelaGPUTexture *copied_root(id object)
 			.buffer = buffer ? 1 : 0,
 		};
 		stela_stream_entry(&_stream, StelaCommandBufferCodeSurfaceUse, &use, sizeof(use), NULL, 0);
+		[self holdSurface:surface];
 		StelaGPUTexture *root = buffer ? nil : copied_root(object);
 		if (root) {
 			[self noteSeed:use.seed of:root];
@@ -411,6 +415,43 @@ static StelaGPUTexture *copied_root(id object)
 		[self noteSeed:seed of:texture];
 	}
 	os_unfair_lock_unlock(&_referencesLock);
+}
+
+/* Marks `surface` in use until the command buffer completes, once for each
+ * surface, as Apple's GPU driver does for every IOSurface a submitted command
+ * buffer names: a CVPixelBufferPool (a video decoder's frames) and a Core
+ * Animation backing store reuse only a surface that is not in use
+ * (IOSurfaceIsInUse). Unmarked, a decoder wrote its next frame into a surface
+ * whose sampling command buffer the service had yet to run, which then read a
+ * frame half decoded: rows not yet written are zero, which YCbCr shows green,
+ * below the decoder's stair-stepped front. Under the references lock; the
+ * array keeps each surface until `releaseSurfaces`. */
+- (void)holdSurface:(IOSurfaceRef)surface
+{
+	uint32_t identity = IOSurfaceGetID(surface);
+	for (NSUInteger i = 0; i < _surfacesInUse.count; i++) {
+		if (IOSurfaceGetID((__bridge IOSurfaceRef)[_surfacesInUse objectAtIndex:i]) == identity) {
+			return;
+		}
+	}
+	if (!_surfacesInUse) {
+		_surfacesInUse = [NSMutableArray arrayWithCapacity:4];
+	}
+	IOSurfaceIncrementUseCount(surface);
+	[_surfacesInUse addObject:(__bridge id)surface];
+}
+
+/* Once the command buffer completed or was refused: the GPU no longer reads
+ * or writes the surfaces its commit marked in use. */
+- (void)releaseSurfaces
+{
+	os_unfair_lock_lock(&_referencesLock);
+	NSMutableArray *held = _surfacesInUse;
+	_surfacesInUse = nil;
+	os_unfair_lock_unlock(&_referencesLock);
+	for (NSUInteger i = 0; i < held.count; i++) {
+		IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)[held objectAtIndex:i]);
+	}
 }
 
 - (void)noteSeed:(uint32_t)seed of:(StelaGPUTexture *)texture
@@ -511,6 +552,8 @@ static StelaGPUTexture *copied_root(id object)
 - (void)didCompleteWith:(const StelaFailure *)failure
 {
 	[self didSchedule];
+	/* A surface it used is free for reuse before anyone learns it completed. */
+	[self releaseSurfaces];
 	/* What the GPU signaled reaches the kernel events before anyone learns
 	 * the buffer completed. */
 	os_unfair_lock_lock(&_referencesLock);

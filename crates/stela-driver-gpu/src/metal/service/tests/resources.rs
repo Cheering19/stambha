@@ -642,3 +642,58 @@ fn timed_calls_answer_their_phases_once() {
         }
     ));
 }
+
+/// A video wallpaper's 3840x2160 10-bit 4:2:0 frame ('x420', P010-like) is
+/// named in the log with both planes' offsets, rows and extents, and where
+/// the GPU samples it: the line testers' logs carry for a frame that shows
+/// wrong.
+#[test]
+fn a_two_plane_texture_is_noted_with_its_planes() {
+    use crate::metal::{
+        abi::{CpuCacheMode, HazardTrackingMode, ResourceOptions, SwizzleChannels, TextureUsage},
+        resource::{PlaneLayout, TextureDescriptor},
+    };
+    let descriptor = TextureDescriptor {
+        texture_type: TextureType::D2,
+        pixel_format: PixelFormat::Ycbcr10_420_2p,
+        width: 3840,
+        height: 2160,
+        depth: 1,
+        mipmap_level_count: 1,
+        sample_count: 1,
+        array_length: 1,
+        options: ResourceOptions {
+            cpu_cache_mode: CpuCacheMode::DefaultCache,
+            storage_mode: StorageMode::Shared,
+            hazard_tracking_mode: HazardTrackingMode::Default,
+        },
+        usage: TextureUsage::SHADER_READ,
+        swizzle: SwizzleChannels::IDENTITY,
+    };
+    let planes = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: 7680,
+        },
+        PlaneLayout {
+            offset: 16_596_992,
+            bytes_per_row: 7680,
+        },
+    ];
+    let note = crate::metal::service::resources::two_plane_note(
+        &descriptor,
+        planes,
+        u32::from_be_bytes(*b"x420"),
+        true,
+    );
+    assert_eq!(
+        note,
+        "TWO-PLANE TEXTURE Ycbcr10_420_2p 3840x2160 usage=0x1 surface='x420' (0x78343230) \
+         plane0=0+7680/row 3840x2160 R16Unorm plane1=16596992+7680/row 1920x1080 Rg16Unorm \
+         linear sampled=device-copy"
+    );
+    // A surface format that is no four-character code still prints.
+    let note = crate::metal::service::resources::two_plane_note(&descriptor, planes, 1, false);
+    assert!(note.contains("surface='????' (0x00000001)"), "{note}");
+    assert!(note.ends_with("sampled=in-place"), "{note}");
+}

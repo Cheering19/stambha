@@ -435,6 +435,56 @@ fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
     device.destroy_texture(texture).unwrap();
 }
 
+/// The lock screen's aerial video frame: a 3840x2160 10-bit 4:2:0 surface
+/// of 7680-byte rows, its chroma plane 16 KiB aligned past the luma, in a
+/// 27,872,768-byte buffer, as testers' logs show it. Its device copy takes
+/// every row of both planes at their own offsets, the chroma plane's row of
+/// 1920 two-word texels, so no row of either is left as the copy's zeros
+/// (green, as YCbCr) by the layout.
+#[test]
+fn a_4k_ten_bit_video_frame_copies_both_planes_whole() {
+    let mut device = device();
+    let buffer = buffer(&mut device, 27_872_768);
+    let surface = descriptor(
+        PixelFormat::Ycbcr10_420_2p,
+        3840,
+        2160,
+        TextureUsage::SHADER_READ,
+    );
+    let chroma = 16_596_992;
+    let planes = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: 7680,
+        },
+        PlaneLayout {
+            offset: chroma,
+            bytes_per_row: 7680,
+        },
+    ];
+    let texture = device
+        .new_two_plane_texture(buffer, &surface, planes, u32::from_be_bytes(*b"x420"))
+        .unwrap();
+    assert!(device.has_aligned_copy(texture));
+    let mut commands = device.new_command_buffer();
+    commands.surfaces.push(SurfaceNote {
+        texture: Some(texture),
+        surface: 7,
+        seed: 1,
+    });
+    device.commit(commands).unwrap();
+    assert_eq!(
+        row_copies(&mut device),
+        [
+            (true, 0, 3840, [3840, 2160, 1]),
+            (true, chroma, 1920, [1920, 1080, 1]),
+        ]
+    );
+    // The last chroma row ends inside the surface.
+    assert!(chroma + 7680 * 1080 <= 27_872_768);
+    device.destroy_texture(texture).unwrap();
+}
+
 /// A surface below a 1920x1080 frame keeps sampling its rows in
 /// place: no copy at all.
 #[test]
