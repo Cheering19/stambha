@@ -817,7 +817,7 @@ impl Picker {
         let keys: &[(&str, &str)] = match self.page {
             Page::Partitions => &[("Enter", "Install in free space"), ("Esc", "Back")],
             Page::Confirm => &[
-                ("Left", "Check only"),
+                ("Left", "Install check (dry run)"),
                 ("Right", "Install"),
                 ("Enter", "Choose"),
                 ("Esc", "Back"),
@@ -1174,7 +1174,7 @@ impl Picker {
             "Back",
             self.focus == Focus::Back,
         );
-        let check = "Check only";
+        let check = "Install check (dry run)";
         let check_width = canvas.text_width(check, 1) + 48;
         Self::button(
             canvas,
@@ -1187,7 +1187,7 @@ impl Picker {
         canvas.text(
             layout.left,
             buttons + 56,
-            "Check only reads the disk with Stambha's driver and writes nothing",
+            "A dry run, changes nothing: it reads the disk and installs nothing",
             1,
             ui::DIM,
         );

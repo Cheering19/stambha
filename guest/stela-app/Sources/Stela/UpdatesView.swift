@@ -10,7 +10,7 @@
       VStack(alignment: .leading, spacing: Style.spacing) {
         Surface {
           Rows(rows: [
-            ("Stela", model.host?.stelaVersion, false),
+            ("Stambha", model.host?.stelaVersion, false),
             ("Translator", model.host?.translatorID, true),
             ("App", model.appVersion, false),
             ("Revision", model.appBuild, true),

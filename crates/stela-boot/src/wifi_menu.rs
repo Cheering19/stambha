@@ -27,10 +27,10 @@ use uefi::{
     fs::{FileSystem, PathBuf},
 };
 
-/// Whether the startup menu offers Wi-Fi on this PC, from the firmware's PCI
-/// census before ExitBootServices (`stela_boot_core::wifi_hardware`); one
-/// line says which way it decided.
-pub(crate) fn offered() -> bool {
+/// What the startup menu makes of this PC's Wi-Fi, from the firmware's PCI
+/// census before ExitBootServices (`stela_boot_core::wifi_hardware`): the
+/// Wi-Fi page, or a page saying why there is none. One line says which.
+pub(crate) fn hardware() -> wifi_hardware::Hardware {
     let hardware = match crate::pci_io::capture() {
         Ok(census) => {
             let functions: Vec<_> = census
@@ -48,7 +48,28 @@ pub(crate) fn offered() -> bool {
         Err(error) => wifi_hardware::decide(Err(&alloc::format!("{error}"))),
     };
     output::arguments(format_args!("{}", hardware.line()));
-    hardware.offered()
+    hardware
+}
+
+/// The page `W` opens where the menu offers no Wi-Fi page: `lines`
+/// (`wifi_hardware::Hardware::unavailable`) until a key is pressed.
+pub(crate) fn unavailable(lines: &[String]) {
+    let Some((screen, font)) = Framebuffer::from_firmware().zip(font::console()) else {
+        return;
+    };
+    let mut canvas = Canvas::new(screen, font);
+    output::arguments(format_args!(
+        "CHOICE Wi-Fi page: no Wi-Fi chip the driver starts, so it says why\n"
+    ));
+    let scene = wifi_page::unavailable_scene(lines, geometry(&canvas));
+    paint(&mut canvas, &scene);
+    drop(scene);
+    loop {
+        match key(None) {
+            Wait::Key(_) | Wait::NoInput => return,
+            Wait::Nothing | Wait::Timeout => {}
+        }
+    }
 }
 
 /// The page until a network is chosen, the one `--wifi` names being

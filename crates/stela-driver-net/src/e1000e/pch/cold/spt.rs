@@ -155,7 +155,21 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         }
         Ok(())
     }
+    /// [`Self::start_i219`], with a failed ULP exit named beside the step
+    /// that later failed: the exit's own cause is otherwise lost with the
+    /// controller, and it is the first thing that went wrong.
     pub(super) fn initialize_i219(&mut self) -> Result<(), Error> {
+        let result = self.start_i219();
+        match (result, &self.ulp_exit) {
+            (Err(then), Some((how, Some(exit)))) if then != *exit => Err(Error::AfterUlpExit {
+                how,
+                exit: alloc::boxed::Box::new(exit.clone()),
+                then: alloc::boxed::Box::new(then),
+            }),
+            (result, _) => result,
+        }
+    }
+    fn start_i219(&mut self) -> Result<(), Error> {
         self.inherited_ring_check()?;
         self.validate_nvm()?;
         self.station = self.nvm.station()?;
@@ -175,7 +189,26 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             self.spt_ulp_exit()
         };
         self.ulp_exit_failed = exit.is_err();
-        self.ulp_exit = Some((if managed { "me" } else { "lanphypc" }, exit.err()));
+        self.ulp_exit = Some((if managed { "me" } else { "lanphypc" }, exit.clone().err()));
+        // A PHY that does not answer leaves the exit failed and the epoch
+        // usable. A transport fault (a refused or all-ones access, the
+        // semaphore, the delay clock) ends the epoch: that fault is the
+        // cause, not the `Poisoned` the next PHY access would report.
+        if let Err(error) = exit {
+            if self.phy.is_poisoned() {
+                return Err(error);
+            }
+            // `e1000_disable_ulp_lpt_lp`'s `release:` path: a forced exit
+            // resets the PHY and waits 50 ms whether or not it worked, so the
+            // access checks below meet a PHY in a known state. A reset the
+            // ME blocks is left out, as `e1000e_phy_hw_reset_generic` does.
+            if !managed {
+                if self.reset_phy()? {
+                    self.configuration_done(true)?;
+                }
+                self.phy.wait_minimum(50_000)?;
+            }
+        }
         self.recover_phy_access(managed)?;
         self.identity = self.phy.identify()?;
         // The donor releases SWFLAG before this hardware PHY reset. No PHY
@@ -233,9 +266,11 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// power cycle to be reported done and 30 ms more and goes on either
     /// way, as `e1000_toggle_lanphypc_pch_lpt` does, then SMBus unforced in
     /// the PHY and the MAC, K1 back on and the PHY's ULP configuration
-    /// cleared.
+    /// cleared. A PHY that does not answer its MDIO cycles fails the exit
+    /// with the semaphore released and the epoch kept, as Linux gives up
+    /// at `release:` and goes on; only a transport fault poisons it.
     fn spt_ulp_exit(&mut self) -> Result<(), Error> {
-        let cycle_done = self.phy.transaction(|p| {
+        let (cycle_done, unanswered) = self.phy.transaction(|p| {
             let value = p.read_mac(super::FEXTNVM3)?;
             p.write_mac(
                 super::FEXTNVM3,
@@ -257,43 +292,77 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
                 }
             }
             p.wait_minimum(30_000)?;
-            p.retry_enabled = false;
-            // A mode-switch MDIC error is a source-defined transition, not an
-            // access/removal fault. Only the exact CV_SMB_CTRL response may
-            // take this path; final readback must prove PCIe mode.
-            p.page(SMB_CONTROL.page)?;
-            let mut word = match p.mdic(1, SMB_CONTROL.index, None) {
-                Ok(value) => value,
-                Err(error) if smbus_read_unavailable(error) => {
-                    let value = p.read_mac(CTRL_EXT)?;
-                    p.write_mac(CTRL_EXT, value | FORCE_SMBUS)?;
-                    p.wait_minimum(50_000)?;
-                    p.page(SMB_CONTROL.page)?;
-                    p.mdic(1, SMB_CONTROL.index, None)?
-                }
-                Err(error) => return Err(error),
-            };
-            let switching = word & 1 != 0;
-            word &= !1;
-            match p.mdic(1, SMB_CONTROL.index, Some(word)) {
-                Ok(_) => {}
-                Err(error) if switching && smbus_response_error(error) => {}
-                Err(error) => return Err(error),
-            }
+            let exit = p.spt_leave_smbus_and_ulp();
             p.retry_enabled = true;
-            let value = p.read_mac(CTRL_EXT)?;
-            p.write_mac(CTRL_EXT, value & !FORCE_SMBUS)?;
-            let value = p.access(PM_CONTROL, None)?;
-            p.access(PM_CONTROL, Some(value | K1_ENABLE))?;
-            let value = p.access(ULP_CONFIG, None)? & !ULP_CLEAR;
-            p.access(ULP_CONFIG, Some(value))?;
-            p.access(ULP_CONFIG, Some(value | ULP_START))?;
-            let value = p.read_mac(FEXTNVM7)?;
-            p.write_mac(FEXTNVM7, value & !DISABLE_SMB_PERST)?;
-            Ok(done)
+            match exit {
+                Ok(()) => Ok((done, None)),
+                Err(fault @ (Fault::MdicTimeout | Fault::MdicResponse(_))) => {
+                    Ok((done, Some(fault)))
+                }
+                Err(fault) => Err(fault),
+            }
         })?;
         self.lanphypc_done = Some(cycle_done);
-        Ok(())
+        match unanswered {
+            None => Ok(()),
+            Some(fault) => Err(fault.into()),
+        }
+    }
+}
+
+impl<R: Registers, D: Delay> Phy<R, D> {
+    /// `e1000_disable_ulp_lpt_lp` after its LANPHYPC toggle, under the
+    /// semaphore: SMBus unforced in the PHY and the MAC, K1 back on, the
+    /// ULP configuration cleared and committed, SMBus release on PERST#
+    /// enabled again. The CV_SMB_CTRL cycles run without MDIC retries.
+    fn spt_leave_smbus_and_ulp(&mut self) -> Result<(), Fault> {
+        self.retry_enabled = false;
+        // A mode-switch MDIC error is a source-defined transition, not an
+        // access/removal fault. Only the exact CV_SMB_CTRL response may
+        // take this path; final readback must prove PCIe mode.
+        let mut word = match self.spt_smb_control() {
+            Ok(value) => value,
+            // "The MAC might be in PCIe mode, so temporarily force SMBus mode
+            // in order to access the PHY."
+            Err((true, _)) => {
+                let value = self.read_mac(CTRL_EXT)?;
+                self.write_mac(CTRL_EXT, value | FORCE_SMBUS)?;
+                self.wait_minimum(50_000)?;
+                self.spt_smb_control().map_err(|(_, error)| error)?
+            }
+            Err((false, error)) => return Err(error),
+        };
+        let switching = word & 1 != 0;
+        word &= !1;
+        match self.mdic(1, SMB_CONTROL.index, Some(word)) {
+            Ok(_) => {}
+            Err(error) if switching && smbus_response_error(error) => {}
+            Err(error) => return Err(error),
+        }
+        self.retry_enabled = true;
+        let value = self.read_mac(CTRL_EXT)?;
+        self.write_mac(CTRL_EXT, value & !FORCE_SMBUS)?;
+        let value = self.access(PM_CONTROL, None)?;
+        self.access(PM_CONTROL, Some(value | K1_ENABLE))?;
+        let value = self.access(ULP_CONFIG, None)? & !ULP_CLEAR;
+        self.access(ULP_CONFIG, Some(value))?;
+        self.access(ULP_CONFIG, Some(value | ULP_START))?;
+        let value = self.read_mac(FEXTNVM7)?;
+        self.write_mac(FEXTNVM7, value & !DISABLE_SMB_PERST)
+    }
+    /// `e1000_read_phy_reg_hv_locked(CV_SMB_CTRL)`: as
+    /// `__e1000_read_phy_reg_hv`, the page select is part of the read, so
+    /// a PHY the MAC cannot reach (the PHY in SMBus mode, the MAC in PCIe
+    /// mode) fails that first cycle, and Linux's forced-SMBus retry is for
+    /// it as much as for the read. The read, or the failure and whether
+    /// the retry is for it.
+    fn spt_smb_control(&mut self) -> Result<u16, (bool, Fault)> {
+        if let Err(error) = self.page(SMB_CONTROL.page) {
+            let unreachable = matches!(error, Fault::MdicTimeout | Fault::MdicResponse(_));
+            return Err((unreachable, error));
+        }
+        self.mdic(1, SMB_CONTROL.index, None)
+            .map_err(|error| (smbus_read_unavailable(error), error))
     }
 }
 fn smbus_response_error(error: Fault) -> bool {

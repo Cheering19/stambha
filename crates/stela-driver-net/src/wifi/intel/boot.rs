@@ -109,6 +109,17 @@ pub trait FunctionOwner {
     /// [`BootIo::reset_function`], the claim and BAR mapping kept throughout.
     fn reset(&self) -> Result<bool, crate::block::BlockError>;
 }
+/// The bytes of BAR0 the boot reaches: all 16 KiB, which hold the MSI-X
+/// registers at 0x2000 (`CSR_MSIX_BASE`) above the CSRs' first 8 KiB.
+pub const WINDOW: u32 = 16384;
+/// Whether an access of `width` bytes at `register` is aligned and inside
+/// [`WINDOW`].
+pub fn reach(register: u32, width: u32) -> Result<usize, power::AccessError> {
+    match register.checked_add(width) {
+        Some(end) if register.is_multiple_of(width) && end <= WINDOW => Ok(register as usize),
+        _ => Err(power::AccessError::Bounds),
+    }
+}
 #[derive(Clone)]
 pub struct NativeBootIo {
     registers: Mmio,
@@ -125,7 +136,7 @@ impl NativeBootIo {
     /// context. Nominal clocks cannot supply it. The window stays mapped through
     /// the owner's final Drop, including deliberate quarantine on failure.
     pub unsafe fn from_window(
-        window: NonNull<[u8; 16384]>,
+        window: NonNull<[u8; WINDOW as usize]>,
         owner: Rc<dyn FunctionOwner>,
         minimum: Rc<dyn crate::bus::pci::power::Timer>,
     ) -> Result<Self, Error> {
@@ -137,7 +148,7 @@ impl NativeBootIo {
         }
         Ok(Self {
             // SAFETY: covered by this function's own safety contract.
-            registers: unsafe { Mmio::new(window.as_ptr().cast::<u8>() as u64, 16384) },
+            registers: unsafe { Mmio::new(window.as_ptr().cast::<u8>() as u64, WINDOW as usize) },
             minimum,
             owner,
         })
@@ -145,16 +156,10 @@ impl NativeBootIo {
 }
 impl Csr for NativeBootIo {
     fn read32(&mut self, register: u32) -> Result<u32, power::AccessError> {
-        if !register.is_multiple_of(4) || register > 8188 {
-            return Err(power::AccessError::Bounds);
-        }
-        Ok(self.registers.read32(register as usize))
+        Ok(self.registers.read32(reach(register, 4)?))
     }
     fn write32(&mut self, register: u32, value: u32) -> Result<(), power::AccessError> {
-        if !register.is_multiple_of(4) || register > 8188 {
-            return Err(power::AccessError::Bounds);
-        }
-        self.registers.write32(register as usize, value);
+        self.registers.write32(reach(register, 4)?, value);
         Ok(())
     }
     fn delay_us(&mut self, microseconds: u32) -> Result<(), power::AccessError> {
@@ -166,10 +171,7 @@ impl Csr for NativeBootIo {
 // SAFETY: construction requires the owned exclusive requester/BAR.
 unsafe impl BootIo for NativeBootIo {
     fn write8(&mut self, register: u32, value: u8) -> Result<(), power::AccessError> {
-        if register >= 8192 {
-            return Err(power::AccessError::Bounds);
-        }
-        self.registers.write8(register as usize, value);
+        self.registers.write8(reach(register, 1)?, value);
         Ok(())
     }
     fn reset_function(&mut self) -> Result<bool, crate::block::BlockError> {

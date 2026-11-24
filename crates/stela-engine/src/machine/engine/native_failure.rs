@@ -180,10 +180,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // store let go is not read at a fault: the entry's bytes in guest
         // memory compile its rows again.
         let record = key.and_then(|key| self.stored_record(physical, &key));
+        // Nor is a record that no longer holds the entry: once the pack is
+        // retired, a lookup gives only the pieces of a record still in
+        // memory (`Store::stored`), so the bytes compile the rows then too.
+        let held = record.as_deref().is_some_and(|record| {
+            self.code
+                .blocks
+                .recovery()
+                .get(&index)
+                .is_some_and(|owner| owner.stored_in(record))
+        });
         let mut memory = alloc::vec::Vec::new();
-        if record.is_none()
-            && let Some(bytes) = input_bytes
-        {
+        if !held && let Some(bytes) = input_bytes {
             memory.resize(bytes, 0);
             if !self.host.read_ram(physical, &mut memory) {
                 memory.clear();

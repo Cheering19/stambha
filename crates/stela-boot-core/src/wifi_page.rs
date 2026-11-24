@@ -28,16 +28,29 @@ const CARD: usize = 244;
 /// The startup menu's Wi-Fi line: the network this boot joins first, the
 /// one the page chose (`prefer`) or else stela.cfg's `--wifi` one
 /// (`configured`), and the key that changes it. With no `--wifi` the boot
-/// joins nothing, and saved networks (`saved`) can still be managed. `None`
-/// when this boot has neither. No password reaches it.
-pub fn status_line(configured: Option<&str>, prefer: Option<&str>, saved: bool) -> Option<String> {
+/// joins nothing, and saved networks (`saved`) can still be managed. With
+/// neither, the line says how to choose one: Wi-Fi works only once a
+/// network is chosen, and testers missed the key. No password reaches it.
+pub fn status_line(configured: Option<&str>, prefer: Option<&str>, saved: bool) -> String {
     let network = match (configured, prefer) {
         (Some(_), Some(prefer)) => prefer,
         (Some(configured), None) => configured,
         (None, _) if saved => "not set up",
-        (None, _) => return None,
+        (None, _) => return String::from(CHOOSE),
     };
-    Some(format!("Wi-Fi: {network} \u{b7} press W to change"))
+    format!("Wi-Fi: {network} \u{b7} press W to change")
+}
+
+/// The startup menu's Wi-Fi line when no network is set up.
+pub const CHOOSE: &str = "Wi-Fi: press W to choose a network";
+
+/// The boot log's line for a menu that offers Wi-Fi with no network set up
+/// (`configured` none and nothing `saved`): the hint the menu shows.
+pub fn hint_line(configured: Option<&str>, saved: bool) -> Option<&'static str> {
+    (configured.is_none() && !saved).then_some(
+        "CHOICE Wi-Fi: no network is set up; press W in this menu to choose one, or Wi-Fi \
+         stays off\n",
+    )
 }
 
 /// One network the page lists.
@@ -642,6 +655,38 @@ fn draw_form(scene: &mut Scene, layout: &Layout, form: &Form, joins: bool) {
         (None, Field::Password) => ("8 to 63 characters, or 64 hex digits.", Tone::Dim),
     };
     scene.text(left + 20, y + 212, message, tone);
+}
+
+/// The page `W` opens where the startup menu offers no Wi-Fi page
+/// (`wifi_hardware::Hardware::unavailable`): its `lines` on a card in the
+/// menu's column, the first bright, and the key that leaves.
+pub fn unavailable_scene(lines: &[String], geometry: Geometry) -> Scene {
+    let mut scene = Scene {
+        draws: Vec::new(),
+        glyph: geometry.glyph.max(1),
+    };
+    let layout = Layout::new(geometry);
+    scene.text(layout.left + 16, layout.top, "Wi-Fi", Tone::Text);
+    let card = 24 + lines.len() * 28;
+    scene.panel(
+        layout.left,
+        layout.caption,
+        layout.column,
+        card,
+        8,
+        Tone::Card,
+    );
+    for (index, line) in lines.iter().enumerate() {
+        let tone = if index == 0 { Tone::Text } else { Tone::Dim };
+        scene.text(
+            layout.left + 20,
+            layout.caption + 16 + index * 28,
+            line,
+            tone,
+        );
+    }
+    scene.centred(layout.middle, layout.keys, "Esc: back", Tone::Dim);
+    scene
 }
 
 /// The screen the page is drawn on, in page units (`screen::scale`).
