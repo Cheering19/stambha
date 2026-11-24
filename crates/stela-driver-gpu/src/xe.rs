@@ -123,6 +123,19 @@ pub fn integrated(adapter: &Adapter) -> bool {
     platform(adapter.device).is_some_and(|platform| !platform.discrete)
 }
 
+/// Who takes the adapter from the firmware, as for i915
+/// ([`crate::i915::takeover`]): xe itself for an integrated GPU, which it
+/// resets with its GuC and GT at its probe (`xe_uc_sanitize_reset`), and
+/// which xe also binds when i915's probe of it fails; the claim for a
+/// discrete one. xe's own Driver-FLR is for discrete GPUs alone.
+pub fn takeover(adapter: &Adapter) -> crate::cold::Takeover {
+    if integrated(adapter) {
+        crate::cold::Takeover::Driver
+    } else {
+        crate::cold::Takeover::Claim
+    }
+}
+
 /// Whether xe takes `device`'s stolen memory from the resource the arch's
 /// early quirks fill (`detect_stolen` in `xe_ttm_stolen_mgr.c`): an
 /// integrated GPU whose descriptor fixes its graphics IP, graphics before

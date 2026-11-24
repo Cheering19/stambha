@@ -405,7 +405,7 @@ fn no_reset_starts_unreset_only_when_dma_is_translated() {
             &PhysicalTimer(state.clone()),
             translated,
             false,
-            false,
+            Takeover::Claim,
         );
         let mut cold = Cold::new(inputs);
         if translated {
@@ -443,7 +443,7 @@ fn without_a_function_reset_or_translation_the_bus_is_reset() {
             &PhysicalTimer(state.clone()),
             false,
             true,
-            false,
+            Takeover::Claim,
         );
         assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
         let result = Cold::new(inputs).quiesce_and_bind();
@@ -476,7 +476,7 @@ fn a_function_reset_comes_before_the_bus_reset() {
             &PhysicalTimer(state.clone()),
             translated,
             true,
-            false,
+            Takeover::Claim,
         );
         assert_eq!(
             candidate,
@@ -521,7 +521,7 @@ fn a_driver_that_resets_its_gpu_comes_after_the_function_reset_and_before_the_bu
             &PhysicalTimer(state.clone()),
             translated,
             bus,
-            true,
+            Takeover::DriverWithoutFunctionReset,
         );
         let expected = if flr {
             Reset::Function(ResetMethod::FunctionLevel)
@@ -530,7 +530,8 @@ fn a_driver_that_resets_its_gpu_comes_after_the_function_reset_and_before_the_bu
         };
         assert_eq!(candidate, Ok(Some(expected)));
         // SAFETY: the symbolic driver stands for one that resets its GPU.
-        let mut cold = unsafe { Cold::new(inputs).driver_resets() };
+        let mut cold =
+            unsafe { Cold::new(inputs).taken_over(Takeover::DriverWithoutFunctionReset) };
         if translated {
             // SAFETY: the symbolic domain stands for a translating one.
             cold = unsafe { cold.translated() };
@@ -559,6 +560,94 @@ fn a_driver_that_resets_its_gpu_comes_after_the_function_reset_and_before_the_bu
     }
 }
 
+/// A GPU its driver takes from the firmware whatever reset it offers (Intel's
+/// integrated GPU) gets neither its FLR nor a bus reset from the claim, with
+/// bus mastering still off, translated or not.
+#[test]
+fn a_gpu_its_driver_takes_over_is_not_reset_by_the_claim_though_it_offers_flr() {
+    for (bus, translated) in [(false, false), (true, false), (false, true)] {
+        let (mut inputs, state) = inputs();
+        state.borrow_mut().bus_reset = bus;
+        assert_eq!(
+            inputs.requester.function.reset_method().ok().flatten(),
+            Some(ResetMethod::FunctionLevel),
+            "the function offers FLR"
+        );
+        let candidate = check_candidate(
+            &mut inputs.requester.function,
+            &PhysicalTimer(state.clone()),
+            translated,
+            bus,
+            Takeover::Driver,
+        );
+        assert_eq!(candidate, Ok(Some(Reset::Driver)));
+        // SAFETY: the symbolic driver stands for one that takes its GPU over.
+        let mut cold = unsafe { Cold::new(inputs).taken_over(Takeover::Driver) };
+        if translated {
+            // SAFETY: the symbolic domain stands for a translating one.
+            cold = unsafe { cold.translated() };
+        }
+        let ready = cold
+            .quiesce_and_bind()
+            .unwrap_or_else(|error| panic!("{:?}", error.error));
+        assert_eq!(ready.reset(), Some(Reset::Driver));
+        assert!(!Reset::Driver.by_claim());
+        assert_eq!(
+            state.borrow().events,
+            ["views-seal", "root-drain", "bind"],
+            "no FLR and no bus reset"
+        );
+        // SAFETY: symbolic CPU-only diagnostic handover.
+        let (mut bound, _views) = unsafe { ready.into_parts() };
+        assert_eq!(
+            bound.0.function.config().words[1] & 4,
+            0,
+            "bus mastering stays off"
+        );
+    }
+}
+
+/// The claim's plan for each takeover, by the reset the function offers and
+/// the other ways available, matches Linux's fallbacks except where the
+/// driver takes the GPU itself.
+#[test]
+fn the_plan_of_each_takeover() {
+    let flr = Some(ResetMethod::FunctionLevel);
+    let soft = Some(ResetMethod::PowerManagement);
+    for (bus, translated) in [(false, false), (true, false), (false, true), (true, true)] {
+        // Intel's integrated GPU: never the claim's reset.
+        for method in [flr, soft, None] {
+            assert_eq!(
+                plan(method, Takeover::Driver, bus, translated),
+                Ok(Some(Reset::Driver))
+            );
+        }
+        // nouveau's and amdgpu's GPUs keep a function-local reset first.
+        for takeover in [Takeover::Claim, Takeover::DriverWithoutFunctionReset] {
+            assert_eq!(
+                plan(flr, takeover, bus, translated),
+                Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
+            );
+            assert_eq!(
+                plan(soft, takeover, bus, translated),
+                Ok(Some(Reset::Function(ResetMethod::PowerManagement)))
+            );
+        }
+        assert_eq!(
+            plan(None, Takeover::DriverWithoutFunctionReset, bus, translated),
+            Ok(Some(Reset::Driver))
+        );
+        assert_eq!(
+            plan(None, Takeover::Claim, bus, translated),
+            match (bus, translated) {
+                (true, _) => Ok(Some(Reset::SecondaryBus)),
+                (false, true) => Ok(None),
+                (false, false) => Err(Error::ResetUnavailable),
+            }
+        );
+    }
+}
+
 /// A GPU an earlier run left holding its secure region needs a reset even
 /// when its DMA is translated, so an available bus reset is not skipped.
 #[test]
@@ -575,7 +664,7 @@ fn a_translated_function_without_a_function_reset_still_gets_the_bus_reset() {
         &PhysicalTimer(state.clone()),
         true,
         true,
-        false,
+        Takeover::Claim,
     );
     assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
     // SAFETY: the symbolic domain stands for a translating one.

@@ -73,12 +73,20 @@ void stela_linux_workqueue_test_shutdown(bool force)
 static unsigned int line_enables, line_disables;
 static bool line_masked;
 static bool enable_notify, enable_refuse;
+/* A freed line stays retired, as the boot's native lines do. */
+static bool retire_keeps, line_retired;
 static unsigned int enable_primary_calls;
 
 int stela_linux_workqueue_test_irq_enable(unsigned int irq, bool *unexposed)
 {
 	assert(irq == 7);
 	*unexposed = false;
+	if (line_retired) {
+		/* As the boot's irq_enable: a retired line is never routed again,
+		 * refused before any route, event or callback. */
+		*unexposed = true;
+		return -EOPNOTSUPP;
+	}
 	if (enable_refuse) {
 		/* Actual bounded software peer: no route/event/callback was issued. */
 		*unexposed = true;
@@ -108,6 +116,8 @@ int stela_linux_workqueue_test_irq_disable(unsigned int irq)
 int stela_linux_workqueue_test_irq_retire(unsigned int irq)
 {
 	assert(irq == 7 && stela_linux_irq_actions_joined(irq));
+	if (retire_keeps)
+		line_retired = true;
 	return 0;
 }
 
@@ -510,6 +520,21 @@ void stela_linux_workqueue_test_main(void)
 	assert(enable_primary_calls == 1);
 	enable_notify = false;
 	free_irq(7, &enable_primary_calls);
+	line_enables = line_disables = 0;
+
+	/* A line its first driver freed stays retired (an i915 probe that failed
+	 * after it requested its IRQ). The next driver's request on the same
+	 * line (xe's, on the same MSI line) is refused before anything of it is
+	 * published, so it fails with -EOPNOTSUPP and the boot goes on, where a
+	 * retained refusal stopped it ("IRQ enable uncertain"). */
+	retire_keeps = true;
+	assert(!request_irq(7, initial_enable_handler, 0, "first-driver", &enable_primary_calls));
+	free_irq(7, &enable_primary_calls);
+	assert(line_retired && line_enables == 1);
+	assert(request_irq(7, initial_enable_handler, 0, "next-driver", &enable_primary_calls) ==
+	       -EOPNOTSUPP);
+	assert(line_enables == 1 && !enable_primary_calls);
+	retire_keeps = line_retired = false;
 	line_enables = line_disables = 0;
 
 	assert(!request_threaded_irq(7, hard_handler, thread_handler,

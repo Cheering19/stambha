@@ -1321,7 +1321,16 @@ impl Platform for Host {
             return Err(unsafe { IrqEnableError::unexposed(EINVAL) });
         };
         if line.retired.is_some() {
-            return Err(IrqEnableError::retained(EOPNOTSUPP));
+            // A line its previous driver freed is never routed again: an
+            // i915 probe that failed after its IRQ, before xe's request on
+            // the same MSI line. Nothing of this request was published, and
+            // the retired owners stay with the line, so the refusal is
+            // certain and xe's probe fails cleanly, where "retained" stopped
+            // the boot. MSI has no fresh line past a retired one yet, as
+            // MSI-X has (`enable_msix`).
+            // SAFETY: refused before any route, event or source; the retired
+            // owners stay with the line.
+            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
         }
         if let Some(registration) = &mut line.registration {
             return registration
@@ -1707,14 +1716,14 @@ fn claim(
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
     let translated = services.dma_translated(address);
-    gpu::cold::check_candidate(
-        function,
-        timer.as_ref(),
-        translated,
-        bus_reset,
-        stack.kernel.resets_itself,
-    )
-    .map_err(|error| cold_refusal(address, error))?;
+    // Who takes it from the firmware: the claim's reset, or its driver's
+    // probe (`gpu::cold::Takeover`), by its stack and the device.
+    let takeover = (stack.kernel.takeover)(adapter);
+    // The function-local reset it offers, which a driver that takes it over
+    // whatever it offers leaves unused; read only, for the claim's line.
+    let offers = function.reset_method().ok().flatten();
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset, takeover)
+        .map_err(|error| cold_refusal(address, error))?;
     let owns_screen = match gop {
         ScreenOwner::Function(source) if source.address == address => {
             source.bar.words().try_for_each(|(offset, expected)| {
@@ -1898,10 +1907,14 @@ fn claim(
         // its private domain is the one the cold attempt binds.
         cold = unsafe { cold.translated() };
     }
-    if stack.kernel.resets_itself {
+    if takeover != gpu::cold::Takeover::Claim {
         // SAFETY: this stack's driver takes the GPU from the firmware at its
-        // probe, resetting it where a previous driver left it running.
-        cold = unsafe { cold.driver_resets() };
+        // probe, resetting what a previous owner left running before any of
+        // it reaches memory: amdgpu checks and resets before bus mastering;
+        // i915 resets an Intel integrated GPU's engines before bus mastering
+        // (`sanitize_gpu`), and its firmware ran none, its display engine
+        // reading only the stolen memory the firmware reserved.
+        cold = unsafe { cold.taken_over(takeover) };
     } else {
         // The reset below ends the firmware's picture on this GPU. A driver
         // that resets the GPU itself keeps it until a step of its probe ends
@@ -1926,13 +1939,32 @@ fn claim(
     if reset {
         // It ended the firmware's picture too, also on a GPU whose driver
         // would have reset it at its probe: a function-local reset comes
-        // first wherever the GPU has one.
+        // first wherever the GPU has one, but on Intel's integrated GPU,
+        // which its driver takes as firmware left it (`Takeover::Driver`).
         screen.end(None);
     }
     match ready.reset() {
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
+        Some(gpu::cold::Reset::Driver) if takeover == gpu::cold::Takeover::Driver => {
+            output::arguments(format_args!(
+                "GPU {address}: not reset by the claim{}, left in D0 as the firmware left it: \
+                 {} takes Intel's integrated GPU from the firmware at its probe and resets its \
+                 engines itself, as on Linux, where a reset of the claim's leaves its registers \
+                 reading 0xFFFFFFFF; bus mastering stays off until then; kept {sizes}\n",
+                match offers {
+                    Some(stela_drivers::bus::pci::ResetMethod::FunctionLevel) => {
+                        " though it offers a Function Level Reset"
+                    }
+                    Some(stela_drivers::bus::pci::ResetMethod::PowerManagement) => {
+                        " though it offers a D3hot to D0 power state reset"
+                    }
+                    None => "",
+                },
+                offered(stack, adapter).join(" or "),
+            ))
+        }
         Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
             "GPU {address}: no function-local reset; its driver takes it from the firmware at its probe, with bus mastering off until then; kept {sizes}\n"
         )),

@@ -1,7 +1,8 @@
 //! GPU reset while the original configuration and DMA root stay owned: a
 //! function-local reset, else the kernel driver's own reset at its probe for
 //! a driver that takes the GPU from the firmware itself, else a Secondary
-//! Bus Reset of the GPU's own bus.
+//! Bus Reset of the GPU's own bus. Intel's integrated GPU gets none of the
+//! claim's: its driver takes it as firmware left it ([`Takeover::Driver`]).
 use alloc::{boxed::Box, rc::Rc};
 use core::mem::ManuallyDrop;
 use stela_driver_base::{
@@ -60,8 +61,53 @@ pub enum Reset {
     /// mastering stays off until the driver turns it on after that check
     /// (amdgpu's `amdgpu_asic_need_reset_on_init` and `amdgpu_asic_reset`:
     /// BACO, mode 1 or mode 2 through the GPU's power or security
-    /// processor, or the PCI configuration reset of the older families).
+    /// processor, or the PCI configuration reset of the older families),
+    /// or, on Intel's integrated GPUs, which i915 and xe take as firmware
+    /// left them, the engine and GuC resets of their probe ([`Takeover::Driver`]).
     Driver,
+}
+
+/// Who takes a GPU from the firmware: the claim, by a reset of its own, or
+/// the kernel driver at its probe. Its stack says which, by the device
+/// ([`crate::stack::Kernel::takeover`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Takeover {
+    /// The claim resets the GPU: a function-local reset, else a reset of its
+    /// bus. nouveau's GPUs, and the discrete GPUs of i915 and xe.
+    Claim,
+    /// The driver resets the GPU at its probe where it has no function-local
+    /// reset; one that has one gets it from the claim first. amdgpu's GPUs.
+    DriverWithoutFunctionReset,
+    /// The driver alone, even where the GPU offers a function-local reset:
+    /// Intel's integrated GPU (`00:02.0`), which no Linux driver resets at
+    /// its probe. i915 resets its engines there (`sanitize_gpu`) before it
+    /// turns bus mastering on, and xe its GuC and GT (`xe_uc_sanitize_reset`);
+    /// both take over the picture the firmware left in stolen memory. A
+    /// Function Level Reset of the claim's left a Raptor Lake GPU whose
+    /// registers all read 0xFFFFFFFF, so neither driver could start it.
+    Driver,
+}
+
+/// The reset a claim gives a GPU, from the function-local reset it offers
+/// (`method`), who takes it from the firmware, whether a reset of its own
+/// bus is available, and whether its DMA is translated. Linux
+/// `pci_reset_function` falls back from FLR to a D3hot soft reset, then to a
+/// reset of the bus the function sits on alone; see [`check_candidate`] for
+/// why a claim resets at all.
+pub fn plan(
+    method: Option<ResetMethod>,
+    takeover: Takeover,
+    bus_reset: bool,
+    translated: bool,
+) -> Result<Option<Reset>, Error> {
+    match (takeover, method) {
+        (Takeover::Driver, _) => Ok(Some(Reset::Driver)),
+        (_, Some(method)) => Ok(Some(Reset::Function(method))),
+        (Takeover::DriverWithoutFunctionReset, None) => Ok(Some(Reset::Driver)),
+        (Takeover::Claim, None) if bus_reset => Ok(Some(Reset::SecondaryBus)),
+        (Takeover::Claim, None) if translated => Ok(None),
+        (Takeover::Claim, None) => Err(Error::ResetUnavailable),
+    }
 }
 
 impl Reset {
@@ -163,7 +209,7 @@ struct Pending<P, V> {
     views: V,
     timer: Rc<dyn Timer>,
     translated: bool,
-    driver_resets: bool,
+    takeover: Takeover,
 }
 
 /// A single consumed cold attempt. Abandonment retains the actual inputs.
@@ -209,7 +255,7 @@ fn preflight<C: ConfigSpace>(
     timer: &dyn Timer,
     translated: bool,
     bus_reset: bool,
-    driver_resets: bool,
+    takeover: Takeover,
 ) -> Result<Option<Reset>, Error> {
     timer.check().map_err(Error::Clock)?;
     // Which vendor's display function it is, is its stack's selection
@@ -245,14 +291,17 @@ fn preflight<C: ConfigSpace>(
     // many such GPUs need a power cycle. Else the bus is reset, and only a
     // GPU with neither starts as firmware left it, and only with
     // translation: otherwise an engine firmware left running could write
-    // recycled RAM once bus mastering is on.
-    match function.reset_method().map_err(Error::Reset)? {
-        Some(method) => Ok(Some(Reset::Function(method))),
-        None if driver_resets => Ok(Some(Reset::Driver)),
-        None if bus_reset => Ok(Some(Reset::SecondaryBus)),
-        None if translated => Ok(None),
-        None => Err(Error::ResetUnavailable),
-    }
+    // recycled RAM once bus mastering is on. Intel's integrated GPU is the
+    // exception ([`Takeover::Driver`]): it is left as firmware left it, in
+    // D0, whatever reset it offers, as Linux binds it. Firmware runs none of
+    // its engines, and its display engine reads only the stolen memory
+    // firmware reserved; its driver resets the engines before bus mastering.
+    plan(
+        function.reset_method().map_err(Error::Reset)?,
+        takeover,
+        bus_reset,
+        translated,
+    )
 }
 
 /// Read-only early qualification before native BAR probing/mapping. Success
@@ -260,16 +309,15 @@ fn preflight<C: ConfigSpace>(
 /// repeats the same checks immediately before its consumed reset attempt.
 /// `translated`: whether an active remapper confines the function's DMA.
 /// `bus_reset`: whether a Secondary Bus Reset of its bus is available.
-/// `driver_resets`: whether its kernel driver takes it from the firmware
-/// itself ([`Reset::Driver`]).
+/// `takeover`: who takes it from the firmware ([`Takeover`]).
 pub fn check_candidate<C: ConfigSpace>(
     function: &mut Function<C>,
     timer: &dyn Timer,
     translated: bool,
     bus_reset: bool,
-    driver_resets: bool,
+    takeover: Takeover,
 ) -> Result<Option<Reset>, Error> {
-    preflight(function, timer, translated, bus_reset, driver_resets)
+    preflight(function, timer, translated, bus_reset, takeover)
 }
 impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
     pub fn new(inputs: Inputs<P, V>) -> Self {
@@ -279,20 +327,25 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
                 views: inputs.views,
                 timer: inputs.timer,
                 translated: false,
-                driver_resets: false,
+                takeover: Takeover::Claim,
             })),
         }
     }
 
-    /// Let a function with no function-local reset start without one of
-    /// Stela's, its kernel driver resetting it at its probe.
+    /// Let the function's kernel driver take it from the firmware at its
+    /// probe, without a reset of Stela's: where it has no function-local
+    /// reset ([`Takeover::DriverWithoutFunctionReset`]), or whatever reset it
+    /// offers ([`Takeover::Driver`]).
     ///
     /// # Safety
-    /// The kernel driver that binds the function checks at its probe whether
-    /// a previous driver left its engines running and resets it with its own
-    /// reset before it turns bus mastering on ([`Reset::Driver`]).
-    pub unsafe fn driver_resets(mut self) -> Self {
-        self.kept.driver_resets = true;
+    /// The kernel driver that binds the function resets at its probe what a
+    /// previous owner left running, with its own reset, before any engine of
+    /// that owner reaches memory ([`Reset::Driver`]): amdgpu checks and
+    /// resets before it turns bus mastering on; i915 resets an Intel
+    /// integrated GPU's engines before it does, and firmware runs none of
+    /// them, its display engine reading only the stolen memory it reserved.
+    pub unsafe fn taken_over(mut self, takeover: Takeover) -> Self {
+        self.kept.takeover = takeover;
         self
     }
 
@@ -317,7 +370,7 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
                 attempt.timer.as_ref(),
                 attempt.translated,
                 bus_reset,
-                attempt.driver_resets,
+                attempt.takeover,
             )?;
             attempt
                 .views

@@ -31,12 +31,13 @@ pub struct Kernel {
     /// page window maps in 4 KiB pages whose tables the memory plan counts;
     /// `None` for a driver that maps device memory a buffer at a time.
     pub aperture: Option<u8>,
-    /// Whether the driver's probe takes the GPU from the firmware itself,
-    /// resetting it with the family's own reset where a previous driver left
-    /// it running (amdgpu's `amdgpu_device_need_reset_on_init`), so that a
-    /// function without a function-local reset is handed over with bus
-    /// mastering off and no reset of the boot's, as Linux binds it.
-    pub resets_itself: bool,
+    /// Who takes the adapter from the firmware ([`crate::cold::Takeover`]):
+    /// the claim's reset (nouveau's GPUs, Intel's discrete GPUs), the
+    /// driver's probe where the function has no function-local reset
+    /// (amdgpu, `amdgpu_device_need_reset_on_init`), or the driver's probe
+    /// alone, whatever reset the function offers (Intel's integrated GPU,
+    /// which i915 and xe take as firmware left it, as on Linux).
+    pub takeover: fn(&Adapter) -> crate::cold::Takeover,
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
@@ -263,7 +264,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         registers: |_| 0,
         // nouveau maps BAR1 a buffer at a time (`nouveau_ttm_io_mem_reserve`).
         aperture: None,
-        resets_itself: false,
+        takeover: |_| crate::cold::Takeover::Claim,
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,
@@ -303,7 +304,7 @@ pub static AMD: GpuStack = GpuStack {
         registers: crate::amdgpu::registers,
         // `amdgpu_ttm_init`: `ioremap_wc(aper_base, visible_vram_size)`, BAR 0.
         aperture: Some(0),
-        resets_itself: true,
+        takeover: |_| crate::cold::Takeover::DriverWithoutFunctionReset,
         // The mask the device's memory controller block sets
         // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
         dma_bits: crate::amdgpu::dma_bits,
@@ -374,7 +375,7 @@ pub static INTEL: GpuStack = GpuStack {
         registers: |_| 0,
         // `xe_vram.c`: `devm_ioremap_wc(io_start, io_size)` of LMEMBAR, BAR 2.
         aperture: Some(2),
-        resets_itself: false,
+        takeover: crate::xe::takeover,
         // The platform's `dma_mask_size` (`xe_pci.c`), which
         // `xe_set_dma_info` sets as the mask.
         dma_bits: crate::xe::dma_bits,
@@ -449,7 +450,7 @@ pub static INTEL_I915: GpuStack = GpuStack {
         // or DG1's and DG2's LMEM, BAR 2: mapped whole, as the build has no
         // CONFIG_HAVE_ATOMIC_IOMAP.
         aperture: Some(2),
-        resets_itself: false,
+        takeover: crate::i915::takeover,
         // The platform's `dma_mask_size` (`i915_pci.c`), which
         // `i915_set_dma_info` sets as the mask.
         dma_bits: crate::i915::dma_bits,
@@ -1056,13 +1057,79 @@ mod tests {
         integrated.device = 0x1636;
         assert_eq!(AMD.kernel.table_integrated(&integrated), Some(true));
         assert_eq!((AMD.kernel.registers)(&integrated), 5);
-        // amdgpu resets its GPUs at its probe; nouveau and xe do not.
-        assert!(AMD.kernel.resets_itself);
-        assert!(
-            STACKS
-                .iter()
-                .all(|stack| stack.kernel.resets_itself == (stack.vendor == Vendor::Amd))
-        );
+        // amdgpu resets its GPUs at its probe where they have no
+        // function-local reset, APUs and discrete cards alike; nouveau's
+        // GPUs are reset by the claim.
+        use crate::cold::{Reset, Takeover, plan};
+        let flr = Some(crate::bus::pci::ResetMethod::FunctionLevel);
+        for device in [0x13c0, 0x1636, 0x744c] {
+            let gpu = Adapter {
+                device,
+                ..adapter(0x1002)
+            };
+            let takeover = (AMD.kernel.takeover)(&gpu);
+            assert_eq!(takeover, Takeover::DriverWithoutFunctionReset);
+            assert_eq!(plan(None, takeover, true, false), Ok(Some(Reset::Driver)));
+            assert_eq!(
+                plan(flr, takeover, true, false),
+                Ok(Some(Reset::Function(
+                    crate::bus::pci::ResetMethod::FunctionLevel
+                )))
+            );
+        }
+        assert_eq!((NVIDIA.kernel.takeover)(&adapter(0x10de)), Takeover::Claim);
+    }
+
+    /// Intel's integrated GPU, at 00:02.0, is never reset by the claim,
+    /// though it offers FLR: i915 and xe take it as firmware left it, as
+    /// Linux binds it. dev64's Raptor Lake P (8086:a7a0) came out of the
+    /// claim's FLR with every register reading 0xFFFFFFFF. Intel's discrete
+    /// GPUs and every other vendor's keep the claim's reset.
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+    #[test]
+    fn an_intel_integrated_gpu_gets_no_reset_from_the_claim() {
+        use crate::cold::{Reset, Takeover, plan};
+        let flr = Some(crate::bus::pci::ResetMethod::FunctionLevel);
+        let at = |device| Adapter {
+            address: Address {
+                segment: 0,
+                bus: 0,
+                device: 2,
+                function: 0,
+            },
+            device,
+            ..adapter(0x8086)
+        };
+        let raptor_lake = at(0xa7a0);
+        let mut stacks: alloc::vec::Vec<&GpuStack> = alloc::vec::Vec::new();
+        #[cfg(feature = "i915-port")]
+        {
+            assert!(core::ptr::eq(
+                GpuStack::select(&raptor_lake).unwrap(),
+                &INTEL_I915
+            ));
+            stacks.push(&INTEL_I915);
+        }
+        #[cfg(feature = "xe-port")]
+        {
+            // xe binds it when i915's probe fails; its plan is the same.
+            assert_eq!(crate::xe::admits(&raptor_lake), Ok(()));
+            stacks.push(&INTEL);
+        }
+        for stack in stacks {
+            let takeover = (stack.kernel.takeover)(&raptor_lake);
+            assert_eq!(takeover, Takeover::Driver, "{}", stack.kernel.driver);
+            for (bus, translated) in [(false, false), (true, true)] {
+                let planned = plan(flr, takeover, bus, translated);
+                assert_eq!(planned, Ok(Some(Reset::Driver)), "{}", stack.kernel.driver);
+                assert!(!planned.unwrap().unwrap().by_claim());
+            }
+        }
+        // DG2 (i915) and Battlemage (xe) are discrete: the claim resets them.
+        #[cfg(feature = "i915-port")]
+        assert_eq!((INTEL_I915.kernel.takeover)(&at(0x56a0)), Takeover::Claim);
+        #[cfg(feature = "xe-port")]
+        assert_eq!((INTEL.kernel.takeover)(&at(0xe20b)), Takeover::Claim);
     }
 
     #[test]

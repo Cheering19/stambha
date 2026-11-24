@@ -346,6 +346,37 @@ static void allocation_failure(void)
 	settle_empty_cache();
 }
 
+/* shmem grows the xarray node of a page past the first with the flags of
+ * i915's blocking retry of a shmem object's pages, RETRY_MAYFAIL among them
+ * (file.c's shmem_folio). With every free node held, the store grows one
+ * after the lock drops; where its page is refused, it fails with -ENOMEM
+ * alone. Either way the cache's policy refuses nothing, which this fixture
+ * would stop on. Refused, Raptor Lake P's GuC log buffer failed (-12). */
+static void retry_may_fail_grows_a_node(void)
+{
+	const gfp_t gfp = GFP_KERNEL | __GFP_NOWARN | __GFP_RETRY_MAYFAIL;
+	void *held[64];
+	size_t count = 0;
+	stela_test_allocations_begin(true);
+	while (stela_linux_cache_prime(radix_tree_node_cachep)) {
+		assert(count < ARRAY_SIZE(held));
+		held[count] = kmem_cache_alloc(radix_tree_node_cachep, GFP_KERNEL);
+		assert(held[count++]);
+	}
+	struct xarray array;
+	xa_init(&array);
+	assert(!xa_store(&array, 0, &payload[0], gfp)); /* Root needs no node. */
+	assert(xa_err(xa_store(&array, 1, &payload[1], gfp)) == -ENOMEM);
+	assert(!xa_load(&array, 1));
+	assert(stela_test_allocations_end().pages);
+	assert(!xa_store(&array, 1, &payload[1], gfp));
+	assert(xa_load(&array, 0) == &payload[0] && xa_load(&array, 1) == &payload[1]);
+	for (size_t i = 0; i < count; i++)
+		kmem_cache_free(radix_tree_node_cachep, held[i]);
+	xa_destroy(&array);
+	settle_empty_cache();
+}
+
 static void preload_lifetime(void)
 {
 	struct idr tree;
@@ -397,6 +428,7 @@ void stela_linux_trees_source_test(void)
 	xarray_map_and_allocations();
 	xarray_ordered_entries();
 	allocation_failure();
+	retry_may_fail_grows_a_node();
 	preload_lifetime();
 	stela_test_heap_try_enable(false);
 }
