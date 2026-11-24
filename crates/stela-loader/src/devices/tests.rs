@@ -1672,3 +1672,38 @@ fn original_t602x_boards_keep_their_external_pipe_and_memory_cache() {
         assert!(parsed.memory_cache.is_none(), "{name}");
     }
 }
+
+#[test]
+fn macos_is_told_this_mac_cannot_sleep() {
+    let mut tree = DeviceTree {
+        root: node("device-tree", None, vec![node("defaults", None, vec![])]),
+    };
+    assert!(disable_system_sleep(&mut tree).unwrap());
+    let flag = tree.property(DEFAULTS, SLEEP_DISABLED).unwrap();
+    // PE_get_default copies four bytes into gSleepDisabledFlag: nonzero.
+    assert_eq!(flag.value, 1u32.to_le_bytes());
+    // Idempotent: a second pass leaves one property.
+    assert!(disable_system_sleep(&mut tree).unwrap());
+    let defaults = tree.node(DEFAULTS).unwrap();
+    assert_eq!(
+        defaults
+            .properties
+            .iter()
+            .filter(|property| property.name() == SLEEP_DISABLED)
+            .count(),
+        1
+    );
+    // Without /defaults nothing is invented.
+    let mut bare = DeviceTree {
+        root: node("device-tree", None, vec![]),
+    };
+    assert!(!disable_system_sleep(&mut bare).unwrap());
+    assert!(bare.node(DEFAULTS).is_none());
+}
+
+#[test]
+fn the_boot_says_whether_sleep_is_refused() {
+    assert!(sleep_line(Ok(true)).starts_with("SLEEP off: "));
+    assert!(sleep_line(Ok(false)).starts_with("SLEEP not refused: "));
+    assert!(sleep_line(Ok(false)).ends_with("power gate\n"));
+}

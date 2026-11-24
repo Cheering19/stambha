@@ -1083,6 +1083,16 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             ));
         }
     }
+    // Set in the boot's own tree, not the bundle's, so no bundle revision
+    // changes and a bundle already on a stick takes it too.
+    if let Some(assigned) = &mut assigned {
+        output::arguments(format_args!(
+            "{}",
+            stela_loader::devices::sleep_line(stela_loader::devices::disable_system_sleep(
+                &mut assigned.tree
+            ))
+        ));
+    }
     hardware_step("canonical-ram");
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
