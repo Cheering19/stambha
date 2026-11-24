@@ -643,6 +643,10 @@ pub struct Keeper<R: Radio> {
     /// last took it, and its µs: what a service turn that ran long spent
     /// its time on.
     slowest: Option<(&'static str, u64)>,
+    /// The join's outcome [`Link::take_join`] has not given yet, and the
+    /// last one given, so each change is given once.
+    join: Option<crate::Join>,
+    joined: Option<crate::Join>,
 }
 
 impl<R: Radio> Keeper<R> {
@@ -697,6 +701,8 @@ impl<R: Radio> Keeper<R> {
             michael_failed: None,
             directed: false,
             slowest: None,
+            join: None,
+            joined: None,
         }
     }
 
@@ -744,6 +750,14 @@ impl<R: Radio> Keeper<R> {
     /// The radio, for its vendor's setup and for device models.
     pub(crate) fn radio_mut(&mut self) -> &mut R {
         &mut self.link
+    }
+
+    /// What the join came to, for [`Link::take_join`] when it changed.
+    fn note_join(&mut self, join: crate::Join) {
+        if self.joined.as_ref() != Some(&join) {
+            self.joined = Some(join.clone());
+            self.join = Some(join);
+        }
     }
 
     /// A diagnostic, queued for [`Link::take_diagnostic`] once per message, as
@@ -999,6 +1013,11 @@ impl<R: Radio> Keeper<R> {
                 } else {
                     "the 4-way handshake timed out"
                 };
+                // wpa_supplicant's WRONG_KEY: the AP gave up on, or never
+                // finished, the handshake of the key it was given.
+                self.note_join(crate::Join::WrongPassword {
+                    ssid: self.network.ssid.clone(),
+                });
                 self.failed(now, format!("{}: {message}", R::NAME));
             }
             State::Leaving { at } => match stage {
@@ -1183,6 +1202,11 @@ impl<R: Radio> Keeper<R> {
         let Some((index, handle, bss, security)) = best else {
             let preferred = String::from_utf8_lossy(&self.candidates[0].0.ssid).into_owned();
             let others = self.candidates.len() - 1;
+            if refusal.is_none() {
+                self.note_join(crate::Join::NotInRange {
+                    ssid: self.candidates[0].0.ssid.clone(),
+                });
+            }
             self.fail(match (refusal, others) {
                 (Some((0, reason)), _) => format!("{}: {preferred} {reason}", R::NAME),
                 (Some((at, reason)), _) => format!(
@@ -1737,6 +1761,9 @@ impl<R: Radio> Keeper<R> {
         }
         let Some(security) = candidate.security else {
             // key_mgmt=NONE: the association opens the port.
+            self.note_join(crate::Join::Joined {
+                ssid: self.network.ssid.clone(),
+            });
             self.state = State::Open;
             self.failures = 0;
             return;
@@ -2004,6 +2031,9 @@ impl<R: Radio> Keeper<R> {
         };
         // The resumed PMKSA keyed the handshake: it stays cached.
         self.resuming = None;
+        self.note_join(crate::Join::Joined {
+            ssid: self.network.ssid.clone(),
+        });
         self.state = State::Connected {
             supplicant,
             bssid,
@@ -2108,6 +2138,9 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn slowest_step(&mut self) -> Option<(&'static str, u64)> {
         self.slowest.take()
+    }
+    fn take_join(&mut self) -> Option<crate::Join> {
+        self.join.take()
     }
 }
 
