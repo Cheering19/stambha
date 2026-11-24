@@ -94,10 +94,10 @@
   // ---------- FAQ ----------
   const FAQ = [
     ['Is this a Hackintosh?', 'No. A Hackintosh runs the Intel version of macOS with patches and kexts. Stambha runs the Apple-silicon version, unmodified, by translating its Arm code to your PC’s x86 processor as it runs.'],
-    ['How fast is it?', 'Today it’s slower than a real Mac. The first release is mostly about speed: Apple’s matrix unit running natively on your CPU, and a faster translator. We’ll publish real numbers with it.'],
+    ['How fast is it?', 'Stambha 0.6.0 is about 1.5x faster than Stela 0.5.0, and speed is the focus of the next release. It is still slower than a real Mac, since it translates macOS’s Arm code as it runs.'],
     ['Will it touch Windows?', 'The installer only uses empty (unallocated) space: it never resizes, moves or deletes a partition, checks every write, and has a Check only dry run that writes nothing. You make the empty space yourself in Windows Disk Management.'],
     ['AMD or Intel graphics?', 'Not yet: NVIDIA GTX 16 and RTX 20 to 50 only for now. AMD and Intel graphics are on the roadmap.'],
-    ['Does it work on laptops?', 'Yes. Laptops with an NVIDIA-only (MUX) mode work best. Battery, touchpad gestures, brightness keys, lid and Bluetooth support are coming in the first release.'],
+    ['Does it work on laptops?', 'Yes. Laptops with an NVIDIA-only (MUX) mode work best. The touchpad works and Wi-Fi works on the Realtek RTL8852CE; battery, brightness keys, lid and Bluetooth are coming next.'],
     ['Which Wi-Fi works?', 'Realtek RTL8852CE works today, for installing over Wi-Fi with no cable. Intel and other Wi-Fi chips aren’t supported yet: use Ethernet or a USB Ethernet adapter.'],
     ['How long does an install take?', 'About an hour over a decent connection. Keep the charger in and the network up.'],
     ['I used Stela. Do I start over?', 'No. Stambha uses the same USB stick format as Stela 0.5.0, so your installed macOS stays. You only update the boot program on the stick.'],
