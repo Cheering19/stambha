@@ -16,7 +16,7 @@
             .accessibilityHidden(true)
           Text("macOS \(model.osVersion)").font(Style.title)
           if let version = model.host?.stelaVersion {
-            Text("Stela \(version)").font(Style.caption).foregroundStyle(.secondary)
+            Text("Stambha \(version)").font(Style.caption).foregroundStyle(.secondary)
           }
         }
         .padding(.bottom, Style.spacing)
@@ -24,7 +24,7 @@
         if let host = model.host {
           cards(host)
         } else {
-          Card(label: "Hardware", value: "No PC description from Stela")
+          Card(label: "Hardware", value: "No PC description from Stambha")
         }
 
         if let presented = model.presented {
