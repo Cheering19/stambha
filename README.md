@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/garvitsurana271/stambha/releases/latest"><b>⬇️ Download Stambha 0.6.0</b></a>: about 1.5x faster than Stela 0.5.0
+  <a href="https://github.com/garvitsurana271/stambha/releases/latest"><b>⬇️ Download Stambha 0.6.1</b></a>: about 1.5x faster than Stela 0.5.0
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ Apple hardware macOS expects. No Mac, no Hackintosh kexts, no virtual machine.
 > Experimental. It may not boot on your hardware, and it is slower than a real Mac.
 > Back up anything you care about before installing.
 
-## ✨ What works (0.6.0)
+## ✨ What works (0.6.1)
 
 | | |
 |---|---|
@@ -55,7 +55,7 @@ Apple hardware macOS expects. No Mac, no Hackintosh kexts, no virtual machine.
 
 - ⚡ **More speed:** the next release's main focus
 - 💻 **Laptops:** battery level and charging, brightness keys and lid (in testing now)
-- 🟦 **Bluetooth** (Realtek), and a Wi-Fi network picker in the boot menu
+- 🟦 **Bluetooth** (Realtek)
 - 📶 **More Wi-Fi chips** and full Wi-Fi speed
 
 Later: laptops presented as a MacBook, more CPU cores.
@@ -83,9 +83,9 @@ Installing macOS next to Windows or Linux should never risk them. Stambha's inst
 
 ## 🚀 Getting it
 
-**[Download Stambha 0.6.0](https://github.com/garvitsurana271/stambha/releases/latest)**: the `stambha` tool for Windows or
+**[Download Stambha 0.6.1](https://github.com/garvitsurana271/stambha/releases/latest)**: the `stambha` tool for Windows or
 Linux sets up your USB stick (already on Stela? run `stambha update` and your macOS stays). AMD or Intel graphics? Try the
-[experimental build](https://github.com/garvitsurana271/stambha/releases/tag/v0.6.0-gpu-experimental).
+[experimental build](https://github.com/garvitsurana271/stambha/releases/tag/v0.6.1-gpu-experimental).
 **[Join the Discord](https://discord.gg/M66z9fPJy5)** for help, hardware reports and early builds. The [website](https://garvitsurana271.github.io/stambha/) has the short version.
 
 <details>
