@@ -31,6 +31,13 @@ pub(super) struct Ring {
     /// Dropped receive descriptors that came back complete and error-free
     /// while their own buffer was left as offered ([`UNWRITTEN`]).
     pub misplaced: u64,
+    /// Times the receive ring followed the chip past slots it skipped
+    /// ([`Self::follow_the_chip`]), and the slots passed over.
+    pub resyncs: u64,
+    pub skipped: u64,
+    /// The driver's slot and the chip's first completed slot past it, as
+    /// the last empty look saw them ([`Self::follow_the_chip`]).
+    ahead: Option<(usize, usize)>,
 }
 impl Ring {
     /// A ring of [`BUFFER`]-sized buffers packed in one allocation: every
@@ -74,6 +81,9 @@ impl Ring {
             taken: 0,
             dropped: 0,
             misplaced: 0,
+            resyncs: 0,
+            skipped: 0,
+            ahead: None,
         })
     }
     /// Whether the receive buffers are laid out as Linux's
@@ -219,6 +229,49 @@ impl Ring {
         }
         None
     }
+
+    /// Moves the driver's slot to the chip's when the chip has passed it:
+    /// the slot the driver waits on is still the chip's while a later one
+    /// came back completed. The driver re-offers every slot it takes, so a
+    /// completed slot it has not reached is one the chip wrote after
+    /// skipping the slots before it. Whether the move was made.
+    ///
+    /// Linux's `rtl_rx` reads the ring in order and never meets this. An
+    /// RTL8168H (XID 541) does: it lost its place in the ring during its
+    /// first pass, left a slot unwritten and went on writing the others.
+    /// A driver that waits on that slot takes nothing until the chip comes
+    /// round to it after the other 255, so every frame then waits a full
+    /// ring: on a quiet network 20 s and more, past every DHCP and ARP
+    /// timeout. The guest of boot 1 of 0.6.0 got its frames in runs of
+    /// exactly 256 and never an answer to its DHCP.
+    ///
+    /// The move is made at the second empty look that sees the same slots,
+    /// so a chip whose completions land out of order for an instant is not
+    /// taken for one that skipped. The slots passed over stay offered: a
+    /// chip that comes round to them writes them, and the driver, following
+    /// it, takes them in turn.
+    pub fn follow_the_chip(&mut self) -> bool {
+        let status = |index: usize| self.descriptors.read::<u32>(index * DESCRIPTOR);
+        if status(self.next) & OWN == 0 {
+            self.ahead = None;
+            return false;
+        }
+        let completed = (1..DESCRIPTORS)
+            .map(|ahead| (self.next + ahead) % DESCRIPTORS)
+            .find(|&index| status(index) & OWN == 0);
+        let Some(completed) = completed else {
+            self.ahead = None;
+            return false;
+        };
+        if self.ahead.replace((self.next, completed)) != Some((self.next, completed)) {
+            return false;
+        }
+        self.ahead = None;
+        self.resyncs += 1;
+        self.skipped += ((completed + DESCRIPTORS - self.next) % DESCRIPTORS) as u64;
+        self.next = completed;
+        true
+    }
 }
 /// A completed receive descriptor's frame length without the FCS, as Linux
 /// `rtl_rx` decodes it: none with the error summary (RxRES, which Linux's
@@ -344,6 +397,38 @@ mod tests {
             );
             assert!(rx.buffers.bytes()[index * BUFFER..].starts_with(&UNWRITTEN));
         }
+    }
+    /// A chip that went back to an earlier slot (here the ring's start,
+    /// while the driver waited near its end) is followed there at the
+    /// second empty look, across the wrap; with every slot still the
+    /// chip's, or the driver's own slot completed, nothing moves.
+    #[test]
+    fn the_receive_ring_follows_a_chip_that_passed_the_drivers_slot() {
+        let mut dma = TestRegion::new(DESCRIPTORS * (DESCRIPTOR + BUFFER) + 4096);
+        let mut rx = Ring::new(&mut dma, true).unwrap();
+        rx.initialize(true);
+        assert!(!rx.follow_the_chip());
+        assert!(!rx.follow_the_chip());
+        for n in 0..250 {
+            rx.deliver(&[n as u8; 60]);
+            assert_eq!(rx.receive().unwrap(), [n as u8; 60]);
+        }
+        assert_eq!(rx.next(), 250);
+        rx.deliver_at(0, &[0x33; 60]);
+        rx.deliver_at(1, &[0x44; 60]);
+        assert_eq!(rx.receive(), None);
+        assert!(!rx.follow_the_chip());
+        assert_eq!(rx.next(), 250);
+        assert!(rx.follow_the_chip());
+        assert_eq!((rx.next(), rx.resyncs, rx.skipped), (0, 1, 6));
+        assert_eq!(rx.receive().unwrap(), [0x33; 60]);
+        assert_eq!(rx.receive().unwrap(), [0x44; 60]);
+        // The driver's own slot completed: it is taken, never passed.
+        rx.deliver(&[0x55; 60]);
+        assert!(!rx.follow_the_chip());
+        assert!(!rx.follow_the_chip());
+        assert_eq!(rx.receive().unwrap(), [0x55; 60]);
+        assert_eq!((rx.next(), rx.resyncs, rx.skipped), (3, 1, 6));
     }
     #[test]
     fn device_ownership_ring_wrap_padding_fcs_and_corruption_boundaries() {

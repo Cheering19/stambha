@@ -1125,6 +1125,15 @@ impl GuestNetwork {
             .overdue(output::millis_since(self.opened), self.carrier)
         {
             output::arguments(format_args!("GUEST NETWORK dhcp {line}\n"));
+            // The host adapter's own registers and rings then: a receive
+            // ring the chip and driver disagree on, a fetch mode left or
+            // frames that missed their buffers show here, where boot 1 of
+            // 0.6.0 had frames flowing and so never logged them.
+            if let Some(Some(state)) = self.link.diagnostic_now() {
+                output::arguments(format_args!(
+                    "GUEST NETWORK host adapter while dhcp went unanswered: {state}\n"
+                ));
+            }
         }
         let counters = self.counters;
         output::arguments(format_args!(

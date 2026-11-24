@@ -139,7 +139,7 @@ fn the_diagnostic_line_names_registers_rings_and_events_without_the_address() {
         "isr=0x11 ",
         "imr=0x0 ",
         "station=kept",
-        "rx buffers=2048 next=2 own=dddd taken=2 dropped=1 misplaced=0 device_owned=256",
+        "rx buffers=2048 next=2 own=dddd taken=2 dropped=1 misplaced=0 resyncs=0 skipped=0 device_owned=256",
         "tx next=1 device_owned=1",
         "descriptors_empty=2 fifo_overflow=1 receive_error=0 link_change=1",
         "signalled=true",
