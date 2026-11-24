@@ -506,7 +506,7 @@ mod tests {
                 admits: crate::xe::admits,
                 registers: |_| 0,
                 aperture: Some(2),
-                resets_itself: false,
+                takeover: crate::xe::takeover,
                 dma_bits: crate::xe::dma_bits,
                 integrated: crate::xe::integrated,
                 probed_integrated: None,

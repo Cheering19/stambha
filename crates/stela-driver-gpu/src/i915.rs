@@ -76,6 +76,21 @@ pub fn integrated(adapter: &Adapter) -> bool {
     platform(adapter.device).is_some_and(|platform| !platform.discrete)
 }
 
+/// Who takes the adapter from the firmware: i915 itself at its probe for an
+/// integrated GPU, which it leaves in D0 as firmware left it and whose
+/// engines it resets (`sanitize_gpu`, `i915_driver.c`) before it turns bus
+/// mastering on, taking over the picture in stolen memory. Linux never resets
+/// that GPU before i915 binds it, and a Function Level Reset of the claim's
+/// left a Raptor Lake GPU whose registers read 0xFFFFFFFF. A discrete GPU
+/// (DG1, DG2) is reset by the claim as before.
+pub fn takeover(adapter: &Adapter) -> crate::cold::Takeover {
+    if integrated(adapter) {
+        crate::cold::Takeover::Driver
+    } else {
+        crate::cold::Takeover::Claim
+    }
+}
+
 /// i915's device queries (`uapi/drm/i915_drm.h`).
 pub mod query {
     use super::Control;
