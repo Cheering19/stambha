@@ -57,6 +57,38 @@ pub fn without_gsc(driver: &str) -> String {
     format!("{driver}.gsc_firmware_path=")
 }
 
+/// The masks amdgpu reads once for every GPU it drives, whose bits are the
+/// link speeds and widths it may use ([`crate::amdgpu::link`]).
+const LINK_MASKS: [&str; 2] = ["amdgpu.pcie_gen_cap", "amdgpu.pcie_lane_cap"];
+
+/// Adds `word` to `words` unless it is there already. One of amdgpu's link
+/// masks that another GPU set differently keeps the bits both set, the
+/// narrower link of the two: Linux's last word would give one GPU a link
+/// faster than its slot's.
+pub fn add(words: &mut Vec<String>, word: &str) {
+    if words.iter().any(|seen| seen == word) {
+        return;
+    }
+    let mask = |word: &str| {
+        let (name, value) = word.split_once('=')?;
+        let value = u32::from_str_radix(value.strip_prefix("0x")?, 16).ok()?;
+        LINK_MASKS
+            .contains(&name)
+            .then_some((String::from(name), value))
+    };
+    if let Some((name, value)) = mask(word)
+        && let Some((seen, held)) = words.iter_mut().find_map(|seen| {
+            mask(seen)
+                .filter(|(other, _)| *other == name)
+                .map(|(_, held)| (seen, held))
+        })
+    {
+        *seen = format!("{name}={:#x}", held & value);
+        return;
+    }
+    words.push(String::from(word));
+}
+
 /// Whether a parameter the image registers takes `word`. Linux matches
 /// names with `-` and `_` alike (`parameq`).
 pub fn registered(word: &str) -> bool {
@@ -100,6 +132,17 @@ mod tests {
                 ]);
             }
         }
+        // amdgpu's link masks for a discrete GPU (`amdgpu_drv.c`).
+        #[cfg(feature = "amdgpu-port")]
+        words.extend(
+            crate::amdgpu::link::Link {
+                generation: 4,
+                width: 16,
+            }
+            .parameters()
+            .split_whitespace()
+            .map(String::from),
+        );
         let (line, left_out) = compose(words.clone());
         assert!(
             left_out.is_empty(),
@@ -118,6 +161,36 @@ mod tests {
         assert_eq!(line, "ttm.pages_limit=16");
         assert_eq!(left_out, ["ttm.no_such_parameter=1", "bare"]);
         assert!(registered("ttm.pages-limit=1"));
+    }
+
+    /// A word is added once; two GPUs' link masks keep the narrower link,
+    /// whichever comes first.
+    #[test]
+    fn two_gpus_link_masks_keep_the_narrower_link() {
+        let mut words = Vec::new();
+        for word in [
+            "ttm.pages_limit=8",
+            "amdgpu.pcie_gen_cap=0xf000f",
+            "amdgpu.pcie_lane_cap=0x3f003f",
+            "ttm.pages_limit=8",
+            "amdgpu.pcie_gen_cap=0x70007",
+            "amdgpu.pcie_lane_cap=0x3f003f",
+            "amdgpu.pcie_lane_cap=0xf000f",
+            "amdgpu.pcie_gen_cap=0xf000f",
+        ] {
+            add(&mut words, word);
+        }
+        assert_eq!(
+            words,
+            [
+                "ttm.pages_limit=8",
+                "amdgpu.pcie_gen_cap=0x70007",
+                "amdgpu.pcie_lane_cap=0xf000f"
+            ]
+        );
+        // Another word keeps Linux's own rule: added as it is.
+        add(&mut words, "ttm.pages_limit=16");
+        assert_eq!(words.last().map(String::as_str), Some("ttm.pages_limit=16"));
     }
 
     /// A share's limit is twice it; a bound is itself.

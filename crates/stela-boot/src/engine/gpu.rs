@@ -111,10 +111,10 @@ const ENOSPC: Errno = -28;
 const EOPNOTSUPP: Errno = -95;
 
 const MSI_CAPABILITY: u8 = 5;
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "amdgpu"))]
 const PCIE_CAPABILITY: u8 = 0x10;
 /// `PCI_EXP_LNKSTA`, in the PCIe capability.
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "amdgpu"))]
 const LINK_STATUS: u16 = 0x12;
 #[cfg(feature = "nvk")]
 const REVISION: u16 = 0x08;
@@ -1675,9 +1675,70 @@ pub(super) struct Claimed {
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
     link: Option<PcieLink>,
+    /// Its own Link Status register, read at the claim, from which the
+    /// slot link its driver is given falls back ([`amd_link_parameters`]).
+    #[cfg(feature = "amdgpu")]
+    link_status: Option<u16>,
     /// The PCI Express port above it, read for the link's lines.
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read at a loss"))]
     port: Option<link::Port>,
+}
+
+/// For a discrete AMD GPU, the words of Linux's command line that give
+/// amdgpu its slot's link ([`gpu::amdgpu::link::slot`]): the trained link
+/// between its card's switch and the root port, from the port snapshots
+/// its placement holds, else its own. amdgpu then takes the link from them
+/// before it reads any (`amdgpu_device_get_pcie_info`), and never takes a
+/// width of 0, which the SMU refuses on an Intel host. Said in a line,
+/// with the masks. Only on an Intel host, where amdgpu turns PCIe DPM off
+/// and forces every link level to this link, read on Linux from the same
+/// trained links (`amdgpu_device_pcie_dynamic_switching_supported`); on
+/// another the SMU keeps its own levels below the slot's capabilities, so
+/// nothing is given. Nothing either for another GPU, an integrated one, or
+/// one whose link does not read: amdgpu then reads its own.
+#[cfg(feature = "amdgpu")]
+fn amd_link_parameters(claimed: &Claimed, adapter: &gpu::Adapter) -> Option<String> {
+    use gpu::amdgpu::link;
+    if claimed.stack.kernel.driver != "amdgpu"
+        || planned_census().and_then(|census| census.kind(adapter.address)) != Some(false)
+    {
+        return None;
+    }
+    let vendor = core::arch::x86_64::__cpuid(0);
+    // "GenuineIntel".
+    if (vendor.ebx, vendor.edx, vendor.ecx) != (0x756e_6547, 0x4965_6e69, 0x6c65_746e) {
+        output::arguments(format_args!(
+            "GPU {}: amdgpu reads its slot's PCIe link itself: this host's processor is not \
+             Intel's, so its PCIe DPM keeps the SMU's link levels\n",
+            claimed.name
+        ));
+        return None;
+    }
+    let ports: Vec<(u16, Option<u16>)> = claimed
+        .placement
+        .upstream
+        .iter()
+        .map(|port| (port.config[0] as u16, link::status(&port.config)))
+        .collect();
+    let Some(slot) = link::slot(claimed.link_status, &ports) else {
+        output::arguments(format_args!(
+            "GPU {}: no PCIe link read for it or its slot; amdgpu reads its own\n",
+            claimed.name
+        ));
+        return None;
+    };
+    let (gen_cap, lane_cap) = slot.masks();
+    output::arguments(format_args!(
+        "GPU {}: amdgpu is given its slot's PCIe link, gen {} x{} (pcie_gen_cap {gen_cap:#x}, \
+         pcie_lane_cap {lane_cap:#x}), from {} port(s) above it and its own link status \
+         {:#06x}\n",
+        claimed.name,
+        slot.generation,
+        slot.width,
+        ports.len(),
+        claimed.link_status.unwrap_or(0xffff)
+    ));
+    Some(slot.parameters())
 }
 
 fn claim(
@@ -2024,6 +2085,17 @@ fn claim(
         })
         .transpose()
         .map_err(ServiceError::Config)?;
+    // A status that does not read gives no link: the slot's ports may.
+    #[cfg(feature = "amdgpu")]
+    let link_status = capabilities
+        .iter()
+        .find(|(_, id)| *id == PCIE_CAPABILITY)
+        .and_then(|(offset, _)| {
+            function
+                .config()
+                .read16(u16::from(*offset) + LINK_STATUS)
+                .ok()
+        });
     Ok(Claimed {
         shows_screen: owns_screen,
         screen,
@@ -2055,6 +2127,8 @@ fn claim(
         drm,
         #[cfg(feature = "nvk")]
         link,
+        #[cfg(feature = "amdgpu")]
+        link_status,
         port,
     })
 }
@@ -2378,6 +2452,13 @@ fn claim_at(
             function.market = adapter.name();
             function.census = index;
             function.placement.upstream = upstream_ports(inputs.ports, adapter.address);
+            #[cfg(feature = "amdgpu")]
+            if let Some(words) = amd_link_parameters(&function, adapter) {
+                function.parameters = Some(match function.parameters.take() {
+                    Some(given) => format!("{given} {words}"),
+                    None => words,
+                });
+            }
             Some(function)
         }
         Err(error) => {
@@ -2858,9 +2939,7 @@ impl Setup {
             .chain(fallback.iter().map(String::as_str))
             .flat_map(str::split_whitespace);
         for word in given {
-            if !words.iter().any(|seen| seen == word) {
-                words.push(String::from(word));
-            }
+            gpu::command_line::add(&mut words, word);
         }
         words.extend(gpu_page_parameter(
             crate::native_memory::gpu_share() / 4096,
