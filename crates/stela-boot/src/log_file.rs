@@ -110,6 +110,16 @@ fn boot_note() -> String {
 /// since (`device_starts`), as [`open`] read them from the log.
 static DEVICE_SKIPS: output::Global<Skips> = output::Global(core::cell::RefCell::new(Skips::EMPTY));
 
+/// The earlier boot, as the bytes [`open`] read for the skips tell it
+/// (`wifi_prompt::earlier`): none when the log was not opened or read.
+static EARLIER: output::Global<Option<stela_boot_core::wifi_prompt::Earlier>> =
+    output::Global(core::cell::RefCell::new(None));
+
+/// The earlier boot [`open`] read, for the startup menu's Wi-Fi page.
+pub fn earlier() -> Option<stela_boot_core::wifi_prompt::Earlier> {
+    EARLIER.0.try_borrow().ok().and_then(|earlier| *earlier)
+}
+
 /// The skips [`open`] read: none when the log was not opened.
 pub fn device_skips() -> Skips {
     DEVICE_SKIPS
@@ -131,6 +141,10 @@ fn read_device_skips(device: &mut dyn BlockDevice) {
         ));
         return;
     };
+    // The newest boot is in these bytes whole, this boot's marker not yet.
+    if let Ok(mut earlier) = EARLIER.0.try_borrow_mut() {
+        *earlier = Some(stela_boot_core::wifi_prompt::earlier(&newest));
+    }
     let skips = device_starts::read(&newest);
     for function in skips.iter() {
         output::arguments(format_args!(

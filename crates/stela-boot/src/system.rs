@@ -323,14 +323,11 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
             volume.read(uefi::fs::PathBuf::from(path)).ok()
         })
         .unwrap_or_default();
-    // The other saved networks, beside the key: none when the file is absent
-    // or unreadable; the copy a menu write left when it could not finish the
-    // file stands for an absent one (`wifi_menu::saved_file`).
-    let wifi_saved = system
-        .ssid
-        .as_ref()
-        .and_then(|_| crate::wifi_menu::saved_file(&mut volume))
-        .unwrap_or_default();
+    // The saved networks, beside the key or, with no `--wifi`, the networks
+    // the boot joins: none when the file is absent or unreadable; the copy a
+    // menu write left when it could not finish the file stands for an absent
+    // one (`wifi_menu::saved_file`).
+    let wifi_saved = crate::wifi_menu::saved_file(&mut volume).unwrap_or_default();
     let host_devices = system.storage.is_some()
         || system.preboot.is_some()
         || system.restore_source.is_some()

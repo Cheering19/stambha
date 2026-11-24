@@ -182,6 +182,21 @@ pub fn without(file: &[u8], ssid: &[u8]) -> Vec<u8> {
     kept
 }
 
+/// `file` with the lines of the network `ssid` last, as the menu has a boot
+/// with no `--wifi` join it first (`stela-boot`'s `engine::start`, which
+/// joins the newest saved network first); every other line as it was.
+pub fn last(file: &[u8], ssid: &[u8]) -> Vec<u8> {
+    let mut moved = without(file, ssid);
+    for line in file.split(|&byte| byte == b'\n') {
+        let named = named_lines(line).next().and_then(|(_, name)| name);
+        if named.as_deref() == Some(ssid) {
+            moved.extend_from_slice(line);
+            moved.push(b'\n');
+        }
+    }
+    moved
+}
+
 /// The line that saves `ssid` with `secret`, both written as `--wifi` words
 /// are: `%`, whitespace, control and non-ASCII bytes as `%XX`.
 pub fn line(ssid: &[u8], secret: &[u8]) -> Vec<u8> {
@@ -215,6 +230,29 @@ mod tests {
             .iter()
             .map(|network| &network.ssid[..])
             .collect()
+    }
+
+    /// A network chosen at the menu with no `--wifi` goes last, which a boot
+    /// joins first; the other lines, a comment's too, stay in their order.
+    #[test]
+    fn a_chosen_network_moves_last_and_the_rest_keep_their_order() {
+        let mut file = line(b"home", b"hunter2hunter2");
+        file.extend_from_slice(b"# a note\n");
+        file.extend_from_slice(&line(b"cafe", b"latte-latte"));
+        file.extend_from_slice(&line(b"phone", b"tether-tether"));
+        let moved = last(&file, b"home");
+        assert_eq!(
+            saved_names(&parse(&moved)),
+            [&b"cafe"[..], &b"phone"[..], &b"home"[..]]
+        );
+        assert!(moved.windows(8).any(|window| window == b"# a note"));
+        assert_eq!(moved.len(), file.len());
+        // The newest already, or not saved: as it was.
+        assert_eq!(parse(&last(&moved, b"home")).networks.len(), 3);
+        assert_eq!(
+            saved_names(&parse(&last(&file, b"absent"))),
+            saved_names(&parse(&file))
+        );
     }
 
     #[test]

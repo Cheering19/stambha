@@ -656,7 +656,10 @@ fn asked() -> bool {
 /// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
     menu.wifi_saved = crate::wifi_menu::saved(volume);
-    let hardware = crate::wifi_menu::hardware();
+    let hardware = menu
+        .wifi_hardware
+        .take()
+        .unwrap_or_else(crate::wifi_menu::hardware);
     menu.wifi_offered = hardware.offered();
     menu.wifi_hardware = Some(hardware);
     if menu.wifi_offered
@@ -768,6 +771,8 @@ pub fn choose(
     let Some(choices) = read(volume) else {
         return options.into();
     };
+    let hardware = crate::wifi_menu::hardware();
+    let prefer = prompt_wifi(volume, &choices, &hardware);
     let (disk, found) = startup_disk(volume, &choices, pending);
     // The first choice as it starts with no menu, recording a found disk
     // when it is a macOS choice.
@@ -784,17 +789,73 @@ pub fn choose(
     };
     // Only a key pressed before the menu opens asks for it.
     if choices.timeout_seconds == 0 && pressed().is_none() {
-        return first(volume, 0).into();
+        return with_prefer(first(volume, 0), prefer.as_deref()).into();
     }
-    let opened = Menu::new(&choices, None, (disk.clone(), found), pending);
+    let mut opened = Menu::new(&choices, None, (disk.clone(), found), pending);
     if opened.glance
         && !asked()
         && let Some(Item::Choice(n, _)) = opened.items.first()
     {
-        return first(volume, *n).into();
+        return with_prefer(first(volume, *n), prefer.as_deref()).into();
     }
+    opened.wifi_prefer = prefer;
+    opened.wifi_hardware = Some(hardware);
     menu(volume, &choices, opened)
         .unwrap_or_else(|| chosen(&choices, 0, chosen_disk(volume).as_deref()).into())
+}
+
+/// Open the Wi-Fi page by itself before the menu when
+/// [`wifi_prompt::decide`] says to, on a PC whose census found a Wi-Fi chip
+/// the driver starts (`hardware`): with no network set up, or on the one the
+/// earlier boot could not join. Never on a boot that may run with nobody at
+/// the PC (see `wifi_prompt`); a console with no input leaves it at once.
+/// The network chosen there, which `--wifi-prefer` names for this boot.
+fn prompt_wifi(
+    volume: &mut FileSystem,
+    choices: &Choices,
+    hardware: &stela_boot_core::wifi_hardware::Hardware,
+) -> Option<String> {
+    use stela_boot_core::{options::DEFAULT_WIFI_KEY, wifi_hardware::Hardware, wifi_prompt};
+    let system = choices.entries.iter().find_map(|entry| {
+        System::parse(&entry.options)
+            .ok()
+            .filter(|s| s.ssid.is_some())
+    });
+    let configured = system.as_ref().and_then(|system| system.ssid.clone());
+    let key = system
+        .as_ref()
+        .map(|system| String::from(system.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY)));
+    // The usable saved networks' names, in the order a record counts them.
+    let mut file = crate::wifi_menu::saved_file(volume).unwrap_or_default();
+    let saved: Vec<String> = stela_boot_core::wifi_saved::parse(&file)
+        .networks
+        .into_iter()
+        .filter_map(|network| String::from_utf8(network.ssid).ok())
+        .collect();
+    stela_boot_core::wifi_saved::wipe(&mut file);
+    let facts = wifi_prompt::Facts {
+        earlier: crate::log_file::earlier(),
+        supported: matches!(hardware, Hardware::Supported(_)),
+        held: false,
+        no_menu: choices.timeout_seconds == 0,
+        network: configured.is_some() || !saved.is_empty(),
+    };
+    let decided = wifi_prompt::decide(&facts);
+    output::arguments(format_args!("{}", wifi_prompt::line(&decided)));
+    let prompt = decided.ok()?;
+    let chosen = crate::wifi_menu::open(
+        volume,
+        configured.as_deref(),
+        key.as_deref(),
+        prompt,
+        &saved,
+    );
+    // Only a boot that joins `--wifi` takes a preference, as at the menu.
+    chosen.filter(|name| {
+        configured
+            .as_deref()
+            .is_some_and(|configured| configured != name)
+    })
 }
 
 /// Wait at the menu after `reason`, with no countdown, as LLB waits in
