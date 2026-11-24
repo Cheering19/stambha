@@ -127,3 +127,37 @@ mod rom_retirement;
 mod setup;
 mod transport;
 mod unified_fixture;
+
+/// Asimose's AX200 (0.6.0) stopped at `Boot(Access(Bounds))`: the window
+/// refused the MSI-X registers at 0x2800 and up, which `route_interrupts`
+/// and `causes` reach on a function with a vector.
+#[test]
+fn the_msix_registers_every_family_routes_through_are_inside_the_window() {
+    use super::super::interrupts;
+    for family in [Family::Ax200, Family::Ax210, Family::Bz, Family::Sc] {
+        let routes = interrupts::routes(family);
+        for ivar in routes.ivars {
+            assert_eq!(reach(ivar, 1), Ok(ivar as usize), "{family:?} {ivar:#x}");
+        }
+        for register in [
+            interrupts::FH_CAUSES,
+            interrupts::FH_MASK,
+            interrupts::HW_CAUSES,
+            interrupts::HW_MASK,
+            interrupts::AUTOMASK,
+        ] {
+            assert_eq!(reach(register, 4), Ok(register as usize));
+        }
+    }
+    assert_eq!(reach(WINDOW - 4, 4), Ok(WINDOW as usize - 4));
+    assert_eq!(reach(WINDOW - 1, 1), Ok(WINDOW as usize - 1));
+    for (register, width) in [
+        (WINDOW, 4),
+        (WINDOW, 1),
+        (WINDOW - 2, 4),
+        (0x2802, 4),
+        (u32::MAX, 1),
+    ] {
+        assert_eq!(reach(register, width), Err(power::AccessError::Bounds));
+    }
+}
