@@ -2545,20 +2545,22 @@ fn check(plan: &Plan, disk: &mut dyn BlockDevice, name: &str) -> crate::Refusal 
                 "RESULT PASS: the plan is safe to install. Nothing was written: no partition \
                  table, no zeroes, no TRIM, no BootNext",
             );
-            crate::status::done("PASS, nothing was written");
+            crate::status::done("PASS. Nothing was installed: this was only a check");
             refuse!(
-                "Install check PASSED on {name}: nothing was written. Turn the PC off; to \
-                 install, choose Install macOS again and then Install",
+                "Install check PASSED on {name}. Nothing was installed: this was only a check. \
+                 Choose Install macOS to install: turn the PC off, start Stambha again, choose \
+                 Install macOS and then Install",
                 name
             )
         }
         Err(error) => {
             say(&format!("FAIL {error}"));
             say("RESULT FAIL: do not install. Nothing was written");
-            crate::status::fail("FAIL, nothing was written");
+            crate::status::fail("FAIL. Nothing was installed: this was only a check");
             refuse!(
-                "Install check FAILED on {name}: {error}. Nothing was written. Do not install; \
-                 keep the log",
+                "Install check FAILED on {name}: {error}. Nothing was installed: this was only a \
+                 check. Do not install; keep the log (`stambha log`, or \\EFI\\stela\\boot.log on \
+                 the stick)",
                 name,
                 %error
             )

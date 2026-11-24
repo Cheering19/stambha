@@ -71,27 +71,140 @@ fn has_text(scene: &Scene, wanted: &str) -> bool {
 #[test]
 fn the_status_line_names_the_network_this_boot_joins_first() {
     assert_eq!(
-        status_line(Some("home"), None, false).as_deref(),
-        Some("Wi-Fi: home \u{b7} press W to change")
+        status_line(Some("home"), None, false),
+        "Wi-Fi: home \u{b7} press W to change"
     );
     assert_eq!(
-        status_line(Some("home"), Some("cafe"), true).as_deref(),
-        Some("Wi-Fi: cafe \u{b7} press W to change")
+        status_line(Some("home"), Some("cafe"), true),
+        "Wi-Fi: cafe \u{b7} press W to change"
     );
 }
 
 #[test]
-fn the_status_line_shows_not_set_up_only_with_saved_networks() {
+fn the_status_line_names_saved_networks_without_wifi() {
     assert_eq!(
-        status_line(None, None, true).as_deref(),
-        Some("Wi-Fi: not set up \u{b7} press W to change")
+        status_line(None, None, true),
+        "Wi-Fi: saved networks \u{b7} press W to change"
     );
     // A preference without `--wifi` joins nothing, as `with_prefer` adds none.
     assert_eq!(
-        status_line(None, Some("cafe"), true).as_deref(),
-        Some("Wi-Fi: not set up \u{b7} press W to change")
+        status_line(None, Some("cafe"), true),
+        "Wi-Fi: saved networks \u{b7} press W to change"
     );
-    assert_eq!(status_line(None, None, false), None);
+}
+
+/// The page the boot opens after a failed join: that network selected, its
+/// dialog on the password, the reason drawn; a password typed saves it and
+/// goes on, and Esc starts the boot without Wi-Fi.
+#[test]
+fn a_retry_page_waits_on_the_password_and_esc_starts_without_wifi() {
+    let networks = vec![
+        Network {
+            name: "home".to_string(),
+            configured: true,
+            usable: true,
+        },
+        Network {
+            name: "cafe".to_string(),
+            configured: false,
+            usable: true,
+        },
+    ];
+    let intro = String::from("Couldn't join cafe: the password may be wrong.");
+    let mut page = Page::retry(networks.clone(), true, "cafe", intro.clone());
+    assert_eq!(page.selected(), Row::Network(1));
+    let Mode::Add(form) = page.mode() else {
+        panic!("the dialog");
+    };
+    assert_eq!((form.field(), form.name()), (Field::Password, "cafe"));
+    assert!(has_text(&page.scene(SCREEN), "the password may be wrong"));
+    for character in "new-password".chars() {
+        assert_eq!(page.press(Key::Character(character)), Action::Stay);
+    }
+    let Action::Save(save) = page.press(Key::Enter) else {
+        panic!("a network to save");
+    };
+    assert_eq!(
+        (save.name.as_str(), &save.password[..]),
+        ("cafe", &b"new-password"[..])
+    );
+    // Saved, the boot goes on, even where no `--wifi` lets it choose one.
+    let mut page = Page::retry(networks.clone(), false, "cafe", intro.clone());
+    assert_eq!(
+        page.saved("cafe", Ok(()), networks.clone()),
+        Action::Join(String::from("cafe"))
+    );
+    // Esc in the dialog or the list starts the boot without Wi-Fi.
+    let mut page = Page::retry(networks.clone(), true, "cafe", intro.clone());
+    assert_eq!(page.press(Key::Escape), Action::Leave);
+    let mut page = Page::auto(networks.clone(), true, intro);
+    assert_eq!(page.press(Key::Escape), Action::Leave);
+    // The page W opens keeps its dialog's Esc.
+    let mut page = Page::new(networks, true, None);
+    page.press(Key::End);
+    page.press(Key::Enter);
+    assert_eq!(page.press(Key::Escape), Action::Stay);
+    assert!(matches!(page.mode(), Mode::List));
+}
+
+#[test]
+fn a_long_intro_wraps_at_spaces() {
+    let text = "Connect to Wi-Fi so macOS has internet. Esc: start without Wi-Fi.";
+    let lines = wrap(text, 40);
+    assert_eq!(
+        lines,
+        [
+            "Connect to Wi-Fi so macOS has internet.",
+            "Esc: start without Wi-Fi."
+        ]
+    );
+    assert_eq!(wrap(text, 200), [text]);
+    assert_eq!(wrap("short", 2), ["short"]);
+}
+
+/// The page W opens without a Wi-Fi chip the driver starts shows each line
+/// inside the menu's column, and Esc.
+#[test]
+fn the_unavailable_page_draws_its_lines_in_the_column() {
+    let lines = [String::from("first"), String::from("second")];
+    let geometry = Geometry {
+        width: 1280,
+        height: 720,
+        top: 80,
+        glyph: 8,
+    };
+    let scene = unavailable_scene(&lines, geometry);
+    let texts: Vec<&str> = scene.texts().collect();
+    assert_eq!(texts, ["Wi-Fi", "first", "second", "Esc: back"]);
+    let column = (1280 - 440) / 2..(1280 - 440) / 2 + 440;
+    for draw in &scene.draws {
+        if let Draw::Text { x, text, .. } = draw
+            && text != "Esc: back"
+        {
+            assert!(
+                column.contains(x) && x + 8 * text.len() <= column.end,
+                "{text}"
+            );
+        }
+    }
+}
+
+/// Testers with a Wi-Fi chip the driver starts missed that a network is
+/// chosen with W: with none set up the menu and the log both say so.
+#[test]
+fn with_no_network_set_up_the_line_and_the_log_say_to_press_w() {
+    assert_eq!(
+        status_line(None, None, false),
+        "Wi-Fi: press W to choose a network"
+    );
+    let hint = hint_line(None, false).unwrap();
+    assert_eq!(
+        hint,
+        "CHOICE Wi-Fi: no network is set up; press W in this menu to choose one, or Wi-Fi \
+         stays off\n"
+    );
+    assert_eq!(hint_line(Some("home"), false), None);
+    assert_eq!(hint_line(None, true), None);
 }
 
 // The rows.
@@ -560,7 +673,7 @@ fn no_other_screen_draws_the_password() {
     };
     assert_eq!(save.password, b"password");
     assert!(!has_text(&page.scene(SCREEN), "password"));
-    let status = status_line(Some("home"), Some("cafe"), true).unwrap_or_default();
+    let status = status_line(Some("home"), Some("cafe"), true);
     assert!(!status.contains("password"));
 }
 

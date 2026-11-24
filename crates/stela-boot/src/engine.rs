@@ -925,7 +925,8 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
     if output::usb_log_kept() {
         crate::status::info(
             "Its full log is on this USB: on any computer with stambha, plug in this USB and run \
-             `stambha log`, which saves it to log.txt.",
+             `stambha log`, which saves it to log.txt, or open the file \\EFI\\stela\\boot.log on \
+             the USB.",
         );
     }
     crate::status::countdown(action, hold);

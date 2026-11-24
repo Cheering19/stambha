@@ -341,15 +341,7 @@ impl Service {
                 input_turn.read_done = host::rdtsc();
                 input_turn.reports = inputs.len();
             }
-            if inputs.iter().any(|input| {
-                matches!(
-                    input,
-                    stela_drivers::input::Input::Move { .. }
-                        | stela_drivers::input::Input::Motion { .. }
-                )
-            }) {
-                super::cursor::motion(host::rdtsc());
-            }
+            super::cursor::inputs(&inputs, host::rdtsc());
             if !inputs.is_empty() {
                 devices.serve(|devices| {
                     #[cfg(feature = "diagnostics")]

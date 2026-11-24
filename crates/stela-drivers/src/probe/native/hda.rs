@@ -115,6 +115,18 @@ pub(in crate::probe) unsafe fn attach(
         mapping: None,
         minimum: Some(minimum),
     };
+    // Linux `azx_probe` -> `pci_enable_device`: D0 first (`pci_power_up`,
+    // which also restores BARs a D3hot soft reset cleared), then memory
+    // decode, with Bus Master left as it was. Firmware that never used the
+    // controller may leave it in D3hot or with decode off (an AMD laptop's
+    // 1022:15e3 behind its GPU's bridge), which the cold preflight refused
+    // as PowerNotReady.
+    if let Err(error) = enable_memory(
+        cold.requester.as_mut().unwrap().function_mut(),
+        cold.minimum.as_deref().unwrap(),
+    ) {
+        return Err((error, Some(Box::new(cold))));
+    }
     let bars = match cold.requester.as_mut().unwrap().function_mut().bars() {
         Ok(bars) => bars,
         Err(error) => return Err((error.into(), Some(Box::new(cold)))),
@@ -179,3 +191,32 @@ pub(in crate::probe) unsafe fn attach(
         discovery_error: discovery.discovery_error,
     })
 }
+
+/// D0, then memory decode on, as Linux `pci_enable_device` leaves a
+/// function before `azx_probe` maps BAR0. Bus Master and INTx are left as
+/// they are: the cold stage stops inherited engines before any of its own.
+#[expect(
+    clippy::result_large_err,
+    reason = "The probe's shared error keeps the exact PCI cause, as the other attaches' do"
+)]
+fn enable_memory<C: crate::bus::pci::ConfigSpace>(
+    function: &mut crate::bus::pci::Function<C>,
+    minimum: &dyn crate::bus::pci::power::Timer,
+) -> Result<(), Error> {
+    use crate::bus::pci::regs;
+    function.power_up(minimum)?;
+    let config = function.config();
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX {
+        return Err(Error::HdaNative(RetirementError::Pci(
+            hda::pci::AttachError::PowerNotReady,
+        )));
+    }
+    if command & regs::COMMAND_MEMORY == 0 {
+        config.write16(regs::COMMAND, command | regs::COMMAND_MEMORY)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

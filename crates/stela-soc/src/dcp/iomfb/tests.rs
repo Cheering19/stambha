@@ -2015,6 +2015,111 @@ fn a_swap_waits_for_the_gpu_fences_of_the_surfaces_it_shows() {
 }
 
 #[test]
+fn a_pointer_swap_is_shown_ahead_of_a_frame_still_drawing_and_completes_after_it() {
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let frames = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(0x40);
+        true
+    };
+    let pointer_at = |methods: &mut Methods, x: u32| {
+        let id = start_client_swap(methods, 0xc0de);
+        let mut input = submission(id, &[(1, 1, 1, 0x9000)]);
+        place(&mut input, 1, rect(0, 0, 1, 1), rect(x, 1, 1, 1));
+        returned(methods.call(*b"A407", &input, 0xc));
+        id
+    };
+    let shown = |methods: &Methods| {
+        let shown = methods.shown.expect("a frame is on screen");
+        let (desktop, pointer) = (shown[0].unwrap(), shown[1].unwrap());
+        (desktop.surface.iova, pointer.destination.x)
+    };
+    // The desktop on layer 0 and the pointer on layer 1.
+    let first = start_swap(&mut methods);
+    let mut input = submission(first, &[(0, 4, 2, 0x1000), (1, 1, 1, 0x9000)]);
+    place(&mut input, 1, rect(0, 0, 1, 1), rect(0, 1, 1, 1));
+    returned(methods.call(*b"A407", &input, 0xc));
+    methods.refresh(0);
+    methods.present(0, fill).unwrap();
+    complete(&mut methods, first, true);
+    assert_eq!(shown(&methods), (0x1000, 0));
+
+    // WindowServer's next desktop frame waits for the GPU; the pointer's
+    // client moves it twice meanwhile.
+    let drawing = start_swap(&mut methods);
+    returned(methods.call(
+        *b"A407",
+        &fenced_submission(drawing, &[(0, 4, 2, 0x2000)], 1, [5, 0, 0, 0]),
+        0xc,
+    ));
+    let moved = pointer_at(&mut methods, 1);
+    methods.refresh(period);
+    assert!(methods.frame_ready(period));
+    methods
+        .present(period, |dva, bytes| {
+            assert!(
+                !(0x2000..0x9000).contains(&dva),
+                "a surface still drawing is read"
+            );
+            fill(dva, bytes)
+        })
+        .unwrap();
+    // The pointer moved over the desktop on screen, and nothing completed:
+    // its swap waits for the frame in front of it.
+    assert_eq!(shown(&methods), (0x1000, 1));
+    assert_eq!(frames.borrow().len(), 2);
+    assert!(!methods.callback_pending());
+    // One present a vblank, and none while nothing more moved.
+    assert!(!methods.frame_ready(period + 1));
+    methods.refresh(2 * period);
+    assert!(!methods.frame_ready(2 * period));
+    let again = pointer_at(&mut methods, 2);
+    methods.refresh(3 * period);
+    methods.present(3 * period, fill).unwrap();
+    assert_eq!(shown(&methods), (0x1000, 2));
+
+    // A ready swap that sets the waiting frame's slot keeps its place, and
+    // so does a pointer move behind it: each slot shows in order.
+    let both = start_swap(&mut methods);
+    returned(methods.call(
+        *b"A407",
+        &submission(both, &[(0, 4, 2, 0x3000), (1, 1, 1, 0x9000)]),
+        0xc,
+    ));
+    let behind = pointer_at(&mut methods, 3);
+    methods.refresh(4 * period);
+    assert!(!methods.frame_ready(4 * period));
+    assert_eq!(shown(&methods), (0x1000, 2));
+
+    // The frame drawn: every swap is latched together and completes in
+    // submission order.
+    let input = Packed::new()
+        .u32(drawing)
+        .u32(5)
+        .u64(0x1234)
+        .u32(0)
+        .finish(0x14)
+        .unwrap();
+    returned(methods.call(*b"A470", &input, 4));
+    methods.refresh(5 * period);
+    methods.present(5 * period, fill).unwrap();
+    assert_eq!(shown(&methods), (0x3000, 3));
+    for id in [drawing, moved, again, both, behind] {
+        let callback = methods.take_callback().expect("a completion is due");
+        assert_eq!(&callback.input[..4], &id.to_le_bytes());
+        (callback.then)(&mut methods, &[]).unwrap();
+    }
+    assert!(!methods.frame_pending());
+    assert_eq!(
+        (methods.pacing.overtaking, methods.pacing.presented),
+        (2, 4)
+    );
+}
+
+#[test]
 fn each_set_parameter_dcp_parameter_is_reported_with_its_answer() {
     let mut methods = methods();
     let parameter = |id: u32| {

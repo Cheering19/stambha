@@ -67,7 +67,7 @@ fn the_diagnostic_counts_the_receive_events_an_empty_receive_acknowledged() {
     let line = net.diagnostic().unwrap();
     for part in [
         "isr=0x50 ",
-        "rx buffers=2048 next=0 own=dddd taken=0 dropped=0 misplaced=0 device_owned=256",
+        "rx buffers=2048 next=0 own=dddd taken=0 dropped=0 misplaced=0 resyncs=0 skipped=0 device_owned=256",
         "tx next=0 device_owned=0",
         "descriptors_empty=1 fifo_overflow=1 receive_error=0 link_change=0",
         "signalled=true",
@@ -237,4 +237,73 @@ fn a_frame_that_missed_its_buffer_is_dropped_and_ends_multiple_fetch() {
         line.contains("rx buffers=16384 next=4 own=dddd taken=4 dropped=2 misplaced=2"),
         "{line}"
     );
+}
+
+/// An RTL8168H (XID 541) that skipped the slot the driver waits on and
+/// went on writing the slots after it (boot 1 of 0.6.0: the guest got its
+/// frames in runs of exactly 256, a full ring late, and no DHCP answer).
+/// The driver follows it at its second empty look and takes those frames
+/// in order at once, where it waited until the chip came round to the
+/// skipped slot after the other 255. The skipped slot stays offered.
+#[test]
+fn a_chip_that_skipped_the_drivers_slot_is_followed_without_waiting_a_full_ring() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; (DESCRIPTORS * (RECEIVE_BUFFER + BUFFER) + (1 << 16)) / 8];
+    registers[RX_CONFIG / 4] = receive_config(46) | RX_ACCEPT;
+    let mut net = modelled_as(0x5410_0000, true, &mut registers, &mut memory, false);
+    assert_eq!(net.revision.version, 46);
+    net.receive.initialize(true);
+    net.transmit.initialize(false);
+    // Broadcasts, as a DHCP offer or an ARP request arrives.
+    let frame = |n: u8| {
+        let mut frame = vec![0xff; 6];
+        frame.extend_from_slice(&[2, 0, 0, 0, 0, n, 0x08, 0x00]);
+        frame.resize(60, n);
+        frame
+    };
+    // Slot 0 left with the chip, ten frames in the slots after it.
+    for n in 1..=10u8 {
+        net.receive.deliver_at(usize::from(n), &frame(n));
+    }
+    // The first empty look only notes it.
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!(net.receive.next(), 0);
+    for n in 1..=10u8 {
+        assert_eq!(net.receive(), Ok(Some(frame(n))), "frame {n}");
+    }
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!((net.receive.resyncs, net.receive.skipped), (1, 1));
+    assert_eq!(net.receive.next(), 11);
+    // The skipped slot is still offered to the chip, as offered.
+    assert_eq!(
+        net.receive.descriptors.read::<u32>(0),
+        OWN | (RECEIVE_BUFFER as u32 - 1)
+    );
+    // The fetch mode is left alone: no frame missed its buffer.
+    assert_eq!(registers[RX_CONFIG / 4], receive_config(46) | RX_ACCEPT);
+    let line = net.diagnostic().unwrap();
+    assert!(
+        line.contains("taken=10 dropped=0 misplaced=0 resyncs=1 skipped=1 "),
+        "{line}"
+    );
+}
+
+/// A completion that lands after a later one for an instant is not taken
+/// for a skipped slot: one empty look sees it, the next takes both in
+/// order, and the driver's slot never moves.
+#[test]
+fn an_out_of_order_completion_seen_once_moves_nothing() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; (DESCRIPTORS * (RECEIVE_BUFFER + BUFFER) + (1 << 16)) / 8];
+    let mut net = modelled_as(0x5410_0000, true, &mut registers, &mut memory, false);
+    net.receive.initialize(true);
+    net.receive.deliver_at(1, &[0x22; 60]);
+    assert_eq!(net.receive(), Ok(None));
+    net.receive.deliver_at(0, &[0x11; 60]);
+    assert_eq!(net.receive(), Ok(Some(vec![0x11; 60])));
+    assert_eq!(net.receive(), Ok(Some(vec![0x22; 60])));
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!((net.receive.resyncs, net.receive.skipped), (0, 0));
+    assert_eq!(net.receive.next(), 2);
 }

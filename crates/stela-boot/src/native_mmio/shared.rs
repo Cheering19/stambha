@@ -814,8 +814,8 @@ impl Source {
             }
             crate::output::arguments(format_args!(
                 "HOST PCI BAR at {address:#x} ({bytes:#x} bytes) on segment {segment} lies in \
-                 no memory window its ACPI host bridges declare (windows:{listed}); Stela \
-                 assigns no BARs, so it stays unmapped\n"
+                 no memory window the firmware's root bridges report (windows:{listed}); \
+                 Stambha assigns no BARs, so it stays unmapped\n"
             ));
             return Err(Error::OutsideResource);
         };

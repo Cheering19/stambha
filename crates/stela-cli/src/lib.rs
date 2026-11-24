@@ -38,7 +38,10 @@ fn examples() -> String {
   stambha               Choose what to do, step by step
   stambha update        Update the plugged-in stick
   stambha log           Save the boot logs to log.txt
-  stambha create {disk} --confirm-disk 64.0GB --installer offline"
+  stambha create {disk} --confirm-disk 64.0GB --installer offline
+
+The boot log: run `stambha log` on any computer with the stick plugged in,
+or open the file \\EFI\\stela\\boot.log on the stick."
     )
 }
 

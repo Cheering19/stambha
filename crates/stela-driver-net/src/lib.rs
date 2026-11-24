@@ -117,6 +117,24 @@ pub enum LinkError {
 /// and up to 5-7 s at 2.5G/5G/10GBASE-T, with margin.
 pub const WIRED_CARRIER_WAIT_US: u64 = 10_000_000;
 
+/// What a Wi-Fi link's attempt to join came to, for the boot's record of
+/// it (`stela_boot_core::wifi_prompt`). The network's name stays in memory:
+/// the boot logs only where the network is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Join {
+    Joined {
+        ssid: alloc::vec::Vec<u8>,
+    },
+    /// The handshake failed or timed out: the password may be wrong.
+    WrongPassword {
+        ssid: alloc::vec::Vec<u8>,
+    },
+    /// No scan found the preferred network, nor any saved one.
+    NotInRange {
+        ssid: alloc::vec::Vec<u8>,
+    },
+}
+
 /// A raw Ethernet II link: whole frames without the FCS.
 pub trait Link {
     /// The adapter's station address, which the stack sends from.
@@ -188,6 +206,11 @@ pub trait Link {
     /// failed; each is given once, and none is an error. Problems found
     /// while attaching stay with the probe's warnings.
     fn take_diagnostic(&mut self) -> Option<String> {
+        None
+    }
+    /// The newest change in what a Wi-Fi link's join came to, given once
+    /// per change; None for a wired link and between changes.
+    fn take_join(&mut self) -> Option<Join> {
         None
     }
 }

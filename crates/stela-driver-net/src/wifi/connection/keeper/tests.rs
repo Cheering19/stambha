@@ -839,3 +839,28 @@ fn an_open_network_takes_only_a_bss_without_privacy_rsn_or_wpa() {
     bss.elements = vec![221, 4, 0, 0x50, 0xf2, 2];
     assert!(!protected(&bss));
 }
+
+/// What the join came to reaches the boot's record once per change: a
+/// scan that finds no saved network, then a join, the same join again
+/// giving nothing new.
+#[test]
+fn a_join_outcome_is_given_once_per_change() {
+    let mut keeper = kept(Tuned { mac: LOCAL });
+    let missing = crate::Join::NotInRange {
+        ssid: b"test".to_vec(),
+    };
+    keeper.choose(0);
+    assert_eq!(keeper.take_join(), Some(missing.clone()));
+    assert_eq!(keeper.take_join(), None);
+    keeper.choose(1);
+    assert_eq!(keeper.take_join(), None);
+    let joined = crate::Join::Joined {
+        ssid: b"test".to_vec(),
+    };
+    keeper.note_join(joined.clone());
+    keeper.note_join(joined.clone());
+    assert_eq!(keeper.take_join(), Some(joined));
+    assert_eq!(keeper.take_join(), None);
+    keeper.note_join(missing.clone());
+    assert_eq!(keeper.take_join(), Some(missing));
+}

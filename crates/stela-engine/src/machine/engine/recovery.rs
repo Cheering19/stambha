@@ -382,6 +382,18 @@ impl CodeRecovery {
         }
     }
 
+    /// Whether `record` holds this owner's entry, from which its first fault
+    /// qualifies; else the entry's bytes in guest memory do
+    /// ([`Self::qualify`]). An owner with no stored entry to find needs none.
+    pub(super) fn stored_in(&self, record: &StoredRecord) -> bool {
+        match &self.rows {
+            Rows::Stored { origin, offset, .. } if origin.kept.is_none() => {
+                record.contains(*offset, &origin.context)
+            }
+            _ => true,
+        }
+    }
+
     /// The rows, qualifying a stored record's on its first fault at `pc`, the
     /// block's entry: in the dispatcher, before any guest projection. `record`
     /// is the one [`Self::stored_key`] names; without it, `memory` holds the

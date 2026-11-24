@@ -121,6 +121,14 @@ pub enum Error {
     Dma(crate::block::BlockError),
     Stopped,
     Poisoned,
+    /// A step that failed after the PHY's forced ULP exit had failed,
+    /// through the ME (`me`) or a LANPHYPC toggle (`lanphypc`): both
+    /// causes, the exit's first.
+    AfterUlpExit {
+        how: &'static str,
+        exit: alloc::boxed::Box<Error>,
+        then: alloc::boxed::Box<Error>,
+    },
 }
 
 impl From<super::Error> for Error {
@@ -189,6 +197,10 @@ impl core::fmt::Display for Error {
             Self::Dma(error) => write!(f, "its DMA memory failed ({error})"),
             Self::Stopped => f.write_str("it is stopped"),
             Self::Poisoned => f.write_str("an earlier failure left it unusable"),
+            Self::AfterUlpExit { how, exit, then } => write!(
+                f,
+                "{then}, after the PHY did not leave its ultra-low-power state ({how}: {exit})"
+            ),
         }
     }
 }
