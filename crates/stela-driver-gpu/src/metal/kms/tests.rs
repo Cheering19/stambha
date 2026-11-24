@@ -118,6 +118,8 @@ struct Card {
     scaling_error: Option<i64>,
     /// Each controller lit, with its connector's scaling mode then.
     lit_scaling: Vec<(u32, u64)>,
+    /// amdgpu GEM buffers made: their bytes, domains and flags.
+    gem_created: Vec<(u64, u64, u64)>,
 }
 
 impl Card {
@@ -167,6 +169,7 @@ impl Card {
             property_reads: 0,
             scaling_error: None,
             lit_scaling: Vec::new(),
+            gem_created: Vec::new(),
         }
     }
 
@@ -256,6 +259,13 @@ unsafe impl Drm for &mut Card {
                         62 | 63 if self.mst => 0b11,
                         other => panic!("encoder {other}"),
                     };
+                }
+                AMDGPU_GEM_CREATE => {
+                    let create = &mut *argument.cast::<AmdgpuGemCreate>();
+                    assert_eq!(self.driver, b"amdgpu");
+                    self.gem_created
+                        .push((create.bytes, create.domains, create.flags));
+                    create.bytes = u64::from(self.id());
                 }
                 CREATE_DUMB => {
                     let dumb = &mut *argument.cast::<CreateDumb>();
@@ -457,6 +467,7 @@ fn requests_match_linux() {
     assert_eq!(ADD_FB2, 0xc068_64b8);
     assert_eq!(REMOVE_FB, 0xc004_64af);
     assert_eq!(DESTROY_DUMB, 0xc004_64b4);
+    assert_eq!(AMDGPU_GEM_CREATE, 0xc020_6440);
     assert_eq!(GET_PROPERTY, 0xc040_64aa);
     assert_eq!(OBJECT_PROPERTIES, 0xc020_64b9);
     assert_eq!(SET_OBJECT_PROPERTY, 0xc018_64ba);
@@ -871,4 +882,28 @@ fn a_display_that_is_not_taken_gives_its_buffers_back() {
 
     // The next look takes the display.
     assert!(Display::take(&mut card, (1920, 1080)).is_ok());
+}
+
+#[test]
+fn an_amdgpu_display_makes_its_scanout_buffers_in_system_memory_when_asked() {
+    // 100 pixels' rows are 128 pixels apart, as amdgpu aligns a dumb
+    // buffer; 100 rows of 512 bytes fill 13 pages.
+    let mut card = Card::new(vec![mode(100, 100, PREFERRED)]);
+    card.driver = b"amdgpu";
+    set_system_scanout(true);
+    let taken = Display::take(&mut card, (100, 100)).map(|display| {
+        display
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.pitch, buffer.bytes))
+            .collect::<Vec<_>>()
+    });
+    set_system_scanout(false);
+    assert_eq!(taken.unwrap(), [(512, 53248); 3]);
+    assert_eq!(card.gem_created, [(53248, 2, 5); 3]);
+    // Without the ask, and on any other driver, the dumb buffers stay.
+    let mut card = Card::new(vec![mode(100, 100, PREFERRED)]);
+    card.driver = b"amdgpu";
+    Display::take(&mut card, (100, 100)).unwrap();
+    assert!(card.gem_created.is_empty());
 }

@@ -13,12 +13,24 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod anv;
+#[cfg(feature = "linux-drm")]
+pub mod command_line;
+#[cfg(feature = "i915-port")]
+pub mod i915;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod intel_stolen;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 
 pub mod cold;
+pub mod drm_version;
 pub mod gsp_perf;
+pub mod names;
 pub mod nouveau_chip;
+pub mod selection;
+pub mod share;
 pub mod stack;
 
 #[cfg(feature = "linux-kernel")]
@@ -90,6 +102,8 @@ pub struct Adapter {
     pub vendor: Vendor,
     pub device: u16,
     pub class: [u8; 3],
+    /// The revision ID, which tells some products of one device apart.
+    pub revision: u8,
 }
 
 impl Adapter {
@@ -101,7 +115,13 @@ impl Adapter {
             vendor: Vendor::from_pci(function.vendor),
             device: function.device,
             class: function.class,
+            revision: function.revision,
         })
+    }
+
+    /// Its market name, or its maker alone ([`names::name`]).
+    pub fn name(&self) -> alloc::string::String {
+        names::name(self.vendor, self.device, self.revision)
     }
 
     /// Every discovered adapter remains unbound until a real port exists.
@@ -109,10 +129,7 @@ impl Adapter {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
             Vendor::Amd => "AMDGPU is not ported to Stambha",
-            Vendor::Intel => {
-                "it needs Linux's i915 driver, which Stambha does not have: its xe driver runs \
-                 Tiger Lake and later"
-            }
+            Vendor::Intel => "no driver here runs Stambha's Metal device on this Intel GPU",
             Vendor::Other(_) => "no Stambha GPU backend for this PCI vendor",
         }
     }

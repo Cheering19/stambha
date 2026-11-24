@@ -684,6 +684,7 @@ fn power_up_refuses_invalid_clock_before_any_configuration_access() {
             vendor: 0x1af4,
             device: 0x1042,
             class: [1, 8, 2],
+            revision: 0,
             config: NoAccess,
         };
         // Nominal frequency data cannot supply the missing physical provider.
@@ -1051,6 +1052,7 @@ fn resettable(capabilities: u32, silence: u32) -> Function<Resettable> {
         vendor: 0x8086,
         device: 0x1234,
         class: [2, 0x80, 0],
+        revision: 0,
         config: Resettable {
             words,
             silence,

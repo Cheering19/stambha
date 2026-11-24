@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:24:30 +0000
+Subject: [PATCH] fix(amdgpu): each ASIC reset and the display engine's start
+ tell Stela they end the firmware's picture on the GPU, where a failed probe
+ gave no sign whether that screen still showed it
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  5 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 37 ++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 6b0c1ad5a0534335bc18a873a24b5987f18650cd..e0f4fa632e6c521ccac30e93825eeed836aa6fd0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1347,7 +1347,10 @@ int emu_soc_asic_init(struct amdgpu_device *adev);
+  */
+ #define amdgpu_asic_set_vga_state(adev, state) \
+     ((adev)->asic_funcs->set_vga_state ? (adev)->asic_funcs->set_vga_state((adev), (state)) : 0)
+-#define amdgpu_asic_reset(adev) (adev)->asic_funcs->reset((adev))
++/* Stela: every ASIC reset names itself to the host as the end of the
++ * firmware's picture on the GPU (amdgpu_device_asic_reset_named). */
++int amdgpu_device_asic_reset_named(struct amdgpu_device *adev);
++#define amdgpu_asic_reset(adev) amdgpu_device_asic_reset_named((adev))
+ #define amdgpu_asic_reset_method(adev) (adev)->asic_funcs->reset_method((adev))
+ #define amdgpu_asic_get_xclk(adev) (adev)->asic_funcs->get_xclk((adev))
+ #define amdgpu_asic_set_uvd_clocks(adev, v, d) (adev)->asic_funcs->set_uvd_clocks((adev), (v), (d))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 4c9f8e153c3eb91fa2928b8ee9f814633c55c304..3b4293e6fe7440a0700b097300f066275e602e41 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -76,6 +76,7 @@
+ #include "amdgpu_pmu.h"
+ #include "amdgpu_fru_eeprom.h"
+ #include "amdgpu_reset.h"
++#include <stela/pci.h>
+ #include "amdgpu_virt.h"
+ #include "amdgpu_dev_coredump.h"
+ 
+@@ -2360,6 +2361,10 @@ static int amdgpu_device_ip_hw_init_phase2(struct amdgpu_device *adev)
+ 		if (!amdgpu_ip_member_of_hwini(
+ 			    adev, adev->ip_blocks[i].version->type))
+ 			continue;
++		/* Stela: the display engine's start blanks every pipe the
++		 * firmware lit, so the firmware's picture ends here. */
++		if (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_DCE)
++			stela_linux_pci_screen_ended(adev->pdev, "start of the display engine");
+ 		r = adev->ip_blocks[i].version->funcs->hw_init(&adev->ip_blocks[i]);
+ 		if (r) {
+ 			dev_err(adev->dev,
+@@ -2373,6 +2378,38 @@ static int amdgpu_device_ip_hw_init_phase2(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++/*
++ * Stela: an ASIC reset, named by its method. It ends the picture the
++ * firmware left on the GPU's outputs; the host gives the firmware's
++ * framebuffer back after a failed probe only when no step of the driver
++ * ended that picture, so each reset names itself to it first.
++ */
++int amdgpu_device_asic_reset_named(struct amdgpu_device *adev)
++{
++	const char *why = "reset";
++
++	if (adev->asic_funcs->reset_method) {
++		switch (amdgpu_asic_reset_method(adev)) {
++		case AMD_RESET_METHOD_MODE1:
++			why = "MODE1 reset";
++			break;
++		case AMD_RESET_METHOD_MODE2:
++			why = "MODE2 reset";
++			break;
++		case AMD_RESET_METHOD_BACO:
++			why = "BACO reset";
++			break;
++		case AMD_RESET_METHOD_PCI:
++			why = "PCI reset";
++			break;
++		default:
++			break;
++		}
++	}
++	stela_linux_pci_screen_ended(adev->pdev, why);
++	return adev->asic_funcs->reset(adev);
++}
++
+ static int amdgpu_device_fw_loading(struct amdgpu_device *adev)
+ {
+ 	int r = 0;

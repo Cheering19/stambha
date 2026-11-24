@@ -92,11 +92,13 @@ impl MountLimits {
 
 pub const MANIFEST_PATH: &str = "EFI/stela/firmware/manifest.json";
 pub const DIRECTORY: &str = "EFI/stela/firmware";
-/// Room for the complete bundle's manifest: an image with the AMD and Intel
-/// ports writes 468 files (194 KiB), which an NVIDIA image must still read
-/// to find its GSP-RM firmware on a stick that image set up.
+/// Room for the complete bundle's manifest, whose amdgpu files alone are
+/// near 700.
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
-pub const MAX_IMAGES: usize = 64;
+/// Room for the files a GPU amdgpu identifies by IP discovery may ask for
+/// (every file named after an IP version, about 220), beside a second
+/// GPU's and the network's.
+pub const MAX_IMAGES: usize = 512;
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Room for a GSP-RM image per GPU family, beside every other driver's firmware.
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;

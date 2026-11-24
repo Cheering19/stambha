@@ -21,6 +21,7 @@ use crate::{
         vulkan::{
             MemoryHeapFlags, MemoryProperties,
             backend::{Backend, Object},
+            object::Semaphore,
             physical::{Identity, PciBusInfo, PhysicalDevice},
         },
     },
@@ -105,7 +106,7 @@ pub enum Refusal {
     Nvidia(nvidia::Refusal),
     #[cfg(feature = "amdgpu-port")]
     Amd(crate::metal::amd::Refusal),
-    #[cfg(feature = "xe-port")]
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     Intel(crate::metal::intel::Refusal),
 }
 
@@ -204,12 +205,19 @@ pub fn describe(physical: &PhysicalDevice) -> String {
 
 /// How long a first submission may take to signal: a GPU whose rings do
 /// not run never does, and the boot goes on without its Metal device.
-const FIRST_SUBMISSION_NS: u64 = 2_000_000_000;
+pub const FIRST_SUBMISSION_NS: u64 = 2_000_000_000;
 
 /// Submits one empty command buffer that signals a timeline semaphore and
 /// waits for it: the first time the kernel driver's command submission, its
 /// fence and its interrupt run for the device. Whether it signaled in time.
 pub fn first_submission<B: Backend>(backend: &mut B) -> Result<bool, Error> {
+    let semaphore = submit_first(backend)?;
+    first_signaled(backend, semaphore, FIRST_SUBMISSION_NS)
+}
+
+/// The first submission of [`first_submission`], without its wait: the
+/// semaphore it signals at 1.
+pub fn submit_first<B: Backend>(backend: &mut B) -> Result<Semaphore, Error> {
     let semaphore = backend.create_semaphore(0)?;
     let segment = Segment {
         waits: alloc::vec::Vec::new(),
@@ -217,9 +225,20 @@ pub fn first_submission<B: Backend>(backend: &mut B) -> Result<bool, Error> {
         commands: alloc::vec::Vec::new(),
         signals: alloc::vec![(semaphore, 1)],
     };
+    backend.submit(core::slice::from_ref(&segment))?;
+    Ok(semaphore)
+}
+
+/// Whether [`submit_first`]'s `semaphore` signaled within `timeout`
+/// nanoseconds, zero to look without waiting, or the error the kernel
+/// driver refused it with.
+pub fn first_signaled<B: Backend>(
+    backend: &mut B,
+    semaphore: Semaphore,
+    timeout: u64,
+) -> Result<bool, Error> {
     let signaled = backend
-        .submit(core::slice::from_ref(&segment))
-        .and_then(|()| backend.wait_semaphore(semaphore, 1, FIRST_SUBMISSION_NS))
+        .wait_semaphore(semaphore, 1, timeout)
         // A submission the kernel driver refused still signals, on the
         // driver's submit thread after the call returned: its failure is
         // taken by the signal.
@@ -320,7 +339,7 @@ pub unsafe fn open(
     // SAFETY: the caller's guarantees.
     let (mut backend, compiler) = unsafe { stack(loader, gpu.pci, exporter, compiler) }?;
     (loader.log)(&describe(backend.physical_device()));
-    if loader.keep_lost {
+    if loader.check_first_submission {
         let failed = match first_submission(&mut backend) {
             Ok(true) => {
                 (loader.log)("first submission signaled");
@@ -338,8 +357,9 @@ pub unsafe fn open(
             }
         };
         if let Some(error) = failed {
-            // A GPU whose first work hung is one its kernel driver resets,
-            // and releasing the device would wait for that reset's end.
+            // A GPU whose first work hung is one its kernel driver resets:
+            // releasing the device would wait for that reset's end (RADV's
+            // file close) or free memory the GPU may still write.
             core::mem::forget(backend);
             return Err(error.into());
         }
@@ -484,13 +504,21 @@ mod tests {
             kernel: crate::stack::Kernel {
                 driver: "xe",
                 admits: crate::xe::admits,
-                registers: 0,
+                registers: |_| 0,
+                aperture: Some(2),
+                resets_itself: false,
                 dma_bits: crate::xe::dma_bits,
                 integrated: crate::xe::integrated,
                 probed_integrated: None,
+                discovered_integrated: None,
                 chip: crate::xe::query::chip,
                 memory_bytes: crate::xe::query::memory_bytes,
                 reset: None,
+                describe: None,
+                version: None,
+                reads_rom: true,
+                unloads_on_boot_cpu: false,
+                pages_bounded: false,
             },
             metal: Some(intel::ADMISSION),
         };

@@ -8,9 +8,11 @@ mod anv;
 mod clc;
 pub mod fetch;
 mod hosted;
+mod image;
 mod llvm;
 mod mesa;
 mod metal_suite;
+mod names;
 mod nvk;
 mod radv;
 mod support;
@@ -95,6 +97,12 @@ pub enum Command {
         /// Textures currently must refuse explicitly; no GPU work is submitted.
         #[arg(long, num_args = 2, requires = "llvm_library", value_names = ["TRIANGLE", "TEXTURE"])]
         render_inputs: Vec<PathBuf>,
+        /// Sweep these AIR modules from Apple's `metal -c` through the Metal
+        /// compiler, with NAK's options and with BRW's for each Intel
+        /// compiler generation, and compile each kernel by that compiler: a
+        /// census of the shader corpus. No GPU work is submitted.
+        #[arg(long, num_args = 1.., requires = "llvm_library", value_name = "MODULE")]
+        metal_corpus: Vec<PathBuf>,
     },
     /// Compile NVK, NIR and NAK's C for `stela.efi` against Stela's C library,
     /// with ANV and BRW when this host has the tools their build runs, and
@@ -106,9 +114,19 @@ pub enum Command {
     },
     /// Build ANV for this machine with the image's options and run it on an
     /// xe render node with no GPU behind it: device creation, a BRW compute
-    /// pipeline and one submission per platform xe binds, through Stela's
-    /// libdrm stand-in, each xe ioctl checked against Stela's xe.
+    /// pipeline and one submission for each device xe admits that Mesa's
+    /// Intel table lists, through Stela's libdrm stand-in, each xe ioctl
+    /// checked against Stela's xe.
     AnvTest {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+    },
+    /// RADV and ANV as the image compiles them, with its C library and
+    /// defines, built for this machine instead of the image's target and
+    /// run over Mesa's DRM shim: each must make its devices and one
+    /// submission. Run after `nvk`.
+    ImageTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
@@ -118,15 +136,40 @@ pub enum Command {
     /// compute pipeline and one submission per device of the test, through
     /// Stela's libdrm stand-in and libdrm_amdgpu, each amdgpu ioctl checked
     /// against Stela's amdgpu.
+    ///
+    /// Each device then opens the Metal device over the same RADV in a
+    /// process of its own, which checks every Vulkan requirement the device
+    /// has; the first device of each graphics generation also compiles the
+    /// Metal libraries given through ACO.
     RadvTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
+        /// Metal libraries (`.metallib` files, or directories of them) to
+        /// compile function by function through the device's compiler and
+        /// ACO. They are Apple compiler output and never committed.
+        #[arg(long)]
+        corpus: Vec<PathBuf>,
+    },
+    /// The Metal device over the hosted RADV library LIBRARY, in the process
+    /// `radv-test` starts for one device under the amdgpu DRM shim.
+    #[command(hide = true)]
+    RadvMetal {
+        library: PathBuf,
+        corpus: Vec<PathBuf>,
     },
     /// Differential testing of the Metal stack: plan the suite's assertions,
     /// prove them on a Mac, carry them to a guest and check its results.
     #[command(subcommand)]
     MetalSuite(metal_suite::Command),
+    /// Write the market names of NVIDIA, AMD and Intel display controllers
+    /// that the boot screen shows (`crates/stela-driver-gpu/src/names`) from
+    /// the pinned `pci.ids` release and the libdrm and Mesa pins.
+    Names {
+        /// The PCI ID database's `pci.ids` of the pinned release.
+        #[arg(long, default_value = "/usr/share/hwdata/pci.ids")]
+        pci_ids: PathBuf,
+    },
     /// Compile LLVM and libc++ for `stela.efi`, which `nvk` also does.
     Llvm {
         /// Maximum parallel native compiler processes.
@@ -152,6 +195,7 @@ pub fn run(command: Command) -> Result<()> {
             air_fp_profile,
             threadgroup_inputs,
             render_inputs,
+            metal_corpus,
         } => mesa::build(mesa::BuildOptions {
             jobs,
             require_all_targets,
@@ -162,12 +206,18 @@ pub fn run(command: Command) -> Result<()> {
             fp_profile: air_fp_profile.unwrap_or_default(),
             threadgroup_inputs: &threadgroup_inputs,
             render_inputs: &render_inputs,
+            metal_corpus: &metal_corpus,
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
         Command::AnvTest { jobs } => anv::test(jobs),
-        Command::RadvTest { jobs } => radv::test(jobs),
+        Command::ImageTest { jobs } => image::test(jobs),
+        Command::RadvTest { jobs, corpus } => radv::test(jobs, &corpus),
+        Command::RadvMetal { library, corpus } => {
+            radv::metal(&library, &support::third_party("linux"), &corpus)
+        }
         Command::MetalSuite(command) => metal_suite::run(command),
+        Command::Names { pci_ids } => names::generate(&pci_ids),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::discover()?, jobs, test),
     }
 }
@@ -182,17 +232,4 @@ pub fn default_jobs() -> u16 {
 pub fn build_nvk(jobs: u16) -> Result<()> {
     nvk::build(jobs)?;
     crate::guest::run()
-}
-
-/// Fails unless the last `gpu nvk` linked the Vulkan driver `name` (Meson's
-/// name for it), which needs the build host's tools (`clc.rs`).
-pub fn require_vulkan_driver(name: &str) -> Result<()> {
-    let list = support::build_directory("nvk").join(nvk::LINKED);
-    let linked = std::fs::read_to_string(&list).unwrap_or_default();
-    anyhow::ensure!(
-        linked.lines().any(|linked| linked == name),
-        "Vulkan driver {name} is not built: `cargo xtask gpu nvk` says why ({})",
-        list.display()
-    );
-    Ok(())
 }

@@ -1163,18 +1163,55 @@ static void start_case(void)
  START_FIXTURE(f, p);
  /* The bytes after the length are not the command line's. */
  const char line[] = "xe.vbt_firmware=intel/vbt.bin absent=1";
- assert(!stela_linux_start(&f.image, line, strlen("xe.vbt_firmware=intel/vbt.bin"), &test_registry));
+ char rejected[32] = "stale";
+ assert(!stela_linux_start(&f.image, line, strlen("xe.vbt_firmware=intel/vbt.bin"), &test_registry,
+  rejected, sizeof(rejected)));
+ assert(!rejected[0]);
  assert(test_registry && event_count == 1 && events[0] == 60);
  stela_linux_exit();
 }
-/* A word no built-in declares fails the start before any initcall. */
+/* A word no built-in declares fails the start before any initcall, and
+ * the start names it, cut to the caller's buffer. */
 static void start_unknown_case(void)
 {
  stela_linux_enter(&stela_linux_bare);
  START_FIXTURE(f, p);
  const char line[] = "xe.vbt_firmware=intel/vbt.bin absent.word=1";
- assert(stela_linux_start(&f.image, line, strlen(line), &test_registry) == -ENOENT);
+ char rejected[32];
+ assert(stela_linux_start(&f.image, line, strlen(line), &test_registry, rejected,
+  sizeof(rejected)) == -ENOENT);
  assert(!event_count && !strcmp(start_table, "intel/vbt.bin"));
+ assert(!strcmp(rejected, "absent.word=1"));
+ stela_linux_exit();
+}
+static void start_unknown_cut_case(void)
+{
+ stela_linux_enter(&stela_linux_bare);
+ START_FIXTURE(f, p);
+ const char line[] = "absent.word=1";
+ char rejected[7];
+ assert(stela_linux_start(&f.image, line, strlen(line), &test_registry, rejected,
+  sizeof(rejected)) == -ENOENT);
+ assert(!event_count && !strcmp(rejected, "absent"));
+ stela_linux_exit();
+}
+/* A value its parameter refuses fails the start, naming the parameter. */
+static int refuse_value(const char *value, const struct kernel_param *kp)
+{
+ (void)value; (void)kp;
+ return -EINVAL;
+}
+static const struct kernel_param_ops refusing_ops = {.set = refuse_value};
+static void start_refused_case(void)
+{
+ stela_linux_enter(&stela_linux_bare);
+ START_FIXTURE(f, p);
+ p.ops = &refusing_ops;
+ const char line[] = "xe.vbt_firmware=intel/vbt.bin";
+ char rejected[32];
+ assert(stela_linux_start(&f.image, line, strlen(line), &test_registry, rejected,
+  sizeof(rejected)) == -EINVAL);
+ assert(!event_count && !strcmp(rejected, "xe.vbt_firmware"));
  stela_linux_exit();
 }
 /* Without a command line every parameter keeps its default. */
@@ -1184,7 +1221,7 @@ static void start_empty_case(void)
  stela_linux_enter(&stela_linux_bare);
  START_FIXTURE(f, p);
  f.init[0].target = init_default;
- assert(!stela_linux_start(&f.image, NULL, 0, &test_registry));
+ assert(!stela_linux_start(&f.image, NULL, 0, &test_registry, NULL, 0));
  assert(event_count == 1 && events[0] == 61);
  stela_linux_exit();
 }
@@ -1313,6 +1350,8 @@ int main(void)
  assert(stela_test_registry_case(positive_parameter_case));
  assert(stela_test_registry_case(start_case));
  assert(stela_test_registry_case(start_unknown_case));
+ assert(stela_test_registry_case(start_unknown_cut_case));
+ assert(stela_test_registry_case(start_refused_case));
  assert(stela_test_registry_case(start_empty_case));
  printf("Linux static registry: source lifecycle/order/options/context fixtures passed\n");
  return 0;

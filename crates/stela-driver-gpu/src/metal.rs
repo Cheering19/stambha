@@ -13,7 +13,6 @@
 mod macros;
 
 pub mod abi;
-#[cfg(feature = "amdgpu-port")]
 pub mod amd;
 pub mod argument;
 pub mod binding;
@@ -27,7 +26,7 @@ pub mod fault_dump;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;
-#[cfg(feature = "xe-port")]
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
 pub mod intel;
 pub mod kms;
 pub mod library;

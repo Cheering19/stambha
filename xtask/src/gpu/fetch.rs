@@ -251,6 +251,27 @@ fn submodules() -> Result<Vec<Submodule>> {
     Ok(submodules)
 }
 
+/// The file at `path` in the submodule `name` as its pinned commit holds it,
+/// whatever is checked out, sparse or patched, with that commit.
+pub(super) fn pinned_file(name: &str, path: &str) -> Result<(String, String)> {
+    let submodule = submodules()?
+        .into_iter()
+        .find(|submodule| submodule.name == name)
+        .with_context(|| format!("no submodule {name}"))?;
+    let text = capture(
+        submodule
+            .git()
+            .args(["show", &format!("{}:{path}", submodule.pin)]),
+    )
+    .with_context(|| {
+        format!(
+            "{path} at {name}'s pin {}; run `cargo xtask gpu fetch` first",
+            submodule.pin
+        )
+    })?;
+    Ok((submodule.pin, text))
+}
+
 /// Creates the checkout the way `git submodule update --init` would, but
 /// sparse before anything is checked out, then moves its git directory
 /// into the superproject's.

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:48:50 +0000
+Subject: [PATCH] fix(amdgpu): a graphics core whose memory hub places VRAM
+ past the GPU's address space, as one a previous owner left powered down reads
+ all ones, fails the probe with one line saying it does not answer, where its
+ page tables hit a BUG in gmc_v10_0_get_vm_pde that ended the boot
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 25 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c   |  2 +-
+ 6 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 8fb3ebe4c2990d4e0b63951b2d5e07a2d047a7d0..c124e8f7523cf8b1666246407692a6fde60a9af7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -237,6 +237,31 @@ void amdgpu_gmc_vram_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc,
+ 			mc->vram_end, mc->real_vram_size >> 20);
+ }
+ 
++/**
++ * amdgpu_gmc_vram_answers - check that VRAM lies in the GPU's address space
++ *
++ * @adev: amdgpu device structure holding all necessary information
++ * @mc: memory controller structure holding memory information
++ *
++ * A graphics core whose registers read all ones, as one a previous owner
++ * left powered down (GFXOFF allowed, then no reset) or one not powered,
++ * gives a frame buffer location past the GPU's address space; the page
++ * tables built on it hit a BUG at the first page directory entry. The
++ * probe ends here instead, with one line, before anything uses it.
++ *
++ * Returns 0 when VRAM lies in the address space, -ENODEV otherwise.
++ */
++int amdgpu_gmc_vram_answers(struct amdgpu_device *adev, struct amdgpu_gmc *mc)
++{
++	if (mc->vram_start <= mc->mc_mask &&
++	    (!mc->mc_vram_size || mc->vram_end <= mc->mc_mask))
++		return 0;
++	dev_err(adev->dev,
++		"the graphics core does not answer: its memory hub places VRAM at 0x%016llX - 0x%016llX, past the GPU's address space 0x%016llX, as when its registers read all ones (powered down by the previous owner, or not powered); the GPU is not started\n",
++		mc->vram_start, mc->vram_end, mc->mc_mask);
++	return -ENODEV;
++}
++
+ /** amdgpu_gmc_sysvm_location - place vram and gart in sysvm aperture
+  *
+  * @adev: amdgpu device structure holding all necessary information
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index ddb0d500e0faa2f6eb710c051ac7615fb2ac5822..b2dbc980e50fc4c5f3d439cc7f1c62219c33ba72 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -420,6 +420,7 @@ uint64_t amdgpu_gmc_agp_addr(struct ttm_buffer_object *bo);
+ void amdgpu_gmc_sysvm_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc);
+ void amdgpu_gmc_vram_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc,
+ 			      u64 base);
++int amdgpu_gmc_vram_answers(struct amdgpu_device *adev, struct amdgpu_gmc *mc);
+ void amdgpu_gmc_gart_location(struct amdgpu_device *adev,
+ 			      struct amdgpu_gmc *mc,
+ 			      enum amdgpu_gart_placement gart_placement);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+index 6be2000c82614a5a68d524723659131f58241c7a..b14866fd011ed91fcc245b91c5b7f073baf5b64c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+@@ -721,7 +721,7 @@ static int gmc_v10_0_mc_init(struct amdgpu_device *adev)
+ 
+ 	gmc_v10_0_vram_gtt_location(adev, &adev->gmc);
+ 
+-	return 0;
++	return amdgpu_gmc_vram_answers(adev, &adev->gmc);
+ }
+ 
+ static int gmc_v10_0_gart_init(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+index c40d9c46720450715298c5c5c9cad825b8cc9346..1f74764e9513f4aaa99035870ab51313b25d36eb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+@@ -717,7 +717,7 @@ static int gmc_v11_0_mc_init(struct amdgpu_device *adev)
+ 
+ 	gmc_v11_0_vram_gtt_location(adev, &adev->gmc);
+ 
+-	return 0;
++	return amdgpu_gmc_vram_answers(adev, &adev->gmc);
+ }
+ 
+ static int gmc_v11_0_gart_init(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c
+index 0fc0c783b1cc43f60e8c4b9055b5e42cf60acbe9..ef4f98ddf724bbea834f78587dc6fbb0f613955a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c
+@@ -769,7 +769,7 @@ static int gmc_v12_0_mc_init(struct amdgpu_device *adev)
+ 
+ 	gmc_v12_0_vram_gtt_location(adev, &adev->gmc);
+ 
+-	return 0;
++	return amdgpu_gmc_vram_answers(adev, &adev->gmc);
+ }
+ 
+ static int gmc_v12_0_gart_init(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 8a5c44810ba1eec04f51bf6b9bee31cba3cd5671..c2a2590aa0a691ea0dd572fd9460903fe5079071 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -1752,7 +1752,7 @@ static int gmc_v9_0_mc_init(struct amdgpu_device *adev)
+ 
+ 	gmc_v9_0_vram_gtt_location(adev, &adev->gmc);
+ 
+-	return 0;
++	return amdgpu_gmc_vram_answers(adev, &adev->gmc);
+ }
+ 
+ static int gmc_v9_0_gart_init(struct amdgpu_device *adev)

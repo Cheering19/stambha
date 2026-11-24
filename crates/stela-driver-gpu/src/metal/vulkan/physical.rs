@@ -318,6 +318,20 @@ pub struct Memory {
     pub types: Vec<MemoryType>,
 }
 
+/// How a driver's memory heaps share memory, which Vulkan does not say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapLayout {
+    /// A device-local heap may lie inside another: NVK gives the window the
+    /// CPU reaches through a small PCI BAR a heap of its own inside the VRAM
+    /// heap (`nvk_physical_device.c`), so the largest is the GPU's memory.
+    Nested,
+    /// Every heap is memory of its own: RADV splits VRAM into the part the
+    /// CPU reaches and the rest, and on an integrated GPU the shared memory
+    /// into a device-local and a host heap
+    /// (`radv_physical_device_init_mem_types`); ANV splits VRAM likewise.
+    Disjoint,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryHeap {
     pub size: u64,
@@ -376,29 +390,48 @@ impl Memory {
         self
     }
 
-    /// Bytes of the GPU's own memory: its largest device-local heap. A
-    /// driver may give the window the CPU reaches through a small PCI BAR a
-    /// device-local heap of its own that is part of the larger one (NVK
-    /// does), and Vulkan does not say whether two heaps share memory, so a
-    /// sum would count the window twice. Where a driver's heaps are
-    /// disjoint this leaves the window out: never more than the GPU has.
-    pub fn device_local_bytes(&self) -> u64 {
-        self.device_local_heaps()
-            .map(|heap| heap.size)
-            .max()
-            .unwrap_or(0)
+    /// Bytes of the memory the GPU works in, as the driver's heaps are laid
+    /// out ([`HeapLayout`]): its own memory on a discrete GPU, the memory it
+    /// shares with the processor on an integrated one (`unified`).
+    pub fn working_set_bytes(&self, layout: HeapLayout, unified: bool) -> u64 {
+        match layout {
+            HeapLayout::Nested => self.device_local_heaps().map(|heap| heap.size).max(),
+            HeapLayout::Disjoint => Some(
+                self.working_heaps(unified)
+                    .fold(0u64, |total, heap| total.saturating_add(heap.size)),
+            ),
+        }
+        .unwrap_or(0)
     }
 
-    /// The driver's current budget for its largest device-local heap, as
-    /// [`Self::device_local_bytes`] counts it, if it reports budgets.
-    pub fn device_local_budget(&self) -> Option<u64> {
-        let heaps = || self.device_local_heaps();
-        if heaps().any(|heap| heap.budget.is_none()) {
-            return None;
+    /// The driver's current budget for the heaps [`Self::working_set_bytes`]
+    /// counts, if it reports budgets for all of them.
+    pub fn working_set_budget(&self, layout: HeapLayout, unified: bool) -> Option<u64> {
+        match layout {
+            HeapLayout::Nested => {
+                let heaps = || self.device_local_heaps();
+                if heaps().any(|heap| heap.budget.is_none()) {
+                    return None;
+                }
+                heaps()
+                    .max_by_key(|heap| heap.size)
+                    .and_then(|heap| heap.budget)
+            }
+            HeapLayout::Disjoint => {
+                let mut heaps = self.working_heaps(unified).peekable();
+                heaps.peek()?;
+                heaps.try_fold(0u64, |total, heap| Some(total.saturating_add(heap.budget?)))
+            }
         }
-        heaps()
-            .max_by_key(|heap| heap.size)
-            .and_then(|heap| heap.budget)
+    }
+
+    /// The heaps of disjoint memory the GPU works in: its device-local ones,
+    /// and on a GPU that shares the processor's memory every heap, as each
+    /// is a part of that memory.
+    fn working_heaps(&self, unified: bool) -> impl Iterator<Item = &MemoryHeap> {
+        self.heaps
+            .iter()
+            .filter(move |heap| unified || heap.flags.contains(MemoryHeapFlags::DEVICE_LOCAL))
     }
 
     fn device_local_heaps(&self) -> impl Iterator<Item = &MemoryHeap> {
@@ -501,22 +534,25 @@ mod tests {
                 heap(32 << 30, MemoryHeapFlags::EMPTY, Some(24 << 30)),
             ]
         );
-        assert_eq!(capped.device_local_budget(), None);
-        assert_eq!(capped.device_local_bytes(), 4 << 30);
+        assert_eq!(capped.working_set_budget(HeapLayout::Nested, false), None);
+        assert_eq!(capped.working_set_bytes(HeapLayout::Nested, false), 4 << 30);
         assert_eq!(memory.clone().capped(u64::MAX), memory);
         assert_eq!(decimal("4096"), 4096);
+    }
+
+    fn heap(size: u64, flags: MemoryHeapFlags, budget: u64) -> MemoryHeap {
+        MemoryHeap {
+            size,
+            flags,
+            budget: Some(budget),
+        }
     }
 
     /// Without a resizable BAR, NVK gives the 256 MiB the CPU reaches a
     /// device-local heap of its own inside VRAM: the GPU's memory is the
     /// VRAM heap, where the sum of both said 8448 MiB of an 8 GiB card.
     #[test]
-    fn the_gpus_memory_is_its_largest_device_local_heap() {
-        let heap = |size: u64, flags, budget: u64| MemoryHeap {
-            size,
-            flags,
-            budget: Some(budget),
-        };
+    fn nested_heaps_count_the_largest_device_local_heap() {
         let small_bar = Memory {
             heaps: vec![
                 heap(8 << 30, MemoryHeapFlags::DEVICE_LOCAL, 7 << 30),
@@ -525,13 +561,108 @@ mod tests {
             ],
             types: Vec::new(),
         };
-        assert_eq!(small_bar.device_local_bytes(), 8 << 30);
-        assert_eq!(small_bar.device_local_budget(), Some(7 << 30));
+        assert_eq!(
+            small_bar.working_set_bytes(HeapLayout::Nested, false),
+            8 << 30
+        );
+        assert_eq!(
+            small_bar.working_set_budget(HeapLayout::Nested, false),
+            Some(7 << 30)
+        );
         let host_only = Memory {
             heaps: vec![heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30)],
             types: Vec::new(),
         };
-        assert_eq!(host_only.device_local_bytes(), 0);
-        assert_eq!(host_only.device_local_budget(), None);
+        assert_eq!(host_only.working_set_bytes(HeapLayout::Nested, false), 0);
+        assert_eq!(
+            host_only.working_set_budget(HeapLayout::Nested, false),
+            None
+        );
+    }
+
+    /// RADV on an 8 GiB card without a resizable BAR: VRAM the CPU cannot
+    /// reach and the 256 MiB it can are two heaps, which together are the
+    /// card's memory, where the largest alone said 7936 MiB. With a
+    /// resizable BAR one heap holds it all.
+    #[test]
+    fn disjoint_heaps_of_a_discrete_gpu_count_every_device_local_heap() {
+        let small_bar = Memory {
+            heaps: vec![
+                heap(
+                    (8 << 30) - (256 << 20),
+                    MemoryHeapFlags::DEVICE_LOCAL,
+                    7 << 30,
+                ),
+                heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30),
+                heap(256 << 20, MemoryHeapFlags::DEVICE_LOCAL, 200 << 20),
+            ],
+            types: Vec::new(),
+        };
+        assert_eq!(
+            small_bar.working_set_bytes(HeapLayout::Disjoint, false),
+            8 << 30
+        );
+        assert_eq!(
+            small_bar.working_set_budget(HeapLayout::Disjoint, false),
+            Some((7 << 30) + (200 << 20))
+        );
+        let resizable = Memory {
+            heaps: vec![
+                heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30),
+                heap(8 << 30, MemoryHeapFlags::DEVICE_LOCAL, 7 << 30),
+            ],
+            types: Vec::new(),
+        };
+        assert_eq!(
+            resizable.working_set_bytes(HeapLayout::Disjoint, false),
+            8 << 30
+        );
+        let unbudgeted = Memory {
+            heaps: vec![MemoryHeap {
+                size: 8 << 30,
+                flags: MemoryHeapFlags::DEVICE_LOCAL,
+                budget: None,
+            }],
+            types: Vec::new(),
+        };
+        assert_eq!(
+            unbudgeted.working_set_budget(HeapLayout::Disjoint, false),
+            None
+        );
+        let host_only = Memory {
+            heaps: vec![heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30)],
+            types: Vec::new(),
+        };
+        assert_eq!(host_only.working_set_bytes(HeapLayout::Disjoint, false), 0);
+        assert_eq!(
+            host_only.working_set_budget(HeapLayout::Disjoint, false),
+            None
+        );
+    }
+
+    /// RADV on an APU splits the memory it shares with the processor, its
+    /// GTT and the CPU-visible carve-out, into a device-local heap of two
+    /// thirds and a host heap of one third: the GPU works in both, where the
+    /// device-local heap alone left a third out.
+    #[test]
+    fn an_integrated_gpu_works_in_every_heap_of_its_shared_memory() {
+        let shared = (6 << 30) + (256 << 20);
+        let device_local = shared / 3 * 2;
+        let apu = Memory {
+            heaps: vec![
+                heap(shared - device_local, MemoryHeapFlags::EMPTY, 1 << 30),
+                heap(device_local, MemoryHeapFlags::DEVICE_LOCAL, 3 << 30),
+            ],
+            types: Vec::new(),
+        };
+        assert_eq!(apu.working_set_bytes(HeapLayout::Disjoint, true), shared);
+        assert_eq!(
+            apu.working_set_budget(HeapLayout::Disjoint, true),
+            Some(4 << 30)
+        );
+        assert_eq!(
+            apu.working_set_bytes(HeapLayout::Disjoint, false),
+            device_local
+        );
     }
 }

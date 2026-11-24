@@ -277,6 +277,18 @@ impl Laptop {
     }
 }
 
+/// Composes the frames of a laptop panel that an integrated GPU drives on
+/// the discrete GPU that serves Metal (`--hybrid-scanout on|off`), as
+/// Linux's PRIME render offload does on a laptop without a display mux:
+/// the discrete GPU's Metal service imports the integrated GPU's three
+/// scanout buffers, composes each frame into the hidden one and the
+/// integrated GPU flips it on its vblank, where the CPU copied each frame's
+/// rows. On amdgpu the buffers are made in system memory (GTT), which
+/// another GPU can import. Off by default until proven on hardware: a
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13.
+pub const HYBRID_SCANOUT: &str = "--hybrid-scanout";
+
 /// The thermal policy an ASUS laptop's firmware is set to before macOS
 /// starts (`--asus-mode performance|turbo|silent|off`), as Linux's
 /// asus-wmi sets `throttle_thermal_policy`: a hand-written option setup
@@ -783,6 +795,9 @@ pub struct System {
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
+    /// Whether the discrete GPU composes an integrated GPU's panel
+    /// ([`HYBRID_SCANOUT`]); off unless given ([`Self::hybrid_scanout`]).
+    pub hybrid_scanout: Option<bool>,
     /// The ASUS thermal policy set before macOS starts ([`ASUS_MODE`]);
     /// [`AsusMode::Performance`] unless given ([`Self::asus_mode`]).
     pub asus_mode: Option<AsusMode>,
@@ -931,6 +946,7 @@ impl Default for System {
             tier2_check: false,
             pack_preload: None,
             laptop: None,
+            hybrid_scanout: None,
             asus_mode: None,
             gpu_aspm: None,
             amx_native: None,
@@ -1129,6 +1145,12 @@ impl System {
     /// else [`Laptop::Auto`].
     pub fn laptop(&self) -> Laptop {
         self.laptop.unwrap_or_default()
+    }
+
+    /// Whether the discrete GPU composes an integrated GPU's panel:
+    /// `--hybrid-scanout`, else off.
+    pub fn hybrid_scanout(&self) -> bool {
+        self.hybrid_scanout.unwrap_or(false)
     }
 
     /// The ASUS thermal policy set before macOS starts: `--asus-mode`,
@@ -1553,6 +1575,10 @@ impl fmt::Display for System {
             self.pack_preload.map(|on| if on { "on" } else { "off" }),
         )?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
+        line.value(
+            HYBRID_SCANOUT,
+            self.hybrid_scanout.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;

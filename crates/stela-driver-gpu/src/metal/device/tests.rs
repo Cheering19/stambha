@@ -1141,21 +1141,35 @@ fn pipelines_made_before_admission_compile_again_on_next_use() {
         let state = device.render_pipeline_state(id).unwrap();
         (state.id, state.pipeline.unwrap())
     };
-    let early = device.render_variant(state_id, [0, 1]).unwrap();
+    let early = device
+        .render_variant(state_id, [0, 1], PrimitiveTopologyClass::Unspecified)
+        .unwrap();
     device.admit_bicubic(vertex).unwrap();
     device.admit_bicubic(fragment).unwrap();
     device.outdate_pipelines(&[vertex, fragment]);
     assert!(device.render_pipeline_state(id).unwrap().outdated);
     let compiled = device.compiler.compiled.len();
-    let late = device.render_variant(state_id, [0; 2]).unwrap();
+    let late = device
+        .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Unspecified)
+        .unwrap();
     assert_ne!(late, base);
-    assert_ne!(device.render_variant(state_id, [0, 1]).unwrap(), early);
+    assert_ne!(
+        device
+            .render_variant(state_id, [0, 1], PrimitiveTopologyClass::Unspecified)
+            .unwrap(),
+        early
+    );
     assert!(
         device.compiler.compiled[compiled..]
             .iter()
             .all(|stage| stage.bicubic_arguments)
     );
-    assert_eq!(device.render_variant(state_id, [0; 2]).unwrap(), late);
+    assert_eq!(
+        device
+            .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Unspecified)
+            .unwrap(),
+        late
+    );
 }
 
 fn bicubic_request(vertex: FunctionId, fragment: FunctionId) -> RenderPipelineRequest {
@@ -1174,6 +1188,97 @@ fn bicubic_request(vertex: FunctionId, fragment: FunctionId) -> RenderPipelineRe
     }
 }
 
+/// A device that fixes each pipeline's topology class builds a variant of
+/// a pipeline without an input primitive topology for each class it draws,
+/// once; a device that does not, and a pipeline of a class, draw every
+/// primitive with the pipeline itself.
+#[test]
+fn fixed_class_devices_build_a_variant_per_drawn_class() {
+    use crate::metal::vulkan::PrimitiveTopology;
+    for unrestricted in [false, true] {
+        let mut backend = MockBackend::new();
+        if let Some(physical) = &mut backend.physical {
+            physical.features.dynamic_primitive_topology_unrestricted = unrestricted;
+        }
+        let mut device = device_on(backend);
+        let vertex = device.new_function(LIBRARY, "vertex", Some(&[])).unwrap();
+        let fragment = device.new_function(LIBRARY, "fragment", Some(&[])).unwrap();
+        for class in [
+            PrimitiveTopologyClass::Unspecified,
+            PrimitiveTopologyClass::Triangle,
+        ] {
+            let request = RenderPipelineRequest {
+                input_primitive_topology: class,
+                ..bicubic_request(vertex, fragment)
+            };
+            let id = device.new_render_pipeline(&request).unwrap();
+            let state = device.render_pipeline_state(id).unwrap();
+            let (state_id, base) = (state.id, state.pipeline.unwrap());
+            let variants = !unrestricted && class == PrimitiveTopologyClass::Unspecified;
+            assert_eq!(state.plan.topology_variants, variants);
+            let built = device.backend().graphics.len();
+            let points = device
+                .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Point)
+                .unwrap();
+            let lines = device
+                .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Line)
+                .unwrap();
+            if variants {
+                assert!(points != base && lines != base && points != lines);
+                let topologies: Vec<_> = device.backend().graphics[built..]
+                    .iter()
+                    .map(|info| info.topology)
+                    .collect();
+                assert_eq!(
+                    topologies,
+                    [PrimitiveTopology::PointList, PrimitiveTopology::LineList]
+                );
+                assert_eq!(
+                    device
+                        .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Point)
+                        .unwrap(),
+                    points
+                );
+                assert_eq!(device.backend().graphics.len(), built + 2);
+            } else {
+                assert_eq!((points, lines), (base, base));
+                assert_eq!(device.backend().graphics.len(), built);
+            }
+            device.destroy_render_pipeline(id).unwrap();
+        }
+    }
+}
+
+/// GPU-resident commands bind no variants: a fixed-class device's
+/// indirect-bindable pipeline without an input primitive topology draws
+/// triangles alone there, which the device reports once.
+#[test]
+fn fixed_class_indirect_pipelines_draw_triangles_and_report_once() {
+    let mut backend = MockBackend::new();
+    let physical = backend.physical.as_mut().unwrap();
+    physical.features.dynamic_primitive_topology_unrestricted = false;
+    if physical.limits.generated_commands.is_none() {
+        return;
+    }
+    let mut device = device_on(backend);
+    let vertex = device.new_function(LIBRARY, "vertex", Some(&[])).unwrap();
+    let fragment = device.new_function(LIBRARY, "fragment", Some(&[])).unwrap();
+    let request = RenderPipelineRequest {
+        input_primitive_topology: PrimitiveTopologyClass::Unspecified,
+        support_indirect_command_buffers: true,
+        ..bicubic_request(vertex, fragment)
+    };
+    while device.take_unsupported().is_some() {}
+    for _ in 0..2 {
+        let id = device.new_render_pipeline(&request).unwrap();
+        let plan = &device.render_pipeline_state(id).unwrap().plan;
+        assert_eq!(plan.indirect_topology(), PrimitiveTopologyClass::Triangle);
+    }
+    let reported = device.take_unsupported().unwrap();
+    assert!(reported.starts_with("GPU-resident point and line draws"));
+    assert_eq!(device.take_unsupported(), None);
+}
+
 #[test]
 fn bicubic_render_variants_compile_once_per_sampler_mask() {
     let mut device = device();
@@ -1186,10 +1291,17 @@ fn bicubic_render_variants_compile_once_per_sampler_mask() {
     let (state_id, base) = (state.id, state.pipeline.unwrap());
     assert_eq!(state.bicubic, [0; 2]);
     // The pipeline's own mask is the pipeline.
-    assert_eq!(device.render_variant(state_id, [0; 2]).unwrap(), base);
+    assert_eq!(
+        device
+            .render_variant(state_id, [0; 2], PrimitiveTopologyClass::Unspecified)
+            .unwrap(),
+        base
+    );
 
     let compiled = device.compiler.compiled.len();
-    let variant = device.render_variant(state_id, [0, 1 << 2]).unwrap();
+    let variant = device
+        .render_variant(state_id, [0, 1 << 2], PrimitiveTopologyClass::Unspecified)
+        .unwrap();
     assert_ne!(variant, base);
     let stages: Vec<_> = device.compiler.compiled[compiled..]
         .iter()
@@ -1198,11 +1310,15 @@ fn bicubic_render_variants_compile_once_per_sampler_mask() {
     assert_eq!(stages, [0, 1 << 2]);
     // The variant compiles once; another mask is another variant.
     assert_eq!(
-        device.render_variant(state_id, [0, 1 << 2]).unwrap(),
+        device
+            .render_variant(state_id, [0, 1 << 2], PrimitiveTopologyClass::Unspecified)
+            .unwrap(),
         variant
     );
     assert_eq!(device.compiler.compiled.len(), compiled + 2);
-    let other = device.render_variant(state_id, [1, 1 << 2]).unwrap();
+    let other = device
+        .render_variant(state_id, [1, 1 << 2], PrimitiveTopologyClass::Unspecified)
+        .unwrap();
     assert!(other != variant && other != base);
     assert_eq!(device.compiler.compiled.len(), compiled + 4);
     device.destroy_render_pipeline(id).unwrap();
@@ -1601,12 +1717,15 @@ fn cache_header(vendor: u32, device: u32, uuid: [u8; 16]) -> Vec<u8> {
 fn archive_files_hold_pipelines_only_under_this_devices_header() {
     let mut device = device();
     let identity = device.backend().physical_device().identity.clone();
-    let (vendor, id, uuid) = (
+    let (vendor, id, driver_uuid) = (
         identity.vendor_id,
         identity.device_id,
         identity.pipeline_cache_uuid,
     );
+    let uuid = super::pipelines::archive_uuid(&driver_uuid);
     assert!(device.archive_header_matches(&cache_header(vendor, id, uuid)));
+    // The driver's own UUID is every Stela build's: another build's file.
+    assert!(!device.archive_header_matches(&cache_header(vendor, id, driver_uuid)));
     let mut other_uuid = uuid;
     other_uuid[15] ^= 1;
     assert!(!device.archive_header_matches(&cache_header(vendor, id, other_uuid)));
@@ -1620,6 +1739,31 @@ fn archive_files_hold_pipelines_only_under_this_devices_header() {
     assert!(!device.archive_header_matches(&short));
     assert!(!device.archive_header_matches(&cache_header(vendor, id, uuid)[..31]));
     assert!(!device.archive_header_matches(&[]));
+}
+
+#[test]
+fn archive_files_name_this_builds_uuid_and_the_driver_reads_its_own() {
+    let mut device = device();
+    let identity = device.backend().physical_device().identity.clone();
+    let driver = cache_header(
+        identity.vendor_id,
+        identity.device_id,
+        identity.pipeline_cache_uuid,
+    );
+    device.backend().cache_header = driver.clone();
+    let archive = device.new_archive(&[]).unwrap();
+    let data = device.archive_data(archive).unwrap();
+    let file = cache_header(
+        identity.vendor_id,
+        identity.device_id,
+        super::pipelines::archive_uuid(&identity.pipeline_cache_uuid),
+    );
+    assert_eq!(data[..32], file[..]);
+    assert!(device.archive_header_matches(&data));
+    device.new_archive(&data).unwrap();
+    let read = device.backend().cache_inputs.last().unwrap().clone();
+    assert_eq!(read[..32], driver[..], "the driver reads its own header");
+    assert_eq!(read[32..], data[32..]);
 }
 
 #[test]
@@ -3673,6 +3817,59 @@ fn a_device_out_of_memory_frees_at_once_what_work_in_flight_never_read() {
         "{note}"
     );
     complete(&mut device, running);
+}
+
+/// A device on an integrated GPU's share of RAM refuses an allocation
+/// the share would not hold, at its out-of-memory answer and with a note
+/// naming the share, before the driver's own allocation is asked: the
+/// share's state is what Linux holds of it, not the driver's budget.
+#[test]
+fn a_device_on_a_share_refuses_what_the_share_would_not_hold() {
+    use super::share::ShareState;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static HELD: AtomicU64 = AtomicU64::new(400 << 20);
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: HELD.load(Ordering::Relaxed),
+            limit: 1024 << 20,
+        })
+    }
+    let mut device = device_on(MockBackend::new());
+    device.share_memory(state);
+    // 1024M less a 64M margin and Linux's 400M leave 560M, which holds
+    // 448M of the guest's at 1.25 bytes each: seven 64M textures.
+    let large = TextureDescriptor {
+        width: 4096,
+        height: 4096,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let mut textures = Vec::new();
+    for _ in 0..7 {
+        textures.push(device.new_texture(&large).unwrap());
+    }
+    assert_eq!(device.new_texture(&large), Err(Error::OutOfMemory));
+    assert_eq!(device.memory().out_of_memory, 1);
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.ends_with("; the GPU's share of RAM: Linux holds 400M of 1024M"),
+        "{note}"
+    );
+    // Linux's own count decides too: with its pages near the limit even a
+    // small buffer is refused.
+    for texture in textures.drain(..) {
+        device.destroy_texture(texture).unwrap();
+    }
+    HELD.store(1000 << 20, Ordering::Relaxed);
+    assert_eq!(
+        device
+            .new_buffer(1 << 20, options(StorageMode::Private))
+            .err(),
+        Some(Error::OutOfMemory)
+    );
+    HELD.store(400 << 20, Ordering::Relaxed);
+    device
+        .new_buffer(1 << 20, options(StorageMode::Private))
+        .unwrap();
 }
 
 /// A test build's cap makes the device's allocations run out of memory at
@@ -5952,4 +6149,44 @@ fn held_work_of_another_connection_keeps_no_memory() {
     device.set_signaled_value(event, 1).unwrap();
     device.backend().finish();
     device.poll().unwrap();
+}
+
+/// An integrated GPU's note says its memory is the GPU's share of RAM and
+/// ends with what Linux holds of it; with no share, that it is system
+/// memory from Stela's heap, which a log of a heap that ran out is read
+/// against.
+#[test]
+fn an_integrated_gpus_memory_note_names_where_its_memory_comes_from() {
+    use super::share::ShareState;
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: 480 << 20,
+            limit: 2560 << 20,
+        })
+    }
+    let integrated = || {
+        let mut backend = MockBackend::new();
+        backend.physical.as_mut().unwrap().identity.device_type =
+            crate::metal::vulkan::PhysicalDeviceType::IntegratedGpu;
+        device_on(backend)
+    };
+    let mut device = integrated();
+    device.share_memory(state);
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    assert!(
+        first.starts_with("SHARED MEMORY (the GPU's share of RAM) holds 0M of the "),
+        "{first}"
+    );
+    assert!(
+        first.ends_with("; the GPU's share of RAM: Linux holds 480M of 2560M"),
+        "{first}"
+    );
+    let mut device = integrated();
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    assert!(
+        first.starts_with("SHARED MEMORY (system memory from Stela's heap) holds 0M of the "),
+        "{first}"
+    );
 }

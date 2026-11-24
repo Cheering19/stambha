@@ -131,21 +131,25 @@ fn vfio_gpu_needs_kvm_and_a_full_pci_function() {
 }
 
 #[test]
-fn vfio_gpu_takes_its_whole_slot_bound_to_vfio_pci() {
+fn vfio_gpu_takes_a_discrete_cards_whole_slot_bound_to_vfio_pci() {
     let root = std::env::temp_dir().join(format!("stela-vfio-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let device = |name: &str, driver: &str| {
+    let device = |name: &str, driver: &str, vendor: &str, class: &str| {
         let directory = root.join(name);
         fs::create_dir_all(&directory).unwrap();
         std::os::unix::fs::symlink(format!("/drivers/{driver}"), directory.join("driver")).unwrap();
+        fs::write(directory.join("vendor"), format!("{vendor}\n")).unwrap();
+        fs::write(directory.join("device"), "0x0000\n").unwrap();
+        fs::write(directory.join("class"), format!("{class}\n")).unwrap();
     };
-    device("0000:01:00.0", "vfio-pci");
-    device("0000:01:00.1", "vfio-pci");
-    device("0000:02:00.0", "nvme");
-    let functions = machine::vfio_functions("0000:01:00.0", &root).unwrap();
+    // A discrete card: display and HD audio, both the card vendor's.
+    device("0000:01:00.0", "vfio-pci", "0x10de", "0x030000");
+    device("0000:01:00.1", "vfio-pci", "0x10de", "0x040300");
+    device("0000:02:00.0", "nvme", "0x144d", "0x010802");
+    let functions = vfio::vfio_functions("0000:01:00.0", &root).unwrap();
     assert_eq!(functions, ["0000:01:00.0", "0000:01:00.1"]);
     assert_eq!(
-        machine::vfio_devices(&functions),
+        vfio::vfio_devices(&functions),
         [
             "pcie-root-port,id=host-gpu-port,chassis=1,slot=1,addr=0x1c",
             "vfio-pci,host=0000:01:00.0,bus=host-gpu-port,addr=0.0,rombar=0,multifunction=on",
@@ -154,13 +158,73 @@ fn vfio_gpu_takes_its_whole_slot_bound_to_vfio_pci() {
     );
     // The function asked for leads its slot.
     assert_eq!(
-        machine::vfio_functions("0000:01:00.1", &root).unwrap(),
+        vfio::vfio_functions("0000:01:00.1", &root).unwrap(),
         ["0000:01:00.1", "0000:01:00.0"]
     );
-    assert!(machine::vfio_functions("0000:03:00.0", &root).is_err());
-    device("0000:01:00.2", "snd_hda_intel");
-    assert!(machine::vfio_functions("0000:01:00.0", &root).is_err());
+    assert!(vfio::vfio_functions("0000:03:00.0", &root).is_err());
+    // The card's USB-C controllers go with it, and each must be vfio-pci's.
+    device("0000:01:00.2", "xhci_hcd", "0x10de", "0x0c0330");
+    device("0000:01:00.3", "vfio-pci", "0x10de", "0x0c8000");
+    assert!(vfio::vfio_functions("0000:01:00.0", &root).is_err());
+    fs::remove_file(root.join("0000:01:00.2/driver")).unwrap();
+    std::os::unix::fs::symlink("/drivers/vfio-pci", root.join("0000:01:00.2/driver")).unwrap();
+    assert_eq!(
+        vfio::vfio_functions("0000:01:00.0", &root).unwrap(),
+        [
+            "0000:01:00.0",
+            "0000:01:00.1",
+            "0000:01:00.2",
+            "0000:01:00.3"
+        ]
+    );
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn an_integrated_gpu_lends_only_its_display_and_hd_audio() {
+    let function = |name: &str, vendor: u16, class: u32| vfio::Function {
+        name: name.into(),
+        vendor,
+        device: 0,
+        class,
+    };
+    // An APU's slot: its GPU and HD audio, then the platform's security
+    // processor and USB controllers under the CPU vendor's other ID.
+    let slot = [
+        function("0000:0d:00.0", 0x1002, 0x03_00_00),
+        function("0000:0d:00.1", 0x1002, 0x04_03_00),
+        function("0000:0d:00.2", 0x1022, 0x10_80_00),
+        function("0000:0d:00.3", 0x1022, 0x0c_03_30),
+        function("0000:0d:00.4", 0x1022, 0x0c_03_30),
+    ];
+    assert_eq!(
+        vfio::gpu_functions(&slot, "0000:0d:00.0").unwrap(),
+        ["0000:0d:00.0", "0000:0d:00.1"]
+    );
+    assert_eq!(
+        vfio::gpu_functions(&slot, "0000:0d:00.1").unwrap(),
+        ["0000:0d:00.1", "0000:0d:00.0"]
+    );
+    // The host's USB controllers are never lent, even when asked for.
+    assert!(vfio::gpu_functions(&slot, "0000:0d:00.3").is_err());
+    assert!(vfio::gpu_functions(&slot[2..], "0000:0d:00.3").is_err());
+    // The same vendor's USB controller beside an integrated GPU whose slot
+    // holds platform functions stays the host's.
+    let mut shared = slot.to_vec();
+    shared[3].vendor = 0x1002;
+    assert_eq!(
+        vfio::gpu_functions(&shared, "0000:0d:00.0").unwrap(),
+        ["0000:0d:00.0", "0000:0d:00.1"]
+    );
+    // The 5080's slot is lent whole, as before.
+    let card = [
+        function("0000:01:00.0", 0x10de, 0x03_00_00),
+        function("0000:01:00.1", 0x10de, 0x04_03_00),
+    ];
+    assert_eq!(
+        vfio::gpu_functions(&card, "0000:01:00.0").unwrap(),
+        ["0000:01:00.0", "0000:01:00.1"]
+    );
 }
 
 #[test]
@@ -448,4 +512,59 @@ fn a_shipped_image_never_takes_the_memory_cap() {
     assert!(vram_cap(true, false).unwrap());
     let refused = vram_cap(true, true).unwrap_err().to_string();
     assert!(refused.starts_with("STELA_VRAM_CAP_MIB holds"), "{refused}");
+}
+
+#[test]
+fn the_host_vfct_goes_to_the_run_only_when_it_holds_a_lent_gpus_video_bios() {
+    // The fixed part, then a zero-length image, then 1002:13c0's.
+    let image = |vendor: u16, device: u16, length: u32| {
+        let mut header = vec![0u8; 0x1c];
+        header[0xc..0xe].copy_from_slice(&vendor.to_le_bytes());
+        header[0xe..0x10].copy_from_slice(&device.to_le_bytes());
+        header[0x18..0x1c].copy_from_slice(&length.to_le_bytes());
+        header.extend(std::iter::repeat_n(0x55, length as usize));
+        header
+    };
+    let mut table = vec![0u8; 0x4c];
+    table[..4].copy_from_slice(b"VFCT");
+    table[0x34..0x38].copy_from_slice(&0x4cu32.to_le_bytes());
+    table.extend(image(0x10de, 0x2c02, 0));
+    table.extend(image(0x1002, 0x13c0, 0x200));
+    let length = table.len() as u32;
+    table[4..8].copy_from_slice(&length.to_le_bytes());
+    assert!(vfio::vfct_holds(&table, 0x1002, 0x13c0));
+    // A zero-length image is no image; other GPUs have none.
+    assert!(!vfio::vfct_holds(&table, 0x10de, 0x2c02));
+    assert!(!vfio::vfct_holds(&table, 0x1002, 0x1640));
+    // An image past the table's own length, or a table cut short, is not read.
+    let mut short = table.clone();
+    short[4..8].copy_from_slice(&(length - 0x200).to_le_bytes());
+    assert!(!vfio::vfct_holds(&short, 0x1002, 0x13c0));
+    assert!(!vfio::vfct_holds(&table[..0x40], 0x1002, 0x13c0));
+    let mut other = table.clone();
+    other[..4].copy_from_slice(b"FACP");
+    assert!(!vfio::vfct_holds(&other, 0x1002, 0x13c0));
+    assert_eq!(
+        vfio::acpi_table_argument(Path::new("/run/a,b/VFCT")),
+        "file=/run/a,,b/VFCT"
+    );
+}
+
+#[test]
+fn a_release_image_leaves_the_amd_and_intel_ports_out() {
+    // A development image holds amdgpu and the Intel port beside NVK; a
+    // release holds NVK alone, and stela-boot has no other GPU feature to
+    // choose.
+    assert_eq!(linked_features(false), "nvk,amdgpu,intel");
+    assert_eq!(linked_features(true), "nvk");
+    let manifest = include_str!("../../../crates/stela-boot/Cargo.toml");
+    for feature in linked_features(false).split(',') {
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.starts_with(&format!("{feature} = "))),
+            "{feature}"
+        );
+    }
+    assert!(!manifest.lines().any(|line| line.starts_with("radv = ")));
 }

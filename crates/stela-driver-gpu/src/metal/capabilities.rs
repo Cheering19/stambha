@@ -22,7 +22,7 @@ use super::{
     vertex::VertexFormat,
     vulkan::{
         FormatFeatures, PhysicalDeviceType, ResolveModes, SampleCounts,
-        physical::{Features, FormatSupport, PhysicalDevice},
+        physical::{Features, FormatSupport, HeapLayout, PhysicalDevice},
     },
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -119,6 +119,9 @@ pub struct Platform {
     pub linear_offset_alignment: u64,
     /// The backend's sparse page size, which is also its tile size.
     pub sparse_page_bytes: u64,
+    /// How the Vulkan driver's memory heaps share memory, which decides the
+    /// memory the GPU works in (`recommendedMaxWorkingSetSize`).
+    pub heaps: HeapLayout,
 }
 
 /// One capability this device does not provide and the layer that lacks it.
@@ -368,6 +371,17 @@ pub struct Capabilities {
     texel_buffer_alignment: TexelBufferAlignment,
 }
 
+/// The requirements of Metal3 beyond Mac2 and of Apple7 beyond Apple6 and
+/// Metal3, by their names among a device's gaps.
+const METAL3_NEEDS: [&str; 5] = [
+    "mesh shaders",
+    "function pointers",
+    "dynamic libraries",
+    "fast resource loading",
+    "MetalFX upscaling",
+];
+const APPLE7_NEEDS: [&str; 2] = ["simdgroup matrices", "barycentric coordinates"];
+
 impl Capabilities {
     pub fn derive(
         device: &PhysicalDevice,
@@ -383,6 +397,60 @@ impl Capabilities {
             gaps: Vec::new(),
         }
         .run()
+    }
+
+    /// One line for the boot log of a device outside Metal3 or Apple7, the
+    /// families of every Apple GPU macOS 27 runs on: its name, the highest
+    /// Apple family it is in, and what each of the two it lacks needs that
+    /// it does not have. `None` for a device in both.
+    pub fn family_shortfall(&self) -> Option<String> {
+        use core::fmt::Write;
+        let lacks: Vec<(GpuFamily, Vec<&str>)> = [
+            (GpuFamily::Metal3, &METAL3_NEEDS[..]),
+            (GpuFamily::Apple7, &APPLE7_NEEDS[..]),
+        ]
+        .into_iter()
+        .filter(|(family, _)| !self.supports_family(*family))
+        .map(|(family, needs)| {
+            let missing = needs
+                .iter()
+                .copied()
+                .filter(|need| self.gaps.iter().any(|gap| gap.capability == *need))
+                .collect();
+            (family, missing)
+        })
+        .collect();
+        if lacks.is_empty() {
+            return None;
+        }
+        let apple = [
+            GpuFamily::Apple6,
+            GpuFamily::Apple5,
+            GpuFamily::Apple4,
+            GpuFamily::Apple3,
+            GpuFamily::Apple2,
+            GpuFamily::Apple1,
+        ]
+        .into_iter()
+        .find(|family| self.supports_family(*family));
+        let mut line = String::new();
+        let _ = match apple {
+            Some(family) => write!(line, "{}: Metal device in {family:?} at most", self.name),
+            None => write!(line, "{}: Metal device in no Apple GPU family", self.name),
+        };
+        for (index, (family, missing)) in lacks.iter().enumerate() {
+            let _ = write!(
+                line,
+                "{} {family:?}",
+                if index == 0 { ", without" } else { " or" }
+            );
+            let _ = match missing.as_slice() {
+                // Apple7 lacks only Metal3.
+                [] => write!(line, " (needs {:?})", GpuFamily::Metal3),
+                missing => write!(line, " (no {})", missing.join(", ")),
+            };
+        }
+        Some(line)
     }
 
     pub fn supports_family(&self, family: GpuFamily) -> bool {
@@ -1002,10 +1070,24 @@ impl Derivation<'_> {
             low_power: integrated,
             removable: self.platform.removable,
             has_unified_memory: integrated,
-            recommended_max_working_set_size: device
-                .memory
-                .device_local_budget()
-                .unwrap_or_else(|| device.memory.device_local_bytes()),
+            recommended_max_working_set_size: {
+                let heaps = device
+                    .memory
+                    .working_set_budget(self.platform.heaps, integrated)
+                    .unwrap_or_else(|| {
+                        device
+                            .memory
+                            .working_set_bytes(self.platform.heaps, integrated)
+                    });
+                // A GPU with a share of RAM: what the share backs, as the
+                // device budgets its allocations.
+                use crate::metal::device::share;
+                match share::budget(share::probe(), integrated).and_then(|budget| (budget.probe)())
+                {
+                    Some(state) => heaps.min(share::working_set(state)),
+                    None => heaps,
+                }
+            },
             limits: limits_out,
             argument_buffers_tier: argument_tier,
             read_write_texture_tier: read_write_tier,
@@ -1591,7 +1673,7 @@ impl Derivation<'_> {
             && self.check_all(
                 "GPU family Metal3",
                 &[
-                    driver("mesh shaders", capabilities.supports_mesh_shaders),
+                    driver(METAL3_NEEDS[0], capabilities.supports_mesh_shaders),
                     driver("function pointers", capabilities.supports_function_pointers),
                     driver("dynamic libraries", capabilities.supports_dynamic_libraries),
                     api(
@@ -1696,18 +1778,20 @@ impl Derivation<'_> {
                     driver("ASTC HDR sampling", readable(Compression::AstcHdr)),
                 ],
             );
+        // Apple7's own requirements are checked, and a lack recorded, on
+        // any Apple6 device, Metal3 or not, so the boot log can name them.
         let apple7 = apple6
-            && metal3
             && self.check_all(
                 "GPU family Apple7",
                 &[
-                    shader("simdgroup matrices", true, ShaderFeatures::SIMDGROUP_MATRIX),
+                    shader(APPLE7_NEEDS[0], true, ShaderFeatures::SIMDGROUP_MATRIX),
                     driver(
-                        "barycentric coordinates",
+                        APPLE7_NEEDS[1],
                         capabilities.supports_shader_barycentric_coordinates,
                     ),
                 ],
-            );
+            )
+            && metal3;
         self.gap("Apple GPU families from Apple8", Cause::AppleArchitecture);
         self.gap("GPU family Metal4", Cause::AppleArchitecture);
 

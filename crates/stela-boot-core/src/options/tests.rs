@@ -86,6 +86,32 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
 }
 
 #[test]
+fn a_hybrid_laptops_panel_is_copied_by_the_cpu_unless_hybrid_scanout_is_on() {
+    let plain = System::parse("--system").unwrap();
+    assert!(!plain.hybrid_scanout());
+    assert_eq!(plain.hybrid_scanout, None);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, on) in [
+        ("--system --hybrid-scanout on", true),
+        ("--system --hybrid-scanout off", false),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.hybrid_scanout(), on);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --hybrid-scanout", Error::HybridScanout),
+        ("--system --hybrid-scanout yes", Error::HybridScanout),
+        (
+            "--system --hybrid-scanout on --hybrid-scanout off",
+            Error::DuplicateHybridScanout,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
     // The default is performance, and writes nothing.
     let plain = System::parse("--system").unwrap();

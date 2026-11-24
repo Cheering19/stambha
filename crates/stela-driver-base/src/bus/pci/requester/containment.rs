@@ -19,6 +19,9 @@ const ISA_BRIDGE: u32 = 0x0601;
 #[derive(Clone, Copy)]
 struct Control {
     offset: u16,
+    /// The register's name in the PCI Express Base Specification, which a
+    /// refusal names it by ([`Plan::control_name`]).
+    name: &'static str,
     original: u16,
     disabled: u16,
     /// Bits of `disabled` the function may leave clear (see
@@ -48,6 +51,19 @@ pub fn requester_aliases(own: u16, forwarded: impl IntoIterator<Item = u16>) -> 
         }
     }
     aliases
+}
+
+/// What a stopped control that read back `observed` after the stop means,
+/// in plain words, where its register `name` ([`Plan::control_name`]) says:
+/// an ATS Control register whose Enable bit (bit 15, PCI Express Base 6.0
+/// 10.5.1.3) stays set was written by Stela and not by the function, as a
+/// hypervisor that does not pass the write on leaves it.
+pub fn stuck_control(name: &str, observed: u32) -> Option<&'static str> {
+    (name == "ATS Control" && observed & 1 << 15 != 0).then_some(
+        "its Enable bit stays set after Stela cleared it: something between Stela and the \
+         function, such as a hypervisor that does not pass the write on, keeps Address \
+         Translation Services on",
+    )
 }
 
 /// This plan describes PCI-level controls only. It conveys no physical
@@ -137,6 +153,7 @@ impl Plan {
         let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
         plan.push(
             regs::COMMAND,
+            "COMMAND",
             command,
             command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
             regs::command_optional_bits(pin),
@@ -151,10 +168,10 @@ impl Plan {
         for entry in Capabilities::census(Transport(read)) {
             let entry = entry?;
             let id = u16::from(entry.id);
-            let (relative, mut clear, event) = match id {
-                MSI => (2, 1, 0),
-                MSIX => (2, 1 << 15, 0),
-                PCIE => (8, 1 << 11, 0),
+            let (name, relative, mut clear, event) = match id {
+                MSI => ("MSI Message Control", 2, 1, 0),
+                MSIX => ("MSI-X Message Control", 2, 1 << 15, 0),
+                PCIE => ("PCI Express Device Control", 8, 1 << 11, 0),
                 _ => continue,
             };
             let planned = if entry.layout == Layout::Sized {
@@ -172,7 +189,7 @@ impl Plan {
                         plan.express_port = Some((flags >> 4 & 0xf) as u8);
                         clear |= device_control_reset(flags as u16);
                     }
-                    plan.disable(read, entry.offset + relative, clear, event)?;
+                    plan.disable(read, entry.offset + relative, name, clear, event)?;
                 }
                 Err(error) => plan.leave(error)?,
             }
@@ -182,10 +199,11 @@ impl Plan {
             let mut seen = 0u32;
             for entry in ExtendedCapabilities::census(Transport(read)) {
                 let entry = entry?;
-                let (relative, clear, event) = match entry.id {
-                    ATS => (6, 1 << 15, 0),
-                    PASID => (6, 1, 0),
-                    PRI => (4, 1, 2), // Reset is a command, not persistent state.
+                let (name, relative, clear, event) = match entry.id {
+                    ATS => ("ATS Control", 6, 1 << 15, 0),
+                    PASID => ("PASID Control", 6, 1, 0),
+                    // Reset is a command, not persistent state.
+                    PRI => ("Page Request Control", 4, 1, 2),
                     _ => continue,
                 };
                 let planned = if entry.version != 1 {
@@ -201,7 +219,7 @@ impl Plan {
                     record_capability(&mut seen, entry.id, entry.offset, relative, entry.bytes)
                 };
                 match planned {
-                    Ok(()) => plan.disable(read, entry.offset + relative, clear, event)?,
+                    Ok(()) => plan.disable(read, entry.offset + relative, name, clear, event)?,
                     Err(error) => plan.leave(error)?,
                 }
             }
@@ -213,6 +231,7 @@ impl Plan {
         &mut self,
         mut read: impl FnMut(u16, u8) -> Result<u32, ClaimError>,
         offset: u16,
+        name: &'static str,
         clear: u16,
         event: u16,
     ) -> Result<(), ClaimError> {
@@ -225,12 +244,13 @@ impl Plan {
                 ConfigFailure::UnqualifiedControl,
             )));
         }
-        self.push(offset, original, original & !clear, 0)
+        self.push(offset, name, original, original & !clear, 0)
     }
 
     fn push(
         &mut self,
         offset: u16,
+        name: &'static str,
         original: u16,
         disabled: u16,
         optional: u16,
@@ -243,6 +263,7 @@ impl Plan {
             .map_err(|_| ClaimError::Mapping(MappingError::Exhausted))?;
         self.controls.push(Control {
             offset,
+            name,
             original,
             disabled,
             optional,
@@ -265,6 +286,15 @@ impl Plan {
             None | Some(PCI_TO_PCIE_BRIDGE) => Some(own),
             Some(_) => None,
         }
+    }
+
+    /// The name of the control register this plan stops at `offset`, for a
+    /// refusal that names only the offset.
+    pub fn control_name(&self, offset: u16) -> Option<&'static str> {
+        self.controls
+            .iter()
+            .find(|control| control.offset == offset)
+            .map(|control| control.name)
     }
 
     /// Does this exact write narrow one observed control?

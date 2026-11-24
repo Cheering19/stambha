@@ -17,7 +17,7 @@ use stela_drivers::{
         regs::{COMMAND, COMMAND_MASTER},
         requester::{
             ClaimError,
-            containment::{Plan, requester_aliases},
+            containment::{Plan, requester_aliases, stuck_control},
             wait_for_pending_transactions,
         },
     },
@@ -353,6 +353,9 @@ pub(crate) struct ContainmentError {
     address: Option<Address>,
     cause: Cause,
     effect: ConfigEffect,
+    /// The name of the control register a readback failure names by its
+    /// offset, where the function's plan stops one there ([`Self::named_by`]).
+    control: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -406,6 +409,16 @@ impl fmt::Display for ContainmentError {
                     } => f.write_str(
                         "; its Secondary Bus Reset is set, so the buses below it stay in reset",
                     ),
+                    ConfigFailure::Readback { observed, .. } => match self.control {
+                        Some(name) => {
+                            write!(f, "; that is its {name} register")?;
+                            match stuck_control(name, observed) {
+                                Some(meaning) => write!(f, ": {meaning}"),
+                                None => Ok(()),
+                            }
+                        }
+                        None => Ok(()),
+                    },
                     _ => Ok(()),
                 }
             }
@@ -453,6 +466,7 @@ impl ContainmentError {
             address: Some(address),
             cause: Cause::BridgeAlias,
             effect: ConfigEffect::None,
+            control: None,
         }
     }
 }
@@ -467,6 +481,7 @@ impl From<ClaimError> for ContainmentError {
             address: None,
             cause: Cause::Claim(cause),
             effect,
+            control: None,
         }
     }
 }
@@ -477,6 +492,7 @@ impl From<topology::Error> for ContainmentError {
             address: None,
             cause: Cause::Topology(cause),
             effect: ConfigEffect::None,
+            control: None,
         }
     }
 }
@@ -494,6 +510,20 @@ impl From<ConfigError> for ContainmentError {
 }
 
 impl ContainmentError {
+    /// Names the control register a readback failure names by its offset,
+    /// where `plan` stops one there: an extended capability's control sits
+    /// at an offset of the function's own, such as `0x2b6`.
+    fn named_by(mut self, plan: &Plan) -> Self {
+        if let Cause::Claim(ClaimError::Config(ConfigError {
+            reason: ConfigFailure::Readback { offset, .. },
+            ..
+        })) = self.cause
+        {
+            self.control = plan.control_name(offset);
+        }
+        self
+    }
+
     fn at(mut self, address: Address) -> Self {
         self.address = Some(address);
         self
@@ -715,6 +745,7 @@ impl Fabric {
                     address: Some(address),
                     cause: Cause::BridgeForwarding,
                     effect: ConfigEffect::None,
+                    control: None,
                 })?
                 .check()
                 .map_err(|error| error.at(address))?;
@@ -1566,6 +1597,7 @@ impl Source {
                                 reason,
                             },
                             effect: ConfigEffect::None,
+                            control: None,
                         },
                         parked,
                     )),
@@ -1582,6 +1614,7 @@ impl Source {
                 Ok(parked) => fabric.slots[index].configuration = Some(parked),
                 Err(mut refusal) if refusal.error.per_function() => {
                     refusal.error.address = Some(address);
+                    refusal.error = refusal.error.named_by(&plan);
                     let error = refusal.error;
                     // Reported once here: the slot keeps the refusal, and
                     // every later claim of it, or of a function below a
@@ -1822,6 +1855,7 @@ impl Source {
                     address: None,
                     cause: Cause::Claim(cause),
                     effect,
+                    control: None,
                 },
                 config,
                 plan,
@@ -1835,6 +1869,7 @@ impl Source {
                     address: None,
                     cause: Cause::Claim(ClaimError::Mapping(error)),
                     effect,
+                    control: None,
                 },
                 original,
             )

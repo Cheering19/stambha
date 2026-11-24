@@ -3,26 +3,60 @@
 //! of devices it leaves to radeon and its family rules as the build read
 //! them (`build/amdgpu.rs`).
 use crate::{Adapter, stack::Control};
+use stela_driver_core::amd_metal;
 
 include!(concat!(env!("OUT_DIR"), "/amdgpu_devices.rs"));
 
-/// What amdgpu's probe answers for one device of its table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Support {
-    /// The probe goes on to the device's IP blocks.
-    Probed,
-    /// `amdgpu_support_enabled` refuses the family: this build's Kconfig
-    /// leaves its support out.
-    NotBuilt(&'static str),
+/// The table's entry for `device`, if it names the device by ID: its DMA
+/// mask's bits and its `AMD_IS_APU` flag.
+fn entry(device: u16) -> Option<(u8, bool)> {
+    DEVICES
+        .binary_search_by_key(&device, |(id, ..)| *id)
+        .ok()
+        .map(|index| {
+            let (.., bits, apu) = DEVICES[index];
+            (bits, apu)
+        })
 }
 
-/// The table's entry for `device`, if it names the device by ID.
-fn listed(device: u16) -> Option<(u8, Support)> {
+/// The family (`CHIP_*` without the prefix) and graphics generation of
+/// `device`, if the table names it by ID.
+pub fn generation(device: u16) -> Option<(&'static str, u8)> {
     DEVICES
         .binary_search_by_key(&device, |(id, ..)| *id)
         .ok()
         .map(|index| (DEVICES[index].1, DEVICES[index].2))
 }
+
+/// Whether a GPU amdgpu identifies by IP discovery, whose discovery table
+/// gives its graphics block the version `graphics` (major, minor,
+/// revision), can serve the Metal device: one whose block makes no graphics
+/// queue is a compute accelerator, on which RADV opens no Vulkan device
+/// (`radv_is_gpu_supported`), so the port leaves it out
+/// ([`amd_metal::LEFT_OUT`]). [`admits`] cannot tell, as the table is read
+/// only at the claim, before the GPU's reset.
+pub fn discovered_serves(graphics: (u8, u8, u8)) -> Result<(), &'static str> {
+    if COMPUTE_ONLY.contains(&graphics) {
+        Err(amd_metal::LEFT_OUT)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a GPU amdgpu identifies by IP discovery, whose discovery table
+/// gives its graphics block the version `graphics`, is built into the
+/// processor and shares its memory: amdgpu flags it `AMD_IS_APU` by that
+/// version alone (`amdgpu_discovery_set_ip_blocks`), as the build read it.
+/// Its PCI ID table says nothing of such a GPU ([`integrated`]).
+pub fn discovered_integrated(graphics: (u8, u8, u8)) -> bool {
+    DISCOVERED_APUS.contains(&graphics)
+}
+
+/// Every device IP discovery identifies is of a generation that serves the
+/// Metal device in an Apple family, so one the table matches by class is
+/// claimed.
+const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
+const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_APPLE_GENERATION);
 
 /// Whether the table's class entries hold the adapter: any AMD function of
 /// one of these classes, which the driver then identifies by IP discovery.
@@ -31,20 +65,29 @@ fn discovered(adapter: &Adapter) -> bool {
     CLASSES.contains(&class)
 }
 
-/// Whether amdgpu's probe takes the adapter: its table holds it, by ID or by
-/// class, the driver does not leave it to radeon, and this build holds its
-/// family's support.
+/// Whether Stela drives the adapter with amdgpu: its table holds it, by ID
+/// or by class, the driver does not leave it to radeon, and RADV's device on
+/// its family can serve the Metal device in an Apple GPU family
+/// ([`amd_metal::driven`]); the build holds the support of every family
+/// whose device can open. A GPU that cannot serve the Metal device is left
+/// out whole, before anything of it changes: Stela does not drive it for
+/// its displays alone.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     if LEFT_TO_RADEON.binary_search(&adapter.device).is_ok() {
         return Err(
             "amdgpu leaves this GPU to an older driver (radeon, r128 or mach64), which is not ported to Stambha",
         );
     }
-    match listed(adapter.device) {
-        Some((_, Support::Probed)) => Ok(()),
-        Some((_, Support::NotBuilt(reason))) => Err(reason),
-        None if discovered(adapter) => Ok(()),
-        None => Err("amdgpu's PCI ID table does not hold this device"),
+    if let Some(why) = generation(adapter.device)
+        .and_then(|(family, generation)| amd_metal::refusal(family, generation))
+    {
+        return Err(why);
+    }
+    // The build holds amdgpu's support of every family that serves.
+    if entry(adapter.device).is_some() || discovered(adapter) {
+        Ok(())
+    } else {
+        Err("amdgpu's PCI ID table does not hold this device")
     }
 }
 
@@ -53,7 +96,30 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
 /// by class sets its mask after IP discovery, and gets the narrowest mask of
 /// the memory controllers discovery can choose.
 pub fn dma_bits(adapter: &Adapter) -> u8 {
-    listed(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
+    entry(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
+}
+
+/// The BAR of the adapter's register window, as `amdgpu_device_init` maps
+/// it: BAR 5 for every family Stela drives (from Bonaire on, and every
+/// device IP discovery identifies).
+pub fn registers(_: &Adapter) -> usize {
+    usize::from(REGISTERS)
+}
+
+/// Whether the adapter is built into the processor, for a device amdgpu's
+/// table names: its `AMD_IS_APU` flag, which amdgpu's IP discovery keeps
+/// for every named family. `None` for a device the table takes by class,
+/// whose kind its IP discovery table's graphics version gives
+/// ([`discovered_integrated`]).
+pub fn named_integrated(adapter: &Adapter) -> Option<bool> {
+    entry(adapter.device).map(|(_, apu)| apu)
+}
+
+/// Whether amdgpu's table flags the adapter `AMD_IS_APU`. It flags only
+/// the older APUs it names by ID; the probe flags the rest from IP
+/// discovery ([`query::integrated`]).
+pub fn integrated(adapter: &Adapter) -> bool {
+    entry(adapter.device).is_some_and(|(_, apu)| apu)
 }
 
 /// The name amdgpu's interface gives the family `family`
@@ -91,14 +157,95 @@ pub mod query {
     /// The first `N` words of the answer to `query`. The driver copies no
     /// more than the size asked.
     fn get<const N: usize>(control: Control, query: u32) -> Option<[u64; N]> {
+        get_with(control, query, [0; 4])
+    }
+
+    /// [`get`] with the query's own `arguments`.
+    fn get_with<const N: usize>(
+        control: Control,
+        query: u32,
+        arguments: [u32; 4],
+    ) -> Option<[u64; N]> {
         let mut answer = [0_u64; N];
         let mut record = Info {
             return_pointer: answer.as_mut_ptr() as u64,
             return_size: size_of::<[u64; N]>() as u32,
             query,
-            arguments: [0; 4],
+            arguments,
         };
         (control(INFO, (&raw mut record).cast()) == 0).then_some(answer)
+    }
+
+    /// `AMDGPU_INFO_HW_IP_INFO`, answering `struct drm_amdgpu_info_hw_ip`.
+    const HW_IP_INFO: u32 = 0x02;
+    /// `AMDGPU_HW_IP_GFX`.
+    const HW_IP_GFX: u32 = 0;
+    /// `AMDGPU_INFO_FW_VERSION`, answering `struct drm_amdgpu_info_firmware`
+    /// (version, feature) for the `struct drm_amdgpu_query_fw` asked.
+    const FW_VERSION: u32 = 0x0e;
+    /// The firmware the GPU's start and the Metal device's engines run, by
+    /// `AMDGPU_INFO_FW_*`, each answered for any GPU amdgpu drives (zero for
+    /// one the chip does not run), in amdgpu's own short names.
+    const FIRMWARE: [(u32, &str); 12] = [
+        (0x0c, "sos"),
+        (0x15, "toc"),
+        (0x0a, "smc"),
+        (0x1b, "imu"),
+        (0x04, "me"),
+        (0x05, "pfp"),
+        (0x06, "ce"),
+        (0x08, "mec"),
+        (0x07, "rlc"),
+        (0x1a, "mes"),
+        (0x0b, "sdma"),
+        (0x14, "dmcub"),
+    ];
+
+    /// What amdgpu says of the bound chip, for the boot log's summary: its
+    /// family and graphics block version, revisions and compute units, the
+    /// version of each firmware it runs, and its memory (VRAM, the part the
+    /// CPU reaches, and GTT, the system memory it maps).
+    pub fn describe(control: Control) -> Option<alloc::string::String> {
+        use alloc::format;
+        let device = get::<7>(control, DEV_INFO)?;
+        let family = device[2] as u32;
+        let mut text = format!(
+            "family {} ({family}) chip_rev={:#x} external_rev={:#x} cus={}",
+            super::family_name(family).unwrap_or("unnamed"),
+            device[0] >> 32,
+            device[1] as u32,
+            device[6] as u32,
+        );
+        if let Some(gfx) = get_with::<4>(control, HW_IP_INFO, [HW_IP_GFX, 0, 0, 0]) {
+            let discovered = (gfx[3] >> 32) as u32;
+            text.push_str(&match discovered {
+                0 => format!(" gfx={}.{}", gfx[0] as u32, gfx[0] >> 32),
+                _ => format!(
+                    " gfx={}.{}.{}",
+                    discovered >> 16 & 0xff,
+                    discovered >> 8 & 0xff,
+                    discovered & 0xff
+                ),
+            });
+        }
+        text.push_str("; firmware");
+        for (kind, name) in FIRMWARE {
+            match get_with::<1>(control, FW_VERSION, [kind, 0, 0, 0]) {
+                Some([answer]) if answer as u32 != 0 => {
+                    text.push_str(&format!(" {name}={:#x}", answer as u32))
+                }
+                _ => {}
+            }
+        }
+        if let Some(heaps) = get::<12>(control, MEMORY) {
+            text.push_str(&format!(
+                "; vram={}M visible={}M gtt={}M",
+                heaps[0] >> 20,
+                heaps[4] >> 20,
+                heaps[8] >> 20
+            ));
+        }
+        Some(text)
     }
 
     /// The device's family (`AMDGPU_FAMILY_*`), the fifth 32-bit field of
@@ -116,13 +263,21 @@ pub mod query {
         get::<18>(control, DEV_INFO).map(|words| words[17] & FUSION != 0)
     }
 
-    /// The memory the driver hands out: the usable bytes of its VRAM heap
-    /// and of its GTT heap, which on an integrated GPU is system memory.
-    /// `struct drm_amdgpu_memory_info` is three heaps (VRAM, its
-    /// CPU-accessible part, GTT) of four 64-bit fields, the second usable.
+    /// The memory the GPU works in: a discrete GPU's VRAM, as nouveau gives
+    /// its frame buffer's size; a GPU built into the processor
+    /// ([`integrated`]) works in the usable part of its carve-out and of the
+    /// system memory its GTT maps, which it shares. `struct
+    /// drm_amdgpu_memory_info` is three heaps (VRAM, its CPU-accessible
+    /// part, GTT) of four 64-bit fields: total, usable, used, largest.
     pub fn memory_bytes(control: Control) -> Option<u64> {
+        let integrated = integrated(control)?;
         let heaps = get::<12>(control, MEMORY)?;
-        heaps[1].checked_add(heaps[9]).filter(|bytes| *bytes != 0)
+        let bytes = if integrated {
+            heaps[1].checked_add(heaps[9])?
+        } else {
+            heaps[0]
+        };
+        (bytes != 0).then_some(bytes)
     }
 
     /// `DRM_IOCTL_AMDGPU_CTX`: `DRM_IOWR(DRM_COMMAND_BASE + 0x02, union
@@ -198,6 +353,7 @@ mod tests {
             vendor: Vendor::from_pci(0x1002),
             device,
             class,
+            revision: 0,
         }
     }
 
@@ -207,13 +363,33 @@ mod tests {
         assert!(LEFT_TO_RADEON.windows(2).all(|pair| pair[0] < pair[1]));
         // Polaris 10 (GMC 8): 40 bits. Vega 10, Navi 10 and Sienna Cichlid
         // (GMC 9, 10 and 11 or later): the narrowest mask of those.
-        assert_eq!(listed(0x67df), Some((40, Support::Probed)));
+        assert_eq!(entry(0x67df), Some((40, false)));
         for device in [0x6860, 0x731f, 0x73bf] {
-            assert_eq!(listed(device), Some((DISCOVERY_BITS, Support::Probed)));
+            assert_eq!(entry(device), Some((DISCOVERY_BITS, false)));
         }
         assert_eq!(DISCOVERY_BITS, 44);
         // VGA, other display and processing accelerator.
         assert_eq!(CLASSES, [0x03_0000, 0x03_8000, 0x12_0000]);
+    }
+
+    #[test]
+    fn registers_and_apus_are_the_tables() {
+        // Polaris 10, Navi 21 and a device found by class: BAR 5, as for
+        // every family from Bonaire on. Only Southern Islands, which Stela
+        // leaves out, had its registers in BAR 2; the build fails if a
+        // family it drives has them elsewhere.
+        for device in [0x67df, 0x73bf, 0x0001] {
+            assert_eq!(registers(&adapter(device, [3, 0, 0])), 5, "{device:04x}");
+        }
+        // Kaveri, Carrizo, Raven and Renoir are flagged APUs by ID; a
+        // discrete Polaris is not, and a device found by class is decided
+        // by the probe.
+        for device in [0x1304, 0x9870, 0x15dd, 0x1636] {
+            assert!(integrated(&adapter(device, [3, 0, 0])), "{device:04x}");
+        }
+        for device in [0x67df, 0x13c0, 0x164e] {
+            assert!(!integrated(&adapter(device, [3, 0, 0])), "{device:04x}");
+        }
     }
 
     #[test]
@@ -232,34 +408,143 @@ mod tests {
         // A GPU the table does not name is found by its class and gets the
         // mask every memory controller of discovery allows.
         let unnamed = adapter(0x0001, [3, 0, 0]);
-        assert_eq!(listed(unnamed.device), None);
+        assert_eq!(entry(unnamed.device), None);
         assert_eq!(admits(&unnamed), Ok(()));
         assert_eq!(dma_bits(&unnamed), 44);
         // An unnamed function of another class is not amdgpu's.
         assert!(admits(&adapter(0x0001, [4, 3, 0])).is_err());
-        // Polaris 10, by ID.
-        let polaris = adapter(0x67df, [3, 0, 0]);
-        assert_eq!(admits(&polaris), Ok(()));
-        assert_eq!(dma_bits(&polaris), 40);
+        // Vega 10, by ID.
+        let vega = adapter(0x6860, [3, 0, 0]);
+        assert_eq!(admits(&vega), Ok(()));
+        assert_eq!(dma_bits(&vega), 44);
         // A device of the list amdgpu leaves to radeon, VGA class or not.
         let radeon = adapter(LEFT_TO_RADEON[0], [3, 0, 0]);
         assert!(admits(&radeon).unwrap_err().contains("radeon"));
-        // Families whose support the profile leaves out are refused with the
-        // driver's own message: Tahiti (SI) and Bonaire (CIK).
-        for (device, generation) in [(0x6798, "SI"), (0x6649, "CIK")] {
-            let refusal = admits(&adapter(device, [3, 0, 0])).unwrap_err();
+    }
+
+    #[test]
+    fn a_gpu_whose_radv_device_cannot_serve_metal_is_left_out() {
+        // Southern and Sea Islands, GFX6 and GFX7: Tahiti, Hainan (no
+        // display), Bonaire and Kaveri. RADV has no half-float arithmetic
+        // there. Arcturus and Aldebaran are compute accelerators RADV opens
+        // no device on.
+        for (device, family, generation) in [
+            (0x6798, "TAHITI", 6),
+            (0x6660, "HAINAN", 6),
+            (0x6649, "BONAIRE", 7),
+            (0x1304, "KAVERI", 7),
+            (0x738c, "ARCTURUS", 9),
+            (0x7408, "ALDEBARAN", 9),
+        ] {
+            assert_eq!(super::generation(device), Some((family, generation)));
+            let gpu = adapter(device, [3, 0, 0]);
+            assert_eq!(admits(&gpu), Err(amd_metal::LEFT_OUT), "{device:04x}");
+        }
+        // Topaz, Polaris 10 and Carrizo, GFX8, open it in no Apple GPU
+        // family; Vega 10, Navi 10 and Navi 21 serve it.
+        for (device, generation, refusal) in [
+            (0x6900, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x67df, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x9870, 8, Some(amd_metal::NO_APPLE_FAMILY)),
+            (0x6860, 9, None),
+            (0x731f, 9, None),
+            (0x73bf, 9, None),
+        ] {
             assert_eq!(
+                super::generation(device).map(|(_, generation)| generation),
+                Some(generation),
+                "{device:04x}"
+            );
+            assert_eq!(
+                admits(&adapter(device, [3, 0, 0])).err(),
                 refusal,
-                alloc::format!("amdgpu built without {generation} support")
+                "{device:04x}"
+            );
+        }
+        // Every device of the table is admitted exactly where the rule
+        // says Stela drives its family. The build fails unless the profile
+        // holds amdgpu's support for exactly the generations that serve.
+        for &(device, family, generation, ..) in DEVICES {
+            assert_eq!(
+                admits(&adapter(device, [3, 0, 0])).is_ok(),
+                amd_metal::driven(family, generation),
+                "{device:04x} {family}"
+            );
+        }
+        // A device discovery identifies is GFX9 or later.
+        assert_eq!(DISCOVERY_GENERATION, 9);
+    }
+
+    /// The graphics blocks without graphics queues at the pin: Arcturus'
+    /// and Aldebaran's (gfx_v9_0 makes none for them), the MI300 class
+    /// (gfx_v9_4_3) and GC 12.1 (gfx_v12_1). Graphics GPUs of every
+    /// generation IP discovery reaches serve.
+    #[test]
+    fn a_discovered_compute_accelerator_is_left_out() {
+        assert_eq!(
+            COMPUTE_ONLY,
+            [
+                (9, 4, 1),
+                (9, 4, 2),
+                (9, 4, 3),
+                (9, 4, 4),
+                (9, 5, 0),
+                (12, 1, 0)
+            ]
+        );
+        for accelerator in COMPUTE_ONLY {
+            assert_eq!(discovered_serves(*accelerator), Err(amd_metal::LEFT_OUT));
+        }
+        for graphics in [(9, 4, 0), (10, 3, 6), (11, 0, 0), (11, 5, 1), (12, 0, 1)] {
+            assert_eq!(discovered_serves(graphics), Ok(()), "{graphics:?}");
+        }
+    }
+
+    /// Raphael and Mendocino (graphics 10.3.6, the AMD port's first
+    /// hardware), Phoenix (11.0.1) and Strix (11.5.0) are built into the
+    /// processor; Navi 21 (10.3.0), Navi 31 (11.0.0) and Navi 48 (12.0.1)
+    /// are discrete. The build reads the list from amdgpu's switch.
+    #[test]
+    fn a_discovered_gpu_is_integrated_by_its_graphics_version() {
+        for graphics in [(10, 3, 6), (11, 0, 1), (11, 5, 0), (9, 1, 0)] {
+            assert!(discovered_integrated(graphics), "{graphics:?}");
+        }
+        for graphics in [(10, 3, 0), (11, 0, 0), (12, 0, 1), (9, 4, 3)] {
+            assert!(!discovered_integrated(graphics), "{graphics:?}");
+        }
+        assert_eq!(DISCOVERED_APUS.len(), 19);
+        assert!(DISCOVERED_APUS.windows(2).all(|pair| pair[0] < pair[1]));
+        // A device the table names keeps the table's flag: Renoir is an
+        // APU, Polaris 10 and Navi 21 are not, and Raphael is not named.
+        assert_eq!(named_integrated(&adapter(0x1636, [3, 0, 0])), Some(true));
+        assert_eq!(named_integrated(&adapter(0x67df, [3, 0, 0])), Some(false));
+        assert_eq!(named_integrated(&adapter(0x73bf, [3, 0, 0])), Some(false));
+        assert_eq!(named_integrated(&adapter(0x13c0, [3, 0, 0])), None);
+    }
+
+    /// Each requirement the rule names is one the Metal device checks, so a
+    /// requirement the layer drops cannot keep a GPU out.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_rules_requirements_are_the_metal_devices() {
+        use crate::metal::vulkan::{backend::requirements, physical::Features};
+        let checked = requirements(&Features::default());
+        for (name, _) in amd_metal::LATE_REQUIREMENTS {
+            assert!(
+                checked.iter().any(|requirement| requirement.name == *name),
+                "{name} is no requirement of the Metal device"
             );
         }
     }
 
-    #[test]
-    fn queries_ask_the_info_ioctl_and_keep_refusals() {
-        let mut asked = alloc::vec::Vec::new();
-        let mut fused = false;
-        let mut answer = |request: u32, argument: *mut c_void| {
+    /// An answer to amdgpu's info queries: the family, `ids_flags` with
+    /// fusion when `fused`, and VRAM of 8 GiB (7.5 usable) beside a GTT of
+    /// 16 GiB, each query recorded.
+    fn info(
+        asked: &mut alloc::vec::Vec<(u32, u32, u32)>,
+        fused: bool,
+    ) -> impl FnMut(u32, *mut c_void) -> i32 + '_ {
+        move |request: u32, argument: *mut c_void| {
             // SAFETY: the query passes its own record and answer buffer.
             let record = unsafe { &*argument.cast::<[u64; 4]>() };
             let (size, query) = (record[1] as u32, (record[1] >> 32) as u32);
@@ -273,37 +558,104 @@ mod tests {
                 // half of the third word.
                 words[2] = 0x1234_5678_0000_0091;
                 if size > 136 {
-                    // `ids_flags`: preemption, then fusion on the second ask.
+                    // `ids_flags`: preemption, and fusion.
                     words[17] = if fused { 3 } else { 2 };
-                    fused = true;
                 }
             } else {
-                words[1] = 512 << 20;
-                words[9] = 16 << 30;
+                words[0] = 8 << 30;
+                words[1] = (8 << 30) - (512 << 20);
+                words[8] = 16 << 30;
+                words[9] = 15 << 30;
             }
             0
-        };
+        }
+    }
+
+    #[test]
+    fn queries_ask_the_info_ioctl_and_keep_refusals() {
+        let mut asked = alloc::vec::Vec::new();
+        let mut answer = info(&mut asked, false);
         assert_eq!(query::family(&mut answer), Some(0x91));
-        assert_eq!(
-            query::memory_bytes(&mut answer),
-            Some((512 << 20) + (16 << 30))
-        );
         assert_eq!(query::integrated(&mut answer), Some(false));
-        assert_eq!(query::integrated(&mut answer), Some(true));
-        assert_eq!(
-            asked,
-            [
-                (0x4020_6445, 0x16, 24),
-                (0x4020_6445, 0x19, 96),
-                (0x4020_6445, 0x16, 144),
-                (0x4020_6445, 0x16, 144)
-            ]
-        );
+        drop(answer);
+        assert_eq!(asked, [(0x4020_6445, 0x16, 24), (0x4020_6445, 0x16, 144)]);
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!(query::family(&mut refuse), None);
         assert_eq!(query::integrated(&mut refuse), None);
         assert_eq!(query::memory_bytes(&mut refuse), None);
         let mut empty = |_: u32, _: *mut c_void| 0;
         assert_eq!(query::memory_bytes(&mut empty), None);
+    }
+
+    /// A discrete GPU's memory is its VRAM, where the GTT's system memory
+    /// was added to it; an integrated GPU's is what it shares, its usable
+    /// carve-out and GTT.
+    #[test]
+    fn a_gpus_memory_is_its_vram_or_the_memory_it_shares() {
+        let mut asked = alloc::vec::Vec::new();
+        assert_eq!(
+            query::memory_bytes(&mut info(&mut asked, false)),
+            Some(8 << 30)
+        );
+        assert_eq!(asked, [(0x4020_6445, 0x16, 144), (0x4020_6445, 0x19, 96)]);
+        assert_eq!(
+            query::memory_bytes(&mut info(&mut alloc::vec::Vec::new(), true)),
+            Some((8 << 30) - (512 << 20) + (15 << 30))
+        );
+    }
+
+    /// The summary names the family, graphics version, each firmware the
+    /// driver reports running (none it answers zero for) and the memory,
+    /// as a Granite Ridge iGPU answers them.
+    #[test]
+    fn the_summary_names_family_firmware_and_memory() {
+        let mut answer = |request: u32, argument: *mut c_void| {
+            assert_eq!(request, 0x4020_6445);
+            // SAFETY: the query passes its own record and answer buffer.
+            let record = unsafe { &*argument.cast::<[u64; 4]>() };
+            let (size, query, kind) =
+                (record[1] as u32, (record[1] >> 32) as u32, record[2] as u32);
+            // SAFETY: as above; the buffer holds `size` bytes.
+            let words = unsafe {
+                core::slice::from_raw_parts_mut(record[0] as *mut u64, size as usize / 8)
+            };
+            match query {
+                0x16 => {
+                    words[0] = 0x1 << 32 | 0x13c0;
+                    words[1] = 0xcb << 32 | 0x2;
+                    words[2] = 149;
+                    words[6] = 2;
+                }
+                0x02 => {
+                    assert_eq!(kind, 0, "the graphics block");
+                    words[0] = 3 << 32 | 10;
+                    words[3] = 0x000a_0306 << 32;
+                }
+                0x0e => {
+                    words[0] = match kind {
+                        0x0c => 0x0047_0028,
+                        0x0a => 0x0062_5400,
+                        0x04 => 0x1d,
+                        _ => 0,
+                    }
+                }
+                0x19 => {
+                    words[0] = 512 << 20;
+                    words[4] = 256 << 20;
+                    words[8] = 1650 << 20;
+                }
+                _ => return -22,
+            }
+            0
+        };
+        assert_eq!(
+            query::describe(&mut answer).as_deref(),
+            Some(
+                "family GC_10_3_6 (149) chip_rev=0x1 external_rev=0x2 cus=2 gfx=10.3.6; firmware \
+                 sos=0x470028 smc=0x625400 me=0x1d; vram=512M visible=256M gtt=1650M"
+            )
+        );
+        let mut refuse = |_: u32, _: *mut c_void| -22;
+        assert_eq!(query::describe(&mut refuse), None);
     }
 }

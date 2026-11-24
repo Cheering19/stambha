@@ -1102,10 +1102,31 @@ int fstat(int fd, struct stat *result)
 	return 0;
 }
 
-/* The only named files are DRM's nodes and /proc/meminfo, which open answers. */
+/* The only named files are the host's render nodes, a character device each,
+ * whose status is answered from the host's list without opening them, as
+ * Linux's stat opens nothing; and /proc/meminfo, which open answers. */
 int stat(const char *path, struct stat *result)
 {
-	int fd = open(path, O_RDWR);
+	static const char prefix[] = "/dev/dri/renderD";
+	if (path && !strncmp(path, prefix, sizeof(prefix) - 1)) {
+		const char *digits = path + sizeof(prefix) - 1;
+		char *end;
+		unsigned long node = strtoul(digits, &end, 10);
+		if (!isdigit((unsigned char)*digits) || *end)
+			return fail(ENOENT);
+		for (unsigned int index = 0; index < stela_libc_drm_devices(); index++) {
+			struct stela_libc_drm_device device;
+			stela_libc_drm_device(index, &device);
+			if (device.minor + 128ul != node)
+				continue;
+			memset(result, 0, sizeof(*result));
+			result->st_mode = S_IFCHR | 0666;
+			result->st_rdev = makedev(226, (unsigned int)node);
+			return 0;
+		}
+		return fail(ENOENT);
+	}
+	int fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -1;
 	int status = fstat(fd, result);

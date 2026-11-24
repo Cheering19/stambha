@@ -557,7 +557,9 @@ impl GopScanout {
              firmware may have turned that adapter off\n",
             self.refresh_millihertz
         ));
-        crate::status::info(stela_boot_core::gpu_status::SHOWN_BY_COPY);
+        crate::status::info(&stela_boot_core::gpu_status::shown_by_copy(
+            super::gpu::drawing_name().unwrap_or("GPU"),
+        ));
         super::ident::set(
             super::ident::Kind::Display,
             format_args!(

@@ -1685,6 +1685,25 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         self.try_turn().map(|turn| turn.memory())
     }
 
+    /// The memory the guest is told it works in and the Vulkan driver's
+    /// heaps as it counts them now, for the boot log's summary of the GPU;
+    /// `None` while a call holds the service.
+    pub fn memory_plan(&self) -> Option<(u64, Vec<crate::metal::vulkan::backend::HeapUse>)> {
+        self.try_turn().map(|mut turn| {
+            let device = turn.device();
+            let working = device.capabilities().recommended_max_working_set_size;
+            (working, device.backend().memory_heaps())
+        })
+    }
+
+    /// What keeps the device from Metal3 or Apple7, for the boot log
+    /// ([`crate::metal::capabilities::Capabilities::family_shortfall`]);
+    /// `None` for a device in both, or while a call holds the service.
+    pub fn family_shortfall(&self) -> Option<alloc::string::String> {
+        self.try_turn()
+            .and_then(|mut turn| turn.device().capabilities().family_shortfall())
+    }
+
     /// Where retired command buffers' time went since the last call, unless
     /// a call holds the service now; it is then counted for the next.
     pub fn gpu_times(&self) -> Option<crate::metal::device::gpu_times::GpuTimes> {

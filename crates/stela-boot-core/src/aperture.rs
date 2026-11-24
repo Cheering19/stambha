@@ -830,9 +830,144 @@ pub fn bar_physical(
         .and_then(|window| address.checked_add(window.translation))
 }
 
+/// Why a function's configuration space gives a memory BAR no address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarError {
+    /// The index names no BAR of a Type 0 header.
+    Index,
+    /// The BAR decodes I/O space.
+    Io,
+    /// Its type field holds the reserved value 01b.
+    ReservedType,
+    /// A 64-bit BAR in the last slot, with no upper half.
+    NoUpperHalf,
+    /// It holds address zero: no address was assigned.
+    Unassigned,
+}
+
+impl core::fmt::Display for BarError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Index => "names no BAR",
+            Self::Io => "decodes I/O space",
+            Self::ReservedType => "holds the reserved type 01b",
+            Self::NoUpperHalf => "is 64-bit in the last slot, with no upper half",
+            Self::Unassigned => "holds no address",
+        })
+    }
+}
+
+/// The bus address of memory BAR `index` in a Type 0 configuration
+/// `header`, and whether it is prefetchable, as Linux's `__pci_read_base`
+/// decodes it (PCI Local Bus 3.0, 6.2.5.1). Reads only; the BAR's size is
+/// not sized here.
+pub fn memory_bar(header: &[u8; 64], index: u8) -> Result<(u64, bool), BarError> {
+    let dword = |at: usize| {
+        u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+    };
+    if index >= 6 {
+        return Err(BarError::Index);
+    }
+    let at = 0x10 + usize::from(index) * 4;
+    let low = dword(at);
+    if low & 1 != 0 {
+        return Err(BarError::Io);
+    }
+    let address = match low >> 1 & 3 {
+        0 => u64::from(low & !0xf),
+        2 if index == 5 => return Err(BarError::NoUpperHalf),
+        2 => u64::from(low & !0xf) | u64::from(dword(at + 4)) << 32,
+        _ => return Err(BarError::ReservedType),
+    };
+    if address == 0 {
+        return Err(BarError::Unassigned);
+    }
+    Ok((address, low & 1 << 3 != 0))
+}
+
+/// The Resizable BAR extended capability's ID (PCIe Base 7.8.6).
+const RESIZABLE_BAR: u32 = 0x15;
+
+/// The size BAR `bar` decodes now, by its function's Resizable BAR
+/// capability, read without a write: `read` gives the configuration dword
+/// at an offset in extended space. `None` where the function has no such
+/// capability or it does not list `bar`.
+pub fn resizable_bar_bytes(mut read: impl FnMut(u16) -> u32, bar: u8) -> Option<u64> {
+    let mut offset: u16 = 0x100;
+    // Each capability is at least a dword; a loop in the list ends here.
+    for _ in 0..(4096 - 0x100) / 4 {
+        let header = read(offset);
+        if header == 0 || header == u32::MAX {
+            return None;
+        }
+        if header & 0xffff == RESIZABLE_BAR {
+            // Bits 7:5 of the first control register: how many BARs it lists.
+            let count = (read(offset + 8) >> 5 & 7).max(1) as u16;
+            return (0..count).find_map(|index| {
+                let control = read(offset + 8 + index * 8);
+                (control & 7 == u32::from(bar)).then(|| 1u64 << (20 + (control >> 8 & 0x3f)))
+            });
+        }
+        offset = (header >> 20) as u16 & !3;
+        if offset < 0x100 {
+            return None;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resizable_bars_size_is_read_from_its_control() {
+        // AER at 0x100, then Resizable BAR at 0x200 listing BAR 0 at 16 GiB
+        // (encoding 14) and BAR 2 at 256 MiB (encoding 8).
+        let space = |offset: u16| match offset {
+            0x100 => 0x2000_0001,
+            0x200 => 0x0001_0015,
+            0x208 => 0x0000_0e40,
+            0x210 => 0x0000_0802,
+            _ => 0,
+        };
+        assert_eq!(resizable_bar_bytes(space, 0), Some(16 << 30));
+        assert_eq!(resizable_bar_bytes(space, 2), Some(256 << 20));
+        assert_eq!(resizable_bar_bytes(space, 5), None);
+        // No extended capabilities, or a list that loops on itself.
+        assert_eq!(resizable_bar_bytes(|_| 0, 0), None);
+        assert_eq!(resizable_bar_bytes(|_| 0x1000_0001, 0), None);
+    }
+
+    #[test]
+    fn a_memory_bar_is_read_from_the_header_as_linux_decodes_it() {
+        let mut header = [0u8; 64];
+        let mut put =
+            |at: usize, value: u32| header[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        // BAR 0: 64-bit prefetchable at 0x60_0000_0000; BAR 2: 64-bit at
+        // 0x80_0000_0000 + 0xc; BAR 4: I/O; BAR 5: 32-bit at 0xfcb0_0000.
+        put(0x10, 0x0000_000c);
+        put(0x14, 0x60);
+        put(0x18, 0x1000_000c);
+        put(0x1c, 0x80);
+        put(0x20, 0xe001);
+        put(0x24, 0xfcb0_0000);
+        assert_eq!(memory_bar(&header, 0), Ok((0x60_0000_0000, true)));
+        assert_eq!(memory_bar(&header, 2), Ok((0x80_1000_0000, true)));
+        assert_eq!(memory_bar(&header, 4), Err(BarError::Io));
+        assert_eq!(memory_bar(&header, 5), Ok((0xfcb0_0000, false)));
+        assert_eq!(memory_bar(&header, 6), Err(BarError::Index));
+        let mut header = [0u8; 64];
+        header[0x24..0x28].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(memory_bar(&header, 5), Err(BarError::NoUpperHalf));
+        header[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(memory_bar(&header, 5), Err(BarError::ReservedType));
+        assert_eq!(memory_bar(&header, 1), Err(BarError::Unassigned));
+        assert_eq!(
+            alloc::format!("{}", BarError::Unassigned),
+            "holds no address"
+        );
+    }
 
     const PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
 

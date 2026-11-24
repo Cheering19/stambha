@@ -704,6 +704,8 @@ pub struct Function<C = EcamConfig> {
     pub device: u16,
     /// Base class, subclass and programming interface.
     pub class: [u8; 3],
+    /// The revision ID, read with the class.
+    pub revision: u8,
     config: C,
 }
 impl<C> fmt::Debug for Function<C> {
@@ -749,6 +751,7 @@ impl<C> Function<C> {
             vendor,
             device,
             class,
+            revision,
             config,
         } = self;
         match transform(config) {
@@ -757,6 +760,7 @@ impl<C> Function<C> {
                 vendor,
                 device,
                 class,
+                revision,
                 config,
             }),
             Err((error, config)) => Err((
@@ -766,6 +770,7 @@ impl<C> Function<C> {
                     vendor,
                     device,
                     class,
+                    revision,
                     config,
                 },
             )),
@@ -812,6 +817,7 @@ impl<C: ConfigSpace> Function<C> {
                 vendor: id as u16,
                 device: (id >> 16) as u16,
                 class: [(class >> 24) as u8, (class >> 16) as u8, (class >> 8) as u8],
+                revision: class as u8,
                 config,
             }),
             Err(reason) => Err(FunctionRefusal { reason, config }),

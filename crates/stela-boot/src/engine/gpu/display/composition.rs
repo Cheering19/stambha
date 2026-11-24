@@ -11,6 +11,14 @@
 //! never torn. A frame the CPU draws first waits for the composition, for
 //! [`SETTLE_MS`] at most.
 //!
+//! With `--hybrid-scanout on`, a display whose own GPU runs no Metal
+//! service, as an integrated GPU's panel on a laptop without a display mux,
+//! shares its buffers with the service of the GPU that draws instead, as
+//! Linux's PRIME render offload: that GPU composes into the display GPU's
+//! buffers, which amdgpu then makes in system memory
+//! ([`stela_drivers::gpu::metal::kms::set_system_scanout`]), and the
+//! display's GPU flips them on its vblank, where the CPU copied each frame.
+//!
 //! [`Scanout::try_present_gpu`]: stela_soc::machine::Scanout::try_present_gpu
 use super::{super::gate, Node};
 use crate::{engine::host, output};
@@ -28,6 +36,18 @@ use stela_soc::scanout::{GpuPresent, GpuStats, Layer, PixelFormat};
 
 /// The longest a frame the CPU draws waits for the composition before it.
 pub(super) const SETTLE_MS: u64 = 50;
+
+/// Whether a display without a Metal service of its own is composed by the
+/// GPU that draws (`--hybrid-scanout on`).
+static HYBRID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `--hybrid-scanout`, chosen before any display is taken: on, an amdgpu
+/// display's buffers are made in system memory and a display whose GPU
+/// serves no Metal is composed by the GPU that draws.
+pub(in crate::engine) fn set_hybrid(on: bool) {
+    HYBRID.store(on, core::sync::atomic::Ordering::Relaxed);
+    stela_drivers::gpu::metal::kms::set_system_scanout(on);
+}
 
 /// The GPU's composition of the display's frames.
 #[derive(Default)]
@@ -226,7 +246,16 @@ impl Composition {
         if self.shared.is_some() {
             return Ok(());
         }
-        let service = gate::service_of(name).ok_or("no Metal service runs on the display's GPU")?;
+        let (service, drawer) = match gate::service_of(name) {
+            Some(service) => (service, None),
+            None if HYBRID.load(core::sync::atomic::Ordering::Relaxed) => {
+                let (drawer, service) = gate::drawing_service(name).ok_or(
+                    "no Metal service runs on the display's GPU or on another to lend it frames",
+                )?;
+                (service, Some(drawer))
+            }
+            None => return Err("no Metal service runs on the display's GPU"),
+        };
         let buffers = match display.share_buffers() {
             None => return Err("the display's buffers are shared from the boot CPU first"),
             Some(Err(error)) => {
@@ -246,9 +275,15 @@ impl Composition {
                     target,
                     buffers: buffers.map(|buffer| (buffer.framebuffer, buffer.pitch as u32)),
                 });
-                output::arguments(format_args!(
-                    "GPU {name}: composes the display's frames into its shared scanout buffers\n"
-                ));
+                match drawer {
+                    None => output::arguments(format_args!(
+                        "GPU {name}: composes the display's frames into its shared scanout buffers\n"
+                    )),
+                    Some(drawer) => output::arguments(format_args!(
+                        "GPU {name}: GPU {drawer} composes the display's frames into its shared \
+                         scanout buffers (--hybrid-scanout on), which it flips on its vblank\n"
+                    )),
+                }
                 Ok(())
             }
             Err(error) => {

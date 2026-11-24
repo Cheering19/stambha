@@ -371,4 +371,4 @@ impl Drop for HeapAllocation {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

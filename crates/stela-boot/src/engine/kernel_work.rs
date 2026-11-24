@@ -792,6 +792,54 @@ impl KernelWork {
         .map_err(Error::Work)
     }
 
+    /// [`Self::dispatch_linux`] for a fatal stop on the boot processor: the
+    /// host drivers' lock is waited for `wait_micros` at most, and every
+    /// refusal is returned, never waited out or turned into a second stop.
+    /// `None` on another processor, before the clock is installed, or when
+    /// another processor kept the lock.
+    #[cfg(feature = "nvk")]
+    pub(super) fn dispatch_linux_within<T>(
+        &'static self,
+        wait_micros: u64,
+        body: impl FnOnce(Pin<&'static work::Runtime<SLOTS>>) -> Result<T, WorkError>,
+    ) -> Option<Result<T, Error>> {
+        let clock = self.installed_clock?;
+        let identity = &self.reservation.identity;
+        if !identity.owner_here() {
+            return None;
+        }
+        let admitted = (|| {
+            identity.check_irq_cpu()?;
+            if identity.in_interrupt() {
+                return Err(WorkError::InterruptContext);
+            }
+            Ok(())
+        })();
+        if let Err(error) = admitted {
+            return Some(Err(Error::Work(error)));
+        }
+        let _watched = Watched::enter();
+        // SAFETY: the loader root on this physical BSP, with no IRQ frame,
+        // which the checks above and below refuse.
+        let root = unsafe { RestoreRoot::enter_within(self.root, wait_micros) }?;
+        let result = (|| {
+            identity.check_clock_root()?;
+            identity.check_dispatch()?;
+            if self.linux_execution.get().is_some() {
+                return Err(WorkError::Busy);
+            }
+            // SAFETY: as in `dispatch_linux`: the kept loader root on the
+            // owning BSP. This scope ends after every active frame returns
+            // or parks.
+            let execution = unsafe { clock.enter_driver_execution()? };
+            self.linux_execution.set(Some(NonNull::from(&execution)));
+            let _clear = ClearLinuxExecution(&self.linux_execution);
+            body(self.executor.runtime())
+        })();
+        drop(root);
+        Some(result.map_err(Error::Work))
+    }
+
     /// [`Self::dispatch_linux`] from a processor other than the boot
     /// processor, in its place: for the GPUs' pump on a PE whose guest
     /// waits, or one waiting for its own posted call. Linux is `!SMP` and

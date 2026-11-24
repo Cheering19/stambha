@@ -98,6 +98,16 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateLaptop);
                 }
             }
+            HYBRID_SCANOUT => {
+                let on = match value().ok_or(Error::HybridScanout)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::HybridScanout),
+                };
+                if options.hybrid_scanout.replace(on).is_some() {
+                    return Err(Error::DuplicateHybridScanout);
+                }
+            }
             ASUS_MODE => {
                 let mode = AsusMode::parse(value().ok_or(Error::AsusMode)?)?;
                 if options.asus_mode.replace(mode).is_some() {

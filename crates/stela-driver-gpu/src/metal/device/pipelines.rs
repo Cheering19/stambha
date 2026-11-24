@@ -38,6 +38,7 @@ use crate::metal::{
     },
 };
 use alloc::{format, string::String, vec::Vec};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// What a destroyed object's id fails with.
 const DESTROYED: &str = "unknown or destroyed object";
@@ -283,9 +284,11 @@ struct RenderObject {
     /// A vertex pipeline's request, which its bicubic variants compile.
     request: Option<RenderPipelineRequest>,
     /// Variants whose vertex and fragment stages filter the samplers at
-    /// these indices bicubically ([`RenderPipelineState::bicubic`]), and
-    /// whether their process had made such samplers when they compiled.
-    bicubic: Vec<([u32; 2], bool, Pipeline)>,
+    /// these indices bicubically ([`RenderPipelineState::bicubic`]), built
+    /// for primitives of a topology class (`Unspecified` for the state's
+    /// own, [`RenderPipelinePlan::topology_variants`]), and whether their
+    /// process had made such samplers when they compiled.
+    bicubic: Vec<([u32; 2], PrimitiveTopologyClass, bool, Pipeline)>,
 }
 
 /// The object and mesh functions of a mesh pipeline, which its variants
@@ -369,7 +372,7 @@ impl Pipelines {
                     .state
                     .pipeline
                     .into_iter()
-                    .chain(render.bicubic.iter().map(|&(_, _, pipeline)| pipeline))
+                    .chain(render.bicubic.iter().map(|&(_, _, _, pipeline)| pipeline))
                     .chain(render.variants.iter().map(|&(_, _, pipeline)| pipeline))
                     .collect()
             }
@@ -549,6 +552,50 @@ pub struct MeshPipelineRequest {
 /// The bytes of a `VkPipelineCacheHeaderVersionOne`, which an archive file
 /// begins with when it holds this device's pipelines.
 pub const ARCHIVE_HEADER_BYTES: u64 = 32;
+
+/// Where the pipeline cache UUID lies in that header.
+const ARCHIVE_UUID: core::ops::Range<usize> = 16..32;
+
+/// The build identity of the drivers that compile pipelines, set once
+/// before any device opens ([`set_build_identity`]).
+static BUILD: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static BUILD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Names the build of the drivers that compile pipelines: the hash of the
+/// image's driver archives. A driver's pipeline cache UUID comes from its
+/// build ID, which is the same in every Stela build, so an archive file a
+/// guest keeps across a Stela update is told apart by this instead.
+pub fn set_build_identity(identity: &'static [u8]) {
+    BUILD.store(identity.as_ptr().cast_mut(), Ordering::Relaxed);
+    BUILD_BYTES.store(identity.len(), Ordering::Release);
+}
+
+fn build_identity() -> &'static [u8] {
+    let bytes = BUILD_BYTES.load(Ordering::Acquire);
+    let start = BUILD.load(Ordering::Relaxed);
+    if start.is_null() {
+        return &[];
+    }
+    // SAFETY: `set_build_identity` stored a static slice's start, then its length.
+    unsafe { core::slice::from_raw_parts(start, bytes) }
+}
+
+/// The UUID an archive file of this build's pipelines for a driver of
+/// `pipeline_cache_uuid` names in its header: the driver's, mixed with the
+/// drivers' build identity.
+pub fn archive_uuid(pipeline_cache_uuid: &[u8; 16]) -> [u8; 16] {
+    use stela_crypto::{Sha256, digest::Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(b"Stela binary archive");
+    hasher.update(pipeline_cache_uuid);
+    let build = build_identity();
+    hasher.update((build.len() as u64).to_le_bytes());
+    hasher.update(build);
+    let digest = hasher.finalize();
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    uuid
+}
 
 impl<B: Backend, C: Compiler> Device<B, C> {
     /// `newLibraryWithSource:` of the AIR the source compiled to.
@@ -735,8 +782,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Whether an archive file beginning with `header` may hold this
     /// device's pipelines: a pipeline cache header of version one naming
-    /// its vendor, device and pipeline cache UUID. The driver ignores any
-    /// other data, such as another GPU's archive, so it need not be read.
+    /// its vendor, device and this build's archive UUID ([`archive_uuid`]).
+    /// The driver ignores any other data, such as another GPU's archive, so
+    /// it need not be read; another Stela build's it would not ignore, as
+    /// its drivers' UUID is the same.
     pub fn archive_header_matches(&self, header: &[u8]) -> bool {
         let identity = &self.backend.physical_device().identity;
         let word = |at: usize| {
@@ -748,12 +797,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             && word(4) == Some(1)
             && word(8) == Some(identity.vendor_id)
             && word(12) == Some(identity.device_id)
-            && header.get(16..32) == Some(&identity.pipeline_cache_uuid[..])
+            && header.get(ARCHIVE_UUID) == Some(&archive_uuid(&identity.pipeline_cache_uuid)[..])
     }
 
     /// `newBinaryArchiveWithDescriptor:error:` of `data`, a file's bytes:
     /// another device's or driver's archive holds nothing of this one's.
     pub fn new_archive(&mut self, data: &[u8]) -> Result<ArchiveId> {
+        // The driver reads its own UUID where the file names this build's.
+        let mut restored;
+        let data = if self.archive_header_matches(data) {
+            restored = data.to_vec();
+            restored[ARCHIVE_UUID]
+                .copy_from_slice(&self.backend.physical_device().identity.pipeline_cache_uuid);
+            &restored[..]
+        } else {
+            data
+        };
         let cache = self.backend.create_pipeline_cache(data)?;
         let index = self.pipelines.archives.insert(ArchiveObject {
             cache,
@@ -765,7 +824,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The bytes `serializeToURL:error:` writes.
     pub fn archive_data(&mut self, id: ArchiveId) -> Result<Vec<u8>> {
         let cache = self.pipelines.archives.get(id.0)?.cache;
-        self.backend.pipeline_cache_data(cache)
+        let mut data = self.backend.pipeline_cache_data(cache)?;
+        // The file names this build's archive UUID where the driver's is.
+        let uuid = self.backend.physical_device().identity.pipeline_cache_uuid;
+        if data.len() as u64 >= ARCHIVE_HEADER_BYTES && data[ARCHIVE_UUID] == uuid {
+            data[ARCHIVE_UUID].copy_from_slice(&archive_uuid(&uuid));
+        }
+        Ok(data)
     }
 
     /// Ends the creator's use of an archive, which goes with the last
@@ -1305,8 +1370,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         } else {
             [0; 2]
         };
-        let (vulkan, plan, interfaces) =
-            self.create_render(request, linkings, &sources, bicubic, indirect_bindable)?;
+        let (vulkan, plan, interfaces) = self.create_render(
+            request,
+            linkings,
+            &sources,
+            bicubic,
+            indirect_bindable,
+            PrimitiveTopologyClass::Unspecified,
+        )?;
+        if plan.topology_variants && plan.info.indirect_bindable {
+            // GPU-resident commands bind no variants: such a pipeline's
+            // point and line draws there draw nothing.
+            self.unsupported(
+                "GPU-resident point and line draws of render pipelines without an input \
+                 primitive topology on a device that fixes each pipeline's topology class",
+            );
+        }
         self.tests_fragments |= plan.tests_fragments;
         let indirect = if plan.info.indirect_bindable {
             match self.add_indirect_render(&plan, &interfaces, vulkan) {
@@ -1366,6 +1445,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         sources: &Sources,
         [vertex_bicubic, fragment_bicubic]: [u32; 2],
         indirect_bindable: bool,
+        class: PrimitiveTopologyClass,
     ) -> Result<(Pipeline, RenderPipelinePlan, Vec<Interface>)> {
         let pipelines = &self.pipelines;
         let function = pipelines.interface(request.vertex_function)?;
@@ -1445,7 +1525,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             fragment_function: fragment.as_ref(),
             vertex_descriptor: request.vertex_descriptor.as_ref(),
             targets: request.targets,
-            input_primitive_topology: request.input_primitive_topology,
+            input_primitive_topology: match class {
+                PrimitiveTopologyClass::Unspecified => request.input_primitive_topology,
+                class => class,
+            },
             max_vertex_amplification_count: request.max_vertex_amplification_count,
             tessellation: tessellation.as_ref().zip(feeding).map(
                 |(tessellation, [vertex, control])| TessellatedVertex {
@@ -1455,12 +1538,20 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 },
             ),
         };
+        let fixed_class = !self
+            .backend
+            .physical_device()
+            .features
+            .dynamic_primitive_topology_unrestricted;
         // The driver compiles the NIR into the pipeline, which outlives it.
         let start = self.timing.now();
         let created =
             pipeline::render_pipeline(&self.capabilities, &descriptor).and_then(|mut plan| {
                 let start = self.timing.since(Phase::PipelinePlan, start);
                 plan.info.indirect_bindable = indirect_bindable;
+                plan.topology_variants = fixed_class
+                    && plan.tessellation.is_none()
+                    && descriptor.input_primitive_topology == PrimitiveTopologyClass::Unspecified;
                 let pipeline = self.create_from(sources, |backend, source| {
                     plan.info.source = source;
                     backend.create_graphics_pipeline(&plan.info)
@@ -1621,10 +1712,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The vertex pipeline whose vertex and fragment stages filter the
     /// samplers at `bicubic` bicubically, for draws binding bicubic samplers
     /// there; compiled on first use.
-    pub(super) fn render_variant(&mut self, id: u64, bicubic: [u32; 2]) -> Result<Pipeline> {
+    pub(super) fn render_variant(
+        &mut self,
+        id: u64,
+        bicubic: [u32; 2],
+        class: PrimitiveTopologyClass,
+    ) -> Result<Pipeline> {
         let index = u32::try_from(id).map_err(|_| Error::Invalid("unknown pipeline"))?;
         let render = self.pipelines.render.get(index)?;
+        // Only a pipeline of topology variants builds one for a class.
+        let class = match render.state.plan.topology_variants {
+            true => class,
+            false => PrimitiveTopologyClass::Unspecified,
+        };
         if bicubic == render.state.bicubic
+            && class == PrimitiveTopologyClass::Unspecified
             && !render.state.outdated
             && let Some(pipeline) = render.state.pipeline
         {
@@ -1635,10 +1737,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .clone()
             .ok_or(Error::Invalid("not a vertex pipeline"))?;
         let arguments = self.admitted(request.vertex_function)?;
-        if let Some((_, _, pipeline)) = render
-            .bicubic
-            .iter()
-            .find(|(known, admitted, _)| *known == bicubic && *admitted == arguments)
+        if let Some((_, _, _, pipeline)) =
+            render
+                .bicubic
+                .iter()
+                .find(|(known, known_class, admitted, _)| {
+                    *known == bicubic && *known_class == class && *admitted == arguments
+                })
         {
             return Ok(*pipeline);
         }
@@ -1655,12 +1760,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             &Sources::default(),
             bicubic,
             false,
+            class,
         )?;
         self.pipelines
             .render
             .get_mut(index)?
             .bicubic
-            .push((bicubic, arguments, pipeline));
+            .push((bicubic, class, arguments, pipeline));
         Ok(pipeline)
     }
 
@@ -1778,7 +1884,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             (_, pipeline) => pipeline,
         };
         let variants = render.variants.into_iter().map(|(_, _, pipeline)| pipeline);
-        let bicubic = render.bicubic.into_iter().map(|(_, _, pipeline)| pipeline);
+        let bicubic = render
+            .bicubic
+            .into_iter()
+            .map(|(_, _, _, pipeline)| pipeline);
         for pipeline in pipeline.into_iter().chain(variants).chain(bicubic) {
             self.defer(Object::Pipeline(pipeline));
         }

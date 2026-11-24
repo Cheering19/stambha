@@ -133,9 +133,11 @@ const LIBDRM_AMDGPU: Library = Library {
     // What libdrm's configuration (its `config.h`) and its amdgpu build set
     // for a Linux target with GCC's atomic builtins. The table of marketing
     // names lies under its data directory; the image holds no file system,
-    // so a device has no marketing name and libdrm says once per device
-    // which file it lacks.
+    // so a device has no marketing name. What the library prints goes
+    // through `compat/mesa/drm.c`, which names its lines and says once per
+    // boot which files it lacks.
     defines: &[
+        "fprintf=libdrm_amdgpu_report",
         "HAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
         "HAVE_LIB_ATOMIC_OPS=0",
         "HAVE_ALLOCA_H=1",
@@ -150,6 +152,10 @@ const LIBDRM_AMDGPU: Library = Library {
         ("amdgpu_bo_set_metadata", "libdrm_amdgpu_bo_set_metadata"),
     ],
 };
+
+/// "Stela statically", the build ID note of `compat/mesa/build_id.c`, in hex
+/// with its 20 bytes' padding.
+const RADV_BUILD_ID: &str = "-Dradv-build-id=5374656c6120737461746963616c6c7900000000";
 
 /// The loader entry every Mesa Vulkan driver defines.
 const ENTRY: &str = "vk_icdGetInstanceProcAddr";
@@ -192,13 +198,14 @@ const ANV: Driver = Driver {
     renamed: &[],
     options: &ANV_OPTIONS,
     host_tools: true,
-    // Intel's stack gives no Vulkan driver yet.
+    // A release image holds no Intel port.
     released: false,
     model: "anv_util.c",
     stand_ins: &["anv_nir_options"],
     libraries: &[],
 };
-/// RADV, with ACO, for AMD GPUs from GFX6. Mesa's configuration has it
+/// RADV, with ACO, for the AMD GPUs the port drives, from GFX8
+/// (`stela_driver_core::amd_metal`). Mesa's configuration has it
 /// compile the shaders that build acceleration structures from GLSL, which
 /// needs the host's glslang; without it RADV would report ray tracing it
 /// cannot build. Its objects are its shared library's own, not a library's,
@@ -215,9 +222,13 @@ pub(super) const RADV: Driver = Driver {
         "metro_exodus_GetSemaphoreCounterValue",
         "radv_metro_exodus_GetSemaphoreCounterValue",
     )],
-    options: &["-Damd-use-llvm=false"],
+    // RADV keys its cache UUID on the build ID of its own shared object, read
+    // through `dladdr`, which the image lacks: without one no physical device
+    // is made ("cannot generate UUID"). Mesa's option names the ID instead,
+    // here the bytes of the one note `compat/mesa/build_id.c` gives NVK and ANV.
+    options: &["-Damd-use-llvm=false", RADV_BUILD_ID],
     host_tools: true,
-    // AMD's stack gives no Vulkan driver yet.
+    // A release image holds no amdgpu, so none of its GPUs asks for RADV.
     released: false,
     model: "radv_query.c",
     stand_ins: &["radv_nir_options", "radv_submit"],
@@ -282,7 +293,7 @@ const SKIPPED: [&str; 12] = [
 ];
 /// The Metal compiler service, under `compiler`, built with the first
 /// driver's model unit's flags.
-const AIR: [&str; 16] = [
+pub(super) const AIR: [&str; 16] = [
     "air_call",
     "air_calls",
     "air_commands",
@@ -1357,32 +1368,47 @@ pub fn build(jobs: u16) -> Result<()> {
     Ok(())
 }
 
-/// Builds `compat/libc/tests/libc_test.c` with the C library as a static Linux
-/// program, and runs it.
+/// Builds `compat/libc/tests/libc_test.c` with the C library and libdrm's
+/// stand-in (`compat/mesa/drm.c`) as a static Linux program, and runs it.
 fn test_libc(toolchain: &Toolchain, sysroot: &Sysroot, directory: &Path) -> Result<()> {
     let libc = gpu().join("compat/libc");
     let output = directory.join("libc-test");
     fs::create_dir_all(&output)?;
     let resource = format!("{}/include", resource_directory(&toolchain.clang)?);
-    let test = output.join("libc_test.o");
-    exec(
-        Command::new(&toolchain.clang)
-            .args(LIBC_TEST_FLAGS)
-            .arg("-isystem")
-            .arg(&libc)
-            .arg("-isystem")
-            .arg(&resource)
-            .arg("-c")
-            .arg(libc.join("tests/libc_test.c"))
-            .arg("-o")
-            .arg(&test),
-    )?;
+    let libdrm = third_party("libdrm");
+    let mut objects = Vec::new();
+    for source in [
+        libc.join("tests/libc_test.c"),
+        gpu().join("compat/mesa/drm.c"),
+    ] {
+        let object = output.join(
+            source
+                .with_extension("o")
+                .file_name()
+                .context("a test source")?,
+        );
+        exec(
+            Command::new(&toolchain.clang)
+                .args(LIBC_TEST_FLAGS)
+                .arg("-isystem")
+                .arg(&libc)
+                .arg("-isystem")
+                .arg(&resource)
+                .arg(format!("-I{}", libdrm.display()))
+                .arg(format!("-I{}", libdrm.join("include/drm").display()))
+                .arg("-c")
+                .arg(&source)
+                .arg("-o")
+                .arg(&object),
+        )?;
+        objects.push(object);
+    }
     let program = output.join("libc_test");
     exec(
         Command::new(&toolchain.linker)
             .args(["-static", "-o"])
             .arg(&program)
-            .arg(&test)
+            .args(&objects)
             .arg(sysroot.libc()),
     )?;
     exec(&mut Command::new(&program)).context("the C library's test failed")

@@ -1585,3 +1585,27 @@ fn containment_refuses_an_unsizable_control_beside_a_hardwired_bus_master() {
             .is_some()
     );
 }
+
+/// A refusal that names a control only by its offset can name it: an ATS
+/// Control register that keeps its Enable bit reads as `ATS Control`.
+#[test]
+fn the_plan_names_each_control_it_stops() {
+    let mut function = endpoint();
+    ext(&mut function, 0x100, ATS, 1, 0);
+    let plan = containment_plan(function.config()).unwrap();
+    assert_eq!(plan.control_name(regs::COMMAND), Some("COMMAND"));
+    assert_eq!(plan.control_name(0x48), Some("PCI Express Device Control"));
+    assert_eq!(plan.control_name(0x106), Some("ATS Control"));
+    assert_eq!(plan.control_name(0x108), None);
+}
+
+/// An ATS Control register that keeps Enable after the stop is said to be
+/// held on outside the function; any other read back has no meaning given.
+#[test]
+fn a_stuck_ats_enable_is_said_to_be_held_outside_the_function() {
+    let meaning = containment::stuck_control("ATS Control", 0x8000).unwrap();
+    assert!(meaning.starts_with("its Enable bit stays set after Stela cleared it"));
+    assert!(meaning.contains("hypervisor"));
+    assert_eq!(containment::stuck_control("ATS Control", 0x001f), None);
+    assert_eq!(containment::stuck_control("PASID Control", 0x8000), None);
+}

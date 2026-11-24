@@ -35,6 +35,7 @@ use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
 use stela_soc::scanout::{GpuPresent, GpuStats, Layer};
 
 mod composition;
+pub(in crate::engine) use composition::set_hybrid as set_hybrid_scanout;
 
 /// A GPU's primary node, the DRM master.
 struct Node(c_int);
@@ -664,6 +665,17 @@ pub(in crate::engine) fn take(
     firmware: Shown<'_>,
     size: Option<(u32, u32)>,
 ) {
+    take_from(0, wanted, firmware, size);
+}
+
+/// [`take`] over the bound GPUs from index `first` on, the GPUs a fallback
+/// started, where no display was taken before.
+pub(in crate::engine) fn take_from(
+    first: usize,
+    wanted: (usize, usize),
+    firmware: Shown<'_>,
+    size: Option<(u32, u32)>,
+) {
     let Some(gpu) = super::installed() else {
         return;
     };
@@ -671,7 +683,10 @@ pub(in crate::engine) fn take(
     let bound = &gpu.start.bound;
     // SAFETY: the one boot CPU, before any reader.
     let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
-    for (index, bound_gpu) in bound.iter().enumerate() {
+    if taken.is_some() {
+        return;
+    }
+    for (index, bound_gpu) in bound.iter().enumerate().skip(first) {
         let name = &bound_gpu.name;
         let Some(fd) = client::minor(index).and_then(client::open_node) else {
             continue;

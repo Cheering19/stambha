@@ -299,6 +299,51 @@ fn missing_families_name_the_layer_that_lacks_them() {
     assert_eq!(unique.len(), names.len(), "each gap is reported once");
 }
 
+/// A device whose driver has no mesh shaders and no barycentric
+/// coordinates, as RADV on GFX9 and GFX10.1: in Apple6 but not in Metal3
+/// or Apple7, which the boot log says in one line with what each lacks.
+#[test]
+fn a_device_below_apple7_names_what_it_lacks() {
+    let chip = Chip::find(0x172).unwrap();
+    assert_eq!(complete(chip).family_shortfall(), None);
+    let mut device = nvk(chip, 16 << 30);
+    device.features.mesh_shader = false;
+    device.features.task_shader = false;
+    device.features.fragment_shader_barycentric = false;
+    let capabilities = Capabilities::derive(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    assert!(capabilities.supports_family(GpuFamily::Apple6));
+    assert!(!capabilities.supports_family(GpuFamily::Metal3));
+    assert!(!capabilities.supports_family(GpuFamily::Apple7));
+    assert_eq!(
+        capabilities.family_shortfall().unwrap(),
+        alloc::format!(
+            "{}: Metal device in Apple6 at most, without Metal3 (no mesh shaders) or Apple7 \
+             (no barycentric coordinates)",
+            capabilities.name
+        )
+    );
+    // Without mesh shaders alone, Apple7 needs only Metal3.
+    let mut device = nvk(chip, 16 << 30);
+    device.features.mesh_shader = false;
+    let capabilities = Capabilities::derive(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    assert!(
+        capabilities
+            .family_shortfall()
+            .unwrap()
+            .ends_with("without Metal3 (no mesh shaders) or Apple7 (needs Metal3)")
+    );
+}
+
 #[test]
 fn compute_only_compilers_advertise_no_family() {
     let chip = Chip::find(0x1b3).unwrap();

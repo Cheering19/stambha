@@ -739,7 +739,8 @@ fn translation_store(
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
-    let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
+    let budget =
+        stela_boot_core::host_memory::pack_budget(free, cores, cores, crate::storage::gpu_plan());
     let Some(store) = crate::engine::translations::read(budget, background) else {
         crate::status::done("none on this USB");
         return (files, storage);
@@ -969,6 +970,9 @@ fn load(
     let memory::EngineMemory {
         heap,
         kept_code,
+        gpu,
+        pages,
+        pages_held,
         native_resources,
         native_task_allocations,
         stack,
@@ -1008,6 +1012,9 @@ fn load(
         boot_disk[..take].copy_from_slice(&location.as_bytes()[..take]);
         boot_disk_bytes = take;
     }
+    // Before the firmware's exit, while its PCI bus driver keeps what it
+    // sized and the option ROMs it read.
+    let pci_map = crate::pci_io::firmware_map();
     let (device_skips, device_needs) = device_starts(&system);
     // Found now, through the firmware's own protocol; claimed as the first
     // act after the firmware's exit.
@@ -1253,6 +1260,7 @@ fn load(
             power,
             efi_reset: runtime.reset,
             rsdp: storage::rsdp().unwrap_or(0),
+            pci_map,
             wifi_key: Region {
                 physical: wifi_key.as_ptr() as u64,
                 bytes: wifi_key.len() as u64,
@@ -1268,6 +1276,10 @@ fn load(
                 physical: wifi_saved.as_ptr() as u64,
                 bytes: wifi_saved.len() as u64,
             },
+            gpu_share: gpu,
+            gpu_pages: pages,
+            gpu_pages_held: pages_held,
+            gpu_census: storage::gpu_census(),
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

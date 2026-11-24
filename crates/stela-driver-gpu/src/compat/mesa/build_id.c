@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Mesa finds its build ID in its own ELF notes. It uses them to key caches
  * across driver builds; there is no ELF here and the shader cache is out, so
- * one note serves. */
+ * one note serves. The pipeline cache UUID it gives is then every Stela
+ * build's: the pipeline store and the guest's binary archives are keyed by
+ * the hash of the drivers' archives instead (`archive_uuid`). */
 #include <string.h>
 #include "util/build_id.h"
 

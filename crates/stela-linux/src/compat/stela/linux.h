@@ -53,8 +53,10 @@ struct stela_linux_services {
 	void *(*map_device)(void *context, u64 physical, size_t size,
 			    bool write_combining);
 	void (*unmap_device)(void *context, void *address);
-	/* Map count write-back pages contiguously, or return NULL. */
-	void *(*map_pages)(void *context, const u64 *physical, size_t count);
+	/* Map count pages contiguously, write-back or write-combining, or
+	 * return NULL. */
+	void *(*map_pages)(void *context, const u64 *physical, size_t count,
+			   bool write_combining);
 	void (*unmap_pages)(void *context, void *address, size_t count);
 	/* Action is already linked before enable. Initialize *unexposed=false;
 	 * set true only with actual no-publication plus exact owner/event cleanup
@@ -144,6 +146,12 @@ bool stela_linux_try_enter(const struct stela_linux_owner *owner);
 void stela_linux_exit(void);
 /* Checked quiescence in the serialized context, not a native IRQ witness. */
 bool stela_linux_quiescent(void);
+/* Whether a blocking allocation from the platform heap may be made now
+ * (kernel/linux.c): when quiescent, or inside a kernel FPU section that holds
+ * only preemption off. */
+bool stela_linux_blocking_allocation_allowed(void);
+/* Whether a kernel_fpu_begin section is open (kernel/fpu.c). */
+bool stela_linux_kernel_fpu_open(void);
 /* Runs irq_work a workqueue worker raised in process context, from a
  * quiescent task (its cond_resched after the item, or its park). */
 void stela_linux_irq_work_run_owed(void);

@@ -161,6 +161,25 @@ impl Framebuffer {
         Some((handle, Self::current(&mut gop)?))
     }
 
+    /// The PCI function whose BAR holds the firmware's screen, for the
+    /// memory plan, without changing the firmware's mode: `Ok(None)` where
+    /// the firmware left no screen, `Err` where no function was found.
+    pub(crate) fn firmware_function() -> Result<Option<stela_drivers::bus::pci::Address>, ()> {
+        let Some((handle, mut gop)) = gop() else {
+            return Ok(None);
+        };
+        let mut buffer = gop.frame_buffer();
+        let (base, bytes) = (buffer.as_mut_ptr() as u64, buffer.size() as u64);
+        drop(gop);
+        if base == 0 || bytes == 0 {
+            return Ok(None);
+        }
+        match crate::pci_io::framebuffer_source(handle, base, bytes) {
+            Ok(Some(source)) => Ok(Some(source.address)),
+            _ => Err(()),
+        }
+    }
+
     /// Capture the original display function before the engine handoff.
     pub(crate) fn for_engine() -> crate::Result<Option<Self>> {
         let Some((handle, mut screen)) = Self::firmware_mode() else {
