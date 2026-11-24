@@ -445,6 +445,54 @@ fn retire_hidden_capabilities(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
     hidden.extend(notes);
 }
 
+/// `/defaults` `sleep-disabled`, a 4-byte nonzero word: XNU's
+/// `PE_get_default` reads it once the system has booted into
+/// `gSleepDisabledFlag` (26B123 T8112, xnu-13432.41.4: kernel file
+/// 0x54de9c8, the "PMRD: power event" handler), and
+/// `checkSystemSleepAllowed` (0x54d3c60) then refuses every system sleep,
+/// idle, the Apple menu's, a HID sleep key's or a lid's, with
+/// `kPMConfigPreventSystemSleep`. macOS stays awake and only its display
+/// sleeps.
+pub const SLEEP_DISABLED: &str = "sleep-disabled";
+
+/// Tell macOS this Mac cannot sleep ([`SLEEP_DISABLED`]); `false` when the
+/// tree has no `/defaults` to say it in.
+///
+/// System sleep is not modeled. macOS's sleep path quiesces the SEP and
+/// waits for its power gate: `AppleSEPManager`'s quiesce action (kernel file
+/// 0x2d89054) calls `iop-sep-nub`'s `function-wait_for_power_gate`, PMGR's
+/// `Wait` on device 0xa0 (`SEP`), for at most 5 s and panics with "SEP
+/// failed to power-gate after 5s" when it times out (0x2da6194). Past it
+/// the processors stop (`cpu-start`) and the boot processor enters deep
+/// sleep, to resume only through the reset vector, none of which is
+/// modeled either. Refusing sleep up front keeps the boot alive instead.
+pub fn disable_system_sleep(tree: &mut DeviceTree) -> crate::Result<bool> {
+    let Some(defaults) = tree.node_mut(DEFAULTS) else {
+        return Ok(false);
+    };
+    defaults.set_property(SLEEP_DISABLED, 1u32.to_le_bytes().to_vec())?;
+    Ok(true)
+}
+
+/// The boot's line for [`disable_system_sleep`]'s result.
+pub fn sleep_line(result: crate::Result<bool>) -> String {
+    match result {
+        Ok(true) => String::from(
+            "SLEEP off: system sleep is not modeled, so macOS is told this Mac cannot sleep \
+             (/defaults sleep-disabled); the Apple menu's Sleep and a closed lid leave it \
+             running, and only the display sleeps\n",
+        ),
+        Ok(false) => String::from(
+            "SLEEP not refused: the device tree has no /defaults, so macOS may try to sleep, \
+             which is not modeled and stops at the SEP's power gate\n",
+        ),
+        Err(error) => format!(
+            "SLEEP not refused: {error}; macOS may try to sleep, which is not modeled and \
+             stops at the SEP's power gate\n"
+        ),
+    }
+}
+
 /// Hides the AGX model (`sgx`, its `gfx-asc` coprocessor and firmware mapper)
 /// from a boot whose guest has a real GPU, so that StelaGPU is its only Metal
 /// device, and from an installed macOS's console boot without one, which then

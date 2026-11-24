@@ -849,3 +849,50 @@ fn a_passcode_create_completes_by_dma_steps_alone_and_holds_later_requests() {
     let passcode_hex = observe::hex(b"correct horse");
     assert!(!lines.iter().any(|l| l.contains(&passcode_hex)));
 }
+
+/// macOS's sleep sequence as `AppleSEPManager` sends it: the AP's
+/// sleep-ready notification, `cmsgSLEEP` with its type, then on wake
+/// `cmsgWAKE`. Each tagged request is answered with its own tag and success;
+/// while asleep only a wake is taken, and the sequence repeats.
+#[test]
+fn macos_sleep_and_wake_round_trips_repeat() {
+    let mut os = active(None);
+    for cycle in 0..2u8 {
+        let base = 1 + cycle * 4;
+        assert!(
+            reply(&mut os, control(0, control::AP_SLEEP_READY, 0, 0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(os.ap_sleep_ready());
+        let sleep = control(base, control::SLEEP, 1, 0);
+        assert_eq!(
+            reply(&mut os, sleep).unwrap(),
+            [control::reply(sleep, Status::Success, 0)]
+        );
+        assert_eq!(os.power(), Power::Asleep(1));
+        // Asleep: no control request but a wake, no OOL registration, no
+        // second sleep, and no nap.
+        for refused in [
+            control(base + 1, control::NOP, 0, 0),
+            control(base + 1, control::SET_OOL_IN_LENGTH, 9, 0x4000),
+            control(base + 1, control::SLEEP, 1, 0),
+            control(0, control::NAP, 0, 0),
+        ] {
+            assert!(reply(&mut os, refused).is_err());
+            assert_eq!(os.power(), Power::Asleep(1));
+        }
+        let wake = control(base + 2, control::WAKE, 0, 0);
+        assert_eq!(
+            reply(&mut os, wake).unwrap(),
+            [control::reply(wake, Status::Success, 0)]
+        );
+        assert_eq!(os.power(), Power::Awake);
+        assert!(!os.ap_sleep_ready());
+        let nop = control(base + 3, control::NOP, 0, 0);
+        assert_eq!(
+            reply(&mut os, nop).unwrap(),
+            [control::reply(nop, Status::Success, 0)]
+        );
+    }
+}
