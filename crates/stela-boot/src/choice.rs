@@ -31,7 +31,7 @@ use core::time::Duration;
 use stela_boot_core::{
     chosen_disk::{Adopted, adopt},
     options::{System, WIFI_PREFER, wifi_word},
-    wifi_page,
+    wifi_hardware, wifi_page,
 };
 use stela_contracts::refuse;
 use stela_loader::mount_interface::{
@@ -313,9 +313,11 @@ struct Menu<'a> {
     /// not `--wifi`'s ([`with_prefer`]).
     wifi_prefer: Option<String>,
     /// The PC may have a Wi-Fi chip the driver starts
-    /// ([`crate::wifi_menu::offered`]); without one the Wi-Fi line is not
-    /// shown and `W` opens nothing.
+    /// ([`crate::wifi_menu::hardware`]); without one `W` opens a page that
+    /// says why instead of the Wi-Fi page.
     wifi_offered: bool,
+    /// What the census found of the PC's Wi-Fi, once the menu read it.
+    wifi_hardware: Option<wifi_hardware::Hardware>,
 }
 
 /// What the menu was left with.
@@ -324,6 +326,8 @@ enum Pick {
     Item(usize),
     /// `W`: the Wi-Fi page.
     Wifi,
+    /// `W` without a Wi-Fi chip the driver starts: the page saying why.
+    Unavailable(Vec<String>),
 }
 
 impl<'a> Menu<'a> {
@@ -460,6 +464,7 @@ impl<'a> Menu<'a> {
             wifi_saved: false,
             wifi_prefer: None,
             wifi_offered: true,
+            wifi_hardware: None,
         }
     }
 
@@ -507,6 +512,12 @@ impl<'a> Menu<'a> {
                 self.wifi_saved,
             );
             canvas.text_centred(width / 2, height.saturating_sub(24), &line, 1, ui::DIM);
+        } else if let Some(line) = self
+            .wifi_hardware
+            .as_ref()
+            .and_then(wifi_hardware::Hardware::unsupported_line)
+        {
+            canvas.text_centred(width / 2, height.saturating_sub(24), line, 1, ui::DIM);
         }
         let (status, colour) = match (self.notice, self.countdown, self.held) {
             (Some(notice), _, _) => (String::from(notice), ui::ORANGE),
@@ -548,11 +559,18 @@ impl<'a> Menu<'a> {
                     if let Some(chosen) = chosen {
                         return Some(Pick::Item(chosen));
                     }
-                    if matches!(key, 'w' | 'W')
-                        && self.wifi_offered
-                        && (self.wifi.is_some() || self.wifi_saved)
-                    {
-                        return Some(Pick::Wifi);
+                    // The page saves a network on a USB with none yet too.
+                    if matches!(key, 'w' | 'W') {
+                        if self.wifi_offered {
+                            return Some(Pick::Wifi);
+                        }
+                        if let Some(lines) = self
+                            .wifi_hardware
+                            .as_ref()
+                            .and_then(wifi_hardware::Hardware::unavailable)
+                        {
+                            return Some(Pick::Unavailable(lines));
+                        }
                     }
                 }
                 Wait::Key(_) | Wait::Nothing => {}
@@ -638,7 +656,9 @@ fn asked() -> bool {
 /// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
     menu.wifi_saved = crate::wifi_menu::saved(volume);
-    menu.wifi_offered = crate::wifi_menu::offered();
+    let hardware = crate::wifi_menu::hardware();
+    menu.wifi_offered = hardware.offered();
+    menu.wifi_hardware = Some(hardware);
     if menu.wifi_offered
         && let Some(hint) = wifi_page::hint_line(menu.wifi.as_deref(), menu.wifi_saved)
     {
@@ -647,6 +667,10 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
     loop {
         let index = match menu.run()? {
             Pick::Item(index) => index,
+            Pick::Unavailable(lines) => {
+                crate::wifi_menu::unavailable(&lines);
+                continue;
+            }
             Pick::Wifi => {
                 let configured = menu.wifi.clone();
                 let chosen = crate::wifi_menu::run(

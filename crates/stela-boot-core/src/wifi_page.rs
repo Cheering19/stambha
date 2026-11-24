@@ -657,6 +657,38 @@ fn draw_form(scene: &mut Scene, layout: &Layout, form: &Form, joins: bool) {
     scene.text(left + 20, y + 212, message, tone);
 }
 
+/// The page `W` opens where the startup menu offers no Wi-Fi page
+/// (`wifi_hardware::Hardware::unavailable`): its `lines` on a card in the
+/// menu's column, the first bright, and the key that leaves.
+pub fn unavailable_scene(lines: &[String], geometry: Geometry) -> Scene {
+    let mut scene = Scene {
+        draws: Vec::new(),
+        glyph: geometry.glyph.max(1),
+    };
+    let layout = Layout::new(geometry);
+    scene.text(layout.left + 16, layout.top, "Wi-Fi", Tone::Text);
+    let card = 24 + lines.len() * 28;
+    scene.panel(
+        layout.left,
+        layout.caption,
+        layout.column,
+        card,
+        8,
+        Tone::Card,
+    );
+    for (index, line) in lines.iter().enumerate() {
+        let tone = if index == 0 { Tone::Text } else { Tone::Dim };
+        scene.text(
+            layout.left + 20,
+            layout.caption + 16 + index * 28,
+            line,
+            tone,
+        );
+    }
+    scene.centred(layout.middle, layout.keys, "Esc: back", Tone::Dim);
+    scene
+}
+
 /// The screen the page is drawn on, in page units (`screen::scale`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {

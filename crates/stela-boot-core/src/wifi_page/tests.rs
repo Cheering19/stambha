@@ -93,6 +93,33 @@ fn the_status_line_shows_not_set_up_only_with_saved_networks() {
     );
 }
 
+/// The page W opens without a Wi-Fi chip the driver starts shows each line
+/// inside the menu's column, and Esc.
+#[test]
+fn the_unavailable_page_draws_its_lines_in_the_column() {
+    let lines = [String::from("first"), String::from("second")];
+    let geometry = Geometry {
+        width: 1280,
+        height: 720,
+        top: 80,
+        glyph: 8,
+    };
+    let scene = unavailable_scene(&lines, geometry);
+    let texts: Vec<&str> = scene.texts().collect();
+    assert_eq!(texts, ["Wi-Fi", "first", "second", "Esc: back"]);
+    let column = (1280 - 440) / 2..(1280 - 440) / 2 + 440;
+    for draw in &scene.draws {
+        if let Draw::Text { x, text, .. } = draw
+            && text != "Esc: back"
+        {
+            assert!(
+                column.contains(x) && x + 8 * text.len() <= column.end,
+                "{text}"
+            );
+        }
+    }
+}
+
 /// Testers with a Wi-Fi chip the driver starts missed that a network is
 /// chosen with W: with none set up the menu and the log both say so.
 #[test]
