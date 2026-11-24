@@ -74,7 +74,7 @@ Installing macOS next to Windows or Linux should never risk them. Stambha's inst
 | Part | Requirement |
 |---|---|
 | CPU | Intel or AMD x86-64-v2 or newer (Intel Nehalem, AMD Bulldozer). AVX2 and AVX-512 are used when present. |
-| Memory | 8 GB or more (16 GB recommended) |
+| Memory | 8 GB or more with a graphics card (16 GB recommended). Built-in graphics (Intel Iris Xe/UHD, AMD Radeon in Ryzen) borrow part of the RAM, so use 12 GB or more |
 | Firmware | 64-bit UEFI with Secure Boot off |
 | GPU | NVIDIA GeForce GTX 16 or RTX 20/30/40/50 series. Laptops with a MUX switch: use dGPU-only mode. |
 | Disk | NVMe, or SATA in AHCI mode, with **60 GB or more of unallocated space** (shrink a partition, leave the space empty) |
