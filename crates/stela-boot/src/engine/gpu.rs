@@ -1321,7 +1321,16 @@ impl Platform for Host {
             return Err(unsafe { IrqEnableError::unexposed(EINVAL) });
         };
         if line.retired.is_some() {
-            return Err(IrqEnableError::retained(EOPNOTSUPP));
+            // A line its previous driver freed is never routed again: an
+            // i915 probe that failed after its IRQ, before xe's request on
+            // the same MSI line. Nothing of this request was published, and
+            // the retired owners stay with the line, so the refusal is
+            // certain and xe's probe fails cleanly, where "retained" stopped
+            // the boot. MSI has no fresh line past a retired one yet, as
+            // MSI-X has (`enable_msix`).
+            // SAFETY: refused before any route, event or source; the retired
+            // owners stay with the line.
+            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
         }
         if let Some(registration) = &mut line.registration {
             return registration
