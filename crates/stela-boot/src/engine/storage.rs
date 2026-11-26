@@ -2203,7 +2203,10 @@ pub unsafe fn open(
         .collect();
     let required = named.len();
     let mut optional: Vec<(Named, Optional)> = store
-        .map(|guid| (Named::Unique(guid), Optional::Store))
+        // Like `log` and `fdr`, the store only reads and writes preallocated
+        // file runs on its FAT32 volume and is never handed to the guest, so
+        // it may live on an EFI system partition alongside Stambha itself.
+        .map(|guid| (Named::Host(guid), Optional::Store))
         .into_iter()
         .chain(log.map(|guid| (Named::Host(guid), Optional::Log)))
         .collect();
