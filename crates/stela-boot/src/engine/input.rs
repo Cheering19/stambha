@@ -132,11 +132,18 @@ const STARVED_WAIT_MICROS: u64 = 1000;
 /// How long a device is polled at every service turn after it last gave
 /// input, so a pointer's motion keeps its full rate.
 const ACTIVE_SECONDS: u64 = 5;
-/// A device's polls may take at most one part in this of the boot PE: a
+/// An idle device's polls may take at most one part in this of the boot PE: a
 /// poll costing more is spaced this many times its cost apart. A port read
 /// that costs a microsecond on hardware can wait milliseconds for a
 /// hypervisor's device-model lock; the boot PE's time is the guest's.
 const COST_SHARE: u64 = 32;
+/// An active device's polls may take at most one part in this of the boot PE.
+/// A 400 kHz I2C-HID precision touchpad takes ~1.25 ms on the wire to read one
+/// multitouch frame: spacing active polls by [`COST_SHARE`] (32) clamped it to
+/// [`ACTIVE_MILLIS`] (32 ms, ~30 Hz) even though the emulated trackpad polls
+/// every 1 ms. Spacing active polls by 5 keeps a 1.25 ms touchpad past 120 Hz
+/// while still bounding slow hypervisor locks by [`ACTIVE_MILLIS`].
+const ACTIVE_COST_SHARE: u64 = 5;
 /// The longest an idle device waits for its next poll however costly its
 /// polls are, which its first input can wait.
 const SLOW_MILLIS: u64 = 250;
@@ -393,7 +400,7 @@ impl HostInput {
             let active =
                 now.wrapping_sub(reported.active) < super::host::COUNTER_HZ * ACTIVE_SECONDS;
             let interval = if active {
-                (reported.cost * COST_SHARE).min(millis * ACTIVE_MILLIS)
+                (reported.cost * ACTIVE_COST_SHARE).min(millis * ACTIVE_MILLIS)
             } else {
                 (reported.cost * COST_SHARE).clamp(millis * IDLE_MILLIS, millis * SLOW_MILLIS)
             };
