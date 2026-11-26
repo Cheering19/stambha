@@ -56,11 +56,15 @@ static LOW_DMA: NativeMemory = NativeMemory::new(&LOW_DMA_HEAP, cache::verify_wr
 static LOW_DMA_START: AtomicU64 = AtomicU64::new(0);
 static LOW_DMA_END: AtomicU64 = AtomicU64::new(0);
 
-/// Pages of the low DMA pool to ask the firmware for, largest first: an
-/// RTL8852CE's rings, RX buffers and TX pools take about 1.1 MiB, and the
-/// rest leaves room for other 32-bit requesters (HDA, tg3) on a
-/// passthrough domain.
-const LOW_DMA_PAGES: [usize; 3] = [4096, 2048, 1024];
+/// Pages of the low DMA pool to ask the firmware for, largest first:
+/// MediaTek MT7925 installs 256 WM TX, 128 FWDL TX, 512 event RX and 1536
+/// data RX buffers as individual 4 KiB page-aligned allocations (~20 MiB in
+/// the heap with page-alignment overhead before in-flight TX buffers and
+/// bring-up retries, exceeding 16 MiB), while RTL8852CE takes ~1.1 MiB and
+/// other 32-bit requesters (HDA, tg3) share the same passthrough pool. Asking
+/// for 64 MiB first and stepping down on tighter firmware maps fits MT7925
+/// rings and TX buffers with headroom.
+const LOW_DMA_PAGES: [usize; 5] = [16384, 8192, 4096, 2048, 1024];
 
 /// Reserve the low DMA pool from the firmware, below 4 GiB, before boot
 /// services end. Without room the pool is absent and a 32-bit request the
