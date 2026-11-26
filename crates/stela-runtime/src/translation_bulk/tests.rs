@@ -874,3 +874,163 @@ fn launch(sim: &mut Sim, keys: &[Digest], apart: u64) -> Outcome {
         reads: sim.stick.reads(),
     }
 }
+
+#[test]
+fn file_read_splits_contiguous_extents_to_the_devices_read_transfer_limit() {
+    const LIMIT: usize = 128 << 10;
+    const FILE_BYTES: usize = 1 << 20;
+
+    struct Capped {
+        stick: Stick,
+        sizes: Vec<usize>,
+    }
+
+    impl BlockDevice for Capped {
+        fn identity(&self) -> &Identity {
+            &self.stick.identity
+        }
+        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.stick.read(lba, buffer)
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            self.stick.write(lba, data)
+        }
+        fn depth(&self) -> usize {
+            self.stick.depth()
+        }
+        fn room(&self) -> bool {
+            self.stick.room()
+        }
+        fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+            if let Command::Read { bytes, .. } = command {
+                if bytes > LIMIT {
+                    return Err(BlockError::Protocol("read exceeded max_transfer"));
+                }
+                self.sizes.push(bytes);
+            }
+            self.stick.start(command)
+        }
+        fn finish(&mut self, tag: u32) -> Option<Finished> {
+            self.stick.finish(tag)
+        }
+    }
+
+    let image: Vec<u8> = (0..FILE_BYTES)
+        .map(|i| ((i * 31 + 7) & 0xff) as u8)
+        .collect();
+    let mut stick = Stick::new(image.clone(), 1);
+    stick.identity.features.max_transfer = LIMIT;
+    let mut device = Capped {
+        stick,
+        sizes: Vec::new(),
+    };
+    let extents = [Extent {
+        offset: 0,
+        bytes: FILE_BYTES as u64,
+    }];
+    let offset = 123u64;
+    let length = (512 << 10) + 777;
+    let mut read = FileRead::start(&mut device, &extents, offset, length)
+        .expect("a contiguous extent past max_transfer splits into valid commands");
+    device.stick.now = u64::MAX / 2;
+    assert!(read.poll(&mut device));
+    let bytes = read.bytes().expect("every split command succeeded");
+    assert_eq!(
+        bytes,
+        &image[offset as usize..offset as usize + length as usize]
+    );
+    assert!(device.sizes.len() >= 5, "sizes: {:?}", device.sizes);
+    assert!(device.sizes.iter().all(|&size| size <= LIMIT));
+}
+
+#[test]
+fn file_read_paces_split_chunks_within_the_devices_queue_room() {
+    const LIMIT: usize = 128 << 10;
+    const FILE_BYTES: usize = 1 << 20;
+    const QUEUE_CAP: usize = 2;
+
+    struct TightQueue {
+        stick: Stick,
+        in_flight: usize,
+        peak_in_flight: usize,
+        commits: usize,
+    }
+
+    impl BlockDevice for TightQueue {
+        fn identity(&self) -> &Identity {
+            &self.stick.identity
+        }
+        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.stick.read(lba, buffer)
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            self.stick.write(lba, data)
+        }
+        fn depth(&self) -> usize {
+            QUEUE_CAP
+        }
+        fn room(&self) -> bool {
+            self.in_flight < QUEUE_CAP
+        }
+        fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+            if self.in_flight >= QUEUE_CAP {
+                return Err(BlockError::Protocol("the staged disk queue is full"));
+            }
+            if let Command::Read { bytes, .. } = command
+                && bytes > LIMIT
+            {
+                return Err(BlockError::Protocol("read exceeded max_transfer"));
+            }
+            let tag = self.stick.start(command)?;
+            self.in_flight += 1;
+            self.peak_in_flight = self.peak_in_flight.max(self.in_flight);
+            Ok(tag)
+        }
+        fn commit(&mut self) {
+            self.commits += 1;
+        }
+        fn finish(&mut self, tag: u32) -> Option<Finished> {
+            let result = self.stick.finish(tag)?;
+            self.in_flight -= 1;
+            Some(result)
+        }
+    }
+
+    let image: Vec<u8> = (0..FILE_BYTES)
+        .map(|i| ((i * 17 + 3) & 0xff) as u8)
+        .collect();
+    let mut stick = Stick::new(image.clone(), 1);
+    stick.identity.features.max_transfer = LIMIT;
+    let mut device = TightQueue {
+        stick,
+        in_flight: 0,
+        peak_in_flight: 0,
+        commits: 0,
+    };
+    let extents = [Extent {
+        offset: 0,
+        bytes: FILE_BYTES as u64,
+    }];
+    let offset = 4096 + 77;
+    let length = (640 << 10) + 333;
+    let mut read = FileRead::start(&mut device, &extents, offset, length)
+        .expect("a tight queue accepts the first chunks without failing");
+    assert_eq!(device.in_flight, QUEUE_CAP);
+    let mut polls = 0;
+    loop {
+        device.stick.now = device.stick.busy_until;
+        polls += 1;
+        if read.poll(&mut device) {
+            break;
+        }
+        assert!(polls < 32, "read did not complete");
+    }
+    assert_eq!(device.in_flight, 0);
+    assert_eq!(device.peak_in_flight, QUEUE_CAP);
+    assert!(device.commits >= 2, "later chunks must ring commit()");
+    let bytes = read.bytes().expect("every paced chunk succeeded");
+    assert_eq!(
+        bytes,
+        &image[offset as usize..offset as usize + length as usize]
+    );
+}

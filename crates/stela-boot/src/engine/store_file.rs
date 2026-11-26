@@ -3,7 +3,7 @@
 //! targets that carry a journal plan's writes to a file's device extents,
 //! queued through the staged partition while the guest runs or completed at
 //! once at a stop, and the slot that admits one writer at a time.
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{collections::VecDeque, format, string::String, vec, vec::Vec};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
@@ -61,10 +61,12 @@ impl<T> Held<T> {
     }
 }
 
-/// The commands the write in flight queued, by the file offset it began at.
+/// The commands the write in flight queued, by the file offset it began at:
+/// those still waiting for queue room and the tags in flight on the device.
 #[derive(Default)]
 pub(super) struct Queued {
     at: Option<u64>,
+    pending: VecDeque<Command>,
     tags: Vec<u32>,
 }
 
@@ -77,36 +79,61 @@ pub(super) struct Staged<'a> {
 }
 
 impl Staged<'_> {
-    /// Queue `commands` for the write at `at`, or take their results:
-    /// whether all finished.
+    /// Queue `commands` for the write at `at` while the device has queue room,
+    /// and take finished results: whether every command finished.
     fn run(
         &mut self,
         at: u64,
         commands: impl FnOnce() -> Result<Vec<Command>, String>,
     ) -> Result<bool, String> {
         if self.queued.at != Some(at) {
-            let mut tags = Vec::new();
-            for command in commands()? {
-                tags.push(
-                    self.device
-                        .start(command)
-                        .map_err(|error| format!("{error:?}"))?,
-                );
-            }
-            *self.queued = Queued { at: Some(at), tags };
-            return Ok(false);
+            *self.queued = Queued {
+                at: Some(at),
+                pending: VecDeque::from(commands()?),
+                tags: Vec::new(),
+            };
         }
-        while let Some(&tag) = self.queued.tags.last() {
+        let mut index = 0;
+        while index < self.queued.tags.len() {
+            let tag = self.queued.tags[index];
             match self.device.finish(tag) {
-                None => return Ok(false),
+                None => index += 1,
                 Some(result) => {
-                    result.map_err(|error| format!("{error:?}"))?;
-                    self.queued.tags.pop();
+                    self.queued.tags.swap_remove(index);
+                    if let Err(error) = result {
+                        self.queued.pending.clear();
+                        return Err(format!("{error:?}"));
+                    }
                 }
             }
         }
-        *self.queued = Queued::default();
-        Ok(true)
+        let mut started = false;
+        while self.device.room() {
+            let Some(command) = self.queued.pending.pop_front() else {
+                break;
+            };
+            match self.device.start_more(command) {
+                Ok(tag) => {
+                    self.queued.tags.push(tag);
+                    started = true;
+                }
+                Err(error) => {
+                    if started {
+                        self.device.commit();
+                    }
+                    self.queued.pending.clear();
+                    return Err(format!("{error:?}"));
+                }
+            }
+        }
+        if started {
+            self.device.commit();
+        }
+        if self.queued.pending.is_empty() && self.queued.tags.is_empty() {
+            *self.queued = Queued::default();
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -128,17 +155,32 @@ fn ranges(
 impl Target for Staged<'_> {
     type Error = String;
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
-        let block = u64::from(self.device.identity().block_size);
+        let identity = self.device.identity();
+        let block = u64::from(identity.block_size).max(1);
+        // Queued controllers such as NVMe reserve bounce pages per command up
+        // to `max_transfer` (`BOUNCE_BYTES`): split larger contiguous extents
+        // so a 1 MiB journal piece never exhausts the bounce pool.
+        let chunk = match identity.features.max_transfer {
+            0 => u64::MAX,
+            limit => (limit as u64 / block * block).max(block),
+        };
         let extents = self.extents;
         self.run(offset, || {
-            Ok(ranges(extents, block, offset, bytes)?
-                .into_iter()
-                .map(|(lba, length, from)| Command::Write {
-                    lba,
-                    data: bytes[from..from + length as usize].to_vec(),
-                    fua: false,
-                })
-                .collect())
+            let mut commands = Vec::new();
+            for (lba, length, from) in ranges(extents, block, offset, bytes)? {
+                let mut done = 0u64;
+                while done < length {
+                    let piece = (length - done).min(chunk);
+                    let start = from + done as usize;
+                    commands.push(Command::Write {
+                        lba: lba + done / block,
+                        data: bytes[start..start + piece as usize].to_vec(),
+                        fua: false,
+                    });
+                    done += piece;
+                }
+            }
+            Ok(commands)
         })
     }
     /// A device without a write cache is sent no flush, as the block

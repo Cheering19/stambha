@@ -372,12 +372,14 @@ pub fn asked<'b>(
 }
 
 /// One read of `bytes` bytes of the pack file at `at` in flight: the
-/// blocks' buffer, where the bytes start in it, and the device reads (tag,
-/// where each lands in the buffer).
+/// blocks' buffer, where the bytes start in it, the device chunks still
+/// waiting for queue room (`(lba, bytes, offset)`), and the device reads
+/// in flight (`(tag, offset)`).
 pub struct FileRead {
     buffer: Vec<u8>,
     skip: usize,
     bytes: usize,
+    pending: alloc::collections::VecDeque<(u64, usize, usize)>,
     reads: Vec<(u32, usize)>,
     failed: bool,
 }
@@ -385,36 +387,79 @@ pub struct FileRead {
 impl FileRead {
     /// Start the read of the file whose device extents are `extents`:
     /// `None` when the range is outside the file or the device refused a
-    /// command.
+    /// command. Each extent is split to the device's read transfer limit so
+    /// a queued controller whose `room` reserves one `max_transfer` command
+    /// (such as NVMe's `BOUNCE_BYTES` bounce pool) never sees an oversized
+    /// read, and chunks beyond the device's current queue room wait in
+    /// `pending` until [`Self::poll`] submits them.
     pub fn start(
         device: &mut dyn BlockDevice,
         extents: &[Extent],
         at: u64,
         bytes: u64,
     ) -> Option<Self> {
-        let block = u64::from(device.identity().block_size).max(1);
+        let identity = device.identity();
+        let block = u64::from(identity.block_size).max(1);
+        let limit = identity
+            .features
+            .max_read_transfer
+            .map_or(identity.features.max_transfer, |limit| limit.get());
+        let chunk = match limit {
+            0 => u64::MAX,
+            limit => (limit as u64 / block * block).max(block),
+        };
         let start = at / block * block;
         let end = at.checked_add(bytes)?.next_multiple_of(block);
         let ranges = journal::device_ranges(extents, block, start, end - start)?;
+        let mut pending = alloc::collections::VecDeque::new();
+        for (lba, length, from) in ranges {
+            let mut done = 0u64;
+            while done < length {
+                let piece = (length - done).min(chunk);
+                pending.push_back((lba + done / block, piece as usize, from + done as usize));
+                done += piece;
+            }
+        }
         let mut read = Self {
             buffer: vec![0; (end - start) as usize],
             skip: (at - start) as usize,
             bytes: bytes as usize,
+            pending,
             reads: Vec::new(),
             failed: false,
         };
-        for (lba, length, from) in ranges {
-            let command = Command::Read {
-                lba,
-                bytes: length as usize,
-            };
-            let tag = device.start_more(command).ok()?;
-            read.reads.push((tag, from));
+        read.submit(device);
+        if read.failed && read.reads.is_empty() {
+            return None;
         }
         Some(read)
     }
 
-    /// Take the device reads that ended: whether every one did.
+    /// Submit waiting chunks while the device has queue room; returns whether
+    /// any chunk was submitted.
+    fn submit(&mut self, device: &mut dyn BlockDevice) -> bool {
+        let mut started = false;
+        while !self.failed && device.room() {
+            let Some((lba, bytes, from)) = self.pending.pop_front() else {
+                break;
+            };
+            match device.start_more(Command::Read { lba, bytes }) {
+                Ok(tag) => {
+                    self.reads.push((tag, from));
+                    started = true;
+                }
+                Err(_) => {
+                    self.failed = true;
+                    self.pending.clear();
+                    break;
+                }
+            }
+        }
+        started
+    }
+
+    /// Take the device reads that ended and submit any waiting chunks as
+    /// queue room opens: whether every chunk has ended.
     pub fn poll(&mut self, device: &mut dyn BlockDevice) -> bool {
         let (buffer, failed) = (&mut self.buffer, &mut self.failed);
         self.reads.retain(|&(tag, from)| match device.finish(tag) {
@@ -431,7 +476,12 @@ impl FileRead {
                 false
             }
         });
-        self.reads.is_empty()
+        if self.failed {
+            self.pending.clear();
+        } else if self.submit(device) {
+            device.commit();
+        }
+        self.reads.is_empty() && self.pending.is_empty()
     }
 
     /// The bytes read, once every device read ended: `None` when one failed.
