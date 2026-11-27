@@ -1053,6 +1053,9 @@ fn staged_writes_split_to_max_transfer_pace_on_room_and_reset_on_error() {
         writes_started: usize,
         fail_finish_on: Option<usize>,
         fail_start_on: Option<usize>,
+        /// Keep this tag in flight (`finish` returns `None`) for `remaining`
+        /// finish polls before completing it.
+        hold_finish: Option<(u32, usize)>,
     }
 
     impl TightWriteQueue {
@@ -1079,6 +1082,7 @@ fn staged_writes_split_to_max_transfer_pace_on_room_and_reset_on_error() {
                 writes_started: 0,
                 fail_finish_on: None,
                 fail_start_on: None,
+                hold_finish: None,
             }
         }
     }
@@ -1128,6 +1132,13 @@ fn staged_writes_split_to_max_transfer_pace_on_room_and_reset_on_error() {
             self.commits += 1;
         }
         fn finish(&mut self, tag: u32) -> Option<Finished> {
+            if let Some((held, remaining)) = self.hold_finish.as_mut()
+                && *held == tag
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return None;
+            }
             let (lba, data, fail) = self.pending.remove(&tag)?;
             if fail {
                 return Some(Err(BlockError::Protocol("injected completion failure")));
@@ -1248,6 +1259,64 @@ fn staged_writes_split_to_max_transfer_pace_on_room_and_reset_on_error() {
             break;
         }
     }
+    assert_eq!(&device.image[1024..3072], &payload[..2048]);
+    assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
+
+    // 4. Commands still in flight when an error aborts the write are retained
+    // in `abandoned` and collected on subsequent turns so no queue slot is
+    // permanently leaked and retries wait until in-flight tags finish.
+    let mut device = TightWriteQueue::new();
+    device.fail_finish_on = Some(1);
+    device.hold_finish = Some((2, 2)); // tag 2 stays in flight across abort + 1 poll
+    let mut queued = Queued::default();
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        assert_eq!(staged.write_at(offset, &payload), Ok(false));
+        assert!(staged.write_at(offset, &payload).is_err());
+    }
+    assert_eq!(
+        device.pending.len(),
+        1,
+        "tag 2 must still be in flight after abort"
+    );
+    device.fail_finish_on = None;
+    let started_before_drain = device.writes_started;
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        // First retry poll: tag 2 is still not ready -> no new writes started yet.
+        assert_eq!(staged.write_at(offset, &payload), Ok(false));
+        assert_eq!(device.writes_started, started_before_drain);
+        assert_eq!(device.pending.len(), 1);
+    }
+    device.image.fill(0);
+    let mut polls = 0;
+    loop {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        polls += 1;
+        if staged
+            .write_at(offset, &payload)
+            .expect("retry succeeds after abandoned tag is collected")
+        {
+            break;
+        }
+        assert!(polls < 16, "retry after abandoned drain did not finish");
+    }
+    assert!(
+        device.pending.is_empty(),
+        "every abandoned tag slot must be reclaimed"
+    );
     assert_eq!(&device.image[1024..3072], &payload[..2048]);
     assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
 }

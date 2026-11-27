@@ -487,13 +487,15 @@ impl FileRead {
 }
 
 /// The commands a staged journal write has queued, by the file offset it
-/// began at: those waiting for queue room and the tags in flight on the
-/// device.
+/// began at: those waiting for queue room, the tags in flight on the device,
+/// and any tags left in flight after an aborted write that must still be
+/// collected to free their device queue slots.
 #[derive(Default)]
 pub struct Queued {
     at: Option<u64>,
     pending: VecDeque<Command>,
     tags: Vec<u32>,
+    abandoned: Vec<u32>,
 }
 
 /// A staged partition target while the guest runs: each write splits its
@@ -506,14 +508,26 @@ pub struct Staged<'a> {
 }
 
 impl Staged<'_> {
-    /// Drain any already-completed tags without blocking, abandon any still
-    /// in flight, and reset [`Queued`] so a retry at the same offset starts
+    /// Collect any completed tags left in flight by an earlier aborted write
+    /// so their device queue slots are returned before reuse.
+    fn drain_abandoned(&mut self) {
+        self.queued
+            .abandoned
+            .retain(|&tag| self.device.finish(tag).is_none());
+    }
+
+    /// Collect any already-completed tags without blocking, keep any still in
+    /// flight in `abandoned` so subsequent turns finish freeing their queue
+    /// slots, and reset the active write so a retry at the same offset starts
     /// fresh rather than skipping command setup.
     fn abort(&mut self) {
         for tag in self.queued.tags.drain(..) {
-            let _ = self.device.finish(tag);
+            if self.device.finish(tag).is_none() {
+                self.queued.abandoned.push(tag);
+            }
         }
-        *self.queued = Queued::default();
+        self.queued.at = None;
+        self.queued.pending.clear();
     }
 
     /// Queue `commands` for the write at `at` while the device has queue room,
@@ -523,12 +537,17 @@ impl Staged<'_> {
         at: u64,
         commands: impl FnOnce() -> Result<Vec<Command>, String>,
     ) -> Result<bool, String> {
+        self.drain_abandoned();
+        if !self.queued.abandoned.is_empty() {
+            // Wait for every still-in-flight command from an aborted write to
+            // complete so all device queue slots are reclaimed and a retry at
+            // the same offset never overlaps an in-flight command.
+            return Ok(false);
+        }
         if self.queued.at != Some(at) {
-            *self.queued = Queued {
-                at: Some(at),
-                pending: VecDeque::from(commands()?),
-                tags: Vec::new(),
-            };
+            self.queued.at = Some(at);
+            self.queued.pending = VecDeque::from(commands()?);
+            self.queued.tags.clear();
         }
         let mut index = 0;
         while index < self.queued.tags.len() {
