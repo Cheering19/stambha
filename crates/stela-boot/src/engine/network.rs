@@ -1021,6 +1021,18 @@ impl GuestNetwork {
         self.link.mac()
     }
 
+    /// Whether the backing host adapter is a Wi-Fi device (rather than wired
+    /// Ethernet).
+    pub fn wireless(&self) -> bool {
+        self.link.device.wireless()
+    }
+
+    /// Whether previously dequeued outbound frames are still waiting to be
+    /// handed to the host adapter.
+    pub fn has_unsent(&self) -> bool {
+        !self.unsent.is_empty()
+    }
+
     /// The host adapter's carrier, looked at once per [`CARRIER_MILLIS`],
     /// for the guest adapter's link (`AppleDevices::network_carrier`):
     /// macOS sees a host link without carrier as an unplugged cable, and

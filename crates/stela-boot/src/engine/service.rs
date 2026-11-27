@@ -295,9 +295,7 @@ impl Service {
         let deferred = millis * DEFERRED_MILLIS;
         let mut turn = Turn::new(from, now, step.then_some(limit));
         let guest = || watch.pending(host::fresh_counter()).is_some();
-        let network_pacing = !*network_idle
-            || !super::host_core::here()
-            || stamp.wrapping_sub(ran[NETWORK]) >= millis * NETWORK_IDLE_MILLIS;
+        let network_idle_window = stamp.wrapping_sub(ran[NETWORK]) < NETWORK_IDLE_MILLIS * millis;
         // Whether `part` runs in this turn; `drivers` when it calls the host
         // drivers, whose lock another core may hold: such a part is left
         // to a later turn without ending this one.
@@ -390,10 +388,19 @@ impl Service {
             });
             lap.part_of(Part::Log, |_| drivers);
         }
-        if let Some(network) = network
-            .as_mut()
-            .filter(|_| network_pacing && due(NETWORK, true, &mut turn))
-        {
+        let network_due = network.as_ref().is_some_and(|net| {
+            let idle_skip = !boot
+                && super::host_core::here()
+                && net.wireless()
+                && *network_idle
+                && !net.has_unsent()
+                && network_idle_window
+                && !devices
+                    .try_with(|devices| devices.network_has_outbound())
+                    .unwrap_or(true);
+            !idle_skip && due(NETWORK, true, &mut turn)
+        });
+        if let Some(network) = network.as_mut().filter(|_| network_due) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let mut split = Split::new(NETWORK_PIECES);
