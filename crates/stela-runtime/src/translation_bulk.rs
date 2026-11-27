@@ -24,7 +24,7 @@
 //! are few while the preload runs ([`RECORD_READS`]): each costs a command
 //! as a chunk does, and a record inside the chunk in flight or the next
 //! ones ([`SOON`]) waits for them instead of reading again ([`Asked`]).
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_drivers::block::{BlockDevice, Command};
 use stela_engine::machine::Looked;
@@ -400,11 +400,7 @@ impl FileRead {
     ) -> Option<Self> {
         let identity = device.identity();
         let block = u64::from(identity.block_size).max(1);
-        let limit = identity
-            .features
-            .max_read_transfer
-            .map_or(identity.features.max_transfer, |limit| limit.get());
-        let chunk = match limit {
+        let chunk = match identity.features.transfer_limit(true) {
             0 => u64::MAX,
             limit => (limit as u64 / block * block).max(block),
         };
@@ -487,6 +483,174 @@ impl FileRead {
     /// The bytes read, once every device read ended: `None` when one failed.
     pub fn bytes(&self) -> Option<&[u8]> {
         (!self.failed).then(|| &self.buffer[self.skip..self.skip + self.bytes])
+    }
+}
+
+/// The commands a staged journal write has queued, by the file offset it
+/// began at: those waiting for queue room and the tags in flight on the
+/// device.
+#[derive(Default)]
+pub struct Queued {
+    at: Option<u64>,
+    pending: VecDeque<Command>,
+    tags: Vec<u32>,
+}
+
+/// A staged partition target while the guest runs: each write splits its
+/// extents to [`stela_drivers::block::Features::transfer_limit`], paces
+/// submissions to [`BlockDevice::room`], and polls until every chunk ends.
+pub struct Staged<'a> {
+    pub device: &'a mut dyn BlockDevice,
+    pub extents: &'a [Extent],
+    pub queued: &'a mut Queued,
+}
+
+impl Staged<'_> {
+    /// Drain any already-completed tags without blocking, abandon any still
+    /// in flight, and reset [`Queued`] so a retry at the same offset starts
+    /// fresh rather than skipping command setup.
+    fn abort(&mut self) {
+        for tag in self.queued.tags.drain(..) {
+            let _ = self.device.finish(tag);
+        }
+        *self.queued = Queued::default();
+    }
+
+    /// Queue `commands` for the write at `at` while the device has queue room,
+    /// and take finished results: whether every command finished.
+    fn run(
+        &mut self,
+        at: u64,
+        commands: impl FnOnce() -> Result<Vec<Command>, String>,
+    ) -> Result<bool, String> {
+        if self.queued.at != Some(at) {
+            *self.queued = Queued {
+                at: Some(at),
+                pending: VecDeque::from(commands()?),
+                tags: Vec::new(),
+            };
+        }
+        let mut index = 0;
+        while index < self.queued.tags.len() {
+            let tag = self.queued.tags[index];
+            match self.device.finish(tag) {
+                None => index += 1,
+                Some(result) => {
+                    self.queued.tags.swap_remove(index);
+                    if let Err(error) = result {
+                        self.abort();
+                        return Err(format!("{error:?}"));
+                    }
+                }
+            }
+        }
+        let mut started = false;
+        while self.device.room() {
+            let Some(command) = self.queued.pending.pop_front() else {
+                break;
+            };
+            match self.device.start_more(command) {
+                Ok(tag) => {
+                    self.queued.tags.push(tag);
+                    started = true;
+                }
+                Err(error) => {
+                    if started {
+                        self.device.commit();
+                    }
+                    self.abort();
+                    return Err(format!("{error:?}"));
+                }
+            }
+        }
+        if started {
+            self.device.commit();
+        }
+        if self.queued.pending.is_empty() && self.queued.tags.is_empty() {
+            *self.queued = Queued::default();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// The device ranges of `bytes` at file offset `offset`.
+fn write_ranges(
+    extents: &[Extent],
+    block: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<Vec<(u64, u64, usize)>, String> {
+    journal::device_ranges(extents, block, offset, bytes.len() as u64).ok_or_else(|| {
+        format!(
+            "bytes {offset}+{} are not on the file's blocks",
+            bytes.len()
+        )
+    })
+}
+
+impl journal::Target for Staged<'_> {
+    type Error = String;
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
+        let identity = self.device.identity();
+        let block = u64::from(identity.block_size).max(1);
+        // Queued controllers such as NVMe reserve bounce pages per command up
+        // to `transfer_limit(false)` (`BOUNCE_BYTES`): split larger contiguous
+        // extents so a 1 MiB journal piece never exhausts the bounce pool.
+        let chunk = match identity.features.transfer_limit(false) {
+            0 => u64::MAX,
+            limit => (limit as u64 / block * block).max(block),
+        };
+        let extents = self.extents;
+        self.run(offset, || {
+            let mut commands = Vec::new();
+            for (lba, length, from) in write_ranges(extents, block, offset, bytes)? {
+                let mut done = 0u64;
+                while done < length {
+                    let piece = (length - done).min(chunk);
+                    let start = from + done as usize;
+                    commands.push(Command::Write {
+                        lba: lba + done / block,
+                        data: bytes[start..start + piece as usize].to_vec(),
+                        fua: false,
+                    });
+                    done += piece;
+                }
+            }
+            Ok(commands)
+        })
+    }
+    /// A device without a write cache is sent no flush, as the block
+    /// layer's ([`BlockDevice::flush`]) and the [`Direct`] target's.
+    fn flush(&mut self) -> Result<bool, String> {
+        if !self.device.identity().features.write_cache {
+            return Ok(true);
+        }
+        self.run(u64::MAX, || Ok(vec![Command::Flush]))
+    }
+}
+
+/// A synchronous partition target at a stop: each write completes before it
+/// returns.
+pub struct Direct<'a> {
+    pub device: &'a mut dyn BlockDevice,
+    pub extents: &'a [Extent],
+}
+
+impl journal::Target for Direct<'_> {
+    type Error = String;
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
+        let block = u64::from(self.device.identity().block_size);
+        for (lba, length, from) in write_ranges(self.extents, block, offset, bytes)? {
+            self.device
+                .write(lba, &bytes[from..from + length as usize])
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        Ok(true)
+    }
+    fn flush(&mut self) -> Result<bool, String> {
+        self.device.flush().map_err(|error| format!("{error:?}"))?;
+        Ok(true)
     }
 }
 
