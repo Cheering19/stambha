@@ -56,22 +56,31 @@ static LOW_DMA: NativeMemory = NativeMemory::new(&LOW_DMA_HEAP, cache::verify_wr
 static LOW_DMA_START: AtomicU64 = AtomicU64::new(0);
 static LOW_DMA_END: AtomicU64 = AtomicU64::new(0);
 
-/// Pages of the low DMA pool to ask the firmware for, largest first:
-/// MediaTek MT7925 installs 256 WM TX, 128 FWDL TX, 512 event RX and 1536
-/// data RX buffers as individual 4 KiB page-aligned allocations (~20 MiB in
-/// the heap with page-alignment overhead before in-flight TX buffers and
-/// bring-up retries, exceeding 16 MiB), while RTL8852CE takes ~1.1 MiB and
-/// other 32-bit requesters (HDA, tg3) share the same passthrough pool. Asking
-/// for 64 MiB first and stepping down on tighter firmware maps fits MT7925
-/// rings and TX buffers with headroom.
-const LOW_DMA_PAGES: [usize; 5] = [16384, 8192, 4096, 2048, 1024];
+/// Pages of the low DMA pool to ask the firmware for, largest first: an
+/// RTL8852CE's rings, RX buffers and TX pools take about 1.1 MiB, and the
+/// rest leaves room for other 32-bit requesters (HDA, tg3) on a
+/// passthrough domain.
+const LOW_DMA_PAGES: [usize; 3] = [4096, 2048, 1024];
+
+/// Larger low DMA pool requested only when the PCI census sees an MT7925
+/// (`14c3:7925` / `14c3:0717`): it installs 256 WM TX, 128 FWDL TX, 512
+/// event RX and 1536 data RX buffers as individual 4 KiB page-aligned
+/// allocations (~20 MiB in the heap before in-flight TX buffers and bring-up
+/// retries, exceeding 16 MiB), stepping down on tighter firmware maps.
+const MT7925_LOW_DMA_PAGES: [usize; 5] = [16384, 8192, 4096, 2048, 1024];
 
 /// Reserve the low DMA pool from the firmware, below 4 GiB, before boot
-/// services end. Without room the pool is absent and a 32-bit request the
-/// heap cannot meet fails as before.
-pub(crate) fn reserve_low_dma() -> crate::handoff::Region {
+/// services end. When `mt7925` is true, requests up to 64 MiB first and
+/// steps down; otherwise keeps the default 16 MiB ceiling. Without room the
+/// pool is absent and a 32-bit request the heap cannot meet fails as before.
+pub(crate) fn reserve_low_dma(mt7925: bool) -> crate::handoff::Region {
     use uefi::boot::{self, AllocateType, MemoryType};
-    for pages in LOW_DMA_PAGES {
+    let sizes: &[usize] = if mt7925 {
+        &MT7925_LOW_DMA_PAGES
+    } else {
+        &LOW_DMA_PAGES
+    };
+    for &pages in sizes {
         if let Ok(allocation) = boot::allocate_pages(
             AllocateType::MaxAddress(u32::MAX.into()),
             MemoryType::LOADER_DATA,
