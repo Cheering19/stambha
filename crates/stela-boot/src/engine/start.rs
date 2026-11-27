@@ -2993,6 +2993,14 @@ fn start_platform(
         takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
+    if let Some(acpi) = host_acpi
+        && !options.acpi_hardware
+    {
+        // Without hardware mode no EC handler is installed after the census;
+        // run before the census with PCI config writes admitted so AMD
+        // firmware (`\_SB.ALIB`) can write the Root Complex SMN mailbox.
+        acpi.set_asus_thermal_policy(options.asus_mode(), true);
+    }
     report_power_limits(host_acpi, native_mmio, handoff.root);
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
@@ -3130,9 +3138,11 @@ fn start_platform(
     };
     if let Some(acpi) = host_acpi {
         acpi.activate(prepared_sci);
-        // After hardware mode, where it runs, so an EC whose RAM is reached
-        // through its operation region is installed; it needs none.
-        acpi.set_asus_thermal_policy(options.asus_mode());
+        // With hardware mode, run after `activate` so an EC whose RAM is
+        // reached through its operation region is installed.
+        if options.acpi_hardware {
+            acpi.set_asus_thermal_policy(options.asus_mode(), false);
+        }
     }
     super::step_watchdog::clear_stage();
     super::step_watchdog::leave();
