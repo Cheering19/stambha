@@ -13,6 +13,7 @@
 //! adapter). Its registers and DMA pages are identity-mapped in the
 //! loader's root, so every frame moves inside that root
 //! (`storage::RestoreRoot`), as block and input I/O do.
+
 mod security;
 use super::storage::RestoreRoot;
 use crate::Refusal;
