@@ -48,7 +48,7 @@ Apple hardware macOS expects. No Mac, no Hackintosh kexts, no virtual machine.
 | ⚡ **About 1.5x faster than Stela 0.5.0** | Hundreds of translator and engine improvements, and Apple's matrix engine (AMX) running natively on your CPU |
 | 🛡️ **Steady** | No Wi-Fi freezes, laptop touchpads stay working, and a macOS crash stops cleanly with the log saved |
 | 📶 **Wi-Fi** | Install over Wi-Fi and network inside macOS with a Realtek RTL8852CE; more chips experimental |
-| 🎮 **AMD & Intel graphics** | An experimental build for Radeon and Intel GPUs |
+| 🎮 **AMD & Intel graphics** | Experimental: Radeon RX 6000 and RX 7000 cards boot macOS, and Intel built-in graphics now reach the macOS desktop in test builds (RX 9000 in testing; early builds on Discord) |
 | 🛡️ **A safe installer** | Only ever uses empty space on your disk; see [below](#-safe-for-the-system-you-already-have) |
 
 ## 🔧 Coming next
