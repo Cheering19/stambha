@@ -277,6 +277,9 @@ pub struct Cpu {
     /// CPUID.80000007H:EDX[8]: the TSC, which this boot keeps time with,
     /// runs in every C-state.
     pub nonstop_tsc: bool,
+    /// Opt-in (`--io-cstates`): admit System I/O C2/C3 states; off by default
+    /// so non-opted-in boots keep refusing `Entry::SystemIo`.
+    pub allow_io: bool,
 }
 
 /// How an admitted state is entered.
@@ -362,17 +365,22 @@ pub fn admit(states: &[CState], cpu: &Cpu) -> (Vec<Admitted>, Vec<(CState, Refus
                     continue;
                 }
             },
-            Entry::SystemIo(address) => match u16::try_from(address).ok().filter(|&port| port != 0)
-            {
-                Some(port) => (
-                    Enter::IoPort(port),
-                    cpu.amd && cpu.always_running_timer && cpu.nonstop_tsc,
-                ),
-                None => {
-                    refused.push((*state, Refusal::IoPort));
-                    continue;
+            Entry::SystemIo(address) => {
+                match cpu
+                    .allow_io
+                    .then(|| u16::try_from(address).ok().filter(|&port| port != 0))
+                    .flatten()
+                {
+                    Some(port) => (
+                        Enter::IoPort(port),
+                        cpu.amd && cpu.always_running_timer && cpu.nonstop_tsc,
+                    ),
+                    None => {
+                        refused.push((*state, Refusal::IoPort));
+                        continue;
+                    }
                 }
-            },
+            }
         };
         let refusal = match state.kind {
             1 => None,

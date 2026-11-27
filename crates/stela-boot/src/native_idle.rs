@@ -9,7 +9,7 @@ use core::{
         x86_64::{__cpuid, __cpuid_count},
     },
     ptr,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 use stela_drivers::platform::acpi::processor::{
     self, Admitted, CState, Cpu, CstError, Declaration, Declared, Enter, Handshake, IdleHistory,
@@ -47,6 +47,8 @@ unsafe impl Sync for Admission {}
 /// The declared processors by APIC ID, published once by [`install`] when
 /// any has states. Without one, a wait halts without asking which CPU it is.
 static PROCESSORS: AtomicPtr<Vec<Processor>> = AtomicPtr::new(ptr::null_mut());
+/// Opt-in (`--io-cstates`) to admit System I/O C2/C3 states.
+static ALLOW_IO: AtomicBool = AtomicBool::new(false);
 
 /// The line MONITOR arms. Nothing writes it, so only interrupts end a wait.
 #[repr(align(64))]
@@ -95,7 +97,8 @@ pub(crate) fn capabilities() -> u32 {
 
 /// Install the firmware's idle declaration, or report why idle halts.
 /// This processor's states, and each one it leaves out, are reported.
-pub(crate) fn install(declaration: Option<Declaration>) {
+pub(crate) fn install(declaration: Option<Declaration>, allow_io: bool) {
+    ALLOW_IO.store(allow_io, Ordering::Release);
     let Some(declaration) = declaration else {
         crate::output::arguments(format_args!(
             "HOST IDLE: no ACPI processor declaration; processors halt\n"
@@ -404,6 +407,7 @@ fn cpu() -> Cpu {
         always_running_timer: leaf.eax >= 6 && __cpuid(6).eax & ARAT != 0,
         nonstop_tsc: __cpuid(0x8000_0000).eax >= 0x8000_0007
             && __cpuid(0x8000_0007).edx & INVARIANT_TSC != 0,
+        allow_io: ALLOW_IO.load(Ordering::Acquire),
     }
 }
 

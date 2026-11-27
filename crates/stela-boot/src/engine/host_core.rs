@@ -67,10 +67,11 @@ pub(super) fn takes_pump() -> bool {
     )
 }
 
-/// Wake the host core with a doorbell IPI if it is currently sleeping in
-/// [`pause`], so raised GPU work does not wait for the next service timer.
+/// Wake the host core with a doorbell IPI if it is currently serving and
+/// sleeping in [`pause`], so raised GPU work does not wait for the next
+/// service timer.
 pub(super) fn wake_if_sleeping() -> bool {
-    if !SLEEPING.load(Ordering::Acquire) {
+    if !takes_pump() || !SLEEPING.load(Ordering::Acquire) {
         return false;
     }
     let apic = APIC_ID.load(Ordering::Relaxed);
@@ -129,7 +130,8 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
     loop {
         crate::native_mmio::shootdown::service();
         let mut pumped = false;
-        match CHANNEL.turn(host::fresh_counter()) {
+        let turn = CHANNEL.turn(host::fresh_counter());
+        match turn {
             Turn::Serve => {
                 let now = host::rdtsc();
                 if now.wrapping_sub(served) >= service_ticks {
@@ -148,6 +150,7 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
             Turn::Idle => {}
             Turn::Leave => break,
         }
+        let wakeable = matches!(turn, Turn::Serve);
         let wait_us = if pumped {
             PAUSE_MICROS
         } else {
@@ -155,22 +158,26 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
             let left_us = service_ticks.saturating_sub(elapsed) / micros;
             left_us.clamp(PAUSE_MICROS, SERVICE_MICROS)
         };
-        pause(wait_us, fallback_ticks);
+        pause(wait_us, fallback_ticks, wakeable);
     }
     // Stopped: it serves nothing more, and answers shootdowns for good.
     loop {
         crate::native_mmio::shootdown::service();
-        pause(1000, fallback_ticks);
+        pause(1000, fallback_ticks, false);
     }
 }
 
-fn pause(wait_us: u64, fallback_ticks: u64) {
+fn pause(wait_us: u64, fallback_ticks: u64, wakeable: bool) {
     // Halted, the host core uses no window translation: shootdowns count it
     // as acknowledged until it wakes, and it flushes first then.
     let _idle = crate::native_mmio::shootdown::idle();
-    SLEEPING.store(true, Ordering::Release);
+    if wakeable {
+        SLEEPING.store(true, Ordering::Release);
+    }
     let slept = host::try_sleep_for(wait_us);
-    SLEEPING.store(false, Ordering::Release);
+    if wakeable {
+        SLEEPING.store(false, Ordering::Release);
+    }
     if !slept {
         let start = host::rdtsc();
         while host::rdtsc().wrapping_sub(start) < fallback_ticks {

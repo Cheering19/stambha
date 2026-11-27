@@ -68,6 +68,7 @@ const SKYLAKE: Cpu = Cpu {
     mwait: Some((3, 0x0011_1120)),
     always_running_timer: true,
     nonstop_tsc: true,
+    allow_io: false,
 };
 
 const ZEN5: Cpu = Cpu {
@@ -77,6 +78,7 @@ const ZEN5: Cpu = Cpu {
     mwait: Some((3, 0x0000_0011)),
     always_running_timer: true,
     nonstop_tsc: true,
+    allow_io: true,
 };
 
 #[test]
@@ -168,6 +170,20 @@ fn without_mwait_c1_halts_and_deeper_states_stay_out() {
             entry: Entry::SystemIo(0x415),
         },
     ];
+    // Without opt-in (`allow_io: false`), System I/O C2/C3 are refused.
+    let (default_admitted, default_refused) = admit(
+        &amd_cst,
+        &Cpu {
+            allow_io: false,
+            ..ZEN5
+        },
+    );
+    assert_eq!(default_admitted.len(), 1);
+    assert_eq!(
+        default_refused.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+        [Refusal::IoPort, Refusal::IoPort]
+    );
+    // With opt-in (`allow_io: true`), AMD Zen 5 System I/O C2/C3 (0x414/0x415) are admitted.
     let (amd_admitted, amd_refused) = admit(&amd_cst, &ZEN5);
     assert!(amd_refused.is_empty(), "{amd_refused:?}");
     let amd_entered: Vec<_> = amd_admitted
