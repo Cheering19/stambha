@@ -344,7 +344,10 @@ fn an_off_config_enables_nothing() {
     // generated table enables every routine it holds.
     assert_eq!(config::booted(false, &[], two_routines()), off);
     assert_eq!(Config::boot(false, &[]), off);
-    assert_eq!(Config::boot(true, &[]).enabled, Id::Memmove.bit());
+    assert_eq!(
+        Config::boot(true, &[]).enabled,
+        Id::Memmove.bit() | Id::Bzero.bit()
+    );
     // A routine without a signature is never enabled.
     assert_eq!(Config::with_table(two_routines(), &[Id::Strlen]).enabled, 0);
 }
@@ -442,6 +445,6 @@ fn a_boot_config_describes_its_routines() {
     );
     assert_eq!(
         Config::boot(true, &[]).describe(&[]),
-        "on signatures=1 ids=memmove off=- max=65536"
+        "on signatures=2 ids=memmove,bzero off=- max=65536"
     );
 }
