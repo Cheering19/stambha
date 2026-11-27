@@ -2993,12 +2993,17 @@ fn start_platform(
         takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
+    let amd_cpu = {
+        let vendor = core::arch::x86_64::__cpuid(0);
+        (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163)
+    };
+    let asus_pre_census = amd_cpu && !options.acpi_hardware;
     if let Some(acpi) = host_acpi
-        && !options.acpi_hardware
+        && asus_pre_census
     {
-        // Without hardware mode no EC handler is installed after the census;
-        // run before the census with PCI config writes admitted so AMD
-        // firmware (`\_SB.ALIB`) can write the Root Complex SMN mailbox.
+        // On AMD laptops without hardware mode no EC handler is installed after
+        // the census; run before the census with PCI config writes admitted so
+        // AMD firmware (`\_SB.ALIB`) can write the Root Complex SMN mailbox.
         acpi.set_asus_thermal_policy(options.asus_mode(), true);
     }
     report_power_limits(host_acpi, native_mmio, handoff.root);
@@ -3138,9 +3143,9 @@ fn start_platform(
     };
     if let Some(acpi) = host_acpi {
         acpi.activate(prepared_sci);
-        // With hardware mode, run after `activate` so an EC whose RAM is
-        // reached through its operation region is installed.
-        if options.acpi_hardware {
+        // With hardware mode (or on non-AMD laptops), run after `activate` so
+        // an EC whose RAM is reached through its operation region is installed.
+        if !asus_pre_census {
             acpi.set_asus_thermal_policy(options.asus_mode(), false);
         }
     }
