@@ -2210,14 +2210,7 @@ pub unsafe fn open(
         // By default `Optional::Store` uses `Named::Unique` so an internal ESP
         // shared with another OS is not written unasked; `--store-esp` opts
         // into `Named::Host`, like `log` and `fdr`.
-        .map(|guid| {
-            let named = if store_esp {
-                Named::Host(guid)
-            } else {
-                Named::Unique(guid)
-            };
-            (named, Optional::Store)
-        })
+        .map(|guid| (Named::store(guid, store_esp), Optional::Store))
         .into_iter()
         .chain(log.map(|guid| (Named::Host(guid), Optional::Log)))
         .collect();
