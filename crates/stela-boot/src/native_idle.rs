@@ -189,6 +189,9 @@ fn describe(state: &Admitted) -> String {
             "C{} MWAIT {hint:#x} exit {} us",
             state.kind, state.latency_us
         ),
+        Enter::IoPort(port) => {
+            format!("C{} I/O {port:#x} exit {} us", state.kind, state.latency_us)
+        }
     }
 }
 
@@ -306,6 +309,34 @@ pub(crate) unsafe fn wait_with(budget_us: impl FnOnce() -> Option<u64>, ring: Op
                 asm!("mwait", "sti", "nop", "cli", in("eax") hint, in("ecx") 1, options(nostack));
             }
         }
+        Some((Enter::IoPort(port), _)) => {
+            let pm_port = crate::firmware::pm_timer_port();
+            // SAFETY: `port` came from this processor's `_CST` System I/O entry.
+            // Entered with IF=0, reading the ACPI C-state port enters hardware
+            // C2/C3 (e.g. AMD CC6) and wakes on any interrupt event (APIC timer
+            // or IPI). A dummy PM timer read serializes the C-state exit before
+            // `sti; nop; cli` takes the waking interrupt (matching Linux
+            // `acpi_idle_do_entry`).
+            unsafe {
+                let mut _byte: u8;
+                asm!(
+                    "in al, dx",
+                    out("al") _byte,
+                    in("dx") port,
+                    options(nomem, nostack, preserves_flags)
+                );
+                if let Some(pm) = pm_port {
+                    let mut _dummy: u32;
+                    asm!(
+                        "in eax, dx",
+                        out("eax") _dummy,
+                        in("dx") pm,
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+                asm!("sti", "nop", "cli", options(nostack));
+            }
+        }
         // SAFETY: STI's interrupt shadow covers HLT, so no wake-up is lost.
         _ => unsafe { asm!("sti", "hlt", "cli", options(nostack)) },
     }
@@ -358,9 +389,9 @@ fn cpu() -> Cpu {
     let vendor = (leaf.ebx, leaf.edx, leaf.ecx);
     // "GenuineIntel", "AuthenticAMD" and "HygonGenuine".
     let intel = vendor == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
-    let mwait_vendor = intel
-        || vendor == (0x6874_7541, 0x6974_6e65, 0x444d_4163)
+    let amd = vendor == (0x6874_7541, 0x6974_6e65, 0x444d_4163)
         || vendor == (0x6f67_7948, 0x6e65_476e, 0x656e_6975);
+    let mwait_vendor = intel || amd;
     let mwait = (leaf.eax >= 5 && __cpuid(1).ecx & MWAIT != 0).then(|| {
         let leaf = __cpuid(5);
         (leaf.ecx, leaf.edx)
@@ -368,6 +399,7 @@ fn cpu() -> Cpu {
     Cpu {
         mwait_vendor,
         intel,
+        amd,
         mwait,
         always_running_timer: leaf.eax >= 6 && __cpuid(6).eax & ARAT != 0,
         nonstop_tsc: __cpuid(0x8000_0000).eax >= 0x8000_0007

@@ -265,6 +265,10 @@ pub struct Cpu {
     /// Intel, AMD or Hygon: the vendors whose `_CST` MWAIT hints Linux uses.
     pub mwait_vendor: bool,
     pub intel: bool,
+    /// AuthenticAMD or HygonGenuine: modern AMD CPUs handle cache coherency
+    /// across hardware CC6 (`SystemIo` C3) without legacy BM_STS polling when
+    /// ARAT and nonstop TSC are present.
+    pub amd: bool,
     /// CPUID leaf 5 ECX and EDX, when MONITOR/MWAIT and the leaf exist.
     pub mwait: Option<(u32, u32)>,
     /// CPUID.06H:EAX[2]: the APIC timer runs in every C-state. Deeper states
@@ -281,6 +285,8 @@ pub enum Enter {
     Halt,
     /// MWAIT with this hint and interrupts as break events.
     Mwait(u32),
+    /// System I/O read from this 16-bit port (e.g. AMD ACPI C2/C3 `0x414`/`0x415`).
+    IoPort(u16),
 }
 
 /// A state the CPU may enter.
@@ -356,10 +362,17 @@ pub fn admit(states: &[CState], cpu: &Cpu) -> (Vec<Admitted>, Vec<(CState, Refus
                     continue;
                 }
             },
-            Entry::SystemIo(_) => {
-                refused.push((*state, Refusal::IoPort));
-                continue;
-            }
+            Entry::SystemIo(address) => match u16::try_from(address).ok().filter(|&port| port != 0)
+            {
+                Some(port) => (
+                    Enter::IoPort(port),
+                    cpu.amd && cpu.always_running_timer && cpu.nonstop_tsc,
+                ),
+                None => {
+                    refused.push((*state, Refusal::IoPort));
+                    continue;
+                }
+            },
         };
         let refusal = match state.kind {
             1 => None,
